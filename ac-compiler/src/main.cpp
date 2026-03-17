@@ -16,6 +16,9 @@ std::string generateJava(const ASTNode& ast);
 std::string generateCpp(const ASTNode& ast);
 std::string generateC(const ASTNode& ast);
 std::string generateAsm(const ASTNode& ast);
+std::string generateRs(const ASTNode& ast);
+std::string generateGo(const ASTNode& ast);
+std::string generateV(const ASTNode& ast);
 
 static std::string readFile(const std::string& path) {
     std::ifstream f(path);
@@ -49,8 +52,9 @@ static std::string getRunner(const std::string& backend, const std::string& outF
     if (backend == "C++")  return "g++ " + outFile + " -o /tmp/ac_out && /tmp/ac_out";
     if (backend == "C")    return "gcc " + outFile + " -o /tmp/ac_out && /tmp/ac_out";
     if (backend == "ASM")  return "gcc " + outFile + " -o /tmp/ac_out && /tmp/ac_out";
-    if (backend == "GO")   return "go run " + outFile;
     if (backend == "RS")   return "rustc " + outFile + " -o /tmp/ac_out && /tmp/ac_out";
+    if (backend == "GO")   return "go run " + outFile;
+    if (backend == "V")    return "cd /tmp/v && /usr/local/bin/v run " + outFile;
     return "";
 }
 
@@ -105,6 +109,15 @@ int main(int argc, char* argv[]) {
         } else if (backend == "ASM") {
             outFile = inputFile.substr(0, inputFile.rfind('.')) + ".s";
             writeFile(outFile, generateAsm(*ast));
+        } else if (backend == "RS") {
+            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".rs";
+            writeFile(outFile, generateRs(*ast));
+        } else if (backend == "GO") {
+            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".go";
+            writeFile(outFile, generateGo(*ast));
+        } else if (backend == "V") {
+            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".v";
+            writeFile(outFile, generateV(*ast));
         } else {
             std::cerr << "Backend '" << backend << "' not yet implemented.\n";
             return 1;
