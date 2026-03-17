@@ -1,0 +1,19 @@
+AC->PY *backend*
+
+<mainloop>
+
+     <LOGIC>
+
+          Term.display $Before foreign code$
+
+          <Foreign>
+import platform
+print("Foreign: running on", platform.system(), platform.release())
+          <Foreign>
+
+          Term.display $After foreign code$
+          /kill
+
+     <LOGIC>
+
+<mainloop>
