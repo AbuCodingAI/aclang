@@ -10,6 +10,7 @@
 class AsmCodeGen {
     std::ostringstream out;
     std::ostringstream functions;
+    std::ostringstream* currentOut;  // Points to either out or functions
     int labelCounter = 0;
     int stackOffset = 0;
     bool collectingFunctions = false;
@@ -22,14 +23,11 @@ class AsmCodeGen {
     }
 
     void emit(const std::string& line) {
-        out << "    " << line << "\n";
+        *currentOut << "    " << line << "\n";
     }
-    void emitRaw(const std::string& line) { out << line << "\n"; }
-    
-    void emitFunc(const std::string& line) {
-        functions << "    " << line << "\n";
+    void emitRaw(const std::string& line) { 
+        *currentOut << line << "\n"; 
     }
-    void emitFuncRaw(const std::string& line) { functions << line << "\n"; }
 
     std::string quoteIfString(const std::string& val) {
         std::string v = val;
@@ -82,6 +80,8 @@ class AsmCodeGen {
         switch (node.type) {
 
         case NodeType::Program: {
+            currentOut = &out;  // Initialize to main output
+            
             emitRaw(".section .rodata");
             emitRaw("    fmt_int: .asciz \"%d\\n\"");
             emitRaw("    fmt_str: .asciz \"%s\\n\"");
@@ -176,14 +176,25 @@ class AsmCodeGen {
 
         case NodeType::ReturnStmt: {
             std::string val = node.value;
+            
+            // For now, just handle simple cases
+            // TODO: Handle complex expressions like "fn n*(factorial(n-1))"
+            
             if (!val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1))) {
                 emit("mov $" + val + ", %eax");
             } else if (!val.empty()) {
                 auto it = varOffsets.find(val);
                 if (it != varOffsets.end()) {
                     emit("mov " + std::to_string(it->second) + "(%rbp), %eax");
+                } else {
+                    // Assume it's a simple expression - just emit as is
+                    emit("# return " + val);
+                    emit("mov $0, %eax");  // Default to 0
                 }
             }
+            
+            emit("pop %rbp");
+            emit("ret");
             break;
         }
 
@@ -278,10 +289,14 @@ class AsmCodeGen {
         case NodeType::FuncDef: {
             if (!collectingFunctions) break;
             std::string arg = node.attrs.empty() ? "" : node.attrs[0];
-            emitFuncRaw(node.value + ":");
-            emitFunc("push %rbp");
-            emitFunc("mov %rsp, %rbp");
-            emitFunc("sub $256, %rsp");
+            
+            // Switch to functions output
+            currentOut = &functions;
+            
+            emitRaw(node.value + ":");
+            emit("push %rbp");
+            emit("mov %rsp, %rbp");
+            emit("sub $256, %rsp");
             
             // Save current state
             auto savedOffsets = varOffsets;
@@ -292,49 +307,95 @@ class AsmCodeGen {
             varTypes.clear();
             currentOffset = 0;
             
-            // Parameter at 16(%rbp)
-            varOffsets[arg] = 16;
+            // Parameter passed in %edi, move to stack
+            emit("mov %edi, -8(%rbp)  # parameter " + arg);
+            varOffsets[arg] = -8;
             varTypes[arg] = std::make_shared<Type>(TypeKind::Numeral);
             
-            if (!node.children.empty()) {
+            if (!node.children.empty() && !node.children[0]->children.empty()) {
                 for (auto& c : node.children[0]->children) {
-                    // Emit function body
-                    std::ostringstream tempOut = std::move(out);
-                    out.str("");
-                    out.clear();
                     genNode(*c);
-                    functions << out.str();
-                    out = std::move(tempOut);
                 }
             }
             
-            emitFunc("pop %rbp");
-            emitFunc("ret");
+            // If no explicit return, return 0
+            emit("mov $0, %eax");
+            emit("pop %rbp");
+            emit("ret");
             
             // Restore state
             varOffsets = savedOffsets;
             varTypes = savedTypes;
             currentOffset = savedOffset;
+            currentOut = &out;  // Switch back to main output
             break;
         }
 
         case NodeType::IfStmt: {
-            std::string label_else = newLabel();
             std::string cond = node.value;
-            emit("# if " + cond);
-            emit("cmp $0, %eax");
-            emit("je " + label_else);
-            if (!node.children.empty()) {
-                for (auto& c : node.children[0]->children) genNode(*c);
+            
+            // Handle OTHER case
+            if (cond == "OTHER") {
+                if (!node.children.empty()) {
+                    for (auto& c : node.children[0]->children) genNode(*c);
+                }
+            } else {
+                std::string label_else = newLabel();
+                
+                // Parse condition: "n = 0" or "n #= 0"
+                size_t eqPos = cond.find('=');
+                if (eqPos != std::string::npos) {
+                    std::string lhs = cond.substr(0, eqPos);
+                    std::string rhs = cond.substr(eqPos + 1);
+                    
+                    // Trim whitespace
+                    while (!lhs.empty() && lhs.back() == ' ') lhs.pop_back();
+                    while (!rhs.empty() && rhs[0] == ' ') rhs = rhs.substr(1);
+                    
+                    // Get variable value
+                    auto it = varOffsets.find(lhs);
+                    if (it != varOffsets.end()) {
+                        emit("mov " + std::to_string(it->second) + "(%rbp), %eax");
+                        emit("cmp $" + rhs + ", %eax");
+                        emit("jne " + label_else);
+                    } else {
+                        emit("# condition: " + cond);
+                    }
+                } else {
+                    emit("# condition: " + cond);
+                }
+                
+                if (!node.children.empty()) {
+                    for (auto& c : node.children[0]->children) genNode(*c);
+                }
+                emitRaw(label_else + ":");
             }
-            emitRaw(label_else + ":");
             break;
         }
 
         case NodeType::ElseIfStmt: {
             std::string label_else = newLabel();
-            emit("cmp $0, %eax");
-            emit("je " + label_else);
+            std::string cond = node.value;
+            
+            // Parse condition similar to IfStmt
+            size_t eqPos = cond.find('=');
+            if (eqPos != std::string::npos) {
+                std::string lhs = cond.substr(0, eqPos);
+                std::string rhs = cond.substr(eqPos + 1);
+                
+                // Trim whitespace
+                while (!lhs.empty() && lhs.back() == ' ') lhs.pop_back();
+                while (!rhs.empty() && rhs[0] == ' ') rhs = rhs.substr(1);
+                
+                // Get variable value
+                auto it = varOffsets.find(lhs);
+                if (it != varOffsets.end()) {
+                    emit("mov " + std::to_string(it->second) + "(%rbp), %eax");
+                    emit("cmp $" + rhs + ", %eax");
+                    emit("jne " + label_else);
+                }
+            }
+            
             if (!node.children.empty()) {
                 for (auto& c : node.children[0]->children) genNode(*c);
             }
@@ -394,14 +455,14 @@ class AsmCodeGen {
             break;
 
         case NodeType::CustomTagDef:
-            emitFuncRaw("spawn_" + node.value + ":");
-            emitFunc("push %rbp");
-            emitFunc("mov %rsp, %rbp");
+            emitRaw("spawn_" + node.value + ":");
+            emit("push %rbp");
+            emit("mov %rsp, %rbp");
             if (!node.children.empty()) {
                 for (auto& c : node.children[0]->children) genNode(*c);
             }
-            emitFunc("pop %rbp");
-            emitFunc("ret");
+            emit("pop %rbp");
+            emit("ret");
             break;
 
         case NodeType::SpawnStmt: {
