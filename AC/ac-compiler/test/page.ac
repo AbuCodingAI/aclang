@@ -1,0 +1,16 @@
+AC->HTML *backend*
+
+<mainloop>
+
+     <LOGIC>
+
+          title.display $My AC Page$
+          header.display $Welcome$ Hierarchy 1
+          header.display $About$ Hierarchy 3
+          bold.display $This is bold text$
+          italic.display $This is italic$
+          display $Just a paragraph$
+
+     <LOGIC>
+
+<mainloop>
