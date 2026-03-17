@@ -195,9 +195,28 @@ class AsmCodeGen {
                 bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
                 bool isFuncCall = val.find('(') != std::string::npos && val.find(')') != std::string::npos;
                 
-                if (isNum || isFuncCall) {
+                if (isNum) {
                     varType = std::make_shared<Type>(TypeKind::Numeral);
                     emit("mov $" + val + ", %eax");
+                } else if (isFuncCall) {
+                    // Handle function call: extract function name and argument
+                    varType = std::make_shared<Type>(TypeKind::Numeral);
+                    size_t parenPos = val.find('(');
+                    std::string funcName = val.substr(0, parenPos);
+                    std::string arg = val.substr(parenPos + 1, val.find(')') - parenPos - 1);
+                    
+                    // Move argument to %edi (first parameter register)
+                    if (std::isdigit(arg[0]) || (arg[0] == '-' && arg.size() > 1)) {
+                        emit("mov $" + arg + ", %edi");
+                    } else {
+                        // It's a variable
+                        auto it = varOffsets.find(arg);
+                        if (it != varOffsets.end()) {
+                            emit("mov " + std::to_string(it->second) + "(%rbp), %edi");
+                        }
+                    }
+                    emit("call " + funcName);
+                    emit("# result in %eax");
                 } else {
                     varType = std::make_shared<Type>(TypeKind::String);
                     emit("# assign string: " + val);
