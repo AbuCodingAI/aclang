@@ -26,17 +26,17 @@ ac mycode.ac --backend PY
 
 | Declaration in file | Target         | Status        |
 |---------------------|----------------|---------------|
-| `AC->PY`            | Python         | Implemented   |
-| `AC->JS`            | JavaScript     | Implemented   |
-| `AC->HTML`          | HTML           | Implemented   |
+| `AC->PY`            | Python         | ✅ Implemented   |
+| `AC->JS`            | JavaScript     | ✅ Implemented   |
+| `AC->HTML`          | HTML           | ✅ Implemented   |
+| `AC->Java`          | Java           | ✅ Implemented   |
+| `AC->C`             | C              | ✅ Implemented   |
+| `AC->C++`           | C++            | ✅ Implemented   |
+| `AC->ASM`           | Assembly       | ✅ Implemented   |
 | `AC->CSS`           | CSS            | Planned       |
-| `AC->ASM`           | Assembly       | In Progress   |
-| `AC->Java`          | Java           | Implemented   |
 | `AC->GO`            | Go             | Planned       |
 | `AC->RS`            | Rust           | Planned       |
 | `AC->V`             | V              | Planned       |
-| `AC->C`             | C              | In Progress   |
-| `AC->C++`           | C++            | In Progress   |
 | `AC->BNY`           | Machine Code   | Planned       |
 
 ---
