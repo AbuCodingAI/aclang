@@ -72,31 +72,36 @@ class GoCodeGen {
             emitRaw("    \"fmt\"");
             emitRaw("    \"os\"");
             emitRaw(")");
-            
-            // First pass: collect functions
-            collectingFunctions = true;
-            std::function<void(const ASTNode&)> collectFuncs = [&](const ASTNode& n) {
-                if (n.type == NodeType::FuncDef) {
-                    genNode(n);
-                }
-                for (auto& c : n.children) {
-                    collectFuncs(*c);
-                }
-            };
+            emitRaw("");
+            const ASTNode* mainloopBlock = nullptr;
             for (auto& c : node.children) {
-                collectFuncs(*c);
+                if (c->type == NodeType::TagBlock && c->value == "mainloop")
+                    mainloopBlock = c.get();
+                else if (c->type == NodeType::AssignStmt && !c->attrs.empty()) {
+                    std::string val = c->attrs[0];
+                    emitRaw("var " + c->value + " = " + unwrapDollars(val));
+                }
+            }
+            emitRaw("");
+            collectingFunctions = true;
+            {
+                std::function<void(const ASTNode&)> collectFuncs = [&](const ASTNode& n) {
+                    if (n.type == NodeType::FuncDef) genNode(n);
+                    for (auto& c : n.children) collectFuncs(*c);
+                };
+                if (mainloopBlock) collectFuncs(*mainloopBlock);
             }
             collectingFunctions = false;
-            
-            // Emit functions
             emitRaw(functions.str());
-            
             emitRaw("func main() {");
             indentLevel++;
-            
-            // Second pass: emit main body
-            for (auto& c : node.children) genNode(*c);
-            
+            if (mainloopBlock) {
+                emit("for {");
+                indentLevel++;
+                for (auto& c : mainloopBlock->children) genNode(*c);
+                indentLevel--;
+                emit("}");
+            }
             indentLevel--;
             emit("}");
             break;
@@ -104,6 +109,7 @@ class GoCodeGen {
 
         case NodeType::BackendDecl: break;
         case NodeType::UseStmt:     break;
+        case NodeType::UseLibStmt:  break;
         case NodeType::SaveStmt:    break;
         case NodeType::ConfigCall:  break;
         case NodeType::ObjDecl:     break;

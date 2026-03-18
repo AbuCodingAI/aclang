@@ -128,6 +128,7 @@ class AsmCodeGen {
 
         case NodeType::BackendDecl: break;
         case NodeType::UseStmt:     break;
+        case NodeType::UseLibStmt:  break;
         case NodeType::SaveStmt:    break;
         case NodeType::ConfigCall:  break;
         case NodeType::ObjDecl:     break;
