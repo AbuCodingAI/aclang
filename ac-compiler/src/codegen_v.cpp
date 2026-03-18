@@ -43,6 +43,13 @@ class VCodeGen {
         while (!r.empty() && r.back() == ' ') r.pop_back();
         while (!r.empty() && r.front() == ' ') r = r.substr(1);
         r = unwrapDollars(r);
+        // #= -> !=
+        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
+            r.replace(p, 2, "!="), p += 2;
+        // is -> == (equality keyword)
+        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
+            r.replace(p, 4, " == "), p += 4;
+        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
         // Remove 'fn' keywords
         for (size_t p = 0; (p = r.find("fn", p)) != std::string::npos;) {
             if (p + 2 < r.size() && r[p + 2] == ' ') {
@@ -191,6 +198,14 @@ class VCodeGen {
         case NodeType::IfStmt: {
             std::string cond = node.value;
             if (cond == "OTHER") {
+                std::string cur = out.str();
+                size_t end = cur.rfind("}\n");
+                if (end != std::string::npos) {
+                    size_t start = cur.rfind('\n', end - 1);
+                    start = (start == std::string::npos) ? 0 : start + 1;
+                    out.str(cur.substr(0, start));
+                    out.seekp(0, std::ios::end);
+                }
                 emit("} else {");
             } else {
                 emit("if " + translateExpr(cond) + " {");
@@ -198,15 +213,25 @@ class VCodeGen {
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
+            emit("}");
             break;
         }
 
         case NodeType::ElseIfStmt: {
             std::string cond = node.value;
+            std::string cur = out.str();
+            size_t end = cur.rfind("}\n");
+            if (end != std::string::npos) {
+                size_t start = cur.rfind('\n', end - 1);
+                start = (start == std::string::npos) ? 0 : start + 1;
+                out.str(cur.substr(0, start));
+                out.seekp(0, std::ios::end);
+            }
             emit("} else if " + translateExpr(cond) + " {");
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
+            emit("}");
             break;
         }
 

@@ -46,15 +46,12 @@ class JavaCodeGen {
         std::string r = cond;
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
-        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;) {
-            r.replace(p, 2, "!="); p += 2;
-        }
-        for (size_t p = 0; (p = r.find('=', p)) != std::string::npos;) {
-            bool prevOp = p > 0 && (r[p-1] == '!' || r[p-1] == '<' || r[p-1] == '>' || r[p-1] == '=');
-            bool nextEq = p+1 < r.size() && r[p+1] == '=';
-            if (!prevOp && !nextEq) { r.replace(p, 1, "=="); p += 2; }
-            else p++;
-        }
+        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
+            r.replace(p, 2, "!="), p += 2;
+        // is -> == (equality keyword)
+        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
+            r.replace(p, 4, " == "), p += 4;
+        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
         return r;
     }
 
@@ -274,6 +271,14 @@ class JavaCodeGen {
 
         case NodeType::IfStmt: {
             if (node.value == "OTHER") {
+                std::string cur = out.str();
+                size_t end = cur.rfind("}\n");
+                if (end != std::string::npos) {
+                    size_t start = cur.rfind('\n', end - 1);
+                    start = (start == std::string::npos) ? 0 : start + 1;
+                    out.str(cur.substr(0, start));
+                    out.seekp(0, std::ios::end);
+                }
                 emit("} else {");
             } else {
                 std::string cond = translateCondition(node.value);
@@ -283,16 +288,26 @@ class JavaCodeGen {
             if (!node.children.empty()) genBlock(*node.children[0]);
             else emit("// empty");
             indentLevel--;
+            emit("}");
             break;
         }
 
         case NodeType::ElseIfStmt: {
             std::string cond = translateCondition(node.value);
+            std::string cur = out.str();
+            size_t end = cur.rfind("}\n");
+            if (end != std::string::npos) {
+                size_t start = cur.rfind('\n', end - 1);
+                start = (start == std::string::npos) ? 0 : start + 1;
+                out.str(cur.substr(0, start));
+                out.seekp(0, std::ios::end);
+            }
             emit("} else if (" + cond + ") {");
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             else emit("// empty");
             indentLevel--;
+            emit("}");
             break;
         }
 

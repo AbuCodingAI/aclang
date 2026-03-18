@@ -49,16 +49,12 @@ class PythonCodeGen {
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
         // #= -> !=
-        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;) {
-            r.replace(p, 2, "!="); p += 2;
-        }
-        // isolated = -> ==  (not inside != or <=  or >=)
-        for (size_t p = 0; (p = r.find('=', p)) != std::string::npos;) {
-            bool prevOp = p > 0 && (r[p-1] == '!' || r[p-1] == '<' || r[p-1] == '>' || r[p-1] == '=');
-            bool nextEq = p+1 < r.size() && r[p+1] == '=';
-            if (!prevOp && !nextEq) { r.replace(p, 1, "=="); p += 2; }
-            else p++;
-        }
+        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
+            r.replace(p, 2, "!="), p += 2;
+        // is -> == (AC equality keyword; Python's `is` is identity, so we use ==)
+        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
+            r.replace(p, 4, " == "), p += 4;
+        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
         // not of Obj type
         for (size_t p = 0; (p = r.find("not of Obj type", p)) != std::string::npos;)
             r.replace(p, 15, "not isinstance(arg, object)"), p += 26;

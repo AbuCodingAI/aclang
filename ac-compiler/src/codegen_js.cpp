@@ -45,12 +45,10 @@ class JSCodeGen {
         r = unwrapDollars(r);
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
             r.replace(p, 2, "!=="), p += 3;
-        for (size_t p = 0; (p = r.find('=', p)) != std::string::npos;) {
-            bool prevOp = p > 0 && (r[p-1]=='!'||r[p-1]=='<'||r[p-1]=='>'||r[p-1]=='=');
-            bool nextEq = p+1 < r.size() && r[p+1] == '=';
-            if (!prevOp && !nextEq) { r.replace(p, 1, "==="); p += 3; }
-            else p++;
-        }
+        // is -> === (AC equality keyword; JS strict equality)
+        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
+            r.replace(p, 4, " === "), p += 5;
+        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
         return r;
     }
 

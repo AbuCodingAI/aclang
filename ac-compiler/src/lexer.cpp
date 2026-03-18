@@ -42,6 +42,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"ilib",     TokenType::KW_ILIB},
     {"range",    TokenType::KW_RANGE},
     {"sequence", TokenType::KW_SEQUENCE},
+    {"is",       TokenType::KW_IS},
 };
 
 class Lexer {

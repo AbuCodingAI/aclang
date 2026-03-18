@@ -58,9 +58,12 @@ class AsmCodeGen {
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
         // #= -> !=
-        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;) {
-            r.replace(p, 2, "!="); p += 2;
-        }
+        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
+            r.replace(p, 2, "!="), p += 2;
+        // is -> == (equality keyword)
+        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
+            r.replace(p, 4, " == "), p += 4;
+        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
         return r;
     }
 

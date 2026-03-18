@@ -60,6 +60,7 @@ enum class TokenType {
     KW_ILIB,        // ilib (import library)
     KW_RANGE,       // range N  → [0..N], Numeral Pos only
     KW_SEQUENCE,    // sequence(x,y) → [x..y], breaks if x > y
+    KW_IS,          // is  → equality comparison (==)
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>
