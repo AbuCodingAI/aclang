@@ -1,5 +1,6 @@
 #include "../include/token.hpp"
 #include "../include/ast.hpp"
+#include "acc_cache.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -86,8 +87,18 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        auto tokens = lex(source);
-        auto ast    = parse(tokens);
+        std::string accFile = inputFile.substr(0, inputFile.rfind('.')) + ".acc";
+
+        NodePtr ast;
+        if (cacheIsValid(inputFile, accFile)) {
+            ast = loadCache(accFile);
+        }
+        if (!ast) {
+            // Cache miss or stale — full lex + parse
+            auto tokens = lex(source);
+            ast = parse(tokens);
+            saveCache(accFile, *ast);
+        }
 
         std::string outFile;
         if (backend == "PY") {
