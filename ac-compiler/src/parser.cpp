@@ -181,6 +181,31 @@ private:
             return node;
         }
 
+        // range N — Numeral Pos only
+        if (at(TokenType::KW_RANGE)) {
+            advance();
+            std::string n;
+            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
+                n += advance().value;
+            auto node = std::make_unique<ASTNode>(NodeType::RangeExpr, n);
+            node->inferredType = std::make_shared<Type>(Type::makeRange());
+            return node;
+        }
+
+        // sequence(x, y)
+        if (at(TokenType::KW_SEQUENCE)) {
+            advance();
+            expect(TokenType::LPAREN, "Expected ( after sequence");
+            std::string x, y;
+            while (!at(TokenType::COMMA) && !at(TokenType::END_OF_FILE)) x += advance().value;
+            if (at(TokenType::COMMA)) advance();
+            while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) y += advance().value;
+            if (at(TokenType::RPAREN)) advance();
+            auto node = std::make_unique<ASTNode>(NodeType::SequenceExpr, x + "," + y);
+            node->inferredType = std::make_shared<Type>(Type::makeSequence());
+            return node;
+        }
+
         // display $string$ (screen output)
         if (at(TokenType::KW_DISPLAY)) {
             advance();
@@ -433,6 +458,7 @@ private:
                 while (!at(TokenType::END_OF_FILE) && depth > 0) {
                     if (at(TokenType::LPAREN)) depth++;
                     if (at(TokenType::RPAREN)) { depth--; if (depth == 0) break; }
+                    if (at(TokenType::STRING)) { args += "$" + advance().value + "$"; continue; }
                     args += advance().value;
                 }
                 if (at(TokenType::RPAREN)) advance();
@@ -508,6 +534,28 @@ private:
                 auto fnNode = parseFnExpr();
                 auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
                 node->attrs.push_back("__fn__" + fnNode->value);
+                return node;
+            }
+            // range N
+            if (at(TokenType::KW_RANGE)) {
+                advance();
+                std::string n;
+                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) n += advance().value;
+                auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
+                node->attrs.push_back("__range__" + n);
+                return node;
+            }
+            // sequence(x, y)
+            if (at(TokenType::KW_SEQUENCE)) {
+                advance();
+                expect(TokenType::LPAREN, "Expected ( after sequence");
+                std::string x, y;
+                while (!at(TokenType::COMMA) && !at(TokenType::END_OF_FILE)) x += advance().value;
+                if (at(TokenType::COMMA)) advance();
+                while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) y += advance().value;
+                if (at(TokenType::RPAREN)) advance();
+                auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
+                node->attrs.push_back("__sequence__" + x + "," + y);
                 return node;
             }
             std::string val;

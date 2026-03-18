@@ -43,6 +43,8 @@ enum class NodeType {
     SpawnStmt,      // SpawnTerrain etc
     BinaryExpr,     // fn a*(b-c) — multiply/arithmetic
     UseLibStmt,     // use ilib <libname>
+    RangeExpr,      // range N  → [0..N], N must be Numeral Pos
+    SequenceExpr,   // sequence(x,y) → [x..y], breaks if x > y
 };
 
 struct ASTNode {

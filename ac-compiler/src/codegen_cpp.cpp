@@ -227,33 +227,46 @@ class CppCodeGen {
             if (!node.attrs.empty()) {
                 std::string val = node.attrs[0];
                 TypePtr varType = nullptr;
-                
+
                 if (val.substr(0, 8) == "__list__") {
-                    varType = std::make_shared<Type>(TypeKind::String);
+                    varType = std::make_shared<Type>(Type::makeList());
+                    varTypes[node.value] = varType;
                     emit("vector<string> " + node.value + " = {" + parseCollectionItems(val.substr(8)) + "};");
                 } else if (val.substr(0, 9) == "__tuple__") {
-                    varType = std::make_shared<Type>(TypeKind::String);
-                    emit("vector<string> " + node.value + " = {" + parseCollectionItems(val.substr(9)) + "};");
+                    varType = std::make_shared<Type>(Type::makeTuple());
+                    varTypes[node.value] = varType;
+                    emit("const vector<string> " + node.value + " = {" + parseCollectionItems(val.substr(9)) + "};");
                 } else if (val.substr(0, 6) == "__fn__") {
-                    varType = std::make_shared<Type>(TypeKind::Numeral);
+                    varType = std::make_shared<Type>(Type::makeNumeral());
+                    varTypes[node.value] = varType;
                     emit("int " + node.value + " = " + translateExpr(val.substr(6)) + ";");
+                } else if (val.substr(0, 7) == "__range") {
+                    // range N assigned to variable
+                    varType = std::make_shared<Type>(Type::makeRange());
+                    varTypes[node.value] = varType;
+                    std::string n = val.substr(7);
+                    while (!n.empty() && n[0] == '_') n = n.substr(1);
+                    emit("vector<int> " + node.value + " = [&]{ vector<int> _r; for(int _i=0;_i<=(int)(" + n + ");_i++) _r.push_back(_i); return _r; }();");
+                } else if (val.substr(0, 10) == "__sequence") {
+                    varType = std::make_shared<Type>(Type::makeSequence());
+                    varTypes[node.value] = varType;
+                    std::string xy = val.substr(10);
+                    while (!xy.empty() && xy[0] == '_') xy = xy.substr(1);
+                    size_t comma = xy.find(',');
+                    std::string x = xy.substr(0, comma), y = xy.substr(comma + 1);
+                    emit("vector<int> " + node.value + " = [&]{ if((" + x + ")>(" + y + ")) throw runtime_error(\"Preposterous: sequence start > end\"); vector<int> _r; for(int _i=(" + x + ");_i<=(" + y + ");_i++) _r.push_back(_i); return _r; }();");
                 } else {
-                    // Infer type from value
-                    bool isFuncCall = val.find('(') != std::string::npos && val.find(')') != std::string::npos;
+                    bool isFuncCall = val.find('(') != std::string::npos;
                     bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
-                    
                     if (isNum || isFuncCall) {
-                        varType = std::make_shared<Type>(TypeKind::Numeral);
+                        varType = std::make_shared<Type>(Type::makeNumeral());
+                        varTypes[node.value] = varType;
                         emit("int " + node.value + " = " + val + ";");
                     } else {
-                        varType = std::make_shared<Type>(TypeKind::String);
+                        varType = std::make_shared<Type>(Type::makeString());
+                        varTypes[node.value] = varType;
                         emit("string " + node.value + " = " + quoteIfString(val) + ";");
                     }
-                }
-                
-                // Store type for later use
-                if (varType) {
-                    varTypes[node.value] = varType;
                 }
             }
             break;
@@ -265,16 +278,55 @@ class CppCodeGen {
 
         case NodeType::MethodCall: {
             std::string args = node.attrs.empty() ? "" : node.attrs[0];
-            if (args.size() >= 2 && args.front() == '$' && args.back() == '$')
-                args = "\"" + args.substr(1, args.size() - 2) + "\"";
-            else
-                args = translateExpr(args);
+            // Convert $string$ to "string"
+            args = unwrapDollars(args);
             std::string name = node.value;
+
+            // Extract object name and method
+            size_t dot = name.rfind('.');
+            std::string objName = dot != std::string::npos ? name.substr(0, dot) : "";
+            std::string method  = dot != std::string::npos ? name.substr(dot + 1) : name;
+
+            // Tuple immutability guard
+            if ((method == "push" || method == "add") && !objName.empty()) {
+                auto it = varTypes.find(objName);
+                if (it != varTypes.end() && it->second->isTuple()) {
+                    emit("// Preposterous: cannot modify tuple '" + objName + "' — tuples are immutable");
+                    emit("throw runtime_error(\"Preposterous: cannot modify tuple '" + objName + "'\");");
+                    break;
+                }
+            }
+
             if (name == "Term.display") {
                 emit("cout << " + args + " << endl;");
+            } else if (method == "add" && !objName.empty()) {
+                // list.add(item) — prepend
+                emit(objName + ".insert(" + objName + ".begin(), " + args + ");");
+            } else if (method == "push" && !objName.empty()) {
+                // list.push(item) — append
+                emit(objName + ".push_back(" + args + ");");
             } else {
                 emit(name + "(" + args + ");");
             }
+            break;
+        }
+
+        case NodeType::RangeExpr: {
+            // range N — N must be Numeral Pos (positive integer)
+            std::string n = node.value;
+            while (!n.empty() && n.back() == ' ') n.pop_back();
+            emit("[&]{ if((" + n + ") < 0) throw runtime_error(\"Preposterous: range requires Numeral Pos\"); "
+                 "vector<int> _r; for(int _i=0;_i<=(" + n + ");_i++) _r.push_back(_i); return _r; }()");
+            break;
+        }
+
+        case NodeType::SequenceExpr: {
+            // sequence(x, y) — breaks if x > y
+            size_t comma = node.value.find(',');
+            std::string x = node.value.substr(0, comma);
+            std::string y = node.value.substr(comma + 1);
+            emit("[&]{ if((" + x + ")>(" + y + ")) throw runtime_error(\"Preposterous: sequence start > end\"); "
+                 "vector<int> _r; for(int _i=(" + x + ");_i<=(" + y + ");_i++) _r.push_back(_i); return _r; }()");
             break;
         }
 
@@ -371,7 +423,8 @@ class CppCodeGen {
             break;
 
         case NodeType::TupleLiteral:
-            emit("vector<string>{" + parseCollectionItems(node.value) + "}");
+            // const — immutable at C++ level too
+            emit("/* tuple */ vector<string>{" + parseCollectionItems(node.value) + "}");
             break;
 
         case NodeType::BinaryExpr:
