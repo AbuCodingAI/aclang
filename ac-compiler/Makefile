@@ -6,7 +6,7 @@ OUT = ac
 
 all: $(OUT)
 
-$(OUT):
+$(OUT): $(SRC)
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(OUT)
 
 install: all

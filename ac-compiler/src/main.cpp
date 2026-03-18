@@ -71,6 +71,8 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "--backend" && i + 1 < argc)
             backend = argv[++i];
+        else if (arg[0] != '-')
+            backend = arg; // positional backend override, e.g. ./ac file.ac JS
     }
 
     try {
