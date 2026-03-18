@@ -1,0 +1,57 @@
+AC->C++
+
+use ilib gl
+
+<mainloop>
+     use integratedWebCam
+
+     <gui>
+
+          <OBJECT>
+               Obj.sidebar
+               sidebar.config item=console
+               sidebar.region = left
+               sidebar.interactive = true
+          <OBJECT>
+
+          <SCREEN>
+               WebCam view
+               Background.config mode=livefeed
+          <SCREEN>
+
+          <LOGIC>
+
+               firstFrame.picture()
+               save as pic.png
+
+               <StartHere>
+
+                    use pic.png as reference
+
+                    IF frame #= pic.png
+                         Create console object as sidebar
+                         sidebar.display $Movement Detected$
+                         sidebar.display $Type 'reset' to update reference frame.$
+
+                         latestFrame.picture()
+                         save as pic.png
+
+                    sidebar.ask($Command?$)
+                    usercmd = sidebar.getinput
+
+                    IF usercmd = $reset$
+                         sidebar.display $New reference frame saved.$
+                         latestFrame.picture()
+                         save as pic.png
+
+                    IF usercmd = $exit$
+                         sidebar.display $Stopping AC Motion Tracker...$
+                         /kill
+
+               <EndHere>
+
+          <LOGIC>
+
+     <gui>
+
+<mainloop>

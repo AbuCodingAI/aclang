@@ -373,6 +373,14 @@ private:
     }
 
     NodePtr parseUse() {
+        // use ilib <libname>  — import a built-in library
+        if (at(TokenType::KW_ILIB)) {
+            advance(); // consume ilib
+            std::string libname;
+            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
+                libname += advance().value;
+            return std::make_unique<ASTNode>(NodeType::UseLibStmt, libname);
+        }
         std::string target;
         while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
             target += advance().value + " ";

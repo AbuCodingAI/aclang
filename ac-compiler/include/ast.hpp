@@ -42,6 +42,7 @@ enum class NodeType {
     WhenBlock,      // when many hitbox overlap
     SpawnStmt,      // SpawnTerrain etc
     BinaryExpr,     // fn a*(b-c) — multiply/arithmetic
+    UseLibStmt,     // use ilib <libname>
 };
 
 struct ASTNode {

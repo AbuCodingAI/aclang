@@ -57,6 +57,7 @@ enum class TokenType {
     KW_TEMP,
     KW_FUNC,
     KW_AT,
+    KW_ILIB,        // ilib (import library)
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>

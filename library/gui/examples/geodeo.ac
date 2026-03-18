@@ -1,0 +1,74 @@
+AC->C++
+
+use ilib gl
+
+<mainloop>
+
+     <gui>
+
+          <OBJECT>
+               Obj.Character
+               Character.config item=square(50)
+               Character.Sprite = AC.Search($CharacterSprite.png$)
+
+               Obj.Cactus
+               Cactus.config item=rectangle(100x300)
+               Cactus.Sprite = AC.Search($CactusSprite.png$)
+
+               IF %Sprite.png not found
+                    use %.config definition for %Sprite.png found
+          <OBJECT>
+
+          <SCREEN>
+               Make Screen object
+               Screen.OBJECT resize 1720x1080
+               Background.config color=green
+          <SCREEN>
+
+          <LOGIC>
+
+               <Local>
+                    Make jump func(arg)
+                         IF arg not of Obj type
+                              raise ERR($That is not a valid object$)
+                         OTHER
+                              arg.pixel.up(180)
+                              arg.simulate.airtime(60)
+                              arg.vertex(400,600)
+                              arg.curveshape(-x^2)
+               <Local>
+
+               def tag <terrain>
+                    terrain.generation()
+                         Obj.Cactus
+                         Cactus.config item=rectangle(100x300)
+
+                         IF Character.Hitbox.Coords Overlap Cactus
+                              Cactus.CircleFall(1/4 RightDir)
+
+                         Terrain.ANIMATE
+                         RightDir at 60fps
+
+                         IF Cactus.CircleFell(1/4 RightDir) is True
+                              regen.Cactus.OGpos
+
+               <StartHere>
+                    <terrain>
+                         SpawnTerrain
+                    <terrain>
+                    configure event-listener
+                         use listener to establish rule
+                              on value=space
+                                   jump(Character)
+                    <Local>
+                         when many hitbox overlap
+                              temp.jump.vertex/=2
+                              jump(Character)
+                    <Local>
+               <EndHere>
+
+          <LOGIC>
+
+     <gui>
+
+<mainloop>
