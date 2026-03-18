@@ -1,13 +1,15 @@
 #include "../include/ast.hpp"
+#include "../include/type.hpp"
 #include <string>
 #include <sstream>
 #include <vector>
 #include <cctype>
-#include <sstream>
+#include <map>
 
 class JSCodeGen {
     std::ostringstream out;
     int indentLevel = 0;
+    std::map<std::string, TypePtr> varTypes;
 
     void emit(const std::string& line) {
         out << std::string(indentLevel * 4, ' ') << line << "\n";
@@ -182,14 +184,26 @@ class JSCodeGen {
         case NodeType::AssignStmt:
             if (!node.attrs.empty()) {
                 std::string val = node.attrs[0];
-                if (val.substr(0, 8) == "__list__")
+                if (val.substr(0, 8) == "__list__") {
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeList());
                     emit("let " + node.value + " = [" + parseCollectionItems(val.substr(8)) + "];");
-                else if (val.substr(0, 9) == "__tuple__")
-                    emit("const " + node.value + " = [" + parseCollectionItems(val.substr(9)) + "];");
-                else if (val.substr(0, 6) == "__fn__")
+                } else if (val.substr(0, 9) == "__tuple__") {
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeTuple());
+                    emit("const " + node.value + " = Object.freeze([" + parseCollectionItems(val.substr(9)) + "]);");
+                } else if (val.substr(0, 6) == "__fn__") {
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeNumeral(NumeralSubtype::PosInt));
                     emit("let " + node.value + " = " + translateExpr(val.substr(6)) + ";");
-                else
-                    emit("let " + node.value + " = " + quoteIfString(val) + ";");
+                } else {
+                    bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
+                    if (isNum) {
+                        auto t = Type::inferNumeral(val);
+                        varTypes[node.value] = std::make_shared<Type>(t);
+                        emit("let " + node.value + " = " + val + "; // " + t.toString());
+                    } else {
+                        varTypes[node.value] = std::make_shared<Type>(Type::makeString());
+                        emit("let " + node.value + " = " + quoteIfString(val) + ";");
+                    }
+                }
             }
             break;
 

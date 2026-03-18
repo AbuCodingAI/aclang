@@ -73,8 +73,17 @@ class RsCodeGen {
                 else if (c->type == NodeType::AssignStmt && !c->attrs.empty()) {
                     std::string val = c->attrs[0];
                     bool isStr = (!val.empty() && val.front() == '$');
-                    if (isStr) emitRaw("static " + c->value + ": &str = " + unwrapDollars(val) + ";");
-                    else       emitRaw("static " + c->value + ": i64 = " + val + ";");
+                    if (isStr) {
+                        emitRaw("static " + c->value + ": &str = " + unwrapDollars(val) + ";");
+                    } else {
+                        bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
+                        if (isNum) {
+                            auto t = Type::inferNumeral(val);
+                            emitRaw("static " + c->value + ": " + t.toRs() + " = " + val + ";");
+                        } else {
+                            emitRaw("static " + c->value + ": &str = \"" + val + "\";");
+                        }
+                    }
                 }
             }
             emitRaw("");
@@ -143,13 +152,13 @@ class RsCodeGen {
             if (!node.attrs.empty()) {
                 std::string val = node.attrs[0];
                 bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
-                bool isFuncCall = val.find('(') != std::string::npos && val.find(')') != std::string::npos;
-                
+                bool isFuncCall = val.find('(') != std::string::npos;
                 if (isNum || isFuncCall) {
-                    varTypes[node.value] = std::make_shared<Type>(TypeKind::Numeral);
-                    emit("let " + node.value + ": i32 = " + val + ";");
+                    auto t = Type::inferNumeral(val);
+                    varTypes[node.value] = std::make_shared<Type>(t);
+                    emit("let " + node.value + ": " + t.toRs() + " = " + val + ";");
                 } else {
-                    varTypes[node.value] = std::make_shared<Type>(TypeKind::String);
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeString());
                     emit("let " + node.value + " = " + unwrapDollars(val) + ";");
                 }
             }

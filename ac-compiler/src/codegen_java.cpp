@@ -1,14 +1,17 @@
 #include "../include/ast.hpp"
+#include "../include/type.hpp"
 #include <string>
 #include <sstream>
 #include <vector>
 #include <cctype>
+#include <map>
 
 class JavaCodeGen {
     std::ostringstream out;
     std::ostringstream functions;
     int indentLevel = 0;
     bool collectingFuncs = false;
+    std::map<std::string, TypePtr> varTypes;
 
     void emit(const std::string& line) {
         out << std::string(indentLevel * 4, ' ') << line << "\n";
@@ -185,13 +188,25 @@ class JavaCodeGen {
             if (!node.attrs.empty()) {
                 std::string val = node.attrs[0];
                 if (val.substr(0, 8) == "__list__") {
-                    emit("List<Object> " + node.value + " = Arrays.asList(" + parseCollectionItems(val.substr(8)) + ");");
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeList());
+                    emit("List<Object> " + node.value + " = new ArrayList<>(Arrays.asList(" + parseCollectionItems(val.substr(8)) + "));");
                 } else if (val.substr(0, 9) == "__tuple__") {
-                    emit("Object[] " + node.value + " = {" + parseCollectionItems(val.substr(9)) + "};");
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeTuple());
+                    emit("final Object[] " + node.value + " = {" + parseCollectionItems(val.substr(9)) + "};");
                 } else if (val.substr(0, 6) == "__fn__") {
-                    emit("Object " + node.value + " = " + translateExpr(val.substr(6)) + ";");
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeNumeral(NumeralSubtype::PosInt));
+                    emit("int " + node.value + " = " + translateExpr(val.substr(6)) + ";");
                 } else {
-                    emit("Object " + node.value + " = " + quoteIfString(val) + ";");
+                    bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
+                    bool isFuncCall = val.find('(') != std::string::npos;
+                    if (isNum || isFuncCall) {
+                        auto t = Type::inferNumeral(val);
+                        varTypes[node.value] = std::make_shared<Type>(t);
+                        emit(t.toJava() + " " + node.value + " = " + val + ";");
+                    } else {
+                        varTypes[node.value] = std::make_shared<Type>(Type::makeString());
+                        emit("String " + node.value + " = " + quoteIfString(val) + ";");
+                    }
                 }
             }
             break;

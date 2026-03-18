@@ -149,13 +149,23 @@ class CppCodeGen {
 
             // 2. Emit global variable declarations (AssignStmt before mainloop)
             for (auto* n : preDecls) {
-                if (n->type == NodeType::AssignStmt) {
-                    std::string val = n->attrs.empty() ? "0" : n->attrs[0];
-                    val = quoteIfString(val);
-                    // infer type
-                    bool isStr = (!val.empty() && val.front() == '"');
-                    std::string ctype = isStr ? "string" : "auto";
-                    emitRaw(ctype + " " + n->value + " = " + val + ";");
+                if (n->type == NodeType::AssignStmt && !n->attrs.empty()) {
+                    std::string val = n->attrs[0];
+                    if (val.substr(0, 8) == "__list__") {
+                        emitRaw("vector<string> " + n->value + " = {" + parseCollectionItems(val.substr(8)) + "};");
+                    } else if (val.substr(0, 9) == "__tuple__") {
+                        emitRaw("const vector<string> " + n->value + " = {" + parseCollectionItems(val.substr(9)) + "};");
+                    } else {
+                        bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
+                        if (isNum) {
+                            auto t = Type::inferNumeral(val);
+                            varTypes[n->value] = std::make_shared<Type>(t);
+                            emitRaw(t.toCpp() + " " + n->value + " = " + val + ";");
+                        } else {
+                            varTypes[n->value] = std::make_shared<Type>(Type::makeString());
+                            emitRaw("string " + n->value + " = " + quoteIfString(val) + ";");
+                        }
+                    }
                 }
             }
             emitRaw("");
@@ -259,9 +269,10 @@ class CppCodeGen {
                     bool isFuncCall = val.find('(') != std::string::npos;
                     bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
                     if (isNum || isFuncCall) {
-                        varType = std::make_shared<Type>(Type::makeNumeral());
+                        auto t = Type::inferNumeral(val);
+                        varType = std::make_shared<Type>(t);
                         varTypes[node.value] = varType;
-                        emit("int " + node.value + " = " + val + ";");
+                        emit(t.toCpp() + " " + node.value + " = " + val + ";");
                     } else {
                         varType = std::make_shared<Type>(Type::makeString());
                         varTypes[node.value] = varType;

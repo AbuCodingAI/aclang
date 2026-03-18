@@ -206,34 +206,29 @@ class CCodeGen {
             if (!node.attrs.empty()) {
                 std::string val = node.attrs[0];
                 TypePtr varType = nullptr;
-                
+
                 if (val.substr(0, 8) == "__list__") {
-                    varType = std::make_shared<Type>(TypeKind::String);
+                    varType = std::make_shared<Type>(Type::makeList());
                     emit("char* " + node.value + "[] = {" + parseCollectionItems(val.substr(8)) + "};");
                 } else if (val.substr(0, 9) == "__tuple__") {
-                    varType = std::make_shared<Type>(TypeKind::String);
-                    emit("char* " + node.value + "[] = {" + parseCollectionItems(val.substr(9)) + "};");
+                    varType = std::make_shared<Type>(Type::makeTuple());
+                    emit("const char* " + node.value + "[] = {" + parseCollectionItems(val.substr(9)) + "};");
                 } else if (val.substr(0, 6) == "__fn__") {
-                    varType = std::make_shared<Type>(TypeKind::Numeral);
+                    varType = std::make_shared<Type>(Type::makeNumeral(NumeralSubtype::PosInt));
                     emit("int " + node.value + " = " + translateExpr(val.substr(6)) + ";");
                 } else {
-                    // Infer type from value
-                    bool isFuncCall = val.find('(') != std::string::npos && val.find(')') != std::string::npos;
+                    bool isFuncCall = val.find('(') != std::string::npos;
                     bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
-                    
                     if (isNum || isFuncCall) {
-                        varType = std::make_shared<Type>(TypeKind::Numeral);
-                        emit("int " + node.value + " = " + val + ";");
+                        auto t = Type::inferNumeral(val);
+                        varType = std::make_shared<Type>(t);
+                        emit(t.toC() + " " + node.value + " = " + val + ";");
                     } else {
-                        varType = std::make_shared<Type>(TypeKind::String);
-                        emit("char* " + node.value + " = " + quoteIfString(val) + ";");
+                        varType = std::make_shared<Type>(Type::makeString());
+                        emit("const char* " + node.value + " = " + quoteIfString(val) + ";");
                     }
                 }
-                
-                // Store type for later use
-                if (varType) {
-                    varTypes[node.value] = varType;
-                }
+                if (varType) varTypes[node.value] = varType;
             }
             break;
 

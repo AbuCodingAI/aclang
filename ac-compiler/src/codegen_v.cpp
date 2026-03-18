@@ -139,13 +139,15 @@ class VCodeGen {
             if (!node.attrs.empty()) {
                 std::string val = node.attrs[0];
                 bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
-                bool isFuncCall = val.find('(') != std::string::npos && val.find(')') != std::string::npos;
-                
+                bool isFuncCall = val.find('(') != std::string::npos;
                 if (isNum || isFuncCall) {
-                    varTypes[node.value] = std::make_shared<Type>(TypeKind::Numeral);
-                    emit("mut " + node.value + " := i32(" + val + ")");
+                    auto t = Type::inferNumeral(val);
+                    varTypes[node.value] = std::make_shared<Type>(t);
+                    // V type names: int, f64
+                    std::string vtype = t.isDec() ? "f64" : "int";
+                    emit("mut " + node.value + " := " + vtype + "(" + val + ")");
                 } else {
-                    varTypes[node.value] = std::make_shared<Type>(TypeKind::String);
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeString());
                     emit("mut " + node.value + " := " + unwrapDollars(val));
                 }
             }
