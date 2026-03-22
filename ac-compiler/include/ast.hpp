@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
 #include "type.hpp"
@@ -16,6 +17,11 @@ enum class NodeType {
     UseStmt,        // use X
     SaveStmt,       // save as name
     AssignStmt,     // x = y
+    PlusEqualStmt,  // x += y
+    MinusEqualStmt, // x -= y
+    MultiplyEqualStmt, // x *= y  
+    DivideEqualStmt, // x /= y
+    AtEqualStmt,     // x @= y (compound multiplication since * is comment)
     IfStmt,         // IF condition body [OTHER body]
     ElseIfStmt,     // ELSEIF condition body
     ForLoop,        // FOR item in list
@@ -45,6 +51,11 @@ enum class NodeType {
     UseLibStmt,     // use ilib <libname>
     RangeExpr,      // range N  → [0..N], N must be Numeral Pos
     SequenceExpr,   // sequence(x,y) → [x..y], breaks if x > y
+    PassStmt,       // pass → no-op placeholder
+    SkipStmt,       // skip → stop rest of if/elseif/other chain
+    BreakStmt,      // break → exit loop
+    ContinueStmt,   // continue → next loop iteration
+    DestroyStmt,    // destroy x → remove variable from existence
 };
 
 struct ASTNode {

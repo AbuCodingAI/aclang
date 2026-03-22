@@ -3,6 +3,7 @@
 #include <sstream>
 #include <vector>
 #include <cctype>
+#include <cstring>
 
 class HTMLCodeGen {
     std::ostringstream head;
@@ -24,6 +25,134 @@ class HTMLCodeGen {
         if (v.size() >= 2 && v.front() == '$' && v.back() == '$')
             return v.substr(1, v.size() - 2);
         return v;
+    }
+
+    std::string quoteIfString(const std::string& val) {
+        std::string v = val;
+        while (!v.empty() && v.back() == ' ') v.pop_back();
+        if (v.size() >= 2 && v.front() == '$' && v.back() == '$')
+            return "\"" + v.substr(1, v.size() - 2) + "\"";
+        return v;
+    }
+
+    std::string unwrapDollars(const std::string& s) {
+        std::string result;
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i] == '$') {
+                size_t end = s.find('$', i + 1);
+                if (end != std::string::npos) {
+                    result += "\"" + s.substr(i + 1, end - i - 1) + "\"";
+                    i = end;
+                    continue;
+                }
+            }
+            result += s[i];
+        }
+        return result;
+    }
+
+    std::string translateCondition(const std::string& cond) {
+        std::string r = cond;
+        while (!r.empty() && r.back() == ' ') r.pop_back();
+        r = unwrapDollars(r);
+
+        // Normalize special AC condition patterns:
+        // <obj>.Hitbox.Coords Overlap <other> -> obj.overlaps(other)
+        size_t overlapPos;
+        if ((overlapPos = r.find("Hitbox.Coords Overlap")) != std::string::npos) {
+            std::string left = r.substr(0, overlapPos);
+            if (!left.empty() && left.back() == ' ') left.pop_back();
+            std::string right = r.substr(overlapPos + strlen("Hitbox.Coords Overlap"));
+            while (!right.empty() && right.front() == ' ') right.erase(0, 1);
+            r = left + ".overlaps(" + right + ")";
+        }
+
+        // CircleFell check pattern -> convert to function call
+        if (r.find("CircleFell") != std::string::npos) {
+            size_t atPos = r.find("CircleFell");
+            std::string prefix = r.substr(0, atPos);
+            if (prefix.find("Cactus") != std::string::npos) {
+                r = "cactusPhysics.circleFell()";
+            }
+        }
+
+        // hitbox overlap in AC pseudo-language
+        if (r.find("hitbox overlap") != std::string::npos) {
+            r = "true";
+        }
+
+        // not found fallback
+        if (r.find("not found") != std::string::npos) {
+            if (r.find("AC.Search") != std::string::npos) {
+                r = r.substr(0, r.find(" not found"));
+            } else {
+                r = "true";
+            }
+        }
+
+        // #= -> !=
+        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
+            r.replace(p, 2, "!="), p += 2;
+
+        // is True/False / is -> ==
+        for (size_t p = 0; (p = r.find(" is True", p)) != std::string::npos;) {
+            r.replace(p, 8, " == true"); p += 8;
+        }
+        for (size_t p = 0; (p = r.find(" is False", p)) != std::string::npos;) {
+            r.replace(p, 9, " == false"); p += 9;
+        }
+        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
+            r.replace(p, 4, " == "), p += 4;
+
+        if (r.rfind("is ", 0) == 0) r = r.substr(3);
+
+        return r;
+    }
+
+    std::string parseCollectionItems(const std::string& raw) {
+        std::string s = raw;
+        if (s.size() >= 2 && s.front() == '$' && s.back() == '$')
+            s = s.substr(1, s.size() - 2);
+        std::string result, item;
+        for (size_t i = 0; i <= s.size(); i++) {
+            if (i == s.size() || s[i] == ',') {
+                size_t a = item.find_first_not_of(' ');
+                size_t b = item.find_last_not_of(' ');
+                if (a != std::string::npos) {
+                    std::string t = item.substr(a, b - a + 1);
+                    if (!result.empty()) result += ", ";
+                    bool isNum = !t.empty() && (std::isdigit(t[0]) || t[0] == '-');
+                    result += isNum ? t : "\"" + t + "\"";
+                }
+                item.clear();
+            } else item += s[i];
+        }
+        return result;
+    }
+
+    std::string translateExpr(const std::string& expr) {
+        std::string r = expr;
+        while (!r.empty() && r.back() == ' ') r.pop_back();
+        while (!r.empty() && r.front() == ' ') r = r.substr(1);
+        r = unwrapDollars(r);
+        // #= -> !=
+        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
+            r.replace(p, 2, "!="), p += 2;
+        // is -> == (equality keyword)
+        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
+            r.replace(p, 4, " == "), p += 4;
+        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
+        // Remove 'fn' keywords
+        for (size_t p = 0; (p = r.find("fn", p)) != std::string::npos;) {
+            if (p + 2 < r.size() && r[p + 2] == ' ') {
+                r.erase(p, 3);
+            } else if (p + 2 < r.size()) {
+                r.erase(p, 2);
+            } else {
+                r.erase(p, 2);
+            }
+        }
+        return r;
     }
 
     // First pass: scan for title.display to extract page title
@@ -115,6 +244,33 @@ class HTMLCodeGen {
             // logic constructs — just emit children content
             for (auto& c : node.children) genNode(*c);
             break;
+
+        case NodeType::ListLiteral: {
+            std::string items = parseCollectionItems(node.value);
+            emit("<ul><li>" + items + "</li></ul>");
+            break;
+        }
+
+        case NodeType::TupleLiteral: {
+            std::string items = parseCollectionItems(node.value);
+            emit("<div class=\"tuple\">(" + items + ")</div>");
+            break;
+        }
+
+        case NodeType::RangeExpr: {
+            std::string n = node.value;
+            while (!n.empty() && n.back() == ' ') n.pop_back();
+            emit("<span class=\"range\">[0.." + n + "]</span>");
+            break;
+        }
+
+        case NodeType::SequenceExpr: {
+            size_t comma = node.value.find(',');
+            std::string x = node.value.substr(0, comma);
+            std::string y = node.value.substr(comma + 1);
+            emit("<span class=\"sequence\">[" + x + ".." + y + "]</span>");
+            break;
+        }
 
         case NodeType::RaiseStmt:
             emit("<p class=\"error\">Preposterous: " + node.value + "</p>");

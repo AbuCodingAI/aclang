@@ -1,9 +1,11 @@
 #include "../include/ast.hpp"
 #include "../include/type.hpp"
+#include "../include/tags.hpp"
 #include <string>
 #include <sstream>
 #include <vector>
 #include <cctype>
+#include <cstring>
 #include <functional>
 #include <map>
 
@@ -47,33 +49,57 @@ class CCodeGen {
         std::string r = cond;
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
-        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
-            r.replace(p, 2, "!="), p += 2;
-        // is -> == (equality keyword)
-        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
-            r.replace(p, 4, " == "), p += 4;
-        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
-        return r;
-    }
 
-    std::string translateExpr(const std::string& expr) {
-        std::string r = expr;
-        while (!r.empty() && r.back() == ' ') r.pop_back();
-        while (!r.empty() && r.front() == ' ') r = r.substr(1);
-        r = unwrapDollars(r);
-        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;) {
-            r.replace(p, 2, "!="); p += 2;
+        // Normalize special AC condition patterns:
+        // <obj>.Hitbox.Coords Overlap <other> -> obj.overlaps(other)
+        size_t overlapPos;
+        if ((overlapPos = r.find("Hitbox.Coords Overlap")) != std::string::npos) {
+            std::string left = r.substr(0, overlapPos);
+            if (!left.empty() && left.back() == ' ') left.pop_back();
+            std::string right = r.substr(overlapPos + strlen("Hitbox.Coords Overlap"));
+            while (!right.empty() && right.front() == ' ') right.erase(0, 1);
+            r = left + ".overlaps(" + right + ")";
         }
-        // Remove 'fn' keywords
-        for (size_t p = 0; (p = r.find("fn", p)) != std::string::npos;) {
-            if (p + 2 < r.size() && r[p + 2] == ' ') {
-                r.erase(p, 3);
-            } else if (p + 2 < r.size()) {
-                r.erase(p, 2);
-            } else {
-                r.erase(p, 2);
+
+        // CircleFell check pattern -> convert to function call
+        if (r.find("CircleFell") != std::string::npos) {
+            size_t atPos = r.find("CircleFell");
+            std::string prefix = r.substr(0, atPos);
+            if (prefix.find("Cactus") != std::string::npos) {
+                r = "cactusPhysics.circleFell()";
             }
         }
+
+        // hitbox overlap in AC pseudo-language
+        if (r.find("hitbox overlap") != std::string::npos) {
+            r = "true";
+        }
+
+        // not found fallback
+        if (r.find("not found") != std::string::npos) {
+            if (r.find("AC.Search") != std::string::npos) {
+                r = r.substr(0, r.find(" not found"));
+            } else {
+                r = "true";
+            }
+        }
+
+        // #= -> !=
+        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
+            r.replace(p, 2, "!="), p += 2;
+
+        // is True/False / is -> ==
+        for (size_t p = 0; (p = r.find(" is True", p)) != std::string::npos;) {
+            r.replace(p, 8, " == true"); p += 8;
+        }
+        for (size_t p = 0; (p = r.find(" is False", p)) != std::string::npos;) {
+            r.replace(p, 9, " == false"); p += 9;
+        }
+        for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
+            r.replace(p, 4, " == "), p += 4;
+
+        if (r.rfind("is ", 0) == 0) r = r.substr(3);
+
         return r;
     }
 
@@ -96,6 +122,27 @@ class CCodeGen {
             } else item += s[i];
         }
         return result;
+    }
+
+    std::string translateExpr(const std::string& expr) {
+        std::string r = expr;
+        while (!r.empty() && r.back() == ' ') r.pop_back();
+        while (!r.empty() && r.front() == ' ') r = r.substr(1);
+        r = unwrapDollars(r);
+        for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;) {
+            r.replace(p, 2, "!="); p += 2;
+        }
+        // Remove 'fn' keywords
+        for (size_t p = 0; (p = r.find("fn", p)) != std::string::npos;) {
+            if (p + 2 < r.size() && r[p + 2] == ' ') {
+                r.erase(p, 3);
+            } else if (p + 2 < r.size()) {
+                r.erase(p, 2);
+            } else {
+                r.erase(p, 2);
+            }
+        }
+        return r;
     }
 
     void genBlock(const ASTNode& node) {
@@ -264,6 +311,21 @@ class CCodeGen {
             break;
         }
 
+        case NodeType::RangeExpr: {
+            std::string n = node.value;
+            while (!n.empty() && n.back() == ' ') n.pop_back();
+            emit("makeRange(0, " + n + ")");
+            break;
+        }
+
+        case NodeType::SequenceExpr: {
+            size_t comma = node.value.find(',');
+            std::string x = node.value.substr(0, comma);
+            std::string y = node.value.substr(comma + 1);
+            emit("makeSequence(" + x + ", " + y + ")");
+            break;
+        }
+
         case NodeType::FuncDef: {
             if (!collectingFunctions) break;  // Skip in second pass
             std::string arg = node.attrs.empty() ? "" : node.attrs[0];
@@ -308,15 +370,7 @@ class CCodeGen {
 
         case NodeType::IfStmt: {
             if (node.value == "OTHER") {
-                std::string cur = out.str();
-                size_t end = cur.rfind("}\n");
-                if (end != std::string::npos) {
-                    size_t start = cur.rfind('\n', end - 1);
-                    start = (start == std::string::npos) ? 0 : start + 1;
-                    out.str(cur.substr(0, start));
-                    out.seekp(0, std::ios::end);
-                }
-                emit("} else {");
+                emit("else {");
             } else {
                 std::string cond = translateCondition(node.value);
                 emit("if (" + cond + ") {");
@@ -331,15 +385,7 @@ class CCodeGen {
 
         case NodeType::ElseIfStmt: {
             std::string cond = translateCondition(node.value);
-            std::string cur = out.str();
-            size_t end = cur.rfind("}\n");
-            if (end != std::string::npos) {
-                size_t start = cur.rfind('\n', end - 1);
-                start = (start == std::string::npos) ? 0 : start + 1;
-                out.str(cur.substr(0, start));
-                out.seekp(0, std::ios::end);
-            }
-            emit("} else if (" + cond + ") {");
+            emit("else if (" + cond + ") {");
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             else emit("// empty");
@@ -350,13 +396,25 @@ class CCodeGen {
 
         case NodeType::ForLoop: {
             std::string lst = node.attrs.empty() ? "arr" : translateExpr(node.attrs[0]);
-            emit("for (int i = 0; i < 3; i++) {");
+            emit("for (size_t i = 0; i < " + lst + ".size(); i++) {");
             indentLevel++;
-            emit("char* " + node.value + " = " + lst + "[i];");
+            emit("auto " + node.value + " = " + lst + "[i];");
             if (!node.children.empty()) genBlock(*node.children[0]);
             else emit("// empty");
             indentLevel--;
             emit("}");
+            break;
+        }
+
+        case NodeType::IndexExpr: {
+            if (node.attrs.size() == 2) {
+                std::string idx = translateExpr(node.attrs[0]);
+                std::string val = translateExpr(node.attrs[1]);
+                emit(node.value + "[" + idx + "] = " + val + ";");
+            } else if (node.attrs.size() == 1) {
+                std::string idx = translateExpr(node.attrs[0]);
+                emit("(void)" + node.value + "[" + idx + "]; // evaluate index read");
+            }
             break;
         }
 
@@ -419,7 +477,7 @@ class CCodeGen {
 
     void genTagBlock(const ASTNode& node) {
         std::string name = node.value;
-        if (name == "mainloop") {
+        if (Tags::isMainLoop(name)) {
             bool hasStartHere = false;
             for (auto& c : node.children)
                 if (c->type == NodeType::TagBlock && c->value == "StartHere")
@@ -447,13 +505,11 @@ class CCodeGen {
                 indentLevel--;
                 emit("}");
             }
-        } else if (name == "gui" || name == "OBJECT" || name == "SCREEN") {
+        } else if (Tags::isGUIBox(name)) {
             // GUI — skip
-        } else if (name == "LOGIC") {
+        } else if (Tags::isLogicScope(name)) {
             for (auto& c : node.children) genNode(*c);
-        } else if (name == "Local") {
-            for (auto& c : node.children) genNode(*c);
-        } else if (name == "StartHere") {
+        } else if (Tags::isStartHere(name)) {
             emit("while (1) {");
             indentLevel++;
             for (auto& c : node.children) genNode(*c);

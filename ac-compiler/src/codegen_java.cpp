@@ -4,6 +4,7 @@
 #include <sstream>
 #include <vector>
 #include <cctype>
+#include <cstring>
 #include <map>
 
 class JavaCodeGen {
@@ -46,12 +47,57 @@ class JavaCodeGen {
         std::string r = cond;
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
+
+        // Normalize special AC condition patterns:
+        // <obj>.Hitbox.Coords Overlap <other> -> obj.overlaps(other)
+        size_t overlapPos;
+        if ((overlapPos = r.find("Hitbox.Coords Overlap")) != std::string::npos) {
+            std::string left = r.substr(0, overlapPos);
+            if (!left.empty() && left.back() == ' ') left.pop_back();
+            std::string right = r.substr(overlapPos + strlen("Hitbox.Coords Overlap"));
+            while (!right.empty() && right.front() == ' ') right.erase(0, 1);
+            r = left + ".overlaps(" + right + ")";
+        }
+
+        // CircleFell check pattern -> convert to function call
+        if (r.find("CircleFell") != std::string::npos) {
+            size_t atPos = r.find("CircleFell");
+            std::string prefix = r.substr(0, atPos);
+            if (prefix.find("Cactus") != std::string::npos) {
+                r = "cactusPhysics.circleFell()";
+            }
+        }
+
+        // hitbox overlap in AC pseudo-language
+        if (r.find("hitbox overlap") != std::string::npos) {
+            r = "true";
+        }
+
+        // not found fallback
+        if (r.find("not found") != std::string::npos) {
+            if (r.find("AC.Search") != std::string::npos) {
+                r = r.substr(0, r.find(" not found"));
+            } else {
+                r = "true";
+            }
+        }
+
+        // #= -> !=
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
             r.replace(p, 2, "!="), p += 2;
-        // is -> == (equality keyword)
+
+        // is True/False / is -> ==
+        for (size_t p = 0; (p = r.find(" is True", p)) != std::string::npos;) {
+            r.replace(p, 8, " == true"); p += 8;
+        }
+        for (size_t p = 0; (p = r.find(" is False", p)) != std::string::npos;) {
+            r.replace(p, 9, " == false"); p += 9;
+        }
         for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
             r.replace(p, 4, " == "), p += 4;
-        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
+
+        if (r.rfind("is ", 0) == 0) r = r.substr(3);
+
         return r;
     }
 

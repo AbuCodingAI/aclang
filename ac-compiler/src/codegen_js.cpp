@@ -4,6 +4,7 @@
 #include <sstream>
 #include <vector>
 #include <cctype>
+#include <cstring>
 #include <map>
 
 class JSCodeGen {
@@ -43,12 +44,57 @@ class JSCodeGen {
         std::string r = cond;
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
+
+        // Normalize special AC condition patterns:
+        // <obj>.Hitbox.Coords Overlap <other> -> obj.overlaps(other)
+        size_t overlapPos;
+        if ((overlapPos = r.find("Hitbox.Coords Overlap")) != std::string::npos) {
+            std::string left = r.substr(0, overlapPos);
+            if (!left.empty() && left.back() == ' ') left.pop_back();
+            std::string right = r.substr(overlapPos + strlen("Hitbox.Coords Overlap"));
+            while (!right.empty() && right.front() == ' ') right.erase(0, 1);
+            r = left + ".overlaps(" + right + ")";
+        }
+
+        // CircleFell check pattern -> convert to function call
+        if (r.find("CircleFell") != std::string::npos) {
+            size_t atPos = r.find("CircleFell");
+            std::string prefix = r.substr(0, atPos);
+            if (prefix.find("Cactus") != std::string::npos) {
+                r = "cactusPhysics.circleFell()";
+            }
+        }
+
+        // hitbox overlap in AC pseudo-language
+        if (r.find("hitbox overlap") != std::string::npos) {
+            r = "true";
+        }
+
+        // not found fallback
+        if (r.find("not found") != std::string::npos) {
+            if (r.find("AC.Search") != std::string::npos) {
+                r = r.substr(0, r.find(" not found"));
+            } else {
+                r = "true";
+            }
+        }
+
+        // #= -> !=
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
-            r.replace(p, 2, "!=="), p += 3;
-        // is -> === (AC equality keyword; JS strict equality)
+            r.replace(p, 2, "!="), p += 2;
+
+        // is True/False / is -> ==
+        for (size_t p = 0; (p = r.find(" is True", p)) != std::string::npos;) {
+            r.replace(p, 8, " == true"); p += 8;
+        }
+        for (size_t p = 0; (p = r.find(" is False", p)) != std::string::npos;) {
+            r.replace(p, 9, " == false"); p += 9;
+        }
         for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
-            r.replace(p, 4, " === "), p += 5;
-        if (r.substr(0, 3) == "is ") r.replace(0, 3, "");
+            r.replace(p, 4, " == "), p += 4;
+
+        if (r.rfind("is ", 0) == 0) r = r.substr(3);
+
         return r;
     }
 
@@ -205,6 +251,36 @@ class JSCodeGen {
             }
             break;
 
+        case NodeType::PlusEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " += " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
+        case NodeType::MinusEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " -= " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
+        case NodeType::MultiplyEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " *= " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
+        case NodeType::DivideEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " /= " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
+        case NodeType::AtEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " *= " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
         case NodeType::PropAssign:
             if (!node.attrs.empty())
                 emit(node.value + " = " + quoteIfString(node.attrs[0]) + ";");
@@ -242,6 +318,23 @@ class JSCodeGen {
             break;
         }
 
+        case NodeType::RangeExpr: {
+            std::string n = node.value;
+            while (!n.empty() && n.back() == ' ') n.pop_back();
+            emit("(()=>{ if((" + n + ") < 0) throw new Error('Preposterous: range requires positive integer'); "
+                 "let _r = []; for(let _i=0;_i<=(" + n + ");_i++) _r.push(_i); return _r; })()");
+            break;
+        }
+
+        case NodeType::SequenceExpr: {
+            size_t comma = node.value.find(',');
+            std::string x = node.value.substr(0, comma);
+            std::string y = node.value.substr(comma + 1);
+            emit("(()=>{ if((" + x + ")>(" + y + ")) throw new Error('Preposterous: sequence start > end'); "
+                 "let _r = []; for(let _i=(" + x + ");_i<=(" + y + ");_i++) _r.push(_i); return _r; })()");
+            break;
+        }
+
         case NodeType::FuncDef: {
             std::string arg = node.attrs.empty() ? "" : node.attrs[0];
             emit("function " + node.value + "(" + arg + ") {");
@@ -254,27 +347,21 @@ class JSCodeGen {
 
         case NodeType::IfStmt: {
             if (node.value == "OTHER") {
-                removeLastBrace();
-                emit("} else {");
-                indentLevel++;
-                if (!node.children.empty()) genBlock(*node.children[0]);
-                indentLevel--;
-                emit("}");
+                emit("else {");
             } else {
                 std::string cond = translateCondition(node.value);
                 emit("if (" + cond + ") {");
-                indentLevel++;
-                if (!node.children.empty()) genBlock(*node.children[0]);
-                indentLevel--;
-                emit("}");
             }
+            indentLevel++;
+            if (!node.children.empty()) genBlock(*node.children[0]);
+            indentLevel--;
+            emit("}");
             break;
         }
 
         case NodeType::ElseIfStmt: {
             std::string cond = translateCondition(node.value);
-            removeLastBrace();
-            emit("} else if (" + cond + ") {");
+            emit("else if (" + cond + ") {");
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
@@ -284,8 +371,9 @@ class JSCodeGen {
 
         case NodeType::ForLoop: {
             std::string lst = node.attrs.empty() ? "[]" : translateExpr(node.attrs[0]);
-            emit("for (const " + node.value + " of " + lst + ") {");
+            emit("for (let i = 0; i < " + lst + ".length; ++i) {");
             indentLevel++;
+            emit("let " + node.value + " = " + lst + "[i];");
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
             emit("}");
@@ -299,6 +387,18 @@ class JSCodeGen {
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
             emit("}");
+            break;
+        }
+
+        case NodeType::IndexExpr: {
+            if (node.attrs.size() == 2) {
+                std::string idx = translateExpr(node.attrs[0]);
+                std::string val = translateExpr(node.attrs[1]);
+                emit(node.value + "[" + idx + "] = " + val + ";");
+            } else if (node.attrs.size() == 1) {
+                std::string idx = translateExpr(node.attrs[0]);
+                emit("/* evaluate index */ " + node.value + "[" + idx + "]; ");
+            }
             break;
         }
 

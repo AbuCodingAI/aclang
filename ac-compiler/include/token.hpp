@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <string_view>
 
 enum class TokenType {
     // Literals
@@ -28,6 +29,11 @@ enum class TokenType {
     COMMA,          // ,
     KW_FN,          // fn (multiply prefix)
     KW_DISPLAY,     // display $string$ (screen/GUI output)
+    PLUS_EQUAL,     // +=
+    MINUS_EQUAL,    // -=
+    MULTIPLY_EQUAL, // *=
+    DIVIDE_EQUAL,   // /=
+    AT_EQUAL,       // @= (compound multiplication since * is comment)
 
     // Keywords
     KW_IF,
@@ -61,6 +67,12 @@ enum class TokenType {
     KW_RANGE,       // range N  → [0..N], Numeral Pos only
     KW_SEQUENCE,    // sequence(x,y) → [x..y], breaks if x > y
     KW_IS,          // is  → equality comparison (==)
+    KW_PASS,        // pass → no-op placeholder
+    KW_SKIP,        // skip → stop rest of if/elseif/other chain
+    KW_BREAK,       // break → exit loop
+    KW_CONTINUE,    // continue → next loop iteration
+    KW_DESTROY,     // destroy x → remove variable from existence
+    KW_PROGRAM_LOOP,// programLoop → controls mainloop continuation
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>

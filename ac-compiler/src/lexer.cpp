@@ -43,6 +43,12 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"range",    TokenType::KW_RANGE},
     {"sequence", TokenType::KW_SEQUENCE},
     {"is",       TokenType::KW_IS},
+    {"pass",     TokenType::KW_PASS},
+    {"skip",     TokenType::KW_SKIP},
+    {"break",    TokenType::KW_BREAK},
+    {"continue", TokenType::KW_CONTINUE},
+    {"destroy",  TokenType::KW_DESTROY},
+    {"programLoop", TokenType::KW_PROGRAM_LOOP},
 };
 
 class Lexer {
@@ -194,12 +200,19 @@ public:
                 continue;
             }
 
-            // /kill
+            // /kill or /=
             if (src[pos] == '/') {
                 int sc = col; pos++; col++;
-                std::string word;
-                while (pos < src.size() && std::isalpha(src[pos])) { word += src[pos++]; col++; }
-                tokens.emplace_back(TokenType::SLASH, word, line, sc);
+                // Check for compound assignment /=
+                if (pos < src.size() && src[pos] == '=') {
+                    pos++; col++;
+                    tokens.emplace_back(TokenType::DIVIDE_EQUAL, "/=", line, sc);
+                } else {
+                    // Regular slash command like /kill
+                    std::string word;
+                    while (pos < src.size() && std::isalpha(src[pos])) { word += src[pos++]; col++; }
+                    tokens.emplace_back(TokenType::SLASH, word, line, sc);
+                }
                 continue;
             }
 
@@ -232,7 +245,15 @@ public:
                 if (it != KEYWORDS.end()) {
                     tokens.emplace_back(it->second, word, line, sc);
                 } else {
-                    tokens.emplace_back(TokenType::IDENTIFIER, word, line, sc);
+                    // Case-insensitive boolean check
+                    std::string lower = word;
+                    for (auto& ch : lower) ch = std::tolower(ch);
+                    if (lower == "true")
+                        tokens.emplace_back(TokenType::KW_TRUE, word, line, sc);
+                    else if (lower == "false")
+                        tokens.emplace_back(TokenType::KW_FALSE, word, line, sc);
+                    else
+                        tokens.emplace_back(TokenType::IDENTIFIER, word, line, sc);
                 }
                 continue;
             }
@@ -241,13 +262,28 @@ public:
             int sc = col;
             char c = src[pos++]; col++;
             switch (c) {
+                case '+':
+                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::PLUS_EQUAL, "+=", line, sc); }
+                    else tokens.emplace_back(TokenType::IDENTIFIER, "+", line, sc);
+                    break;
+                case '-':
+                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::MINUS_EQUAL, "-=", line, sc); }
+                    else tokens.emplace_back(TokenType::IDENTIFIER, "-", line, sc);
+                    break;
+                case '*':
+                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::MULTIPLY_EQUAL, "*=", line, sc); }
+                    else tokens.emplace_back(TokenType::IDENTIFIER, "*", line, sc);
+                    break;
+                case '@':
+                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::AT_EQUAL, "@=", line, sc); }
+                    else tokens.emplace_back(TokenType::IDENTIFIER, "@", line, sc);
+                    break;
                 case '=': tokens.emplace_back(TokenType::ASSIGN,    "=",  line, sc); break;
                 case '.': tokens.emplace_back(TokenType::DOT,       ".",  line, sc); break;
                 case '(': tokens.emplace_back(TokenType::LPAREN,    "(",  line, sc); break;
                 case ')': tokens.emplace_back(TokenType::RPAREN,    ")",  line, sc); break;
                 case ',': tokens.emplace_back(TokenType::COMMA,     ",",  line, sc); break;
                 case '&': tokens.emplace_back(TokenType::AMPERSAND, "&",  line, sc); break;
-                case '-': tokens.emplace_back(TokenType::IDENTIFIER,"-",  line, sc); break;
                 case '^': tokens.emplace_back(TokenType::IDENTIFIER,"^",  line, sc); break;
                 case '%': tokens.emplace_back(TokenType::IDENTIFIER,"%",  line, sc); break;
                 case '<':
@@ -262,7 +298,6 @@ public:
                 case ']': tokens.emplace_back(TokenType::RBRACKET,  "]",  line, sc); break;
                 case '{': tokens.emplace_back(TokenType::LBRACE,    "{",  line, sc); break;
                 case '}': tokens.emplace_back(TokenType::RBRACE,    "}",  line, sc); break;
-                case '+': tokens.emplace_back(TokenType::IDENTIFIER,"+",  line, sc); break;
                 default: break; // skip unknown
             }
         }

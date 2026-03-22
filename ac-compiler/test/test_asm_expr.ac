@@ -1,17 +1,11 @@
-AC->ASM *backend*
+AC->ASM
 
 <mainloop>
-
      <LOGIC>
-
-          Term.display $Starting up...$
-
-          result = 120
-
+          a = 5
+          b = 3
+          result = fn a+(b*2)
           Term.display(result)
-
           /kill
-
      <LOGIC>
-
 <mainloop>

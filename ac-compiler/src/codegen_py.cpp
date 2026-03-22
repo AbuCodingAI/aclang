@@ -235,6 +235,36 @@ class PythonCodeGen {
             }
             break;
 
+        case NodeType::PlusEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " += " + quoteIfString(node.attrs[0]));
+            }
+            break;
+
+        case NodeType::MinusEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " -= " + quoteIfString(node.attrs[0]));
+            }
+            break;
+
+        case NodeType::MultiplyEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " *= " + quoteIfString(node.attrs[0]));
+            }
+            break;
+
+        case NodeType::DivideEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " /= " + quoteIfString(node.attrs[0]));
+            }
+            break;
+
+        case NodeType::AtEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " *= " + quoteIfString(node.attrs[0]));
+            }
+            break;
+
         case NodeType::PropAssign:
             if (!node.attrs.empty())
                 emit(node.value + " = " + quoteIfString(node.attrs[0]));

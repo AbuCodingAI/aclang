@@ -51,7 +51,7 @@ ac mycode.ac --backend PY
 ### Strings
 ```
 $this is a string$
-"this is also a string"
+fn "this is also a string"
 ```
 
 ### Backend Declaration
@@ -97,19 +97,20 @@ Background.config color=green
 ### Conditionals
 ```
 IF x #= y
-     * body indented *
+     Term.display $x is not equal to y$
 
 OTHER
-     * else body *
+     Term.display $x is equal to y$
 ```
 
 ### Operators
 | Operator | Meaning       |
 |----------|---------------|
-| `=`      | assign / equals (in IF) |
+| `=`      | assignment only |
+| `is`     | equality comparison |
 | `#=`     | not equal     |
-| `fn arg*argfn` | multiply |
-| `cmd&cmd arg` | run both commands on arg |
+| `fn arg*arg` | multiply |
+| `fn cmd&cmd arg` | run both commands on arg |
 
 ### Functions
 ```

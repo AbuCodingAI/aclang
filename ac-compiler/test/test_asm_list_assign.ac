@@ -1,0 +1,20 @@
+AC->ASM
+
+<mainloop>
+     <LOGIC>
+          a = [1,2,3]
+          a[0] = 10
+          Term.display(a[0])
+          Term.display(a[1])
+
+          x = 5
+          IF x = 5
+               Term.display(100)
+          ELSEIF x = 7
+               Term.display(200)
+          OTHER
+               Term.display(300)
+
+          /kill
+     <LOGIC>
+<mainloop>
