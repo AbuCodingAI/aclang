@@ -2,7 +2,6 @@
   "name": "ac-lang",
   "version": "0.1.0",
   "description": "AC Language Compiler - A multi-target compiler for the AC programming language",
-  "main": "ac-compiler/ac_repl.py",
   "bin": {
     "ac": "ac-compiler/ac"
   },
