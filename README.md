@@ -445,7 +445,7 @@ The AC compiler is open for contributions! Areas of interest:
 
 ## 📄 License
 
-[Your License Here]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
