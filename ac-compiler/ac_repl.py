@@ -1,213 +1,218 @@
 #!/usr/bin/env python3
-"""
-AC Language REPL - Interactive Shell
-Similar to Python's IDLE, allows users to tinker with AC code interactively
-"""
 
 import subprocess
 import tempfile
+import shutil
 import os
 import readline
 import atexit
-import glob
+import time
 
-# History file for command history
 HISTORY_FILE = os.path.expanduser("~/.ac_history")
+DEFAULT_COMPILER = os.environ.get("AC_COMPILER", "ac")
 
 
+# ------------------------
+# History
+# ------------------------
 def load_history():
-    """Load command history from file"""
     if os.path.exists(HISTORY_FILE):
         readline.read_history_file(HISTORY_FILE)
 
 
 def save_history():
-    """Save command history to file"""
     readline.write_history_file(HISTORY_FILE)
 
 
-def clean_temp_files():
-    """Remove temporary compilation files"""
-    patterns = ["*.acc", "*.lir", "*.acb", "*.pyc", "__pycache__"]
-    for pattern in patterns:
-        for f in glob.glob(pattern):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-    # Clean __pycache__ directories
-    for root, dirs, files in os.walk("."):
-        if "__pycache__" in dirs:
-            import shutil
-            shutil.rmtree(os.path.join(root, "__pycache__"))
+# ------------------------
+# REPL Core
+# ------------------------
+class ACRepl:
+    def __init__(self):
+        self.target = "PY"
+        self.compiler = DEFAULT_COMPILER
+        self.program = []
+        self.temp_dir = tempfile.mkdtemp(prefix="ac_repl_")
+        self.timing = False
 
+    # ------------------------
+    # Lifecycle
+    # ------------------------
+    def cleanup(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-def run_ac_code(code, target="PY"):
-    """Compile and run AC code, then clean up"""
-    # Create temp file for AC source
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.ac', delete=False) as f:
-        f.write(f"AC->{target}\n{code}\n")
-        temp_ac = f.name
-    
-    try:
-        # Compile with AC compiler
-        result = subprocess.run(
-            ["./ac", temp_ac, f"--target {target}"],
-            capture_output=True,
-            text=True,
-            cwd="/home/abu/Documents/kiro projects/AC/ac-compiler"
-        )
-        
-        if result.returncode != 0:
-            print(f"Compilation error:\n{result.stderr}")
-            return False
-        
-        # Determine output file based on target
-        if target == "PY":
-            output_file = temp_ac.replace('.ac', '.py')
-        elif target == "JS":
-            output_file = temp_ac.replace('.ac', '.js')
-        elif target == "BNY":
-            output_file = temp_ac.replace('.ac', '.acb')
-        else:
-            output_file = temp_ac.replace('.ac', f'.{target.lower()}')
-        
-        # Run the generated code
-        if target == "PY":
-            result = subprocess.run(
-                ["python3", output_file],
-                capture_output=True,
-                text=True
-            )
-        elif target == "JS":
-            result = subprocess.run(
-                ["node", output_file],
-                capture_output=True,
-                text=True
-            )
-        elif target == "BNY":
-            result = subprocess.run(
-                [output_file],
-                capture_output=True,
-                text=True
-            )
-        else:
-            print(f"Running {target} backend not implemented")
-            return False
-        
-        # Print output
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(f"Runtime error:\n{result.stderr}")
-        
-        return result.returncode == 0
-        
-    except FileNotFoundError:
-        print("Error: AC compiler not found. Make sure 'ac' is in the current directory.")
-        return False
-    except Exception as e:
-        print(f"Error: {e}")
-        return False
-    finally:
-        # Clean up temp files
+    def reset(self):
+        self.program = []
+        print("Session reset.")
+
+    # ------------------------
+    # Internal helpers
+    # ------------------------
+    def _source_path(self):
+        return os.path.join(self.temp_dir, "repl.ac")
+
+    def _output_path(self):
+        ext = {
+            "PY": "py",
+            "JS": "js",
+            "BNY": "acb"
+        }.get(self.target, self.target.lower())
+        return os.path.join(self.temp_dir, f"repl.{ext}")
+
+    def _write_program(self):
+        with open(self._source_path(), "w") as f:
+            f.write(f"AC->{self.target}\n")
+            f.write("\n".join(self.program))
+            f.write("\n")
+
+    # ------------------------
+    # Compile + Run
+    # ------------------------
+    def execute(self, code):
+        self.program.append(code)
+
+        self._write_program()
+
         try:
-            os.unlink(temp_ac)
-        except OSError:
-            pass
-        clean_temp_files()
+            # Compile
+            compile_start = time.time()
+            result = subprocess.run(
+                [self.compiler, self._source_path(), "--target", self.target],
+                capture_output=True,
+                text=True
+            )
+            compile_time = time.time() - compile_start
+
+            if result.returncode != 0:
+                print("Compilation error:\n", result.stderr)
+                self.program.pop()  # rollback
+                return
+
+            # Run
+            run_start = time.time()
+
+            cmd = {
+                "PY": ["python3", self._output_path()],
+                "JS": ["node", self._output_path()],
+                "BNY": [self._output_path()],
+            }.get(self.target)
+
+            if not cmd:
+                print(f"Execution for backend '{self.target}' not implemented.")
+                self.program.pop()
+                return
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True
+            )
+
+            run_time = time.time() - run_start
+
+            if result.stdout:
+                print(result.stdout, end="")
+
+            if result.stderr:
+                print("Runtime error:\n", result.stderr)
+
+            if self.timing:
+                print(f"[compile: {compile_time:.3f}s | run: {run_time:.3f}s]")
+
+        except FileNotFoundError:
+            print("Error: AC compiler not found.")
+            self.program.pop()
+        except Exception as e:
+            print("Error:", e)
+            self.program.pop()
+
+    # ------------------------
+    # Commands
+    # ------------------------
+    def handle_command(self, line):
+        parts = line[1:].split()
+
+        if not parts:
+            return
+
+        cmd = parts[0]
+
+        if cmd == "help":
+            print("""
+Commands:
+  :help           Show this message
+  :exit           Exit REPL
+  :reset          Clear session
+  :target <name>  Set backend (PY, JS, etc.)
+  :time on|off    Toggle timing
+""")
+
+        elif cmd == "exit":
+            raise EOFError
+
+        elif cmd == "reset":
+            self.reset()
+
+        elif cmd == "target":
+            if len(parts) < 2:
+                print("Usage: :target PY|JS|...")
+            else:
+                self.target = parts[1].upper()
+                print(f"Target set to {self.target}")
+
+        elif cmd == "time":
+            if len(parts) < 2:
+                print("Usage: :time on|off")
+            else:
+                self.timing = parts[1].lower() == "on"
+                print(f"Timing {'enabled' if self.timing else 'disabled'}")
+
+        else:
+            print(f"Unknown command: {cmd}")
 
 
+# ------------------------
+# Main Loop
+# ------------------------
 def main():
-    """Main REPL loop"""
-    # Load command history
     load_history()
-    
-    # Register history save on exit
     atexit.register(save_history)
-    
+
+    repl = ACRepl()
+    atexit.register(repl.cleanup)
+
     print("=" * 50)
-    print("AC Language REPL - Interactive Shell")
+    print("AC REPL (Production)")
     print("=" * 50)
-    print("Type 'exit' or 'quit' to leave")
-    print("Type 'clear' to clear the screen")
-    print("Type 'help' for usage information")
-    print()
-    
-    # Multi-line input buffer
+    print("Type :help for commands\n")
+
     buffer = []
-    
+
     while True:
         try:
-            # Prompt based on whether we're in multi-line mode
-            prompt = "ac> " if len(buffer) == 0 else "  ... "
-            
-            # Get input
-            line = input(prompt)
-            
-            # Strip whitespace
-            line = line.strip()
-            
-            # Handle special commands
-            if line.lower() in ("exit", "quit"):
-                print("Goodbye!")
-                break
-            
-            if line.lower() == "clear":
-                os.system("clear" if os.name == "posix" else "cls")
-                continue
-            
-            if line.lower() == "help":
-                print("\nAC Language REPL - Help")
-                print("=" * 50)
-                print("Commands:")
-                print("  exit/quit    - Exit the REPL")
-                print("  clear        - Clear the screen")
-                print("  help         - Show this help message")
-                print()
-                print("Usage:")
-                print("  Type AC code and press Enter to execute")
-                print("  Multi-line input is supported")
-                print("  Press Ctrl+C to cancel current input")
-                print()
-                print("Examples:")
-                print("  ac> Term.display $Hello World$")
-                print("  ac> x = 5")
-                print("  ac> Term.display x @ 2")
-                print()
-                continue
-            
-            # Empty line
+            prompt = "ac> " if not buffer else "... "
+            line = input(prompt).strip()
+
             if not line:
                 continue
-            
-            # Add to buffer
+
+            if line.startswith(":"):
+                repl.handle_command(line)
+                continue
+
             buffer.append(line)
-            
-            # Try to execute if buffer has content
-            if buffer:
-                code = "\n".join(buffer)
-                
-                # Simple check: if buffer ends with a complete statement, execute
-                # For now, execute on every Enter (single-line mode)
-                # Multi-line support can be added later with better parsing
-                
-                print()
-                success = run_ac_code(code)
-                print()
-                
-                # Clear buffer after execution
-                buffer = []
-                
+
+            # simple execution model (can upgrade later)
+            code = "\n".join(buffer)
+            repl.execute(code)
+            buffer.clear()
+
         except EOFError:
-            print("\nGoodbye!")
+            print("\nGoodbye.")
             break
         except KeyboardInterrupt:
             print("\nCancelled.")
-            buffer = []  # Clear buffer on Ctrl+C
-        except Exception as e:
-            print(f"Error: {e}")
-            buffer = []
+            buffer.clear()
 
 
 if __name__ == "__main__":

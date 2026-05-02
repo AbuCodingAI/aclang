@@ -464,7 +464,7 @@ Built with passion for clean syntax and multi-target compilation.
 
 ## 📞 Support
 
-For issues, questions, or contributions, please [open an issue](link-to-issues).
+For issues, questions, or contributions, please [open an issue](https://github.com/AbuCodingAI/aclang/issues).
 
 ---
 
