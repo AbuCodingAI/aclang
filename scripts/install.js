@@ -9,9 +9,21 @@ try {
         try {
             execSync('g++ --version');
         } catch (e) {
-            console.log("g++ not found! Installing MinGW-w64 via MSYS2...");
-            console.log("Installing MSYS2 and MinGW-w64...");
-            execSync('choco install mingw -y', { stdio: 'inherit' });
+            console.log("g++ not found! Installing via winget...");
+            // Try winget first (built into Windows 10/11)
+            try {
+                execSync('winget install mingw.mingw-w64 -e', { stdio: 'inherit' });
+            } catch (e) {
+                console.log("winget failed. Trying choco...");
+                try {
+                    execSync('choco install mingw -y', { stdio: 'inherit' });
+                } catch (e2) {
+                    console.log("Please install MinGW-w64 manually:");
+                    console.log("  - Download from: https://www.mingw-w64.org/");
+                    console.log("  - Or use winget: winget install mingw.mingw-w64");
+                    process.exit(1);
+                }
+            }
         }
     } else if (os.platform() === 'darwin') {
         console.log("macOS detected. Checking for g++...");
