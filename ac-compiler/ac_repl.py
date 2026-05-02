@@ -171,9 +171,9 @@ def main():
                 print("  Press Ctrl+C to cancel current input")
                 print()
                 print("Examples:")
-                print("  ac> print($Hello World$)")
+                print("  ac> display $Hello World$")
                 print("  ac> x = 5")
-                print("  ac> print(x * 2)")
+                print("  ac> display x @ 2")
                 print()
                 continue
             
