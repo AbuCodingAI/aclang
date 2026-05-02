@@ -1,7 +1,7 @@
 {
-  "name": "ac-lang",
+  "name": "aclang",
   "version": "0.1.0",
-  "description": "AC Language Compiler - A multi-target compiler for the AC programming language",
+  "description": "AC Language Compiler - A multi-target compiler for the AC programming language, note, this is more advanced than version 1",
   "bin": {
     "ac": "ac-compiler/ac"
   },
