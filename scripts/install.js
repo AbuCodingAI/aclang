@@ -9,21 +9,25 @@ try {
         try {
             execSync('g++ --version');
         } catch (e) {
-            console.log("g++ not found! Please install MinGW-w64: https://www.mingw-w64.org/");
-            process.exit(1);
+            console.log("g++ not found! Installing MinGW-w64 via MSYS2...");
+            console.log("Installing MSYS2 and MinGW-w64...");
+            execSync('choco install mingw -y', { stdio: 'inherit' });
+        }
+    } else if (os.platform() === 'darwin') {
+        console.log("macOS detected. Checking for g++...");
+        try {
+            execSync('g++ --version');
+        } catch (e) {
+            console.log("g++ missing. Installing via Homebrew...");
+            execSync('brew install gcc', { stdio: 'inherit' });
         }
     } else {
-        console.log("Linux/macOS detected. Checking for g++...");
+        console.log("Linux detected. Checking for g++...");
         try {
             execSync('g++ --version');
         } catch (e) {
             console.log("g++ missing. Attempting install...");
-            if (os.platform() === 'linux') {
-                execSync('sudo apt update && sudo apt install -y g++', { stdio: 'inherit' });
-            } else {
-                console.log("Please install GCC via Homebrew: brew install gcc");
-                process.exit(1);
-            }
+            execSync('sudo apt update && sudo apt install -y g++', { stdio: 'inherit' });
         }
     }
     
