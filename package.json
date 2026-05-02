@@ -1,0 +1,39 @@
+{
+  "name": "ac-lang",
+  "version": "0.1.0",
+  "description": "AC Language Compiler - A multi-target compiler for the AC programming language",
+  "main": "ac-compiler/ac_repl.py",
+  "bin": {
+    "ac": "ac-compiler/ac"
+  },
+  "scripts": {
+    "install": "cd ac-compiler && python3 install.py",
+    "build": "cd ac-compiler && make",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "compiler",
+    "ac-language",
+    "multi-target",
+    "cross-platform"
+  ],
+  "author": "Abu",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AbuCodingAI/aclang.git"
+  },
+  "engines": {
+    "node": ">=14.0.0",
+    "python": ">=3.6.0"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}
