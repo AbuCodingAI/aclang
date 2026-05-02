@@ -16,7 +16,9 @@ enum class TokenType {
     LTE,            // <=
     GTE,            // >=
     MULTIPLY,       // * inside fn...fn context
+    AT,             // @ (default multiplication operator)
     AMPERSAND,      // &
+    DOUBLE_AMPERSAND, // && (method chaining with different args)
     DOT,            // .
     SLASH,          // /
     ARROW,          // ->
@@ -27,13 +29,14 @@ enum class TokenType {
     LBRACE,         // {
     RBRACE,         // }
     COMMA,          // ,
-    KW_FN,          // fn (multiply prefix)
+    COLON,          // : (for dict key:value pairs)
+    KW_FN,          // fn (enables *, &, &&, and "..." with quotes)
     KW_DISPLAY,     // display $string$ (screen/GUI output)
     PLUS_EQUAL,     // +=
     MINUS_EQUAL,    // -=
     MULTIPLY_EQUAL, // *=
     DIVIDE_EQUAL,   // /=
-    AT_EQUAL,       // @= (compound multiplication since * is comment)
+    AT_EQUAL,       // @= (compound multiplication)
 
     // Keywords
     KW_IF,
@@ -64,6 +67,8 @@ enum class TokenType {
     KW_FUNC,
     KW_AT,
     KW_ILIB,        // ilib (import library)
+    KW_ELIB,        // elib (external library)
+    KW_CLIB,        // clib (custom library)
     KW_RANGE,       // range N  → [0..N], Numeral Pos only
     KW_SEQUENCE,    // sequence(x,y) → [x..y], breaks if x > y
     KW_IS,          // is  → equality comparison (==)
@@ -73,6 +78,12 @@ enum class TokenType {
     KW_CONTINUE,    // continue → next loop iteration
     KW_DESTROY,     // destroy x → remove variable from existence
     KW_PROGRAM_LOOP,// programLoop → controls mainloop continuation
+    KW_CONFIGURE,   // configure
+    KW_LISTENER,    // listener
+    KW_ESTABLISH,   // establish
+    KW_RULE,        // rule
+    KW_VALUE,       // value
+    KW_INPUT,       // input (send ghost/simulated input)
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>

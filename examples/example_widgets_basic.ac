@@ -1,0 +1,24 @@
+AC->PY
+
+<mainloop>
+    import tkinter
+    
+    root = tkinter.Tk()
+    root.title($Simple Widget Demo$)
+    root.geometry($400x300$)
+    
+    label = tkinter.Label(root, text=$Hello from AC!$)
+    label.pack()
+    
+    entry = tkinter.Entry(root, width=30)
+    entry.pack()
+    
+    button = tkinter.Button(root, text=$Click Me$)
+    button.pack()
+    
+    result = tkinter.Label(root, text=$Waiting...$)
+    result.pack()
+    
+    root.mainloop()
+    /kill
+<mainloop>

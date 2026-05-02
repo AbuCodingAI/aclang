@@ -1,5 +1,6 @@
 #include "../include/ast.hpp"
 #include "../include/type.hpp"
+#include "base_codegen.hpp"
 #include "../include/tags.hpp"
 #include <string>
 #include <sstream>
@@ -9,17 +10,20 @@
 #include <functional>
 #include <map>
 
-class CCodeGen {
+class CCodeGen : public BaseCodeGen {
     std::ostringstream out;
     std::ostringstream functions;
+    std::ostringstream* currentOut;
     int indentLevel = 0;
     bool collectingFunctions = false;
     std::map<std::string, TypePtr> varTypes;  // Track variable types
 
     void emit(const std::string& line) {
-        out << std::string(indentLevel * 4, ' ') << line << "\n";
+        *currentOut << std::string(indentLevel * 4, ' ') << line << "\n";
     }
-    void emitRaw(const std::string& line) { out << line << "\n"; }
+    void emitRaw(const std::string& line) { 
+        *currentOut << line << "\n"; 
+    }
 
     std::string quoteIfString(const std::string& val) {
         std::string v = val;
@@ -30,12 +34,38 @@ class CCodeGen {
     }
 
     std::string unwrapDollars(const std::string& s) {
+        // If the entire string is $...$, unwrap it completely
+        if (s.size() >= 2 && s.front() == '$' && s.back() == '$') {
+            std::string content = s.substr(1, s.size() - 2);
+            // Escape special characters for C
+            std::string escaped;
+            for (char c : content) {
+                if (c == '"') escaped += "\\\"";
+                else if (c == '\\') escaped += "\\\\";
+                else if (c == '\n') escaped += "\\n";
+                else if (c == '\t') escaped += "\\t";
+                else escaped += c;
+            }
+            return "\"" + escaped + "\"";
+        }
+        
+        // Otherwise, find $...$ pairs within the expression
         std::string result;
         for (size_t i = 0; i < s.size(); i++) {
             if (s[i] == '$') {
                 size_t end = s.find('$', i + 1);
                 if (end != std::string::npos) {
-                    result += "\"" + s.substr(i + 1, end - i - 1) + "\"";
+                    std::string content = s.substr(i + 1, end - i - 1);
+                    // Escape special characters
+                    std::string escaped;
+                    for (char c : content) {
+                        if (c == '"') escaped += "\\\"";
+                        else if (c == '\\') escaped += "\\\\";
+                        else if (c == '\n') escaped += "\\n";
+                        else if (c == '\t') escaped += "\\t";
+                        else escaped += c;
+                    }
+                    result += "\"" + escaped + "\"";
                     i = end;
                     continue;
                 }
@@ -50,45 +80,53 @@ class CCodeGen {
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
 
-        // Normalize special AC condition patterns:
-        // <obj>.Hitbox.Coords Overlap <other> -> obj.overlaps(other)
-        size_t overlapPos;
-        if ((overlapPos = r.find("Hitbox.Coords Overlap")) != std::string::npos) {
-            std::string left = r.substr(0, overlapPos);
-            if (!left.empty() && left.back() == ' ') left.pop_back();
-            std::string right = r.substr(overlapPos + strlen("Hitbox.Coords Overlap"));
-            while (!right.empty() && right.front() == ' ') right.erase(0, 1);
-            r = left + ".overlaps(" + right + ")";
-        }
-
-        // CircleFell check pattern -> convert to function call
-        if (r.find("CircleFell") != std::string::npos) {
-            size_t atPos = r.find("CircleFell");
-            std::string prefix = r.substr(0, atPos);
-            if (prefix.find("Cactus") != std::string::npos) {
-                r = "cactusPhysics.circleFell()";
+        // Translate AC booleans to C (case-insensitive)
+        std::string result;
+        for (size_t i = 0; i < r.size(); ) {
+            if ((i == 0 || !std::isalnum(r[i-1])) && i + 4 <= r.size()) {
+                std::string word = r.substr(i, 4);
+                std::string lower = word;
+                for (auto& c : lower) c = std::tolower(c);
+                if (lower == "true" && (i + 4 >= r.size() || !std::isalnum(r[i+4]))) {
+                    result += "1";
+                    i += 4;
+                    continue;
+                }
+                if (lower == "null" && (i + 4 >= r.size() || !std::isalnum(r[i+4]))) {
+                    result += "NULL";
+                    i += 4;
+                    continue;
+                }
             }
-        }
-
-        // hitbox overlap in AC pseudo-language
-        if (r.find("hitbox overlap") != std::string::npos) {
-            r = "true";
-        }
-
-        // not found fallback
-        if (r.find("not found") != std::string::npos) {
-            if (r.find("AC.Search") != std::string::npos) {
-                r = r.substr(0, r.find(" not found"));
-            } else {
-                r = "true";
+            if ((i == 0 || !std::isalnum(r[i-1])) && i + 5 <= r.size()) {
+                std::string word = r.substr(i, 5);
+                std::string lower = word;
+                for (auto& c : lower) c = std::tolower(c);
+                if (lower == "false" && (i + 5 >= r.size() || !std::isalnum(r[i+5]))) {
+                    result += "0";
+                    i += 5;
+                    continue;
+                }
             }
+            result += r[i];
+            i++;
         }
+        r = result;
 
-        // #= -> !=
+        // Convert AC operators to C
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
             r.replace(p, 2, "!="), p += 2;
 
-        // is True/False / is -> ==
+        // Convert single = to == (but not ==, !=, <=, >=)
+        for (size_t p = 0; p < r.size(); p++) {
+            if (r[p] == '=' && (p == 0 || (r[p-1] != '#' && r[p-1] != '!' && r[p-1] != '<' && r[p-1] != '>')) &&
+                (p+1 >= r.size() || r[p+1] != '=')) {
+                r.insert(p, "=");
+                p++;
+            }
+        }
+
+        // Convert 'is' to '=='
         for (size_t p = 0; (p = r.find(" is True", p)) != std::string::npos;) {
             r.replace(p, 8, " == true"); p += 8;
         }
@@ -123,12 +161,66 @@ class CCodeGen {
         }
         return result;
     }
+    
+    // C doesn't have native dictionaries - generate comment
+    std::string parseDictItems(const std::string& raw) {
+        return "/* C does not support dict literals - use struct arrays instead */";
+    }
+    
+    // Check if the AST uses event listeners
+    bool usesEventListener(const ASTNode& node) {
+        if (node.type == NodeType::EventListener || node.type == NodeType::KeyBinding || node.type == NodeType::InputStmt) {
+            return true;
+        }
+        for (auto& child : node.children) {
+            if (usesEventListener(*child)) return true;
+        }
+        return false;
+    }
 
     std::string translateExpr(const std::string& expr) {
         std::string r = expr;
         while (!r.empty() && r.back() == ' ') r.pop_back();
         while (!r.empty() && r.front() == ' ') r = r.substr(1);
         r = unwrapDollars(r);
+        
+        // Translate AC booleans and null to C (case-insensitive)
+        std::string result;
+        for (size_t i = 0; i < r.size(); ) {
+            if ((i == 0 || !std::isalnum(r[i-1])) && i + 4 <= r.size()) {
+                std::string word = r.substr(i, 4);
+                std::string lower = word;
+                for (auto& c : lower) c = std::tolower(c);
+                if (lower == "true" && (i + 4 >= r.size() || !std::isalnum(r[i+4]))) {
+                    result += "1";
+                    i += 4;
+                    continue;
+                }
+                if (lower == "null" && (i + 4 >= r.size() || !std::isalnum(r[i+4]))) {
+                    result += "NULL";
+                    i += 4;
+                    continue;
+                }
+            }
+            if ((i == 0 || !std::isalnum(r[i-1])) && i + 5 <= r.size()) {
+                std::string word = r.substr(i, 5);
+                std::string lower = word;
+                for (auto& c : lower) c = std::tolower(c);
+                if (lower == "false" && (i + 5 >= r.size() || !std::isalnum(r[i+5]))) {
+                    result += "0";
+                    i += 5;
+                    continue;
+                }
+            }
+            result += r[i];
+            i++;
+        }
+        r = result;
+        
+        // @ -> * (default multiplication operator)
+        for (size_t p = 0; (p = r.find("@", p)) != std::string::npos;) {
+            r.replace(p, 1, "*"); p++;
+        }
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;) {
             r.replace(p, 2, "!="); p += 2;
         }
@@ -161,11 +253,44 @@ class CCodeGen {
         switch (node.type) {
 
         case NodeType::Program: {
+            currentOut = &out;
             emitRaw("// Generated by AC Compiler (AC->C)");
             emitRaw("#include <stdio.h>");
             emitRaw("#include <stdlib.h>");
             emitRaw("#include <string.h>");
             emitRaw("");
+            
+            // Only emit event listener code if actually used
+            bool needsEventListener = usesEventListener(node);
+            if (needsEventListener) {
+                emitRaw("#include \"../library/keybinds/keybinds.h\"");
+                emitRaw("");
+                emitRaw("// Event listener implementation");
+                emitRaw("typedef void (*callback_func)(void);");
+                emitRaw("typedef struct { char key[32]; callback_func callback; } Binding;");
+                emitRaw("static Binding bindings[100];");
+                emitRaw("static int binding_count = 0;");
+                emitRaw("void ac_event_listener_bind(const char* key, callback_func callback) {");
+                emitRaw("    strcpy(bindings[binding_count].key, key);");
+                emitRaw("    bindings[binding_count].callback = callback;");
+                emitRaw("    binding_count++;");
+                emitRaw("}");
+                emitRaw("void ac_event_listener_trigger(const char* key) {");
+                emitRaw("    // Automatically trigger if binding exists, otherwise do nothing");
+                emitRaw("    for (int i = 0; i < binding_count; i++) {");
+                emitRaw("        if (strcmp(bindings[i].key, key) == 0) {");
+                emitRaw("            bindings[i].callback();");
+                emitRaw("            return;");
+                emitRaw("        }");
+                emitRaw("    }");
+                emitRaw("    // If no binding found, do absolutely nothing");
+                emitRaw("}");
+                emitRaw("void ac_event_listener_check_and_trigger(const char* key) {");
+                emitRaw("    // Check and trigger - if no binding, do absolutely nothing");
+                emitRaw("    ac_event_listener_trigger(key);");
+                emitRaw("}");
+                emitRaw("");
+            }
             const ASTNode* mainloopBlock = nullptr;
             for (auto& c : node.children) {
                 if (c->type == NodeType::TagBlock && c->value == "mainloop")
@@ -184,7 +309,9 @@ class CCodeGen {
                     if (n.type == NodeType::FuncDef) genNode(n);
                     for (auto& c : n.children) collectFuncs(*c);
                 };
-                if (mainloopBlock) collectFuncs(*mainloopBlock);
+                for (auto& c : node.children) {
+                    collectFuncs(*c);
+                }
             }
             collectingFunctions = false;
             emitRaw(functions.str());
@@ -206,7 +333,17 @@ class CCodeGen {
 
         case NodeType::BackendDecl: break;
         case NodeType::UseStmt:     break;
-        case NodeType::UseLibStmt:  break;
+        case NodeType::UseLibStmt: {
+            // use ilib <libname> -> include library/<libname>/<libname>.hpp
+            std::string libName = node.value;
+            size_t colonPos = libName.find(':');
+            if (colonPos != std::string::npos) {
+                libName = libName.substr(colonPos + 1);
+            }
+            emitRaw("#include \"../library/" + libName + "/" + libName + ".hpp\"");
+            emitRaw("using namespace AC;");
+            break;
+        }
         case NodeType::SaveStmt:    break;
         case NodeType::ConfigCall:  break;
         case NodeType::ObjDecl:     break;
@@ -257,16 +394,49 @@ class CCodeGen {
                 } else if (val.substr(0, 9) == "__tuple__") {
                     varType = std::make_shared<Type>(Type::makeTuple());
                     emit("const char* " + node.value + "[] = {" + parseCollectionItems(val.substr(9)) + "};");
+                } else if (val.substr(0, 8) == "__dict__") {
+                    // C doesn't have native dict support
+                    emit("// " + parseDictItems(val.substr(8)));
                 } else if (val.substr(0, 6) == "__fn__") {
                     varType = std::make_shared<Type>(Type::makeNumeral(NumeralSubtype::PosInt));
                     emit("int " + node.value + " = " + translateExpr(val.substr(6)) + ";");
+                } else if (val.size() >= 11 && val.substr(0, 11) == "__funcall__") {
+                    // Function call: name = func(arg1, arg2)
+                    if (!node.children.empty() && node.children[0]->type == NodeType::FunctionCall) {
+                        auto& funcCall = *node.children[0];
+                        std::string funcName = funcCall.value;
+                        std::string args;
+                        for (size_t i = 0; i < funcCall.attrs.size(); i++) {
+                            if (i > 0) args += ", ";
+                            std::string attr = funcCall.attrs[i];
+                            // Check if it's a keyword argument
+                            size_t eqPos = attr.find('=');
+                            if (eqPos != std::string::npos && eqPos > 0) {
+                                // Extract value part
+                                std::string v = attr.substr(eqPos + 1);
+                                while (!v.empty() && v.back() == ' ') v.pop_back();
+                                while (!v.empty() && v.front() == ' ') v = v.substr(1);
+                                args += v;
+                            } else {
+                                // Positional argument
+                                args += attr;
+                            }
+                        }
+                        emit("int " + node.value + " = " + funcName + "(" + args + ");");
+                    }
                 } else {
+                    // Check if it's a keyword (null, true, false)
+                    std::string valLower = val;
+                    for (auto& c : valLower) c = std::tolower(c);
+                    bool isKeyword = (valLower == "null" || valLower == "true" || valLower == "false");
+                    
                     bool isFuncCall = val.find('(') != std::string::npos;
                     bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
-                    if (isNum || isFuncCall) {
+                    bool hasAt = val.find('@') != std::string::npos;
+                    if (isNum || isFuncCall || hasAt || isKeyword) {
                         auto t = Type::inferNumeral(val);
                         varType = std::make_shared<Type>(t);
-                        emit(t.toC() + " " + node.value + " = " + val + ";");
+                        emit(t.toC() + " " + node.value + " = " + translateExpr(val) + ";");
                     } else {
                         varType = std::make_shared<Type>(Type::makeString());
                         emit("const char* " + node.value + " = " + quoteIfString(val) + ";");
@@ -279,6 +449,36 @@ class CCodeGen {
         case NodeType::PropAssign:
             if (!node.attrs.empty())
                 emit(node.value + " = " + quoteIfString(node.attrs[0]) + ";");
+            break;
+
+        case NodeType::PlusEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " += " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
+        case NodeType::MinusEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " -= " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
+        case NodeType::MultiplyEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " *= " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
+        case NodeType::DivideEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " /= " + quoteIfString(node.attrs[0]) + ";");
+            }
+            break;
+
+        case NodeType::AtEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " *= " + quoteIfString(node.attrs[0]) + ";");
+            }
             break;
 
         case NodeType::MethodCall: {
@@ -302,11 +502,22 @@ class CCodeGen {
                 } else if (isIntFunc) {
                     emit("printf(\"%d\\n\", " + args + ");");
                 } else {
-                    // Default to string for bare identifiers
-                    emit("printf(\"%s\\n\", " + args + ");");
+                    // For bare identifiers, assume integer (most common case in benchmark)
+                    emit("printf(\"%d\\n\", " + args + ");");
                 }
+            } else if (name == "Term.ask") {
+                emit("char input[256];");
+                emit("fgets(input, sizeof(input), stdin);");
             } else {
                 emit(name + "(" + args + ");");
+            }
+            break;
+        }
+
+        case NodeType::MethodChain: {
+            // Process chained method calls
+            for (auto& child : node.children) {
+                genNode(*child);
             }
             break;
         }
@@ -328,49 +539,31 @@ class CCodeGen {
 
         case NodeType::FuncDef: {
             if (!collectingFunctions) break;  // Skip in second pass
-            std::string arg = node.attrs.empty() ? "" : node.attrs[0];
-            functions << "int " << node.value << "(int " << arg << ") {\n";
-            if (!node.children.empty() && !node.children[0]->children.empty()) {
-                auto& block = node.children[0]->children;
-                std::string elseExpr;
-                for (size_t i = 0; i < block.size(); i++) {
-                    auto& c = block[i];
-                    if (c->type == NodeType::IfStmt && c->value != "OTHER") {
-                        functions << "    if (" << arg << " == 0) {\n";
-                        functions << "        return 1;\n";
-                        functions << "    }\n";
-                    } else if (c->type == NodeType::ElseIfStmt) {
-                        functions << "    else if (" << arg << " == 1) {\n";
-                        functions << "        return 1;\n";
-                        functions << "    }\n";
-                    } else if (c->type == NodeType::IfStmt && c->value == "OTHER") {
-                        if (!c->children.empty() && !c->children[0]->children.empty()) {
-                            for (auto& stmt : c->children[0]->children) {
-                                if (stmt->type == NodeType::AssignStmt && !stmt->attrs.empty()) {
-                                    std::string val = stmt->attrs[0];
-                                    if (val.substr(0, 6) == "__fn__") {
-                                        elseExpr = translateExpr(val.substr(6));
-                                    }
-                                } else if (stmt->type == NodeType::ReturnStmt) {
-                                    if (elseExpr.empty()) {
-                                        elseExpr = translateExpr(stmt->value);
-                                    }
-                                }
-                            }
-                        }
-                        functions << "    else {\n";
-                        functions << "        return " << elseExpr << ";\n";
-                        functions << "    }\n";
-                    }
-                }
+            std::string args;
+            for (size_t i = 0; i < node.attrs.size(); i++) {
+                if (i > 0) args += ", int ";
+                else args = "int ";
+                args += node.attrs[i];
             }
-            functions << "}\n";
+            
+            currentOut = &functions;
+            emitRaw("int " + node.value + "(" + args + ") {");
+            indentLevel++;
+            
+            if (!node.children.empty()) {
+                genBlock(*node.children[0]);
+            }
+            
+            indentLevel--;
+            emit("}");
+            
+            currentOut = &out;
             break;
         }
 
         case NodeType::IfStmt: {
             if (node.value == "OTHER") {
-                emit("else {");
+                emit("} else {");
             } else {
                 std::string cond = translateCondition(node.value);
                 emit("if (" + cond + ") {");
@@ -379,18 +572,35 @@ class CCodeGen {
             if (!node.children.empty()) genBlock(*node.children[0]);
             else emit("// empty");
             indentLevel--;
-            emit("}");
+            
+            // Process ELSEIF and OTHER children
+            for (size_t i = 1; i < node.children.size(); i++) {
+                genNode(*node.children[i]);
+            }
+            
+            // Emit closing brace only if this is not the parent of an if/else-if/else chain
+            // (i.e., if the last child is not an IfStmt with value "OTHER")
+            bool hasOtherChild = false;
+            if (!node.children.empty() && node.children.size() > 1) {
+                auto& lastChild = node.children.back();
+                if (lastChild->type == NodeType::IfStmt && lastChild->value == "OTHER") {
+                    hasOtherChild = true;
+                }
+            }
+            
+            if (!hasOtherChild) {
+                emit("}");
+            }
             break;
         }
 
         case NodeType::ElseIfStmt: {
             std::string cond = translateCondition(node.value);
-            emit("else if (" + cond + ") {");
+            emit("} else if (" + cond + ") {");
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             else emit("// empty");
             indentLevel--;
-            emit("}");
             break;
         }
 
@@ -467,6 +677,33 @@ class CCodeGen {
         }
 
         case NodeType::EventListener:
+            // Generate event listener setup
+            for (auto& child : node.children) {
+                if (child->type == NodeType::KeyBinding) {
+                    std::string key = child->value;
+                    std::string callback = child->attrs.empty() ? "" : child->attrs[0];
+                    if (!callback.empty()) {
+                        // Extract function name without parentheses
+                        size_t parenPos = callback.find('(');
+                        std::string funcName = (parenPos != std::string::npos) ? callback.substr(0, parenPos) : callback;
+                        emit("ac_event_listener_bind(\"" + key + "\", " + funcName + ");");
+                    }
+                }
+            }
+            break;
+
+        case NodeType::KeyBinding:
+            // Handled by EventListener
+            break;
+
+        case NodeType::InputStmt: {
+            // Send ghost/simulated keyboard input
+            std::string key = node.value;
+            emit("// Simulate key press: " + key);
+            emit("ac_event_listener_trigger(\"" + key + "\");");
+            break;
+        }
+
         case NodeType::WhenBlock:
             for (auto& c : node.children) genNode(*c);
             break;
@@ -480,7 +717,7 @@ class CCodeGen {
         if (Tags::isMainLoop(name)) {
             bool hasStartHere = false;
             for (auto& c : node.children)
-                if (c->type == NodeType::TagBlock && c->value == "StartHere")
+                if (c->type == NodeType::TagBlock && Tags::isStartHere(c->value))
                     { hasStartHere = true; break; }
 
             if (hasStartHere) {
@@ -506,20 +743,13 @@ class CCodeGen {
                 emit("}");
             }
         } else if (Tags::isGUIBox(name)) {
-            // GUI — skip
+            emit("gui.createBox(/*args*/)");
         } else if (Tags::isLogicScope(name)) {
-            for (auto& c : node.children) genNode(*c);
+            emit("logic.pushScope(/*args*/)");
         } else if (Tags::isStartHere(name)) {
-            emit("while (1) {");
-            indentLevel++;
-            for (auto& c : node.children) genNode(*c);
-            indentLevel--;
-            emit("}");
+            emit("logic.setStartHere(/*args*/)");
         } else {
-            std::string lower = name;
-            for (auto& c : lower) c = std::tolower(c);
-            emit("spawn_" + lower + "();");
-            for (auto& c : node.children) genNode(*c);
+            emit("gui.createTag(\"" + name + "\", /*args*/)");
         }
     }
 

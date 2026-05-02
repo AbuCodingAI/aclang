@@ -1,0 +1,25 @@
+AC->PY
+
+use ilib widgets
+
+<mainloop>
+    root = Screen.create $Drawing Canvas Demo$ $600$ $500$
+    
+    title = display.create $root$ $AC Widgets Canvas Drawing$
+    title.pack
+    
+    canvas = sketch.create $root$ $550$ $400$
+    canvas.config bg=$white$
+    canvas.pack
+    
+    canvas.line $10$ $10$ $100$ $100$ fill=$red$ width=$2$
+    canvas.rect $120$ $10$ $200$ $100$ fill=$blue$
+    canvas.circle $250$ $50$ $30$ fill=$green$
+    canvas.text $300$ $50$ $AC Widgets$ fill=$black$
+    
+    info = display.create $root$ $Canvas drawing complete!$
+    info.pack
+    
+    root.mainloop()
+    /kill
+<mainloop>

@@ -1,5 +1,6 @@
 #include "../include/ast.hpp"
 #include "../include/type.hpp"
+#include "base_codegen.hpp"
 #include <string>
 #include <sstream>
 #include <vector>
@@ -8,7 +9,7 @@
 #include <map>
 #include <functional>
 
-class VCodeGen {
+class VCodeGen : public BaseCodeGen {
     std::ostringstream out;
     std::ostringstream functions;
     std::ostringstream* currentOut;
@@ -24,12 +25,38 @@ class VCodeGen {
     }
 
     std::string unwrapDollars(const std::string& s) {
+        // If the entire string is $...$, unwrap it completely
+        if (s.size() >= 2 && s.front() == '$' && s.back() == '$') {
+            std::string content = s.substr(1, s.size() - 2);
+            // Escape special characters for V
+            std::string escaped;
+            for (char c : content) {
+                if (c == '\'') escaped += "\\'";
+                else if (c == '\\') escaped += "\\\\";
+                else if (c == '\n') escaped += "\\n";
+                else if (c == '\t') escaped += "\\t";
+                else escaped += c;
+            }
+            return "'" + escaped + "'";
+        }
+        
+        // Otherwise, find $...$ pairs within the expression
         std::string result;
         for (size_t i = 0; i < s.size(); i++) {
             if (s[i] == '$') {
                 size_t end = s.find('$', i + 1);
                 if (end != std::string::npos) {
-                    result += "'" + s.substr(i + 1, end - i - 1) + "'";
+                    std::string content = s.substr(i + 1, end - i - 1);
+                    // Escape special characters
+                    std::string escaped;
+                    for (char c : content) {
+                        if (c == '\'') escaped += "\\'";
+                        else if (c == '\\') escaped += "\\\\";
+                        else if (c == '\n') escaped += "\\n";
+                        else if (c == '\t') escaped += "\\t";
+                        else escaped += c;
+                    }
+                    result += "'" + escaped + "'";
                     i = end;
                     continue;
                 }
@@ -52,51 +79,44 @@ class VCodeGen {
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
 
-        // Normalize special AC condition patterns:
-        // <obj>.Hitbox.Coords Overlap <other> -> obj.overlaps(other)
-        size_t overlapPos;
-        if ((overlapPos = r.find("Hitbox.Coords Overlap")) != std::string::npos) {
-            std::string left = r.substr(0, overlapPos);
-            if (!left.empty() && left.back() == ' ') left.pop_back();
-            std::string right = r.substr(overlapPos + strlen("Hitbox.Coords Overlap"));
-            while (!right.empty() && right.front() == ' ') right.erase(0, 1);
-            r = left + ".overlaps(" + right + ")";
-        }
-
-        // CircleFall check pattern -> convert to function call
-        if (r.find("CircleFell") != std::string::npos) {
-            size_t atPos = r.find("CircleFell");
-            std::string prefix = r.substr(0, atPos);
-            if (prefix.find("Cactus") != std::string::npos) {
-                r = "cactus_physics.circle_fell()";
+        // Translate AC booleans to V (case-insensitive)
+        std::string result;
+        for (size_t i = 0; i < r.size(); ) {
+            if ((i == 0 || !std::isalnum(r[i-1])) && i + 4 <= r.size()) {
+                std::string word = r.substr(i, 4);
+                std::string lower = word;
+                for (auto& c : lower) c = std::tolower(c);
+                if (lower == "true" && (i + 4 >= r.size() || !std::isalnum(r[i+4]))) {
+                    result += "true";
+                    i += 4;
+                    continue;
+                }
+                if (lower == "null" && (i + 4 >= r.size() || !std::isalnum(r[i+4]))) {
+                    result += "none";
+                    i += 4;
+                    continue;
+                }
             }
-        }
-
-        // hitbox overlap in AC pseudo-language
-        if (r.find("hitbox overlap") != std::string::npos) {
-            r = "true";
-        }
-
-        // not found fallback
-        if (r.find("not found") != std::string::npos) {
-            if (r.find("AC.Search") != std::string::npos) {
-                r = r.substr(0, r.find(" not found"));
-            } else {
-                r = "true";
+            if ((i == 0 || !std::isalnum(r[i-1])) && i + 5 <= r.size()) {
+                std::string word = r.substr(i, 5);
+                std::string lower = word;
+                for (auto& c : lower) c = std::tolower(c);
+                if (lower == "false" && (i + 5 >= r.size() || !std::isalnum(r[i+5]))) {
+                    result += "false";
+                    i += 5;
+                    continue;
+                }
             }
+            result += r[i];
+            i++;
         }
+        r = result;
 
-        // #= -> !=
+        // Convert AC operators to V
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
             r.replace(p, 2, "!="), p += 2;
 
-        // is True/False / is -> ==
-        for (size_t p = 0; (p = r.find(" is True", p)) != std::string::npos;) {
-            r.replace(p, 8, " == true"); p += 8;
-        }
-        for (size_t p = 0; (p = r.find(" is False", p)) != std::string::npos;) {
-            r.replace(p, 9, " == false"); p += 9;
-        }
+        // Convert 'is' to '=='
         for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
             r.replace(p, 4, " == "), p += 4;
 
@@ -125,12 +145,45 @@ class VCodeGen {
         }
         return result;
     }
+    
+    std::string parseDictItems(const std::string& raw) {
+        std::string s = raw;
+        if (s.size() >= 2 && s.front() == '$' && s.back() == '$')
+            s = s.substr(1, s.size() - 2);
+        std::string result;
+        size_t i = 0;
+        while (i < s.size()) {
+            std::string key;
+            while (i < s.size() && s[i] != ':') key += s[i++];
+            size_t a = key.find_first_not_of(' ');
+            size_t b = key.find_last_not_of(' ');
+            if (a != std::string::npos) key = key.substr(a, b - a + 1);
+            if (i < s.size() && s[i] == ':') i++;
+            std::string value;
+            while (i < s.size() && s[i] != ',') value += s[i++];
+            a = value.find_first_not_of(' ');
+            b = value.find_last_not_of(' ');
+            if (a != std::string::npos) value = value.substr(a, b - a + 1);
+            if (i < s.size() && s[i] == ',') i++;
+            if (!key.empty()) {
+                if (!result.empty()) result += ", ";
+                bool keyIsNum = !key.empty() && (std::isdigit(key[0]) || key[0] == '-');
+                bool valIsNum = !value.empty() && (std::isdigit(value[0]) || value[0] == '-');
+                result += (keyIsNum ? key : "\"" + key + "\"") + ": " + (valIsNum ? value : "\"" + value + "\"");
+            }
+        }
+        return result;
+    }
 
     std::string translateExpr(const std::string& expr) {
         std::string r = expr;
         while (!r.empty() && r.back() == ' ') r.pop_back();
         while (!r.empty() && r.front() == ' ') r = r.substr(1);
         r = unwrapDollars(r);
+        // @ -> * (default multiplication operator)
+        for (size_t p = 0; (p = r.find("@", p)) != std::string::npos;) {
+            r.replace(p, 1, "*"); p++;
+        }
         // #= -> !=
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
             r.replace(p, 2, "!="), p += 2;
@@ -151,6 +204,17 @@ class VCodeGen {
         return r;
     }
 
+    // Check if the AST uses event listeners
+    bool usesEventListener(const ASTNode& node) {
+        if (node.type == NodeType::EventListener || node.type == NodeType::KeyBinding || node.type == NodeType::InputStmt) {
+            return true;
+        }
+        for (auto& child : node.children) {
+            if (usesEventListener(*child)) return true;
+        }
+        return false;
+    }
+
     void genBlock(const ASTNode& node) {
         for (auto& c : node.children) genNode(*c);
     }
@@ -164,18 +228,120 @@ class VCodeGen {
             emitRaw("import os");
             emitRaw("");
             
-            // First pass: collect functions
-            collectingFunctions = true;
-            std::function<void(const ASTNode&)> collectFuncs = [&](const ASTNode& n) {
-                if (n.type == NodeType::FuncDef) {
-                    genNode(n);
+            // Only emit event listener code if actually used
+            bool needsEventListener = usesEventListener(node);
+            if (needsEventListener) {
+                emitRaw("// Event listener implementation");
+                emitRaw("struct EventListener {");
+                emitRaw("mut:");
+                emitRaw("    bindings map[string]fn()");
+                emitRaw("}");
+                emitRaw("fn new_event_listener() EventListener {");
+                emitRaw("    return EventListener{ bindings: map[string]fn(){} }");
+                emitRaw("}");
+                emitRaw("fn (mut el EventListener) bind(key string, callback fn()) {");
+                emitRaw("    el.bindings[key] = callback");
+                emitRaw("}");
+                emitRaw("fn (el EventListener) trigger(key string) {");
+                emitRaw("    // Automatically trigger if binding exists, otherwise do nothing");
+                emitRaw("    if key in el.bindings { el.bindings[key]() }");
+                emitRaw("}");
+                emitRaw("fn (el EventListener) check_and_trigger(key string) {");
+                emitRaw("    // Check and trigger - if no binding, do absolutely nothing");
+                emitRaw("    el.trigger(key)");
+                emitRaw("}");
+                emitRaw("__global ac_event_listener = new_event_listener()");
+                emitRaw("");
+                emitRaw("// Keybinds");
+                emitRaw("const (");
+                emitRaw("    key_1 = \"1\"");
+                emitRaw("    key_2 = \"2\"");
+                emitRaw("    key_3 = \"3\"");
+                emitRaw("    key_4 = \"4\"");
+                emitRaw("    key_5 = \"5\"");
+                emitRaw("    key_6 = \"6\"");
+                emitRaw("    key_7 = \"7\"");
+                emitRaw("    key_8 = \"8\"");
+                emitRaw("    key_9 = \"9\"");
+                emitRaw("    key_0 = \"0\"");
+                emitRaw("    key_minus = \"minus\"");
+                emitRaw("    key_equal = \"equal\"");
+                emitRaw("    key_backspace = \"backspace\"");
+                emitRaw("    key_backslash = \"backslash\"");
+                emitRaw("    key_tab = \"tab\"");
+                emitRaw("    key_q = \"q\"");
+                emitRaw("    key_w = \"w\"");
+                emitRaw("    key_e = \"e\"");
+                emitRaw("    key_r = \"r\"");
+                emitRaw("    key_t = \"t\"");
+                emitRaw("    key_y = \"y\"");
+                emitRaw("    key_u = \"u\"");
+                emitRaw("    key_i = \"i\"");
+                emitRaw("    key_o = \"o\"");
+                emitRaw("    key_p = \"p\"");
+                emitRaw("    key_lbracket = \"[\"");
+                emitRaw("    key_rbracket = \"]\"");
+                emitRaw("    key_caps = \"caps\"");
+                emitRaw("    key_a = \"a\"");
+                emitRaw("    key_s = \"s\"");
+                emitRaw("    key_d = \"d\"");
+                emitRaw("    key_f = \"f\"");
+                emitRaw("    key_g = \"g\"");
+                emitRaw("    key_h = \"h\"");
+                emitRaw("    key_j = \"j\"");
+                emitRaw("    key_k = \"k\"");
+                emitRaw("    key_l = \"l\"");
+                emitRaw("    key_semicolon = \";\"");
+                emitRaw("    key_apostrophe = \"'\"");
+                emitRaw("    key_enter = \"enter\"");
+                emitRaw("    key_shift = \"shift\"");
+                emitRaw("    key_z = \"z\"");
+                emitRaw("    key_x = \"x\"");
+                emitRaw("    key_c = \"c\"");
+                emitRaw("    key_v = \"v\"");
+                emitRaw("    key_b = \"b\"");
+                emitRaw("    key_n = \"n\"");
+                emitRaw("    key_m = \"m\"");
+                emitRaw("    key_comma = \",\"");
+                emitRaw("    key_period = \".\"");
+                emitRaw("    key_slash = \"/\"");
+                emitRaw("    key_ctrl = \"ctrl\"");
+                emitRaw("    key_alt = \"alt\"");
+                emitRaw("    key_space = \"space\"");
+                emitRaw("    key_fn = \"fn\"");
+                emitRaw("    key_super = \"super\"");
+                emitRaw("    key_windows = \"windows\"");
+                emitRaw("    key_up = \"up\"");
+                emitRaw("    key_down = \"down\"");
+                emitRaw("    key_left = \"left\"");
+                emitRaw("    key_right = \"right\"");
+                emitRaw(")");
+                emitRaw("");
+            }
+            
+            // Find mainloop tag block
+            const ASTNode* mainloopBlock = nullptr;
+            for (auto& c : node.children) {
+                if (c->type == NodeType::TagBlock && c->value == "mainloop") {
+                    mainloopBlock = c.get();
+                    break;
                 }
-                for (auto& c : n.children) {
+            }
+            
+            // First pass: collect functions from entire program
+            collectingFunctions = true;
+            {
+                std::function<void(const ASTNode&)> collectFuncs = [&](const ASTNode& n) {
+                    if (n.type == NodeType::FuncDef) {
+                        genNode(n);
+                    }
+                    for (auto& c : n.children) {
+                        collectFuncs(*c);
+                    }
+                };
+                for (auto& c : node.children) {
                     collectFuncs(*c);
                 }
-            };
-            for (auto& c : node.children) {
-                collectFuncs(*c);
             }
             collectingFunctions = false;
             
@@ -185,8 +351,10 @@ class VCodeGen {
             emitRaw("fn main() {");
             indentLevel++;
             
-            // Second pass: emit main body
-            for (auto& c : node.children) genNode(*c);
+            // Second pass: emit main body from mainloop
+            if (mainloopBlock) {
+                for (auto& c : mainloopBlock->children) genNode(*c);
+            }
             
             indentLevel--;
             emit("}");
@@ -195,7 +363,13 @@ class VCodeGen {
 
         case NodeType::BackendDecl: break;
         case NodeType::UseStmt:     break;
-        case NodeType::UseLibStmt:  break;
+        case NodeType::UseLibStmt: {
+            // use ilib <libname> -> import library.<libname>
+            std::string libName = node.value;
+            emitRaw("// Library: " + libName);
+            emitRaw("// Note: V library support requires manual setup");
+            break;
+        }
         case NodeType::SaveStmt:    break;
         case NodeType::ConfigCall:  break;
         case NodeType::ObjDecl:     break;
@@ -233,22 +407,88 @@ class VCodeGen {
         case NodeType::AssignStmt:
             if (!node.attrs.empty()) {
                 std::string val = node.attrs[0];
-                bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
-                bool isFuncCall = val.find('(') != std::string::npos;
-                if (isNum || isFuncCall) {
-                    auto t = Type::inferNumeral(val);
-                    varTypes[node.value] = std::make_shared<Type>(t);
-                    // V type names: int, f64
-                    std::string vtype = t.isDec() ? "f64" : "int";
-                    emit("mut " + node.value + " := " + vtype + "(" + val + ")");
+                
+                if (val.substr(0, 8) == "__dict__") {
+                    // V: map[string]string
+                    emit("mut " + node.value + " := map[string]string{" + parseDictItems(val.substr(8)) + "}");
+                } else if (val.size() >= 11 && val.substr(0, 11) == "__funcall__") {
+                    // Function call: name = func(arg1, arg2)
+                    if (!node.children.empty() && node.children[0]->type == NodeType::FunctionCall) {
+                        auto& funcCall = *node.children[0];
+                        std::string funcName = funcCall.value;
+                        std::string args;
+                        for (size_t i = 0; i < funcCall.attrs.size(); i++) {
+                            if (i > 0) args += ", ";
+                            std::string attr = funcCall.attrs[i];
+                            // Check if it's a keyword argument
+                            size_t eqPos = attr.find('=');
+                            if (eqPos != std::string::npos && eqPos > 0) {
+                                // Extract value part
+                                std::string v = attr.substr(eqPos + 1);
+                                while (!v.empty() && v.back() == ' ') v.pop_back();
+                                while (!v.empty() && v.front() == ' ') v = v.substr(1);
+                                args += v;
+                            } else {
+                                // Positional argument
+                                args += attr;
+                            }
+                        }
+                        emit("mut " + node.value + " := " + funcName + "(" + args + ")");
+                    }
                 } else {
-                    varTypes[node.value] = std::make_shared<Type>(Type::makeString());
-                    emit("mut " + node.value + " := " + unwrapDollars(val));
+                    // Check if it's a keyword (null, true, false)
+                    std::string valLower = val;
+                    for (auto& c : valLower) c = std::tolower(c);
+                    bool isKeyword = (valLower == "null" || valLower == "true" || valLower == "false");
+                    
+                    bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
+                    bool isFuncCall = val.find('(') != std::string::npos;
+                    bool hasAt = val.find('@') != std::string::npos;
+                    if (isNum || isFuncCall || hasAt || isKeyword) {
+                        auto t = Type::inferNumeral(val);
+                        varTypes[node.value] = std::make_shared<Type>(t);
+                        // V type names: int, f64
+                        std::string vtype = t.isDec() ? "f64" : "int";
+                        emit("mut " + node.value + " := " + vtype + "(" + translateExpr(val) + ")");
+                    } else {
+                        varTypes[node.value] = std::make_shared<Type>(Type::makeString());
+                        emit("mut " + node.value + " := " + unwrapDollars(val));
+                    }
                 }
             }
             break;
 
         case NodeType::PropAssign:
+            break;
+
+        case NodeType::PlusEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " += " + translateExpr(node.attrs[0]));
+            }
+            break;
+
+        case NodeType::MinusEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " -= " + translateExpr(node.attrs[0]));
+            }
+            break;
+
+        case NodeType::MultiplyEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " *= " + translateExpr(node.attrs[0]));
+            }
+            break;
+
+        case NodeType::DivideEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " /= " + translateExpr(node.attrs[0]));
+            }
+            break;
+
+        case NodeType::AtEqualStmt:
+            if (!node.attrs.empty()) {
+                emit(node.value + " *= " + translateExpr(node.attrs[0]));
+            }
             break;
 
         case NodeType::MethodCall: {
@@ -259,6 +499,19 @@ class VCodeGen {
                     args = "'" + args.substr(1, args.size() - 2) + "'";
                 }
                 emit("println(" + args + ")");
+            } else if (name == "Term.ask") {
+                if (args.size() >= 2 && args.front() == '$' && args.back() == '$') {
+                    args = "'" + args.substr(1, args.size() - 2) + "'";
+                }
+                emit("input := os.input(" + args + ")");
+            }
+            break;
+        }
+
+        case NodeType::MethodChain: {
+            // Process chained method calls
+            for (auto& child : node.children) {
+                genNode(*child);
             }
             break;
         }
@@ -280,17 +533,20 @@ class VCodeGen {
 
         case NodeType::FuncDef: {
             if (!collectingFunctions) break;
-            std::string arg = node.attrs.empty() ? "" : node.attrs[0];
+            std::string args;
+            for (size_t i = 0; i < node.attrs.size(); i++) {
+                if (i > 0) args += ", ";
+                args += node.attrs[i] + " int";
+            }
             
             currentOut = &functions;
-            emitRaw("fn " + node.value + "(" + arg + " int) int {");
+            emitRaw("fn " + node.value + "(" + args + ") int {");
             indentLevel++;
             
             if (!node.children.empty()) {
-                for (auto& c : node.children[0]->children) genNode(*c);
+                genBlock(*node.children[0]);
             }
             
-            emit("return 0");
             indentLevel--;
             emit("}");
             
@@ -301,14 +557,6 @@ class VCodeGen {
         case NodeType::IfStmt: {
             std::string cond = node.value;
             if (cond == "OTHER") {
-                std::string cur = out.str();
-                size_t end = cur.rfind("}\n");
-                if (end != std::string::npos) {
-                    size_t start = cur.rfind('\n', end - 1);
-                    start = (start == std::string::npos) ? 0 : start + 1;
-                    out.str(cur.substr(0, start));
-                    out.seekp(0, std::ios::end);
-                }
                 emit("} else {");
             } else {
                 emit("if " + translateExpr(cond) + " {");
@@ -316,25 +564,26 @@ class VCodeGen {
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
-            emit("}");
+            
+            // Process ELSEIF and OTHER children
+            for (size_t i = 1; i < node.children.size(); i++) {
+                genNode(*node.children[i]);
+            }
+            
+            // Only emit closing brace if there are no children
+            if (node.children.size() <= 1) {
+                emit("}");
+            }
             break;
         }
 
         case NodeType::ElseIfStmt: {
             std::string cond = node.value;
-            std::string cur = out.str();
-            size_t end = cur.rfind("}\n");
-            if (end != std::string::npos) {
-                size_t start = cur.rfind('\n', end - 1);
-                start = (start == std::string::npos) ? 0 : start + 1;
-                out.str(cur.substr(0, start));
-                out.seekp(0, std::ios::end);
-            }
             emit("} else if " + translateExpr(cond) + " {");
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
-            emit("}");
+            // Don't emit closing brace - let the parent IfStmt handle it
             break;
         }
 
@@ -395,6 +644,30 @@ class VCodeGen {
         }
 
         case NodeType::EventListener:
+            // Generate event listener setup
+            for (auto& child : node.children) {
+                if (child->type == NodeType::KeyBinding) {
+                    std::string key = child->value;
+                    std::string callback = child->attrs.empty() ? "" : child->attrs[0];
+                    if (!callback.empty()) {
+                        emit("ac_event_listener.bind('" + key + "', fn() { " + callback + " })");
+                    }
+                }
+            }
+            break;
+
+        case NodeType::KeyBinding:
+            // Handled by EventListener
+            break;
+
+        case NodeType::InputStmt: {
+            // Send ghost/simulated keyboard input
+            std::string key = node.value;
+            emit("// Simulate key press: " + key);
+            emit("ac_event_listener.trigger('" + key + "')");
+            break;
+        }
+
         case NodeType::WhenBlock:
             for (auto& c : node.children) genNode(*c);
             break;

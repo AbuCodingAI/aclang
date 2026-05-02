@@ -1,0 +1,35 @@
+AC->PY
+
+use ilib widgets
+
+<mainloop>
+    root = Screen.create $User Form$ $500$ $400$
+    
+    title = display.create $root$ $User Registration Form$
+    title.config font=$Arial 16 bold$
+    title.pack
+    
+    name_label = display.create $root$ $Name:$
+    name_label.pack
+    name_input = ask.create $root$ $30$
+    name_input.pack
+    
+    email_label = display.create $root$ $Email:$
+    email_label.pack
+    email_input = ask.create $root$ $30$
+    email_input.pack
+    
+    age_label = display.create $root$ $Age:$
+    age_label.pack
+    age_slider = slider.create $root$ $18$ $100$ $horizontal$
+    age_slider.pack
+    
+    submit_btn = btn.create $root$ $Submit$ $None$
+    submit_btn.pack
+    
+    result = display.create $root$ $Fill the form and click Submit$
+    result.pack
+    
+    root.mainloop()
+    /kill
+<mainloop>

@@ -74,3 +74,7 @@ public:
 // Macro for easy backend registration
 #define REGISTER_BACKEND(name, ext, gen_func, runner_func) \
     static BackendRegistrar _registrar_##name(name, ext, gen_func, runner_func);
+
+// Library path resolution helper
+std::string resolveLibraryPath(const std::string& libName);
+

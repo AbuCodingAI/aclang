@@ -1,13 +1,15 @@
 #include "../include/ast.hpp"
 #include "../include/type.hpp"
+#include "base_codegen.hpp"
 #include <string>
 #include <sstream>
 #include <vector>
 #include <cctype>
 #include <cstring>
 #include <map>
+#include <regex>
 
-class JSCodeGen {
+class JSCodeGen : public BaseCodeGen {
     std::ostringstream out;
     int indentLevel = 0;
     std::map<std::string, TypePtr> varTypes;
@@ -26,13 +28,40 @@ class JSCodeGen {
     }
 
     std::string unwrapDollars(const std::string& s) {
+        // If the entire string is $...$, unwrap it completely
+        if (s.size() >= 2 && s.front() == '$' && s.back() == '$') {
+            std::string content = s.substr(1, s.size() - 2);
+            // Escape special characters for JavaScript
+            std::string escaped;
+            for (char c : content) {
+                if (c == '`') escaped += "\\`";
+                else if (c == '\\') escaped += "\\\\";
+                else if (c == '\n') escaped += "\\n";
+                else if (c == '\t') escaped += "\\t";
+                else escaped += c;
+            }
+            return "`" + escaped + "`";
+        }
+        
+        // Otherwise, find $...$ pairs within the expression
         std::string result;
         for (size_t i = 0; i < s.size(); i++) {
             if (s[i] == '$') {
                 size_t end = s.find('$', i + 1);
                 if (end != std::string::npos) {
-                    result += "`" + s.substr(i + 1, end - i - 1) + "`";
-                    i = end; continue;
+                    std::string content = s.substr(i + 1, end - i - 1);
+                    // Escape special characters
+                    std::string escaped;
+                    for (char c : content) {
+                        if (c == '`') escaped += "\\`";
+                        else if (c == '\\') escaped += "\\\\";
+                        else if (c == '\n') escaped += "\\n";
+                        else if (c == '\t') escaped += "\\t";
+                        else escaped += c;
+                    }
+                    result += "`" + escaped + "`";
+                    i = end;
+                    continue;
                 }
             }
             result += s[i];
@@ -45,51 +74,17 @@ class JSCodeGen {
         while (!r.empty() && r.back() == ' ') r.pop_back();
         r = unwrapDollars(r);
 
-        // Normalize special AC condition patterns:
-        // <obj>.Hitbox.Coords Overlap <other> -> obj.overlaps(other)
-        size_t overlapPos;
-        if ((overlapPos = r.find("Hitbox.Coords Overlap")) != std::string::npos) {
-            std::string left = r.substr(0, overlapPos);
-            if (!left.empty() && left.back() == ' ') left.pop_back();
-            std::string right = r.substr(overlapPos + strlen("Hitbox.Coords Overlap"));
-            while (!right.empty() && right.front() == ' ') right.erase(0, 1);
-            r = left + ".overlaps(" + right + ")";
-        }
-
-        // CircleFell check pattern -> convert to function call
-        if (r.find("CircleFell") != std::string::npos) {
-            size_t atPos = r.find("CircleFell");
-            std::string prefix = r.substr(0, atPos);
-            if (prefix.find("Cactus") != std::string::npos) {
-                r = "cactusPhysics.circleFell()";
-            }
-        }
-
-        // hitbox overlap in AC pseudo-language
-        if (r.find("hitbox overlap") != std::string::npos) {
-            r = "true";
-        }
-
-        // not found fallback
-        if (r.find("not found") != std::string::npos) {
-            if (r.find("AC.Search") != std::string::npos) {
-                r = r.substr(0, r.find(" not found"));
-            } else {
-                r = "true";
-            }
-        }
-
-        // #= -> !=
+        // Convert AC operators to JavaScript
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
             r.replace(p, 2, "!="), p += 2;
 
-        // is True/False / is -> ==
-        for (size_t p = 0; (p = r.find(" is True", p)) != std::string::npos;) {
-            r.replace(p, 8, " == true"); p += 8;
-        }
-        for (size_t p = 0; (p = r.find(" is False", p)) != std::string::npos;) {
-            r.replace(p, 9, " == false"); p += 9;
-        }
+        // Case-insensitive boolean handling
+        std::regex truePattern(R"(\b(true|True|TRUE)\b)", std::regex::icase);
+        std::regex falsePattern(R"(\b(false|False|FALSE)\b)", std::regex::icase);
+        r = std::regex_replace(r, truePattern, "true");
+        r = std::regex_replace(r, falsePattern, "false");
+
+        // Convert 'is' to '=='
         for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
             r.replace(p, 4, " == "), p += 4;
 
@@ -103,6 +98,21 @@ class JSCodeGen {
         while (!r.empty() && r.back() == ' ') r.pop_back();
         while (!r.empty() && r.front() == ' ') r = r.substr(1);
         r = unwrapDollars(r);
+        
+        // Null handling: null -> null (JavaScript native)
+        std::regex nullPattern(R"(\bnull\b)");
+        r = std::regex_replace(r, nullPattern, "null");
+        
+        // Case-insensitive boolean handling
+        std::regex truePattern(R"(\b(true|True|TRUE)\b)", std::regex::icase);
+        std::regex falsePattern(R"(\b(false|False|FALSE)\b)", std::regex::icase);
+        r = std::regex_replace(r, truePattern, "true");
+        r = std::regex_replace(r, falsePattern, "false");
+        
+        // @ -> * (default multiplication operator)
+        for (size_t p = 0; (p = r.find("@", p)) != std::string::npos;) {
+            r.replace(p, 1, "*"); p++;
+        }
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
             r.replace(p, 2, "!=="), p += 3;
         // 1-based index: list[n] -> list[n-1]
@@ -142,6 +152,61 @@ class JSCodeGen {
         }
         return result;
     }
+    
+    // Parse "key:value,key2:value2" into JavaScript object items
+    std::string parseDictItems(const std::string& raw) {
+        std::string s = raw;
+        if (s.size() >= 2 && s.front() == '$' && s.back() == '$')
+            s = s.substr(1, s.size() - 2);
+        std::string result;
+        size_t i = 0;
+        while (i < s.size()) {
+            // Parse key
+            std::string key;
+            while (i < s.size() && s[i] != ':') {
+                key += s[i++];
+            }
+            // Trim key
+            size_t a = key.find_first_not_of(' ');
+            size_t b = key.find_last_not_of(' ');
+            if (a != std::string::npos) key = key.substr(a, b - a + 1);
+            
+            if (i < s.size() && s[i] == ':') i++; // skip :
+            
+            // Parse value
+            std::string value;
+            while (i < s.size() && s[i] != ',') {
+                value += s[i++];
+            }
+            // Trim value
+            a = value.find_first_not_of(' ');
+            b = value.find_last_not_of(' ');
+            if (a != std::string::npos) value = value.substr(a, b - a + 1);
+            
+            if (i < s.size() && s[i] == ',') i++; // skip ,
+            
+            // Add to result
+            if (!key.empty()) {
+                if (!result.empty()) result += ", ";
+                // Quote key if not a number
+                bool keyIsNum = !key.empty() && (std::isdigit(key[0]) || key[0] == '-');
+                bool valIsNum = !value.empty() && (std::isdigit(value[0]) || value[0] == '-');
+                result += (keyIsNum ? key : "\"" + key + "\"") + ": " + (valIsNum ? value : "\"" + value + "\"");
+            }
+        }
+        return result;
+    }
+
+    // Check if the AST uses event listeners
+    bool usesEventListener(const ASTNode& node) {
+        if (node.type == NodeType::EventListener || node.type == NodeType::KeyBinding || node.type == NodeType::InputStmt) {
+            return true;
+        }
+        for (auto& child : node.children) {
+            if (usesEventListener(*child)) return true;
+        }
+        return false;
+    }
 
     // Remove the last emitted closing brace line so we can chain else/else-if
     void removeLastBrace() {
@@ -168,6 +233,99 @@ class JSCodeGen {
             emitRaw("// Generated by AC Compiler (AC->JS)");
             emitRaw("\"use strict\";");
             emitRaw("");
+            
+            // Only emit event listener code if actually used
+            bool needsEventListener = usesEventListener(node);
+            if (needsEventListener) {
+                emitRaw("// Event listener implementation");
+                emitRaw("class EventListener {");
+                emitRaw("    constructor() { this.bindings = {}; }");
+                emitRaw("    bind(key, callback) { this.bindings[key] = callback; }");
+                emitRaw("    trigger(key) {");
+                emitRaw("        // Automatically trigger if binding exists, otherwise do nothing");
+                emitRaw("        if (this.bindings[key]) this.bindings[key]();");
+                emitRaw("    }");
+                emitRaw("    check_and_trigger(key) {");
+                emitRaw("        // Check and trigger - if no binding, do absolutely nothing");
+                emitRaw("        this.trigger(key);");
+                emitRaw("    }");
+                emitRaw("}");
+                emitRaw("const ac_event_listener = new EventListener();");
+                emitRaw("");
+                emitRaw("// Import keybinds");
+                emitRaw("const KEY_1 = \"1\";");
+                emitRaw("const KEY_2 = \"2\";");
+                emitRaw("const KEY_3 = \"3\";");
+                emitRaw("const KEY_4 = \"4\";");
+                emitRaw("const KEY_5 = \"5\";");
+                emitRaw("const KEY_6 = \"6\";");
+                emitRaw("const KEY_7 = \"7\";");
+                emitRaw("const KEY_8 = \"8\";");
+                emitRaw("const KEY_9 = \"9\";");
+                emitRaw("const KEY_0 = \"0\";");
+                emitRaw("const KEY_MINUS = \"-\";");
+                emitRaw("const KEY_EQUAL = \"=\";");
+                emitRaw("const KEY_BACKSPACE = \"Backspace\";");
+                emitRaw("const KEY_BACKSLASH = \"\\\\\";");
+                emitRaw("const KEY_TAB = \"Tab\";");
+                emitRaw("const KEY_Q = \"q\";");
+                emitRaw("const KEY_W = \"w\";");
+                emitRaw("const KEY_E = \"e\";");
+                emitRaw("const KEY_R = \"r\";");
+                emitRaw("const KEY_T = \"t\";");
+                emitRaw("const KEY_Y = \"y\";");
+                emitRaw("const KEY_U = \"u\";");
+                emitRaw("const KEY_I = \"i\";");
+                emitRaw("const KEY_O = \"o\";");
+                emitRaw("const KEY_P = \"p\";");
+                emitRaw("const KEY_LBRACKET = \"[\";");
+                emitRaw("const KEY_RBRACKET = \"]\";");
+                emitRaw("const KEY_CAPS = \"CapsLock\";");
+                emitRaw("const KEY_A = \"a\";");
+                emitRaw("const KEY_S = \"s\";");
+                emitRaw("const KEY_D = \"d\";");
+                emitRaw("const KEY_F = \"f\";");
+                emitRaw("const KEY_G = \"g\";");
+                emitRaw("const KEY_H = \"h\";");
+                emitRaw("const KEY_J = \"j\";");
+                emitRaw("const KEY_K = \"k\";");
+                emitRaw("const KEY_L = \"l\";");
+                emitRaw("const KEY_SEMICOLON = \";\";");
+                emitRaw("const KEY_APOSTROPHE = \"'\";");
+                emitRaw("const KEY_ENTER = \"Enter\";");
+                emitRaw("const KEY_SHIFT = \"Shift\";");
+                emitRaw("const KEY_Z = \"z\";");
+                emitRaw("const KEY_X = \"x\";");
+                emitRaw("const KEY_C = \"c\";");
+                emitRaw("const KEY_V = \"v\";");
+                emitRaw("const KEY_B = \"b\";");
+                emitRaw("const KEY_N = \"n\";");
+                emitRaw("const KEY_M = \"m\";");
+                emitRaw("const KEY_COMMA = \",\";");
+                emitRaw("const KEY_PERIOD = \".\";");
+                emitRaw("const KEY_SLASH = \"/\";");
+                emitRaw("const KEY_CTRL = \"Control\";");
+                emitRaw("const KEY_ALT = \"Alt\";");
+                emitRaw("const KEY_SPACE = \" \";");
+                emitRaw("const KEY_FN = \"Meta\";");
+                emitRaw("const KEY_SUPER = \"Meta\";");
+                emitRaw("const KEY_WINDOWS = \"Meta\";");
+                emitRaw("const KEY_UP = \"ArrowUp\";");
+                emitRaw("const KEY_DOWN = \"ArrowDown\";");
+                emitRaw("const KEY_LEFT = \"ArrowLeft\";");
+                emitRaw("const KEY_RIGHT = \"ArrowRight\";");
+                emitRaw("");
+            }
+            
+            // Recursively collect and generate ALL function definitions from entire program
+            std::function<void(const ASTNode&)> collectFuncs = [&](const ASTNode& n) {
+                if (n.type == NodeType::FuncDef) genNode(n);
+                for (auto& c : n.children) collectFuncs(*c);
+            };
+            for (auto& c : node.children) {
+                collectFuncs(*c);
+            }
+            
             const ASTNode* mainloopBlock = nullptr;
             for (auto& c : node.children) {
                 if (c->type == NodeType::TagBlock && c->value == "mainloop")
@@ -192,7 +350,14 @@ class JSCodeGen {
 
         case NodeType::BackendDecl: break;
         case NodeType::UseStmt:     break;
-        case NodeType::UseLibStmt:  break;
+        case NodeType::UseLibStmt: {
+            // use ilib camera -> include camera library
+            std::string libName = node.value;
+            if (libName == "camera") {
+                emitRaw("const camera = require('./library/camera/camera.js');");
+            }
+            break;
+        }
         case NodeType::SaveStmt:    break;
         case NodeType::ConfigCall:  break;
         case NodeType::ObjDecl:     break;
@@ -234,15 +399,44 @@ class JSCodeGen {
                 } else if (val.substr(0, 9) == "__tuple__") {
                     varTypes[node.value] = std::make_shared<Type>(Type::makeTuple());
                     emit("const " + node.value + " = Object.freeze([" + parseCollectionItems(val.substr(9)) + "]);");
+                } else if (val.substr(0, 8) == "__dict__") {
+                    varTypes[node.value] = std::make_shared<Type>(Type::makeUnknown());
+                    emit("let " + node.value + " = {" + parseDictItems(val.substr(8)) + "};  // dict");
                 } else if (val.substr(0, 6) == "__fn__") {
                     varTypes[node.value] = std::make_shared<Type>(Type::makeNumeral(NumeralSubtype::PosInt));
                     emit("let " + node.value + " = " + translateExpr(val.substr(6)) + ";");
+                } else if (val.size() >= 11 && val.substr(0, 11) == "__funcall__") {
+                    // Function call: name = func(arg1, arg2) or func(key=val)
+                    if (!node.children.empty() && node.children[0]->type == NodeType::FunctionCall) {
+                        auto& funcCall = *node.children[0];
+                        std::string funcName = funcCall.value;
+                        std::string args;
+                        for (size_t i = 0; i < funcCall.attrs.size(); i++) {
+                            if (i > 0) args += ", ";
+                            std::string attr = funcCall.attrs[i];
+                            // Check if it's a keyword argument
+                            size_t eqPos = attr.find('=');
+                            if (eqPos != std::string::npos && eqPos > 0) {
+                                // Keyword argument - JavaScript doesn't support these directly
+                                // Just use the value part
+                                std::string val = attr.substr(eqPos + 1);
+                                while (!val.empty() && val.back() == ' ') val.pop_back();
+                                while (!val.empty() && val.front() == ' ') val = val.substr(1);
+                                args += quoteIfString(val);
+                            } else {
+                                // Positional argument
+                                args += quoteIfString(attr);
+                            }
+                        }
+                        emit("let " + node.value + " = " + funcName + "(" + args + ");");
+                    }
                 } else {
                     bool isNum = !val.empty() && (std::isdigit(val[0]) || (val[0] == '-' && val.size() > 1));
-                    if (isNum) {
+                    bool hasAt = val.find('@') != std::string::npos;
+                    if (isNum || hasAt) {
                         auto t = Type::inferNumeral(val);
                         varTypes[node.value] = std::make_shared<Type>(t);
-                        emit("let " + node.value + " = " + val + "; // " + t.toString());
+                        emit("let " + node.value + " = " + translateExpr(val) + "; // " + t.toString());
                     } else {
                         varTypes[node.value] = std::make_shared<Type>(Type::makeString());
                         emit("let " + node.value + " = " + quoteIfString(val) + ";");
@@ -294,6 +488,7 @@ class JSCodeGen {
                 args = translateExpr(args);
             std::string name = node.value;
             if (name == "Term.display") name = "console.log";
+            else if (name == "Term.ask") name = "prompt";
 
             // display variants -> DOM injection
             if (name == "display" || name == "bold.display" || name == "italic.display" ||
@@ -318,6 +513,14 @@ class JSCodeGen {
             break;
         }
 
+        case NodeType::MethodChain: {
+            // Process chained method calls
+            for (auto& child : node.children) {
+                genNode(*child);
+            }
+            break;
+        }
+
         case NodeType::RangeExpr: {
             std::string n = node.value;
             while (!n.empty() && n.back() == ' ') n.pop_back();
@@ -336,8 +539,12 @@ class JSCodeGen {
         }
 
         case NodeType::FuncDef: {
-            std::string arg = node.attrs.empty() ? "" : node.attrs[0];
-            emit("function " + node.value + "(" + arg + ") {");
+            std::string args;
+            for (size_t i = 0; i < node.attrs.size(); i++) {
+                if (i > 0) args += ", ";
+                args += node.attrs[i];
+            }
+            emit("function " + node.value + "(" + args + ") {");
             indentLevel++;
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
@@ -356,6 +563,11 @@ class JSCodeGen {
             if (!node.children.empty()) genBlock(*node.children[0]);
             indentLevel--;
             emit("}");
+            
+            // Handle ELSEIF and OTHER blocks (they are additional children)
+            for (size_t i = 1; i < node.children.size(); i++) {
+                genNode(*node.children[i]);
+            }
             break;
         }
 
@@ -431,6 +643,30 @@ class JSCodeGen {
         }
 
         case NodeType::EventListener:
+            // Generate event listener setup
+            for (auto& child : node.children) {
+                if (child->type == NodeType::KeyBinding) {
+                    std::string key = child->value;
+                    std::string callback = child->attrs.empty() ? "" : child->attrs[0];
+                    if (!callback.empty()) {
+                        emit("ac_event_listener.bind('" + key + "', () => " + callback + ");");
+                    }
+                }
+            }
+            break;
+
+        case NodeType::KeyBinding:
+            // Handled by EventListener
+            break;
+
+        case NodeType::InputStmt: {
+            // Send ghost/simulated keyboard input
+            std::string key = node.value;
+            emit("// Simulate key press: " + key);
+            emit("ac_event_listener.trigger('" + key + "');");
+            break;
+        }
+
         case NodeType::WhenBlock:
             for (auto& c : node.children) genNode(*c);
             break;

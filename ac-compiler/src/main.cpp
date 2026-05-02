@@ -2,16 +2,24 @@
 #include "../include/ast.hpp"
 #include "../include/error.hpp"
 #include "../include/backend_registry.hpp"
+#include "../include/ir.hpp"
 #include "acc_cache.hpp"
+#include "ir_cache.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <cstdlib>
+#include <sys/stat.h>
 
 // Forward declarations
 std::vector<Token> lex(const std::string& source);
 NodePtr parse(const std::vector<Token>& tokens);
+
+// IR-based compilation (defined in ir.cpp inside AC_IR namespace)
+namespace AC_IR { IRProgram generateIR(const ASTNode& ast, const std::string& backend); }
+
+// Legacy direct codegens (for fallback)
 std::string generatePython(const ASTNode& ast);
 std::string generateJS(const ASTNode& ast);
 std::string generateHTML(const ASTNode& ast);
@@ -22,6 +30,9 @@ std::string generateAsm(const ASTNode& ast);
 std::string generateRs(const ASTNode& ast);
 std::string generateGo(const ASTNode& ast);
 std::string generateV(const ASTNode& ast);
+std::string generateBny(const ASTNode& ast);
+
+// IR JSON generator and codegen implementation
 
 static std::string readFile(const std::string& path) {
     std::ifstream f(path);
@@ -48,6 +59,9 @@ static std::string detectBackend(const std::string& source) {
 }
 
 int main(int argc, char* argv[]) {
+    // Initialize backend registry
+    BackendRegistry::initializeStandardBackends();
+    
     if (argc < 2) {
         std::cerr << "Usage: ac <file.ac>\n";
         return 1;
@@ -97,78 +111,50 @@ int main(int argc, char* argv[]) {
         }
 
         std::string accFile = inputFile.substr(0, inputFile.rfind('.')) + ".acc";
+        std::string lirFile = inputFile.substr(0, inputFile.rfind('.')) + ".lir";
 
         NodePtr ast;
-        if (!forceCompile && cacheIsValid(inputFile, accFile)) {
-            ast = loadCache(accFile);
+        AC_IR::IRProgram irProgram;
+        
+        // Try to load from LIR cache first (fastest path)
+        if (!forceCompile && lirCacheIsValid(inputFile, lirFile, backend)) {
+            irProgram = loadLIRCache(lirFile);
         }
-        if (!ast) {
-            // Cache miss or stale — full lex + parse
-            auto tokens = lex(source);
-            ast = parse(tokens);
-            saveCache(accFile, *ast);
+        
+        // If LIR cache miss, try AST cache
+        if (!irProgram.functions.size()) {
+            if (!forceCompile && cacheIsValid(inputFile, accFile)) {
+                ast = loadCache(accFile);
+            }
+            
+            // If AST cache miss, parse from source
+            if (!ast) {
+                auto tokens = lex(source);
+                ast = parse(tokens);
+                saveCache(accFile, *ast);
+            }
+            
+            // Generate IR from AST
+            irProgram = AC_IR::generateIR(*ast, backend);
+            
+            // Save LIR cache
+            saveLIRCache(lirFile, irProgram, backend);
         }
-
-        // Use backend registry to generate code
-        std::string outFile;
-        if (backend == "PY") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".py";
-            writeFile(outFile, generatePython(*ast));
-        } else if (backend == "JS") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".js";
-            writeFile(outFile, generateJS(*ast));
-        } else if (backend == "HTML") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".html";
-            writeFile(outFile, generateHTML(*ast));
-        } else if (backend == "Java") {
-            outFile = "Main.java";
-            writeFile(outFile, generateJava(*ast));
-        } else if (backend == "C++") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".cpp";
-            writeFile(outFile, generateCpp(*ast));
-        } else if (backend == "C") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".c";
-            writeFile(outFile, generateC(*ast));
-        } else if (backend == "ASM") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".s";
-            writeFile(outFile, generateAsm(*ast));
-        } else if (backend == "RS") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".rs";
-            writeFile(outFile, generateRs(*ast));
-        } else if (backend == "GO") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".go";
-            writeFile(outFile, generateGo(*ast));
-        } else if (backend == "V") {
-            outFile = inputFile.substr(0, inputFile.rfind('.')) + ".v";
-            writeFile(outFile, generateV(*ast));
-        } else {
-            std::cerr << "Backend '" << backend << "' not yet implemented.\n";
-            return 1;
+        
+        // Generate target code from AST using backend
+        if (!BackendRegistry::hasBackend(backend)) {
+            throw BACKEND_ERROR("Unknown backend: " + backend);
         }
-
-        if (compileOnly) {
-            std::cout << "Compiled " << outFile << " (compile-only mode)\n";
-            return 0;
-        }
-
-        std::string runner;
-        if (backend == "PY")   runner = "python3 " + outFile;
-        else if (backend == "JS")   runner = "node " + outFile;
-        else if (backend == "HTML") runner = "xdg-open " + outFile;
-        else if (backend == "Java") runner = "javac " + outFile + " && java Main";
-        else if (backend == "C++")  runner = "g++ " + outFile + " -I.. -o /tmp/ac_out && /tmp/ac_out";
-        else if (backend == "C")    runner = "gcc " + outFile + " -I.. -o /tmp/ac_out && /tmp/ac_out";
-        else if (backend == "ASM")  runner = "gcc " + outFile + " -I.. -o /tmp/ac_out && /tmp/ac_out";
-        else if (backend == "RS")   runner = "rustc " + outFile + " -o /tmp/ac_out && /tmp/ac_out";
-        else if (backend == "GO")   runner = "go run " + outFile;
-        else if (backend == "V")    runner = "cd /tmp/v && /usr/local/bin/v run " + outFile;
-
-        if (runner.empty()) {
-            std::cerr << "No runner defined for backend: " << backend << "\n";
-            return 1;
-        }
-
-        return std::system(runner.c_str());
+        
+        const auto& backendInfo = BackendRegistry::getBackend(backend);
+        std::string code = backendInfo.generator(*ast);
+        
+        // Output target file
+        std::string outFile = inputFile.substr(0, inputFile.rfind('.')) + backendInfo.extension;
+        writeFile(outFile, code);
+        
+        std::cout << "Generated: " << outFile << " (IR: " << lirFile << ")\n";
+        return 0;
 
     } catch (const std::exception& e) {
                 std::cerr << e.what() << "\n";

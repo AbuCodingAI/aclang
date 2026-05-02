@@ -8,8 +8,6 @@ enum class TypeKind {
     String,
     List,
     Tuple,
-    Range,
-    Sequence,
     Unknown
 };
 
@@ -51,8 +49,6 @@ struct Type {
     static Type makeString()   { return Type(TypeKind::String); }
     static Type makeList()     { return Type(TypeKind::List); }
     static Type makeTuple()    { Type t(TypeKind::Tuple); t.immutable = true; return t; }
-    static Type makeRange()    { return Type(TypeKind::Range); }
-    static Type makeSequence() { return Type(TypeKind::Sequence); }
     static Type makeUnknown()  { return Type(TypeKind::Unknown); }
 
     // ── predicates ───────────────────────────────────────────────────────────
@@ -61,8 +57,8 @@ struct Type {
     bool isBoolean()  const { return kind == TypeKind::Boolean; }
     bool isList()     const { return kind == TypeKind::List; }
     bool isTuple()    const { return kind == TypeKind::Tuple; }
-    bool isRange()    const { return kind == TypeKind::Range; }
-    bool isSequence() const { return kind == TypeKind::Sequence; }
+    bool isRange()    const { return false; }
+    bool isSequence() const { return false; }
     bool isUnknown()  const { return kind == TypeKind::Unknown; }
 
     bool isPosInt()   const { return isNumeral() && numSub == NumeralSubtype::PosInt; }
@@ -114,8 +110,6 @@ struct Type {
             case TypeKind::String:   return "String";
             case TypeKind::List:     return "List";
             case TypeKind::Tuple:    return "Tuple(immutable)";
-            case TypeKind::Range:    return "Range(Numeral Pos.Int)";
-            case TypeKind::Sequence: return "Sequence(Numeral Pos.Int)";
             case TypeKind::Unknown:  return "Unknown";
         }
         return "Unknown";

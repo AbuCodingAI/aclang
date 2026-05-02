@@ -1,0 +1,6 @@
+AC->PY
+
+<mainloop>
+    Term.display $Creating Tkinter GUI...$
+    /kill
+<mainloop>

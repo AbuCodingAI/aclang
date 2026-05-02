@@ -1,0 +1,52 @@
+AC->PY
+
+Make greet func()
+    Term.display $Hello from AC!$
+
+Make farewell func()
+    Term.display $Goodbye!$
+
+Make count func()
+    Term.display $Counting: 1$
+    Term.display $Counting: 2$
+    Term.display $Counting: 3$
+
+Make automation_demo func()
+    Term.display $=== Automation Demo ===$
+    Term.display $Triggering greet...$
+    input g
+    Term.display $Triggering count...$
+    input c
+    Term.display $Triggering farewell...$
+    input f
+
+<mainloop>
+    configure event-listener
+        use listener to establish rule
+            on value=g
+                greet()
+            on value=f
+                farewell()
+            on value=c
+                count()
+            on value=a
+                automation_demo()
+    
+    Term.display $======================================$
+    Term.display $   AC Input Keyword Demo$
+    Term.display $======================================$
+    Term.display $ $
+    Term.display $Manual triggers:$
+    input g
+    input f
+    
+    Term.display $ $
+    Term.display $Automated sequence:$
+    input a
+    
+    Term.display $ $
+    Term.display $======================================$
+    Term.display $   Demo Complete!$
+    Term.display $======================================$
+    /kill
+<mainloop>

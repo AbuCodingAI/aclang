@@ -6,10 +6,12 @@ import (
     "os"
 )
 
+
+
 func main() {
     for {
         fmt.Println("Starting up...")
-        result := 120
+        result := 120 // Numeral(Pos.Int)
         fmt.Println(result)
         os.Exit(0)
     }

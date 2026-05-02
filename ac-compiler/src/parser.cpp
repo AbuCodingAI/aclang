@@ -10,12 +10,17 @@
 class Parser {
     std::vector<Token> tokens;
     size_t pos = 0;
-    // tag open/close tracking: name -> open count
-    std::unordered_map<std::string, int> tagCount;
+    // tag open/close tracking: stack of open tag names
+    std::vector<std::string> tagStack;
     // custom tags defined by `def tag <name>`
     std::unordered_set<std::string> customTags;
 
     Token& peek() { return tokens[pos]; }
+
+    Token& peekAhead(size_t offset) { 
+        if (pos + offset < tokens.size()) return tokens[pos + offset];
+        return tokens.back();
+    }
 
     bool isRecognizedTag(const std::string& name) const {
         return Tags::isKnownTag(name) || customTags.count(name) > 0;
@@ -31,6 +36,22 @@ class Parser {
     void skipAll() {
         while (at(TokenType::NEWLINE) || at(TokenType::INDENT) || at(TokenType::DEDENT))
             advance();
+    }
+    
+    void expectIndent() {
+        skipNewlines();
+        if (!at(TokenType::INDENT)) {
+            throw SYNTAX_ERROR("Expected indentation", peek().line, peek().col);
+        }
+        advance();
+    }
+    
+    void expectDedent() {
+        skipNewlines();
+        if (!at(TokenType::DEDENT)) {
+            throw SYNTAX_ERROR("Expected dedent (unindent)", peek().line, peek().col);
+        }
+        advance();
     }
 
     Token expect(TokenType t, const std::string& msg) {
@@ -54,7 +75,7 @@ public:
 
 private:
     NodePtr parseStatement() {
-        skipAll();
+        skipNewlines(); // Changed from skipAll() - only skip newlines, not indents
         if (at(TokenType::END_OF_FILE)) return nullptr;
 
         // Backend declaration
@@ -114,6 +135,16 @@ private:
             std::string name;
             if (at(TokenType::IDENTIFIER)) name = advance().value;
             return std::make_unique<ASTNode>(NodeType::DestroyStmt, name);
+        }
+
+        // input <keybind>
+        if (at(TokenType::KW_INPUT)) {
+            advance();
+            std::string keybind;
+            if (at(TokenType::IDENTIFIER)) {
+                keybind = advance().value;
+            }
+            return std::make_unique<ASTNode>(NodeType::InputStmt, keybind);
         }
 
         // use X
@@ -183,37 +214,67 @@ private:
         }
 
         // configure event-listener
-        if (at(TokenType::IDENTIFIER) && peek().value == "configure") {
-            advance();
-            std::string configTarget;
+        if (at(TokenType::KW_CONFIGURE)) {
+            advance(); // consume configure
+            // Skip "event-listener" tokens without calling parseStatement
+            // Consume: event, -, listener
             while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                configTarget += advance().value;
-                if (!at(TokenType::NEWLINE)) configTarget += " ";
-            }
-            // trim whitespace
-            while (!configTarget.empty() && configTarget.back() == ' ') configTarget.pop_back();
-            auto node = std::make_unique<ASTNode>(NodeType::EventListener, configTarget);
-            skipNewlines();
-            node->children.push_back(parseBlock());
-            return node;
-        }
-
-        // on value=space / on value=escape etc
-        if (at(TokenType::KW_ON)) {
-            advance();
-            std::string key;
-            if (at(TokenType::IDENTIFIER) && peek().value == "value") {
                 advance();
-                if (at(TokenType::ASSIGN)) advance();
-                if (at(TokenType::IDENTIFIER)) key = advance().value;
             }
             skipNewlines();
-            auto node = std::make_unique<ASTNode>(NodeType::EventListener, key);
+            
+            auto node = std::make_unique<ASTNode>(NodeType::EventListener);
+            
+            // Parse the nested block: use listener to establish rule
             if (at(TokenType::INDENT)) {
-                node->children.push_back(parseBlock());
-            } else {
-                auto stmt = parseStatement();
-                if (stmt) node->children.push_back(std::move(stmt));
+                advance();
+                // Skip "use listener to establish rule" line
+                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
+                    advance();
+                }
+                skipNewlines();
+                
+                // Skip the INDENT token before the key bindings
+                if (at(TokenType::INDENT)) {
+                    advance();
+                }
+                
+                // Now parse the key bindings - directly handle them here
+                while (at(TokenType::KW_ON) && !at(TokenType::DEDENT)) {
+                    advance(); // consume ON
+                    std::string key;
+                    if (at(TokenType::KW_VALUE)) {
+                        advance();
+                        if (at(TokenType::ASSIGN)) advance();
+                        if (at(TokenType::IDENTIFIER)) key = advance().value;
+                    }
+                    skipNewlines();
+                    auto keyBinding = std::make_unique<ASTNode>(NodeType::KeyBinding, key);
+                    
+                    // Parse the function call on the next line (indented)
+                    if (at(TokenType::INDENT)) {
+                        advance();
+                        skipNewlines();
+                        if (at(TokenType::IDENTIFIER)) {
+                            std::string funcName = advance().value;
+                            std::string args;
+                            if (at(TokenType::LPAREN)) {
+                                advance();
+                                while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
+                                    args += advance().value;
+                                }
+                                if (at(TokenType::RPAREN)) advance();
+                            }
+                            keyBinding->attrs.push_back(funcName + "(" + args + ")");
+                        }
+                        skipNewlines();
+                        if (at(TokenType::DEDENT)) advance();
+                    }
+                    node->children.push_back(std::move(keyBinding));
+                    skipNewlines();
+                }
+                
+                if (at(TokenType::DEDENT)) advance();
             }
             return node;
         }
@@ -240,7 +301,7 @@ private:
             while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
                 n += advance().value;
             auto node = std::make_unique<ASTNode>(NodeType::RangeExpr, n);
-            node->inferredType = std::make_shared<Type>(Type::makeRange());
+            node->inferredType = std::make_shared<Type>(Type::makeList());
             return node;
         }
 
@@ -254,7 +315,7 @@ private:
             while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) y += advance().value;
             if (at(TokenType::RPAREN)) advance();
             auto node = std::make_unique<ASTNode>(NodeType::SequenceExpr, x + "," + y);
-            node->inferredType = std::make_shared<Type>(Type::makeSequence());
+            node->inferredType = std::make_shared<Type>(Type::makeList());
             return node;
         }
 
@@ -320,42 +381,55 @@ private:
         auto tagTok = advance(); // consume <tagname>
         std::string name = tagTok.value;
 
-        tagCount[name]++;
-        bool isClose = (tagCount[name] % 2 == 0);
-
-        if (isClose) {
-            // This is a closing tag, return a sentinel
-            auto node = std::make_unique<ASTNode>(NodeType::Block, "__close__" + name);
-            return node;
+        // Check if this is a closing tag
+        // For StartHere, the closing tag is EndHere
+        std::string closeWith = (name == "StartHere") ? "EndHere" : name;
+        
+        // Check if this tag matches the closing tag of the top of stack
+        if (!tagStack.empty()) {
+            std::string expectedClose = (tagStack.back() == "StartHere") ? "EndHere" : tagStack.back();
+            if (name == expectedClose) {
+                // This is a closing tag
+                tagStack.pop_back();
+                auto node = std::make_unique<ASTNode>(NodeType::Block, "__close__" + name);
+                return node;
+            }
         }
 
-        // Opening tag — parse body until matching close OR EndHere if StartHere
+        // This is an opening tag
+        tagStack.push_back(name);
         auto block = std::make_unique<ASTNode>(NodeType::TagBlock, name);
-        skipAll();
+        
+        // Tag blocks require indentation for their content
+        expectIndent();
 
-        std::string closeWith = (name == "StartHere") ? "EndHere" : name;
-
-        while (!at(TokenType::END_OF_FILE)) {
+        while (!at(TokenType::DEDENT) && !at(TokenType::END_OF_FILE)) {
             if (at(TokenType::TAG_OPEN) && tokens[pos].value == closeWith) {
                 if (name == "StartHere") {
                     advance(); // consume EndHere
+                    tagStack.pop_back();
                     break;
                 }
-                int nextCount = tagCount[name] + 1;
-                if (nextCount % 2 == 0) {
-                    tagCount[name]++;
-                    advance();
+                // Check if this is the matching closing tag
+                if (!tagStack.empty() && tagStack.back() == name) {
+                    advance(); // consume closing tag
+                    tagStack.pop_back();
                     break;
                 }
             }
             auto stmt = parseStatement();
             if (stmt) {
                 if (stmt->type == NodeType::Block &&
-                    stmt->value == "__close__" + name) break;
+                    stmt->value == "__close__" + name) {
+                    tagStack.pop_back();
+                    break;
+                }
                 block->children.push_back(std::move(stmt));
             }
-            skipAll();
+            skipNewlines();
         }
+        
+        expectDedent();
         return block;
     }
 
@@ -462,9 +536,91 @@ private:
     // fn expr*(expr) — fn applies to the whole line, no closing fn needed
     NodePtr parseFnExpr() {
         advance(); // consume fn
+        
+        // Check if this is a method chain (Term.method ... & Term.method ...)
+        if (at(TokenType::IDENTIFIER)) {
+            size_t savedPos = pos;
+            
+            // Try to parse as method chain
+            std::string name = advance().value;
+            if (at(TokenType::DOT)) {
+                advance();
+                std::string prop = advance().value;
+                
+                // Collect arguments first
+                std::string tail;
+                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE) && 
+                       !at(TokenType::AMPERSAND) && !at(TokenType::DOUBLE_AMPERSAND)) {
+                    if (at(TokenType::STRING)) {
+                        tail += "$" + advance().value + "$";
+                    } else {
+                        tail += advance().value;
+                    }
+                    if (!at(TokenType::NEWLINE) && !at(TokenType::AMPERSAND) && !at(TokenType::DOUBLE_AMPERSAND)) 
+                        tail += " ";
+                }
+                
+                // Check if there's a method chain
+                if (at(TokenType::AMPERSAND) || at(TokenType::DOUBLE_AMPERSAND)) {
+                    // This is a method chain - parse it properly
+                    auto node = std::make_unique<ASTNode>(NodeType::MethodCall, name + "." + prop);
+                    if (!tail.empty()) node->attrs.push_back(tail);
+                    
+                    // Create chain node
+                    auto chainNode = std::make_unique<ASTNode>(NodeType::MethodChain);
+                    chainNode->children.push_back(std::move(node));
+                    
+                    // Parse remaining chained calls
+                    while (at(TokenType::AMPERSAND) || at(TokenType::DOUBLE_AMPERSAND)) {
+                        bool isSameArg = at(TokenType::DOUBLE_AMPERSAND);
+                        advance(); // consume & or &&
+                        
+                        if (at(TokenType::IDENTIFIER)) {
+                            std::string nextName = advance().value;
+                            if (at(TokenType::DOT)) {
+                                advance();
+                                std::string nextProp = advance().value;
+                                auto nextNode = std::make_unique<ASTNode>(NodeType::MethodCall, nextName + "." + nextProp);
+                                
+                                // For &&, use the same argument as the first call
+                                if (isSameArg) {
+                                    nextNode->attrs.push_back(tail);
+                                } else {
+                                    // For &, collect different arguments
+                                    std::string nextTail;
+                                    while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE) && 
+                                           !at(TokenType::AMPERSAND) && !at(TokenType::DOUBLE_AMPERSAND)) {
+                                        if (at(TokenType::STRING)) {
+                                            nextTail += "$" + advance().value + "$";
+                                        } else {
+                                            nextTail += advance().value;
+                                        }
+                                        if (!at(TokenType::NEWLINE) && !at(TokenType::AMPERSAND) && !at(TokenType::DOUBLE_AMPERSAND)) 
+                                            nextTail += " ";
+                                    }
+                                    if (!nextTail.empty()) nextNode->attrs.push_back(nextTail);
+                                }
+                                
+                                chainNode->children.push_back(std::move(nextNode));
+                            }
+                        }
+                    }
+                    return chainNode;
+                }
+            }
+            
+            // Not a method chain, reset and capture as string
+            pos = savedPos;
+        }
+        
+        // Fallback: capture entire line as string
         std::string expr;
         while (!at(TokenType::END_OF_FILE) && !at(TokenType::NEWLINE)) {
-            expr += advance().value;
+            if (at(TokenType::STRING)) {
+                expr += "$" + advance().value + "$";
+            } else {
+                expr += advance().value;
+            }
         }
         return std::make_unique<ASTNode>(NodeType::BinaryExpr, expr);
     }
@@ -482,43 +638,133 @@ private:
         return node;
     }
 
-    // {$item1, item2$}
+    // {$item1, item2$} or {key: value\nkey2: value2}
     NodePtr parseTupleLiteral() {
         advance(); // consume {
-        std::string contents;
-        while (!at(TokenType::RBRACE) && !at(TokenType::END_OF_FILE)) {
-            if (at(TokenType::STRING)) contents += advance().value;
-            else contents += advance().value;
+        
+        // Peek ahead to determine if this is a dict or tuple
+        // Dict has : before first comma/newline or }
+        bool isDict = false;
+        size_t lookAhead = pos;
+        while (lookAhead < tokens.size() && 
+               tokens[lookAhead].type != TokenType::RBRACE &&
+               tokens[lookAhead].type != TokenType::END_OF_FILE) {
+            // Skip newlines and indents when looking for colon
+            if (tokens[lookAhead].type == TokenType::NEWLINE || 
+                tokens[lookAhead].type == TokenType::INDENT ||
+                tokens[lookAhead].type == TokenType::DEDENT) {
+                lookAhead++;
+                continue;
+            }
+            if (tokens[lookAhead].type == TokenType::COLON) {
+                isDict = true;
+                break;
+            }
+            lookAhead++;
         }
-        if (at(TokenType::RBRACE)) advance();
-        auto node = std::make_unique<ASTNode>(NodeType::TupleLiteral, contents);
-        return node;
+        
+        if (isDict) {
+            // Parse as dictionary: {key: value\nkey2: value2}
+            std::string contents;
+            skipAll(); // Skip newlines and indents after opening {
+            
+            while (!at(TokenType::RBRACE) && !at(TokenType::DEDENT) && !at(TokenType::END_OF_FILE)) {
+                // Skip any leading newlines/indents
+                while (at(TokenType::NEWLINE) || at(TokenType::INDENT)) advance();
+                
+                if (at(TokenType::RBRACE) || at(TokenType::DEDENT)) break;
+                
+                // Parse key
+                std::string key;
+                while (!at(TokenType::COLON) && !at(TokenType::NEWLINE) && 
+                       !at(TokenType::RBRACE) && !at(TokenType::DEDENT) && !at(TokenType::END_OF_FILE)) {
+                    if (at(TokenType::STRING)) key += advance().value;
+                    else key += advance().value;
+                }
+                
+                // Expect colon
+                if (!at(TokenType::COLON)) {
+                    throw SYNTAX_ERROR("Expected ':' after dict key", peek().line, peek().col);
+                }
+                advance(); // consume :
+                
+                // Parse value
+                std::string value;
+                while (!at(TokenType::NEWLINE) && !at(TokenType::RBRACE) && 
+                       !at(TokenType::DEDENT) && !at(TokenType::END_OF_FILE)) {
+                    if (at(TokenType::STRING)) value += advance().value;
+                    else value += advance().value;
+                }
+                
+                // Add to contents
+                if (!key.empty()) {
+                    if (!contents.empty()) contents += ",";
+                    contents += key + ":" + value;
+                }
+                
+                // Skip newlines between entries
+                while (at(TokenType::NEWLINE)) advance();
+            }
+            
+            // Skip closing dedent and brace
+            if (at(TokenType::DEDENT)) advance();
+            if (at(TokenType::RBRACE)) advance();
+            auto node = std::make_unique<ASTNode>(NodeType::DictLiteral, contents);
+            return node;
+        } else {
+            // Parse as tuple: {$item1, item2$}
+            std::string contents;
+            while (!at(TokenType::RBRACE) && !at(TokenType::END_OF_FILE)) {
+                if (at(TokenType::STRING)) contents += advance().value;
+                else contents += advance().value;
+            }
+            if (at(TokenType::RBRACE)) advance();
+            auto node = std::make_unique<ASTNode>(NodeType::TupleLiteral, contents);
+            return node;
+        }
     }
 
     NodePtr parseBlock() {
         auto block = std::make_unique<ASTNode>(NodeType::Block);
-        skipNewlines(); // skip newlines but NOT INDENT
-        if (at(TokenType::INDENT)) {
-            advance(); // consume INDENT
-            while (!at(TokenType::DEDENT) && !at(TokenType::END_OF_FILE)) {
-                auto stmt = parseStatement();
-                if (stmt) block->children.push_back(std::move(stmt));
-                skipNewlines();
-            }
-            if (at(TokenType::DEDENT)) advance();
+        expectIndent(); // REQUIRE indentation
+        while (!at(TokenType::DEDENT) && !at(TokenType::END_OF_FILE)) {
+            auto stmt = parseStatement();
+            if (stmt) block->children.push_back(std::move(stmt));
+            skipNewlines();
         }
+        expectDedent(); // REQUIRE dedent
         return block;
     }
 
     NodePtr parseUse() {
         // use ilib <libname>  — import a built-in library
+        // use elib <libname>  — import an external library
+        // use clib <libname>  — import a C library
+        // use <libname>       — import a library from library/ folder
+        
         if (at(TokenType::KW_ILIB)) {
             advance(); // consume ilib
             std::string libname;
             while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
                 libname += advance().value;
-            return std::make_unique<ASTNode>(NodeType::UseLibStmt, libname);
+            return std::make_unique<ASTNode>(NodeType::UseLibStmt, "ilib:" + libname);
         }
+        if (at(TokenType::KW_ELIB)) {
+            advance(); // consume elib
+            std::string libname;
+            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
+                libname += advance().value;
+            return std::make_unique<ASTNode>(NodeType::UseLibStmt, "elib:" + libname);
+        }
+        if (at(TokenType::KW_CLIB)) {
+            advance(); // consume clib
+            std::string libname;
+            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
+                libname += advance().value;
+            return std::make_unique<ASTNode>(NodeType::UseLibStmt, "clib:" + libname);
+        }
+        
+        // Regular use statement (not ilib/elib/clib)
         std::string target;
         while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
             target += advance().value + " ";
@@ -652,7 +898,8 @@ private:
             std::string tail;
             while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
                 tail += advance().value;
-                if (!at(TokenType::NEWLINE)) tail += " ";
+                if (!at(TokenType::NEWLINE)) 
+                    tail += " ";
             }
             if (!tail.empty()) node->attrs.push_back(tail);
             return node;
@@ -730,11 +977,15 @@ private:
                 node->attrs.push_back("__list__" + listNode->value);
                 return node;
             }
-            // tuple literal
+            // tuple or dict literal
             if (at(TokenType::LBRACE)) {
-                auto tupleNode = parseTupleLiteral();
+                auto literalNode = parseTupleLiteral();
                 auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
-                node->attrs.push_back("__tuple__" + tupleNode->value);
+                if (literalNode->type == NodeType::DictLiteral) {
+                    node->attrs.push_back("__dict__" + literalNode->value);
+                } else {
+                    node->attrs.push_back("__tuple__" + literalNode->value);
+                }
                 return node;
             }
             // fn multiply expr
@@ -766,6 +1017,60 @@ private:
                 node->attrs.push_back("__sequence__" + x + "," + y);
                 return node;
             }
+            // function call with keyword args: name = func(key=val, key=val) or func(arg1, arg2)
+            if ((at(TokenType::IDENTIFIER) || at(TokenType::KW_DISPLAY)) && peekAhead(1).type == TokenType::LPAREN) {
+                std::string funcName = advance().value;
+                advance(); // consume (
+                std::vector<std::string> kwargs;
+                while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
+                    // Check if this is a keyword argument (has = after identifier)
+                    bool isKeywordArg = false;
+                    if (at(TokenType::IDENTIFIER)) {
+                        // Look ahead to see if there's an = sign
+                        size_t savedPos = pos;
+                        advance(); // consume identifier
+                        if (at(TokenType::ASSIGN)) {
+                            isKeywordArg = true;
+                        }
+                        pos = savedPos; // restore position
+                    }
+                    
+                    if (isKeywordArg) {
+                        // Keyword argument: key=value
+                        std::string key = advance().value;
+                        if (at(TokenType::ASSIGN)) advance();
+                        std::string val;
+                        while (!at(TokenType::COMMA) && !at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
+                            if (at(TokenType::STRING)) {
+                                val += "$" + advance().value + "$";
+                            } else {
+                                val += advance().value;
+                            }
+                        }
+                        kwargs.push_back(key + "=" + val);
+                    } else {
+                        // Positional argument
+                        std::string val;
+                        while (!at(TokenType::COMMA) && !at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
+                            if (at(TokenType::STRING)) {
+                                val += "$" + advance().value + "$";
+                            } else {
+                                val += advance().value;
+                            }
+                        }
+                        kwargs.push_back(val); // No key= prefix for positional args
+                    }
+                    
+                    if (at(TokenType::COMMA)) advance();
+                }
+                if (at(TokenType::RPAREN)) advance();
+                auto funcCall = std::make_unique<ASTNode>(NodeType::FunctionCall, funcName);
+                for (auto& kwarg : kwargs) funcCall->attrs.push_back(kwarg);
+                auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
+                node->attrs.push_back("__funcall__" + funcName);
+                node->children.push_back(std::move(funcCall));
+                return node;
+            }
             std::string val;
             if (at(TokenType::STRING)) { val = "$" + advance().value + "$"; }
             else if (at(TokenType::KW_TRUE) || at(TokenType::KW_FALSE)) {
@@ -783,13 +1088,9 @@ private:
             return node;
         }
 
-        // Bare identifier (SpawnTerrain, etc.)
-        auto node = std::make_unique<ASTNode>(NodeType::SpawnStmt, name);
-        // consume rest of line as args
-        while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-            node->attrs.push_back(advance().value);
-        }
-        return node;
+        // Bare identifier - unidentified syntax, throw error
+        auto t = tokens[pos - 1];  // Get the identifier token we just consumed
+        throw SYNTAX_ERROR("Unidentified syntax detected", t.line, t.col);
     }
 };
 

@@ -1,0 +1,23 @@
+AC->GO
+
+<mainloop>
+     Term.display $Starting up...$
+
+     <Local>
+          Make factorial func(n)
+               IF n is 0
+                    return 1
+               result = 1
+               i = 1
+               WHILST i #= fn n+1
+                    result @= i
+                    i += 1
+               return result
+     <Local>
+
+     result = factorial(20)
+     Term.display(result)
+
+     /kill
+
+<mainloop>

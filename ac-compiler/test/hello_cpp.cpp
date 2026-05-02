@@ -4,29 +4,22 @@
 #include <string>
 using namespace std;
 
+
 int factorial(int arg) {
     if (arg == 0) {
         return 1;
-    }
-    else if (arg == 1) {
+    } else if (arg == 1) {
         return 1;
-    }
-    else {
-        return arg*(factorial(arg-1));
+    } else {
+        int result = arg*(factorial(arg-1));
+        return result;
     }
 }
 
 
 int main() {
     while (true) {
-        cout << "Starting up..." << endl;
-        vector<string> list = {"apple", "banana", "cherry"};
-        for (auto item : list) {
-            cout << item << endl;
-        }
-        int result = factorial(5);
-        cout << result << endl;
-        exit(0);
+        logic.pushScope(/*args*/)
     }
 return 0;
 }

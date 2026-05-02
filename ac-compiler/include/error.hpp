@@ -53,31 +53,26 @@ private:
         
         switch (type) {
             case ErrorType::Syntax:
-                ss << "Syntax Error";
+                ss << "SyntaxError";
                 break;
             case ErrorType::Runtime:
-                ss << "Runtime Error";
+                ss << "RuntimeError";
                 break;
             case ErrorType::File:
-                ss << "File Error";
+                ss << "FileError";
                 break;
             case ErrorType::Backend:
-                ss << "Backend Error";
+                ss << "BackendError";
                 break;
             case ErrorType::Type:
-                ss << "Type Error";
+                ss << "TypeError";
                 break;
             case ErrorType::Semantic:
-                ss << "Semantic Error";
+                ss << "SemanticError";
                 break;
         }
         
-        ss << ": " << message;
-        
-        if (line > 0) {
-            ss << " at line " << line;
-            if (col > 0) ss << " character " << col;
-        }
+        ss << " at line " << line << " char " << col << ": " << message;
         
         return ACError(ss.str());
     }

@@ -29,11 +29,13 @@ enum class NodeType {
     ReturnStmt,     // return expr
     ListLiteral,    // [$a, b$]
     TupleLiteral,   // {$a, b$}
+    DictLiteral,    // {key: value, key2: value2}
     IndexExpr,      // list[1] (1-based)
     DisplayStmt,    // display $string$ (screen output)
     ObjDecl,        // Obj.Name
     PropAssign,     // Name.prop = value
     MethodCall,     // Name.method(args)
+    MethodChain,    // method1 & method2 (same arg) or method1 && method2 (different args)
     ConfigCall,     // Name.config key=value ...
     FuncDef,        // Make funcname func(arg)
     CustomTagDef,   // def tag <name>
@@ -56,6 +58,9 @@ enum class NodeType {
     BreakStmt,      // break → exit loop
     ContinueStmt,   // continue → next loop iteration
     DestroyStmt,    // destroy x → remove variable from existence
+    FunctionCall,   // func arg1 arg2 arg3 (multiple arguments)
+    KeyBinding,     // on value=key function_call
+    InputStmt,      // input <keybind> → send ghost/simulated input
 };
 
 struct ASTNode {

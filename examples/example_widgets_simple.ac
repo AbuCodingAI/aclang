@@ -1,0 +1,22 @@
+AC->PY
+
+use ilib widgets
+
+<mainloop>
+    root = Screen.create $Simple Widget Demo$ $400$ $300$
+    
+    label = display.create $root$ $Hello from AC Widgets!$
+    label.pack
+    
+    input_field = ask.create $root$ $30$
+    input_field.pack
+    
+    button = btn.create $root$ $Click Me$ $None$
+    button.pack
+    
+    result = display.create $root$ $Waiting for input...$
+    result.pack
+    
+    root.mainloop()
+    /kill
+<mainloop>

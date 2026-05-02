@@ -1,8 +1,0 @@
-AC->PY *backend*
-
-<mainloop>
-     <LOGIC>
-          Term.display $Hello, World!$
-          /kill
-     <LOGIC>
-<mainloop>

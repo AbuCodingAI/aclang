@@ -40,6 +40,8 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"func",     TokenType::KW_FUNC},
     {"at",       TokenType::KW_AT},
     {"ilib",     TokenType::KW_ILIB},
+    {"elib",     TokenType::KW_ELIB},
+    {"clib",     TokenType::KW_CLIB},
     {"range",    TokenType::KW_RANGE},
     {"sequence", TokenType::KW_SEQUENCE},
     {"is",       TokenType::KW_IS},
@@ -49,6 +51,12 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"continue", TokenType::KW_CONTINUE},
     {"destroy",  TokenType::KW_DESTROY},
     {"programLoop", TokenType::KW_PROGRAM_LOOP},
+    {"configure", TokenType::KW_CONFIGURE},
+    {"listener", TokenType::KW_LISTENER},
+    {"establish", TokenType::KW_ESTABLISH},
+    {"rule", TokenType::KW_RULE},
+    {"value", TokenType::KW_VALUE},
+    {"input", TokenType::KW_INPUT},
 };
 
 class Lexer {
@@ -122,11 +130,25 @@ public:
                 continue;
             }
 
-            // String: "..."
+            // String: "..." (supports escape sequences with fn prefix)
             if (src[pos] == '"') {
                 int sc = col; pos++; col++;
                 std::string s;
-                while (pos < src.size() && src[pos] != '"') { s += src[pos++]; col++; }
+                while (pos < src.size() && src[pos] != '"') {
+                    if (src[pos] == '\\' && pos + 1 < src.size()) {
+                        // Handle escape sequences
+                        pos++; col++;
+                        char next = src[pos];
+                        if (next == '"') s += '"';
+                        else if (next == '\\') s += '\\';
+                        else if (next == 'n') s += '\n';
+                        else if (next == 't') s += '\t';
+                        else s += next;  // Unknown escape, keep as-is
+                        pos++; col++;
+                    } else {
+                        s += src[pos++]; col++;
+                    }
+                }
                 if (pos < src.size()) { pos++; col++; }
                 tokens.emplace_back(TokenType::STRING, s, line, sc);
                 continue;
@@ -275,15 +297,27 @@ public:
                     else tokens.emplace_back(TokenType::IDENTIFIER, "*", line, sc);
                     break;
                 case '@':
-                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::AT_EQUAL, "@=", line, sc); }
-                    else tokens.emplace_back(TokenType::IDENTIFIER, "@", line, sc);
+                    if (pos < src.size() && src[pos] == '=') { 
+                        pos++; col++; 
+                        tokens.emplace_back(TokenType::AT_EQUAL, "@=", line, sc); 
+                    } else {
+                        tokens.emplace_back(TokenType::AT, "@", line, sc);
+                    }
                     break;
                 case '=': tokens.emplace_back(TokenType::ASSIGN,    "=",  line, sc); break;
                 case '.': tokens.emplace_back(TokenType::DOT,       ".",  line, sc); break;
                 case '(': tokens.emplace_back(TokenType::LPAREN,    "(",  line, sc); break;
                 case ')': tokens.emplace_back(TokenType::RPAREN,    ")",  line, sc); break;
                 case ',': tokens.emplace_back(TokenType::COMMA,     ",",  line, sc); break;
-                case '&': tokens.emplace_back(TokenType::AMPERSAND, "&",  line, sc); break;
+                case ':': tokens.emplace_back(TokenType::COLON,     ":",  line, sc); break;
+                case '&':
+                    if (pos < src.size() && src[pos] == '&') { 
+                        pos++; col++; 
+                        tokens.emplace_back(TokenType::DOUBLE_AMPERSAND, "&&", line, sc); 
+                    } else {
+                        tokens.emplace_back(TokenType::AMPERSAND, "&",  line, sc);
+                    }
+                    break;
                 case '^': tokens.emplace_back(TokenType::IDENTIFIER,"^",  line, sc); break;
                 case '%': tokens.emplace_back(TokenType::IDENTIFIER,"%",  line, sc); break;
                 case '<':
