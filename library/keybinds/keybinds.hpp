@@ -17,10 +17,10 @@ namespace ACKeybinds {
     constexpr const char* KEY_8 = "8";
     constexpr const char* KEY_9 = "9";
     constexpr const char* KEY_0 = "0";
-    constexpr const char* KEY_MINUS = "minus";
-    constexpr const char* KEY_EQUAL = "equal";
+    constexpr const char* KEY_MINUS = "-";
+    constexpr const char* KEY_EQUAL = "=";
     constexpr const char* KEY_BACKSPACE = "backspace";
-    constexpr const char* KEY_BACKSLASH = "backslash";
+    constexpr const char* KEY_BACKSLASH = "\\";
 
     constexpr const char* KEY_TAB = "tab";
     constexpr const char* KEY_Q = "q";
@@ -33,8 +33,8 @@ namespace ACKeybinds {
     constexpr const char* KEY_I = "i";
     constexpr const char* KEY_O = "o";
     constexpr const char* KEY_P = "p";
-    constexpr const char* KEY_LBRACKET = "[";
-    constexpr const char* KEY_RBRACKET = "]";
+    constexpr const char* KEY_LBRACKET = "{";
+    constexpr const char* KEY_RBRACKET = "}";
 
     constexpr const char* KEY_CAPS = "caps";
     constexpr const char* KEY_A = "a";
@@ -49,6 +49,7 @@ namespace ACKeybinds {
     constexpr const char* KEY_SEMICOLON = ";";
     constexpr const char* KEY_APOSTROPHE = "'";
     constexpr const char* KEY_ENTER = "enter";
+    constexpr const char* KEY_ENTER = "\n";
 
     constexpr const char* KEY_SHIFT = "shift";
     constexpr const char* KEY_Z = "z";
@@ -65,9 +66,9 @@ namespace ACKeybinds {
     constexpr const char* KEY_CTRL = "ctrl";
     constexpr const char* KEY_ALT = "alt";
     constexpr const char* KEY_SPACE = "space";
-    constexpr const char* KEY_FN = "fn";
+    constexpr const char* KEY_FN = "function";
     constexpr const char* KEY_SUPER = "super";
-    constexpr const char* KEY_WINDOWS = "windows";
+    constexpr const char* KEY_WINDOWS = "super";
 
     constexpr const char* KEY_UP = "up";
     constexpr const char* KEY_DOWN = "down";

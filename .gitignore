@@ -1,3 +1,7 @@
 *.acc
 *.lir
 *.datac
+.kiro/
+.vscode/
+.windsurf/
+/examples/pong.ac

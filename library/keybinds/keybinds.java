@@ -44,6 +44,7 @@ public class ACKeybinds {
     public static final int KEY_SEMICOLON = java.awt.event.KeyEvent.VK_SEMICOLON;
     public static final int KEY_APOSTROPHE = java.awt.event.KeyEvent.VK_QUOTE;
     public static final int KEY_ENTER = java.awt.event.KeyEvent.VK_ENTER;
+    public static final int KEY_ENTER = java.awt.event.KeyEvent.VK_ENTER;
 
     public static final int KEY_SHIFT = java.awt.event.KeyEvent.VK_SHIFT;
     public static final int KEY_Z = java.awt.event.KeyEvent.VK_Z;

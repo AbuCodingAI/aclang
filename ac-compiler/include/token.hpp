@@ -84,6 +84,8 @@ enum class TokenType {
     KW_RULE,        // rule
     KW_VALUE,       // value
     KW_INPUT,       // input (send ghost/simulated input)
+    KW_BIND,        // bind (for keybinds: bind KEY_W to function)
+    KW_TO,          // to (for keybinds: bind KEY_W to function)
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>

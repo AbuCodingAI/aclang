@@ -11,10 +11,10 @@ pub const KEY_7: &str = "7";
 pub const KEY_8: &str = "8";
 pub const KEY_9: &str = "9";
 pub const KEY_0: &str = "0";
-pub const KEY_MINUS: &str = "minus";
-pub const KEY_EQUAL: &str = "equal";
+pub const KEY_MINUS: &str = "-";
+pub const KEY_EQUAL: &str = "=";
 pub const KEY_BACKSPACE: &str = "backspace";
-pub const KEY_BACKSLASH: &str = "backslash";
+pub const KEY_BACKSLASH: &str = "\\";
 
 pub const KEY_TAB: &str = "tab";
 pub const KEY_Q: &str = "q";
@@ -27,8 +27,8 @@ pub const KEY_U: &str = "u";
 pub const KEY_I: &str = "i";
 pub const KEY_O: &str = "o";
 pub const KEY_P: &str = "p";
-pub const KEY_LBRACKET: &str = "[";
-pub const KEY_RBRACKET: &str = "]";
+pub const KEY_LBRACKET: &str = "{";
+pub const KEY_RBRACKET: &str = "}";
 
 pub const KEY_CAPS: &str = "caps";
 pub const KEY_A: &str = "a";
@@ -43,6 +43,7 @@ pub const KEY_L: &str = "l";
 pub const KEY_SEMICOLON: &str = ";";
 pub const KEY_APOSTROPHE: &str = "'";
 pub const KEY_ENTER: &str = "enter";
+pub const KEY_ENTER: &str = "\n";
 
 pub const KEY_SHIFT: &str = "shift";
 pub const KEY_Z: &str = "z";
@@ -59,9 +60,9 @@ pub const KEY_SLASH: &str = "/";
 pub const KEY_CTRL: &str = "ctrl";
 pub const KEY_ALT: &str = "alt";
 pub const KEY_SPACE: &str = "space";
-pub const KEY_FN: &str = "fn";
+pub const KEY_FN: &str = "function";
 pub const KEY_SUPER: &str = "super";
-pub const KEY_WINDOWS: &str = "windows";
+pub const KEY_WINDOWS: &str = "super";
 
 pub const KEY_UP: &str = "up";
 pub const KEY_DOWN: &str = "down";

@@ -1,9 +1,0 @@
-AC->PY
-<mainloop>
-Term.display $Widgets Library Test$
-Term.display $The widgets library is available at library/widgets/widgets.py$
-Term.display $It provides Tkinter wrapper classes for GUI development$
-Term.display $Classes: Screen, display, ask, btn, slider, listbox, sketch$
-/kill
-<mainloop>
-

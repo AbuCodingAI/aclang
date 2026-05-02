@@ -57,6 +57,8 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"rule", TokenType::KW_RULE},
     {"value", TokenType::KW_VALUE},
     {"input", TokenType::KW_INPUT},
+    {"bind", TokenType::KW_BIND},
+    {"to", TokenType::KW_TO},
 };
 
 class Lexer {
