@@ -209,13 +209,13 @@ Make vectorAdd func(a, b, n)
 **Proposed Syntax:**
 ```ac
 * Internal library (ships with AC) *
-use ilib.math
+use ilib math
 
 * External library (user-installed) *
-use elib.numpy
+use elib numpy
 
 * Computer library (system-level) *
-use clib.opengl
+use clib opengl
 ```
 
 **Implementation:**
@@ -358,7 +358,43 @@ app.listen(8080)
 
 ---
 
-## 🔬 Advanced Optimizations
+## � Language Server Protocol (LSP) Implementation
+
+**Goal:** Create an LSP server for AC that provides IDE features like syntax highlighting, autocomplete, and error detection
+
+**Features:**
+- Syntax highlighting (keywords, functions, strings, comments)
+- Error detection and diagnostics
+- Autocomplete suggestions
+- Go to definition
+- Find references
+- Hover documentation
+- Code formatting
+
+**Implementation:**
+- Use Python with `pylsp` or `pylsp-server`
+- Parse AC syntax and build AST
+- Implement LSP protocol methods
+- Generate diagnostics for syntax errors
+
+**LSP Methods to Implement:**
+- `textDocument/didOpen` - Notify of new document
+- `textDocument/didChange` - Notify of changes
+- `textDocument/completion` - Autocomplete suggestions
+- `textDocument/hover` - Show documentation on hover
+- `textDocument/definition` - Go to definition
+- `textDocument/references` - Find all references
+- `textDocument/diagnostics` - Error/warning reporting
+
+**Client Integration:**
+- VS Code: Extension using `vscode-languageclient`
+- Kiro: Built-in LSP support
+- Vim/Neovim: `coc.nvim` or `lspconfig`
+- Emacs: `lsp-mode`
+
+---
+
+## 📦 Package Management
 
 ### IR-Level Optimizations
 - [ ] Constant folding
@@ -394,7 +430,67 @@ app.listen(8080)
 
 ---
 
-## 📱 Mobile Platform Support
+## �️ AC REPL (Interactive Shell)
+
+**Goal:** Create a Python-based interactive shell for AC, similar to Python's IDLE
+
+**Features:**
+- Interactive prompt for AC code
+- Parse and execute AC code line-by-line
+- Display results immediately
+- Compile to Python backend, run, then clean up (.acc, .lir, .acb files)
+- Multi-line input support
+- History navigation (arrow keys)
+- Clear screen command
+
+**Implementation:**
+```python
+# ac_repl.py
+import subprocess
+import tempfile
+import os
+import readline
+import atexit
+
+def clean_temp_files():
+    # Remove .acc, .lir, .acb files from current directory
+    pass
+
+def run_ac_code(code):
+    # Write code to temp file
+    # Compile with ac compiler
+    # Run generated Python
+    # Clean up temp files
+    pass
+
+def main():
+    print("AC Language REPL - Type 'exit' to quit")
+    while True:
+        try:
+            line = input("ac> ")
+            if line.strip() == "exit":
+                break
+            run_ac_code(line)
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            print("\nUse 'exit' to quit")
+
+if __name__ == "__main__":
+    main()
+```
+
+**Usage:**
+```bash
+ac-repl
+ac> print($Hello World$)
+ac> x = 5
+ac> print(x * 2)
+```
+
+---
+
+## �📱 Mobile Platform Support
 
 ### Android
 ```
