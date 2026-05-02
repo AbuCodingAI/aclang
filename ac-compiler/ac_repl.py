@@ -55,7 +55,7 @@ def run_ac_code(code, target="PY"):
             ["./ac", temp_ac, f"--target {target}"],
             capture_output=True,
             text=True,
-            cwd=os.path.dirname(os.path.abspath(__file__))
+            cwd="/home/abu/Documents/kiro projects/AC/ac-compiler"
         )
         
         if result.returncode != 0:
