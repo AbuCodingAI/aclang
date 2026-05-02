@@ -8,20 +8,35 @@ AC is a clean, readable programming language that compiles to multiple targets -
 
 ## 🚀 Quick Start
 
-```bash
-# Build the compiler first
-cd ac-compiler && make
+### Prerequisites
+- **Linux**: `sudo apt install g++ make`
+- **Windows**: Install [MinGW-w64](https://www.mingw-w64.org/) or [MSYS2](https://www.msys2.org/)
 
-# Compile and run (target auto-detected from file)
+### Compile
+```bash
+cd ac-compiler
+make
+```
+
+### Install (optional)
+```bash
+sudo make install    # Linux
+# Windows: Add ac-compiler to PATH
+```
+
+### Run REPL
+```bash
+python3 ac-compiler/ac_repl.py
+```
+
+### Compile and run (target auto-detected from file)
+```bash
 ./ac-compiler/ac mycode.ac
 
 # Compile to specific target
 ./ac-compiler/ac mycode.ac PY      # Python
 ./ac-compiler/ac mycode.ac BNY     # Native binary
 ./ac-compiler/ac mycode.ac ASM     # x86-64 assembly
-
-# Use the REPL
-python3 ac-compiler/ac_repl.py
 ```
 
 ---

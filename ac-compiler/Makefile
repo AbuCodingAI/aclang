@@ -10,7 +10,15 @@ $(OUT): $(SRC)
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(OUT)
 
 install: all
+ifeq ($(OS),Windows_NT)
+	cp $(OUT) /usr/local/bin/ac
+else
 	sudo cp $(OUT) /usr/local/bin/ac
+endif
 
 clean:
+ifeq ($(OS),Windows_NT)
+	rm -f $(OUT).exe
+else
 	rm -f $(OUT)
+endif

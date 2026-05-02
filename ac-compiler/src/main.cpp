@@ -10,7 +10,7 @@
 #include <sstream>
 #include <string>
 #include <cstdlib>
-#include <sys/stat.h>
+#include <cstdio>
 
 // Forward declarations
 std::vector<Token> lex(const std::string& source);
