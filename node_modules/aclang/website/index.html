@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AC Language - Multi-Backend Compiler</title>
+    <link rel="icon" href="favicon.png" type="image/png">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        header {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 20px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .logo img {
+            width: 40px;
+            height: 40px;
+        }
+
+        .logo h1 {
+            color: #fff;
+            font-size: 1.5rem;
+        }
+
+        nav ul {
+            display: flex;
+            gap: 30px;
+            list-style: none;
+        }
+
+        nav a {
+            color: #fff;
+            text-decoration: none;
+            transition: color 0.3s;
+        }
+
+        nav a:hover {
+            color: #00d4ff;
+        }
+
+        .hero {
+            padding: 100px 0;
+            text-align: center;
+            color: #fff;
+        }
+
+        .hero h1 {
+            font-size: 3.5rem;
+            margin-bottom: 20px;
+            background: linear-gradient(90deg, #00d4ff, #ff00ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .hero p {
+            font-size: 1.2rem;
+            max-width: 600px;
+            margin: 0 auto 30px;
+            color: #ccc;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 30px;
+            background: linear-gradient(90deg, #00d4ff, #0099cc);
+            color: #fff;
+            text-decoration: none;
+            border-radius: 25px;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(0, 212, 255, 0.3);
+        }
+
+        .features {
+            padding: 80px 0;
+        }
+
+        .section-title {
+            text-align: center;
+            color: #fff;
+            font-size: 2.5rem;
+            margin-bottom: 60px;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+        }
+
+        .feature-card {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 30px;
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: transform 0.3s;
+        }
+
+        .feature-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .feature-card h3 {
+            color: #00d4ff;
+            margin-bottom: 15px;
+        }
+
+        .feature-card p {
+            color: #ccc;
+        }
+
+        .backends {
+            padding: 80px 0;
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        .backends-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 20px;
+            text-align: center;
+        }
+
+        .backend-card {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 20px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .backend-card h3 {
+            color: #fff;
+            margin-bottom: 10px;
+        }
+
+        .code-example {
+            padding: 80px 0;
+        }
+
+        .code-block {
+            background: #1a1a2e;
+            border-radius: 10px;
+            padding: 30px;
+            overflow-x: auto;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .code-block pre {
+            color: #e0e0e0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+        }
+
+        footer {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 40px 0;
+            text-align: center;
+            color: #ccc;
+        }
+
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+
+            nav ul {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <nav class="nav">
+                <div class="logo">
+                    <img src="favicon.png" alt="AC Logo">
+                    <h1>AC Language</h1>
+                </div>
+                <nav>
+                    <ul>
+                        <li><a href="#features">Features</a></li>
+                        <li><a href="#backends">Backends</a></li>
+                        <li><a href="#install">Install</a></li>
+                        <li><a href="https://github.com/AbuCodingAI/aclang" target="_blank">GitHub</a></li>
+                    </ul>
+                </nav>
+            </nav>
+        </div>
+    </header>
+
+    <section class="hero">
+        <div class="container">
+            <h1>AC Language</h1>
+            <p>A multi-backend compiler for the AC programming language. Write once, compile to 11+ targets including Python, JavaScript, C, C++, Rust, Go, Java, HTML, V, Assembly, and native binaries.</p>
+            <a href="https://www.npmjs.com/package/aclang" class="btn">Install via npm</a>
+        </div>
+    </section>
+
+    <section class="features" id="features">
+        <div class="container">
+            <h2 class="section-title">Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <h3>Multi-Target Compilation</h3>
+                    <p>Compile to 11+ different backends including Python, JavaScript, C, C++, Rust, Go, Java, HTML, V, Assembly, and native binaries.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Clean Syntax</h3>
+                    <p>Beginner-friendly syntax with clean, readable code. Easy to learn and use.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Native Binaries</h3>
+                    <p>Compile directly to native x86-64 executables with no dependencies.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Event System</h3>
+                    <p>GUI event listeners and key bindings for interactive applications.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Widget System</h3>
+                    <p>Built-in UI components for creating graphical applications.</p>
+                </div>
+                <div class="feature-card">
+                    <h3>Caching System</h3>
+                    <p>Fast recompilation with .acc and .lir cache files.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="backends" id="backends">
+        <div class="container">
+            <h2 class="section-title">Supported Backends</h2>
+            <div class="backends-grid">
+                <div class="backend-card">Python</div>
+                <div class="backend-card">JavaScript</div>
+                <div class="backend-card">C</div>
+                <div class="backend-card">C++</div>
+                <div class="backend-card">Rust</div>
+                <div class="backend-card">Go</div>
+                <div class="backend-card">Java</div>
+                <div class="backend-card">HTML</div>
+                <div class="backend-card">V</div>
+                <div class="backend-card">Assembly</div>
+                <div class="backend-card">Native Binary</div>
+            </div>
+        </div>
+    </section>
+
+    <section class="code-example" id="install">
+        <div class="container">
+            <h2 class="section-title">Quick Start</h2>
+            <div class="code-block">
+                <pre><code># Install via npm
+npm install -g aclang
+
+# Compile and run
+ac mycode.ac
+
+# Compile to specific target
+ac mycode.ac PY      # Python
+ac mycode.ac BNY     # Native binary
+ac mycode.ac ASM     # x86-64 assembly
+
+# Use the REPL
+ac-repl</code></pre>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p>AC Language - Write Once, Compile Anywhere</p>
+            <p>MIT License | <a href="https://github.com/AbuCodingAI/aclang" style="color: #00d4ff;">GitHub</a></p>
+        </div>
+    </footer>
+</body>
+</html>

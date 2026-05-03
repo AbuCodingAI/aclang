@@ -1,0 +1,17 @@
+AC->GO *backend*
+
+<mainloop>
+
+     <LOGIC>
+
+          Term.display $Starting up...$
+
+          result = 120
+
+          Term.display(result)
+
+          /kill
+
+     <LOGIC>
+
+<mainloop>

@@ -1,0 +1,30 @@
+AC->C++
+
+x = 5
+name = $hello$
+
+<mainloop>
+
+     <LOGIC>
+
+          <StartHere>
+
+               IF x is 5
+                    Term.display $x equals 5$
+               ELSEIF x is 99
+                    Term.display $x equals 99$
+               OTHER
+                    Term.display $x is something else$
+
+               IF name is $hello$
+                    Term.display $name equals hello$
+               OTHER
+                    Term.display $name is not hello$
+
+               /kill
+
+          <EndHere>
+
+     <LOGIC>
+
+<mainloop>

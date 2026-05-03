@@ -1,0 +1,6 @@
+AC->PY *backend*
+
+<mainloop>
+     Term.display $Hello, World!$
+     /kill
+<mainloop>

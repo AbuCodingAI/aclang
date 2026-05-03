@@ -1,0 +1,15 @@
+AC->C++
+
+<mainloop>
+     <LOGIC>
+          nums = range 5
+          seq = sequence(2, 6)
+          items = [$apple$, $banana$, $cherry$]
+          fixed = {$a$, $b$, $c$}
+
+          items.add($mango$)
+          items.push($grape$)
+
+          /kill
+     <LOGIC>
+<mainloop>

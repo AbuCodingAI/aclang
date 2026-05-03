@@ -1,0 +1,20 @@
+AC->JS *backend*
+
+<mainloop>
+
+     <LOGIC>
+
+          Term.display $Before foreign code$
+
+          <Foreign>
+               const nums = [1, 2, 3, 4, 5];
+               const sum = nums.reduce((a, b) => a + b, 0);
+               console.log("Foreign JS: sum =", sum);
+          <Foreign>
+
+          Term.display $After foreign code$
+          /kill
+
+     <LOGIC>
+
+<mainloop>
