@@ -40,6 +40,8 @@
     "docs/",
     "examples/",
     "library/",
+    "scripts/",
+    "website/",
     "README.md",
     "LICENSE"
   ],
