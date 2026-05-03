@@ -5,3 +5,4 @@
 .vscode/
 .windsurf/
 /examples/pong.ac
+node_modules/
