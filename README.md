@@ -41,6 +41,62 @@ python3 ac-compiler/ac_repl.py
 
 ---
 
+## 📦 Installation via npm (Recommended)
+
+### Install AC Language globally
+```bash
+npm install -g aclang
+```
+
+### Install all backend dependencies
+```bash
+# After installing aclang, run:
+npx install-backends
+
+# Or from project root:
+npm run install-backends
+```
+
+This will install:
+- Python 3
+- Node.js
+- GCC (C/C++)
+- Rust
+- Go
+- Java (OpenJDK 17)
+- V
+
+### Build the compiler
+```bash
+cd ac-compiler
+make
+```
+
+### Run REPL
+```bash
+python3 ac-compiler/ac_repl.py
+```
+
+---
+
+## 🛠️ Manual Backend Installation
+
+If you prefer to install backends manually, here's what you need for each target:
+
+| Backend | Install Command (Linux) | Install Command (macOS) | Install Command (Windows) |
+|---------|------------------------|------------------------|--------------------------|
+| Python | `sudo apt install python3` | `brew install python` | `winget install Python.Python.3.13` |
+| Node.js | `sudo apt install nodejs npm` | `brew install node` | `winget install OpenJS.NodeJS` |
+| GCC | `sudo apt install gcc g++` | `brew install gcc` | `winget install mingw.mingw-w64` |
+| Rust | `curl https://sh.rustup.rs -sSf | sh` | `brew install rust` | `winget install Rustlang.Rustup` |
+| Go | `sudo apt install golang-go` | `brew install go` | `winget install GoLang.Go` |
+| Java | `sudo apt install default-jdk` | `brew install openjdk@17` | `winget install OpenJDK.OpenJDK.17` |
+| V | `sudo apt install vlang` | `brew install v` | `winget install Vlang.V` |
+
+**Note:** The `install-backends.js` script automates this process for you.
+
+---
+
 ## 🎯 Supported Backends
 
 | Target | Declaration | Output | Status |

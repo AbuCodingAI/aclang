@@ -1,13 +1,15 @@
 {
   "name": "aclang",
-  "version": "0.1.1",
-  "description": "AC Language Compiler - A multi-target compiler for the AC programming language, note, this is more advanced than version 1",
+  "version": "0.1.4",
+  "description": "AC Language Compiler v0.1.4 - A multi-target compiler for the AC programming language, note, this is more advanced than version 1",
   "bin": {
-    "ac": "ac-compiler/ac"
+    "ac": "bin/ac",
+    "install-backends": "scripts/install-backends.js"
   },
   "scripts": {
     "install": "node scripts/install.js",
     "build": "cd ac-compiler && make",
+    "install-backends": "node scripts/install-backends.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [

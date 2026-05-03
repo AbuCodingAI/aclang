@@ -331,6 +331,49 @@ strings = "1.5.0"
 
 ---
 
+## 🛠️ Backend Installation System
+
+### npm Backend Installer
+
+**Status:** ✅ Implemented
+
+**Features:**
+- Automated installation of all backend compilers/interpreters
+- Cross-platform support (Linux, macOS, Windows)
+- Smart detection of already-installed backends
+- Detailed error messages with manual installation instructions
+
+**Usage:**
+```bash
+# After installing aclang via npm
+npx install-backends
+
+# Or from project root
+npm run install-backends
+```
+
+**Installed Backends:**
+- Python 3
+- Node.js
+- GCC (C/C++)
+- Rust
+- Go
+- Java (OpenJDK 17)
+- V
+
+**Installation Script:** `scripts/install-backends.js`
+
+**Features:**
+- Platform-specific install commands
+- Verification after installation
+- Summary report of installed/failed backends
+- Fallback to manual installation instructions
+
+**Manual Installation:**
+Users can also install backends manually using the commands in README.md
+
+---
+
 ## 🌐 Web Platform Support
 
 ### WebAssembly Backend

@@ -59,6 +59,15 @@ static std::string detectBackend(const std::string& source) {
 }
 
 int main(int argc, char* argv[]) {
+    // Check for version flag first
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--version" || arg == "-v") {
+            std::cout << "AC Compiler v0.1.4\n";
+            return 0;
+        }
+    }
+    
     // Initialize backend registry
     BackendRegistry::initializeStandardBackends();
     

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# AC Compiler wrapper script for global npm installation (Linux/macOS)
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Find the ac-compiler directory (go up from bin/ to project root)
+AC_COMPILER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/ac-compiler"
+
+# Run the AC compiler
+"$AC_COMPILER_DIR/ac" "$@"
