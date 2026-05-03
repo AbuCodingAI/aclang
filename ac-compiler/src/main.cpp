@@ -63,7 +63,7 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--version" || arg == "-v") {
-            std::cout << "AC Compiler v0.1.5\n";
+            std::cout << "AC Compiler v0.1.6\n";
             return 0;
         }
     }
