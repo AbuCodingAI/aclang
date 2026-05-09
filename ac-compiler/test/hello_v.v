@@ -3,10 +3,7 @@ import os
 
 
 fn main() {
-    for {
-        println('Starting up...')
-        mut result := i32(120)
-        println(result)
-        exit(0)
-    }
+    println('Starting up...')
+    println(result)
+    exit(0)
 }

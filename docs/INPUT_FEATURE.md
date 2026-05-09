@@ -24,7 +24,7 @@ Make save_file func()
 <mainloop>
     configure event-listener
         use listener to establish rule
-            on value=s
+            on value is s
                 save_file()
     
     # Auto-save every loop iteration
@@ -44,7 +44,7 @@ Make test_handler func()
 <mainloop>
     configure event-listener
         use listener to establish rule
-            on value=space
+            on value is space
                 test_handler()
     
     # Automated test
@@ -77,13 +77,13 @@ Make macro func()
 <mainloop>
     configure event-listener
         use listener to establish rule
-            on value=a
+            on value is a
                 action1()
-            on value=b
+            on value is b
                 action2()
-            on value=c
+            on value is c
                 action3()
-            on value=m
+            on value is m
                 macro()
     
     # Pressing 'm' triggers all three actions
@@ -109,11 +109,11 @@ Make jump func()
 <mainloop>
     configure event-listener
         use listener to establish rule
-            on value=a
+            on value is a
                 move_left()
-            on value=d
+            on value is d
                 move_right()
-            on value=space
+            on value is space
                 jump()
     
     # Simulate a sequence of moves
@@ -222,7 +222,7 @@ If a key has a binding, `input` triggers the bound function:
 ```ac
 configure event-listener
     use listener to establish rule
-        on value=space
+        on value is space
             jump()
 
 input space  # Calls jump()
@@ -233,7 +233,7 @@ If a key has no binding, `input` does nothing (silent):
 ```ac
 configure event-listener
     use listener to establish rule
-        on value=space
+        on value is space
             jump()
 
 input enter  # Does nothing, no error
@@ -281,17 +281,17 @@ Make move_right func()
 <mainloop>
     configure event-listener
         use listener to establish rule
-            on value=w
+            on value is w
                 move_forward()
-            on value=a
+            on value is a
                 move_left()
-            on value=s
+            on value is s
                 move_back()
-            on value=d
+            on value is d
                 move_right()
-            on value=r
+            on value is r
                 record_input()
-            on value=p
+            on value is p
                 playback_input()
     
     # Simulate pressing 'p' to playback
@@ -336,9 +336,9 @@ Make handle_enter func()
 <mainloop>
     configure event-listener
         use listener to establish rule
-            on value=space
+            on value is space
                 handle_space()
-            on value=enter
+            on value is enter
                 handle_enter()
     
     Term.display $Simulating space key press...$

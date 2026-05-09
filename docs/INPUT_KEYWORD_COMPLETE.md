@@ -102,9 +102,9 @@ input w          # Trigger 'w' key
 ```ac
 configure event-listener
     use listener to establish rule
-        on value=space
+        on value is space
             jump()
-        on value=w
+        on value is w
             move_forward()
 
 input space      # Calls jump()
@@ -121,13 +121,13 @@ Make combo func()
 
 configure event-listener
     use listener to establish rule
-        on value=a
+        on value is a
             action_a()
-        on value=b
+        on value is b
             action_b()
-        on value=space
+        on value is space
             action_space()
-        on value=c
+        on value is c
             combo()
 
 input c          # Triggers combo, which triggers a, b, and space

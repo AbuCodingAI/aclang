@@ -1,0 +1,9 @@
+AC->PY
+
+<mainloop>
+    x = 0
+    WHILST x < 5
+        Term.display x
+        x += 1
+    /kill
+<mainloop>

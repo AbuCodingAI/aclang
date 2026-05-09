@@ -79,6 +79,7 @@ enum class TokenType {
     KW_DESTROY,     // destroy x → remove variable from existence
     KW_PROGRAM_LOOP,// programLoop → controls mainloop continuation
     KW_CONFIGURE,   // configure
+    KW_EVENT_LISTENER, // event-listener
     KW_LISTENER,    // listener
     KW_ESTABLISH,   // establish
     KW_RULE,        // rule

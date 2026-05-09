@@ -1,4 +1,4 @@
-AC->RS
+AC->BNY
 
 Make fibonacci func(n)
     IF n <= 1

@@ -5,6 +5,61 @@
 
 namespace AC_IR {
 
+// ─── IRRef legacy helpers ───────────────────────────────────────────────────
+
+// Legacy: Create VAR from string name (for backward compatibility)
+// This should be replaced with symbol table lookups
+IRRef IRRef::varLegacy(const std::string& varName) {
+    IRRef ref;
+    ref.kind = Kind::VAR;
+    ref.id = -1;  // Mark as legacy (needs symbol table lookup)
+    // Store name temporarily in value field as string
+    ref.value = IRValue(varName);
+    return ref;
+}
+
+// Legacy: Create FUNCTION from string name (for backward compatibility)
+IRRef IRRef::funcLegacy(const std::string& funcName) {
+    IRRef ref;
+    ref.kind = Kind::FUNCTION;
+    ref.id = -1;  // Mark as legacy (needs symbol table lookup)
+    // Store name temporarily in value field as string
+    ref.value = IRValue(funcName);
+    return ref;
+}
+
+// Helper to get string representation with symbol table (for better debugging)
+std::string IRRef::toStringWithSymbols(SymbolTable* symbols) const {
+    if (!symbols) {
+        return toString();
+    }
+    
+    switch (kind) {
+        case Kind::VAR:
+            if (id >= 0) {
+                return symbols->getName(id);
+            }
+            // Legacy: extract name from value field
+            if (value.type == IRType::STRING) {
+                return std::get<std::string>(value.data);
+            }
+            return "v" + std::to_string(id);
+            
+        case Kind::FUNCTION:
+            if (id >= 0) {
+                return symbols->getName(id);
+            }
+            // Legacy: extract name from value field
+            if (value.type == IRType::STRING) {
+                return std::get<std::string>(value.data);
+            }
+            return "f" + std::to_string(id);
+            
+        default:
+            return toString();
+    }
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 static std::string typeStr(IRType t) {
@@ -58,6 +113,13 @@ static std::string opcodeStr(IROpcode op) {
         case IROpcode::HALT:          return "halt";
         case IROpcode::FUNC_BEGIN:    return "func_begin";
         case IROpcode::FUNC_END:      return "func_end";
+        case IROpcode::IF_BEGIN:      return "if_begin";
+        case IROpcode::IF_ELSE:       return "if_else";
+        case IROpcode::IF_END:        return "if_end";
+        case IROpcode::WHILE_BEGIN:   return "while_begin";
+        case IROpcode::WHILE_END:     return "while_end";
+        case IROpcode::FOR_BEGIN:     return "for_begin";
+        case IROpcode::FOR_END:       return "for_end";
         case IROpcode::EVENT_BIND:    return "ev_bind";
         case IROpcode::EVENT_TRIGGER: return "ev_trigger";
         case IROpcode::LIB_CALL:      return "lib_call";
@@ -87,9 +149,17 @@ class IRGenerator {
         IRRef r; r.kind = IRRef::Kind::LABEL; r.id = lc++;
         return r;
     }
-    static IRRef mkVar(const std::string& name) {
-        return IRRef::var(name);
+    
+    // NEW: Use symbol table for variable references
+    IRRef mkVar(const std::string& name) {
+        int id = prog.symbols.lookup(name);
+        if (id < 0) {
+            // Variable not in symbol table yet, intern it
+            id = prog.symbols.intern(name);
+        }
+        return IRRef::var(id);
     }
+    
     static IRRef mkConst(const std::string& s) {
         return IRRef::constant(IRValue(s));
     }
@@ -126,6 +196,129 @@ class IRGenerator {
     }
 
     // ── expression lowering ─────────────────────────────────────────────────
+    // New method: Lower structured AST expression nodes to IR
+    IRRef lowerExprNode(const ASTNode& expr) {
+        switch (expr.type) {
+            case NodeType::LiteralExpr: {
+                // Literal values: int, float, string, bool
+                if (!expr.attrs.empty()) {
+                    const std::string& typeStr = expr.attrs[0];
+                    if (typeStr == "INT") {
+                        try {
+                            return mkConstInt(std::stoi(expr.value));
+                        } catch (...) {
+                            return mkConst(expr.value);
+                        }
+                    } else if (typeStr == "FLOAT") {
+                        return mkConst(expr.value);
+                    } else if (typeStr == "STRING") {
+                        return mkConst(expr.value);
+                    } else if (typeStr == "BOOL") {
+                        bool val = (expr.value == "true");
+                        return IRRef::constant(IRValue(val));
+                    }
+                }
+                return mkConst(expr.value);
+            }
+            
+            case NodeType::Identifier: {
+                // Variable reference
+                return mkVar(expr.value);
+            }
+            
+            case NodeType::BinaryExpr: {
+                // Binary operation: left op right
+                if (expr.children.size() >= 2) {
+                    IRRef lRef = lowerExprNode(*expr.children[0]);
+                    IRRef rRef = lowerExprNode(*expr.children[1]);
+                    IRRef dst = mkTemp();
+                    
+                    // Map operator string to IROpcode
+                    IROpcode opcode = IROpcode::NOP;
+                    const std::string& op = expr.value;
+                    if (op == "+") opcode = IROpcode::ADD;
+                    else if (op == "-") opcode = IROpcode::SUB;
+                    else if (op == "*" || op == "@") opcode = IROpcode::MUL;
+                    else if (op == "/") opcode = IROpcode::DIV;
+                    else if (op == "%") opcode = IROpcode::MOD;
+                    else if (op == "==") opcode = IROpcode::EQ;
+                    else if (op == "#=" || op == "!=") opcode = IROpcode::NEQ;
+                    else if (op == "<") opcode = IROpcode::LT;
+                    else if (op == ">") opcode = IROpcode::GT;
+                    else if (op == "<=") opcode = IROpcode::LTE;
+                    else if (op == ">=") opcode = IROpcode::GTE;
+                    else if (op == "AND" || op == "and") opcode = IROpcode::AND;
+                    else if (op == "OR" || op == "or") opcode = IROpcode::OR;
+                    
+                    if (opcode != IROpcode::NOP) {
+                        IRInstruction i(opcode, dst, {lRef, rRef});
+                        emit(std::move(i));
+                        return dst;
+                    }
+                }
+                // Fallback: treat as string expression (legacy compatibility)
+                return lowerExpr(expr.value);
+            }
+            
+            case NodeType::UnaryExpr: {
+                // Unary operation: op operand
+                if (!expr.children.empty()) {
+                    IRRef operand = lowerExprNode(*expr.children[0]);
+                    IRRef dst = mkTemp();
+                    
+                    if (expr.value == "-") {
+                        // Unary minus: 0 - operand
+                        IRRef zero = mkConstInt(0);
+                        IRInstruction i(IROpcode::SUB, dst, {zero, operand});
+                        emit(std::move(i));
+                        return dst;
+                    } else if (expr.value == "NOT") {
+                        IRInstruction i(IROpcode::NOT, dst, {operand});
+                        emit(std::move(i));
+                        return dst;
+                    }
+                }
+                return mkConst("");
+            }
+            
+            case NodeType::CallExpr: {
+                // Function call: func(args)
+                IRRef dst = mkTemp();
+                std::vector<IRRef> ops = {mkVar(expr.value)};
+                
+                // Add arguments
+                for (auto& arg : expr.children) {
+                    ops.push_back(lowerExprNode(*arg));
+                }
+                
+                IRInstruction i(IROpcode::CALL, dst, ops);
+                emit(std::move(i));
+                return dst;
+            }
+            
+            case NodeType::IndexExpr: {
+                // Array indexing: array[index]
+                if (expr.children.size() >= 2) {
+                    IRRef arr = lowerExprNode(*expr.children[0]);
+                    IRRef idx = lowerExprNode(*expr.children[1]);
+                    IRRef dst = mkTemp();
+                    IRInstruction i(IROpcode::LOAD_INDEX, dst, {arr, idx});
+                    emit(std::move(i));
+                    return dst;
+                }
+                // Fallback: use variable name
+                return mkVar(expr.value);
+            }
+            
+            default:
+                // Fallback: treat as variable or constant
+                if (!expr.value.empty()) {
+                    return mkVar(expr.value);
+                }
+                return mkConst("");
+        }
+    }
+    
     // Returns the IRRef holding the result of the expression string.
     // For simple names/literals we just return a VAR or CONST ref.
     // For compound expressions we emit arithmetic and return a temp.
@@ -242,15 +435,27 @@ class IRGenerator {
 
         // ── function definition ─────────────────────────────────────────────
         case NodeType::FuncDef: {
+            // Intern function name in symbol table
+            int funcId = prog.symbols.intern(n.value, IRType::FUNCTION);
+            
             IRFunction fn(n.value);
             fn.returnType = IRType::VOID;
-            for (auto& p : n.attrs) fn.parameters.push_back(p);
+            
+            // Enter function scope
+            prog.symbols.enterScope();
+            
+            // Intern parameters in symbol table
+            for (auto& p : n.attrs) {
+                prog.symbols.intern(p);
+                fn.parameters.push_back(p);
+            }
+            
             prog.functions.push_back(std::move(fn));
             cur = &prog.functions.back();
 
             // function entry label
             IRInstruction entry(IROpcode::FUNC_BEGIN);
-            entry.typedOperands = {mkVar(n.value)};
+            entry.typedOperands = {IRRef::func(funcId)};
             emit(std::move(entry));
 
             if (!n.children.empty()) gen(*n.children[0]);
@@ -261,18 +466,67 @@ class IRGenerator {
             emit(std::move(ret));
 
             IRInstruction end(IROpcode::FUNC_END);
-            end.typedOperands = {mkVar(n.value)};
+            end.typedOperands = {IRRef::func(funcId)};
             emit(std::move(end));
 
+            // Exit function scope
+            prog.symbols.exitScope();
+            
             cur = nullptr;
             break;
         }
 
         // ── assignment ──────────────────────────────────────────────────────
         case NodeType::AssignStmt: {
+            IRRef dst = mkVar(n.value);
+            
+            // Check for special assignment types first (before checking children)
+            if (!n.attrs.empty()) {
+                const std::string& raw = n.attrs[0];
+                
+                // Function call result stored in variable
+                if (raw.substr(0, 11) == "__funcall__") {
+                    if (!n.children.empty() && n.children[0]->type == NodeType::FunctionCall) {
+                        auto& fc = *n.children[0];
+                        std::vector<IRRef> ops = {mkVar(fc.value)};
+                        for (auto& a : fc.attrs) {
+                            // Check if attr is a variable name or a constant
+                            // If it's a number, make it a const int
+                            bool isInt = !a.empty();
+                            for (char c : a) if (!std::isdigit(c) && c != '-') { isInt = false; break; }
+                            if (isInt) {
+                                try { 
+                                    ops.push_back(mkConstInt(std::stoi(a))); 
+                                } catch (...) {
+                                    ops.push_back(mkConst(a));
+                                }
+                            } else if (a.size() >= 2 && a.front() == '$' && a.back() == '$') {
+                                // String literal
+                                ops.push_back(mkConst(a));
+                            } else {
+                                // Variable name
+                                ops.push_back(mkVar(a));
+                            }
+                        }
+                        IRInstruction i(IROpcode::CALL, dst, ops);
+                        emit(std::move(i));
+                        break;
+                    }
+                }
+            }
+            
+            // Check if we have a structured expression as child
+            if (!n.children.empty()) {
+                // Structured expression as child
+                IRRef src = lowerExprNode(*n.children[0]);
+                IRInstruction i(IROpcode::STORE_VAR, dst, {src});
+                emit(std::move(i));
+                break;
+            }
+            
+            // Legacy string-based handling (fallback)
             if (n.attrs.empty()) break;
             const std::string& raw = n.attrs[0];
-            IRRef dst = mkVar(n.value);
 
             if (raw.substr(0, 8) == "__list__") {
                 IRInstruction i(IROpcode::ALLOC, dst, {mkConst("list"), mkConst(raw.substr(8))});
@@ -283,25 +537,35 @@ class IRGenerator {
             } else if (raw.substr(0, 8) == "__dict__") {
                 IRInstruction i(IROpcode::ALLOC, dst, {mkConst("dict"), mkConst(raw.substr(8))});
                 emit(std::move(i));
+            } else if (raw == "__range__") {
+                // Range with structured expression
+                if (n.children.size() > 0) {
+                    IRRef rangeExpr = lowerExprNode(*n.children[0]);
+                    IRInstruction i(IROpcode::ALLOC, dst, {mkConst("range"), rangeExpr});
+                    emit(std::move(i));
+                }
             } else if (raw.substr(0, 9) == "__range__") {
+                // Legacy range with string
                 IRInstruction i(IROpcode::ALLOC, dst, {mkConst("range"), mkConst(raw.substr(9))});
                 emit(std::move(i));
+            } else if (raw == "__sequence__") {
+                // Sequence with structured expressions
+                if (n.children.size() >= 2) {
+                    IRRef xExpr = lowerExprNode(*n.children[0]);
+                    IRRef yExpr = lowerExprNode(*n.children[1]);
+                    // Create a temporary string representation for now
+                    // TODO: Improve sequence handling in IR
+                    IRInstruction i(IROpcode::ALLOC, dst, {mkConst("sequence"), xExpr, yExpr});
+                    emit(std::move(i));
+                }
             } else if (raw.substr(0, 12) == "__sequence__") {
+                // Legacy sequence with string
                 IRInstruction i(IROpcode::ALLOC, dst, {mkConst("sequence"), mkConst(raw.substr(12))});
                 emit(std::move(i));
             } else if (raw.substr(0, 6) == "__fn__") {
                 IRRef src = lowerExpr(raw.substr(6));
                 IRInstruction i(IROpcode::STORE_VAR, dst, {src});
                 emit(std::move(i));
-            } else if (raw.substr(0, 11) == "__funcall__") {
-                // function call result stored in variable
-                if (!n.children.empty() && n.children[0]->type == NodeType::FunctionCall) {
-                    auto& fc = *n.children[0];
-                    std::vector<IRRef> ops = {mkVar(fc.value)};
-                    for (auto& a : fc.attrs) ops.push_back(mkConst(a));
-                    IRInstruction i(IROpcode::CALL, dst, ops);
-                    emit(std::move(i));
-                }
             } else {
                 IRRef src = lowerExpr(raw);
                 IRInstruction i(IROpcode::STORE_VAR, dst, {src});
@@ -311,22 +575,80 @@ class IRGenerator {
         }
 
         case NodeType::PlusEqualStmt:
-            if (!n.attrs.empty()) emitCompound(IROpcode::ADD, n.value, n.attrs[0]);
+            if (!n.children.empty()) {
+                // Structured expression as child
+                IRRef lRef = mkVar(n.value);
+                IRRef rRef = lowerExprNode(*n.children[0]);
+                IRRef tmp = mkTemp();
+                emit(IRInstruction(IROpcode::ADD, tmp, {lRef, rRef}));
+                IRInstruction st(IROpcode::STORE_VAR);
+                st.typedOperands = {mkVar(n.value), tmp};
+                emit(std::move(st));
+            } else if (!n.attrs.empty()) {
+                // Legacy string-based (fallback)
+                emitCompound(IROpcode::ADD, n.value, n.attrs[0]);
+            }
             break;
         case NodeType::MinusEqualStmt:
-            if (!n.attrs.empty()) emitCompound(IROpcode::SUB, n.value, n.attrs[0]);
+            if (!n.children.empty()) {
+                // Structured expression as child
+                IRRef lRef = mkVar(n.value);
+                IRRef rRef = lowerExprNode(*n.children[0]);
+                IRRef tmp = mkTemp();
+                emit(IRInstruction(IROpcode::SUB, tmp, {lRef, rRef}));
+                IRInstruction st(IROpcode::STORE_VAR);
+                st.typedOperands = {mkVar(n.value), tmp};
+                emit(std::move(st));
+            } else if (!n.attrs.empty()) {
+                // Legacy string-based (fallback)
+                emitCompound(IROpcode::SUB, n.value, n.attrs[0]);
+            }
             break;
         case NodeType::MultiplyEqualStmt:
         case NodeType::AtEqualStmt:
-            if (!n.attrs.empty()) emitCompound(IROpcode::MUL, n.value, n.attrs[0]);
+            if (!n.children.empty()) {
+                // Structured expression as child
+                IRRef lRef = mkVar(n.value);
+                IRRef rRef = lowerExprNode(*n.children[0]);
+                IRRef tmp = mkTemp();
+                emit(IRInstruction(IROpcode::MUL, tmp, {lRef, rRef}));
+                IRInstruction st(IROpcode::STORE_VAR);
+                st.typedOperands = {mkVar(n.value), tmp};
+                emit(std::move(st));
+            } else if (!n.attrs.empty()) {
+                // Legacy string-based (fallback)
+                emitCompound(IROpcode::MUL, n.value, n.attrs[0]);
+            }
             break;
         case NodeType::DivideEqualStmt:
-            if (!n.attrs.empty()) emitCompound(IROpcode::DIV, n.value, n.attrs[0]);
+            if (!n.children.empty()) {
+                // Structured expression as child
+                IRRef lRef = mkVar(n.value);
+                IRRef rRef = lowerExprNode(*n.children[0]);
+                IRRef tmp = mkTemp();
+                emit(IRInstruction(IROpcode::DIV, tmp, {lRef, rRef}));
+                IRInstruction st(IROpcode::STORE_VAR);
+                st.typedOperands = {mkVar(n.value), tmp};
+                emit(std::move(st));
+            } else if (!n.attrs.empty()) {
+                // Legacy string-based (fallback)
+                emitCompound(IROpcode::DIV, n.value, n.attrs[0]);
+            }
             break;
 
         // ── display / print ─────────────────────────────────────────────────
         case NodeType::DisplayStmt: {
-            IRRef val = lowerExpr(n.value);
+            IRRef val;
+            if (!n.children.empty()) {
+                // Structured expression as child
+                val = lowerExprNode(*n.children[0]);
+            } else if (!n.value.empty()) {
+                // Legacy string-based expression (fallback)
+                val = lowerExpr(n.value);
+            } else {
+                val = mkConst("");
+            }
+            
             IRInstruction i(IROpcode::PRINT);
             i.typedOperands = {val};
             emit(std::move(i));
@@ -336,7 +658,32 @@ class IRGenerator {
         // ── method / function calls ─────────────────────────────────────────
         case NodeType::MethodCall: {
             std::vector<IRRef> ops = {mkVar(n.value)};
-            for (auto& a : n.attrs) ops.push_back(mkConst(a));
+            for (auto& a : n.attrs) {
+                // Trim whitespace
+                std::string trimmed = a;
+                while (!trimmed.empty() && trimmed.back() == ' ') trimmed.pop_back();
+                while (!trimmed.empty() && trimmed.front() == ' ') trimmed.erase(trimmed.begin());
+                
+                // Check if attr is a variable name or a constant
+                // If it's a number, make it a const int
+                bool isInt = !trimmed.empty();
+                for (char c : trimmed) if (!std::isdigit(c) && c != '-') { isInt = false; break; }
+                if (isInt) {
+                    try { 
+                        ops.push_back(mkConstInt(std::stoi(trimmed))); 
+                    } catch (...) {
+                        ops.push_back(mkConst(trimmed));
+                    }
+                } else if (trimmed.size() >= 2 && trimmed.front() == '$' && trimmed.back() == '$') {
+                    // String literal
+                    ops.push_back(mkConst(trimmed));
+                } else if (!trimmed.empty()) {
+                    // Variable name
+                    ops.push_back(mkVar(trimmed));
+                } else {
+                    // Empty - skip
+                }
+            }
             IRInstruction i(IROpcode::LIB_CALL);
             i.typedOperands = ops;
             emit(std::move(i));
@@ -345,7 +692,25 @@ class IRGenerator {
 
         case NodeType::FunctionCall: {
             std::vector<IRRef> ops = {mkVar(n.value)};
-            for (auto& a : n.attrs) ops.push_back(mkConst(a));
+            for (auto& a : n.attrs) {
+                // Check if attr is a variable name or a constant
+                // If it's a number, make it a const int
+                bool isInt = !a.empty();
+                for (char c : a) if (!std::isdigit(c) && c != '-') { isInt = false; break; }
+                if (isInt) {
+                    try { 
+                        ops.push_back(mkConstInt(std::stoi(a))); 
+                    } catch (...) {
+                        ops.push_back(mkConst(a));
+                    }
+                } else if (a.size() >= 2 && a.front() == '$' && a.back() == '$') {
+                    // String literal
+                    ops.push_back(mkConst(a));
+                } else {
+                    // Variable name
+                    ops.push_back(mkVar(a));
+                }
+            }
             IRInstruction i(IROpcode::CALL);
             i.typedOperands = ops;
             emit(std::move(i));
@@ -363,7 +728,25 @@ class IRGenerator {
 
         case NodeType::ConfigCall: {
             std::vector<IRRef> ops = {mkVar(n.value)};
-            for (auto& a : n.attrs) ops.push_back(mkConst(a));
+            for (auto& a : n.attrs) {
+                // Check if attr is a variable name or a constant
+                // If it's a number, make it a const int
+                bool isInt = !a.empty();
+                for (char c : a) if (!std::isdigit(c) && c != '-') { isInt = false; break; }
+                if (isInt) {
+                    try { 
+                        ops.push_back(mkConstInt(std::stoi(a))); 
+                    } catch (...) {
+                        ops.push_back(mkConst(a));
+                    }
+                } else if (a.size() >= 2 && a.front() == '$' && a.back() == '$') {
+                    // String literal
+                    ops.push_back(mkConst(a));
+                } else {
+                    // Variable name
+                    ops.push_back(mkVar(a));
+                }
+            }
             IRInstruction i(IROpcode::LIB_CALL);
             i.typedOperands = ops;
             emit(std::move(i));
@@ -385,32 +768,80 @@ class IRGenerator {
         // ── control flow ────────────────────────────────────────────────────
         case NodeType::IfStmt: {
             if (n.value == "OTHER") {
+                // OTHER (else) block - just generate the body
+                // The IF_ELSE opcode was already emitted by the parent IF
                 if (!n.children.empty()) gen(*n.children[0]);
                 break;
             }
 
-            IRRef condRef = lowerExpr(n.value);
-            IRRef elseL   = mkLabel();
-            IRRef endL    = mkLabel();
+            // First child is condition expression, second is body
+            IRRef condRef;
+            size_t bodyIndex = 0;
+            if (!n.children.empty() && n.children[0]->type != NodeType::Block) {
+                // Structured expression as first child
+                condRef = lowerExprNode(*n.children[0]);
+                bodyIndex = 1;
+            } else {
+                // Legacy string-based condition (fallback)
+                condRef = lowerExpr(n.value);
+                bodyIndex = 0;
+            }
+            
+            if (prog.useHighLevelIR) {
+                // High-level IR: emit IF_BEGIN with condition
+                IRInstruction ifBegin(IROpcode::IF_BEGIN);
+                ifBegin.typedOperands = {condRef};
+                emit(std::move(ifBegin));
+                
+                if (bodyIndex < n.children.size()) gen(*n.children[bodyIndex]);
+                
+                bool hasElse = n.children.size() > bodyIndex + 1;
+                if (hasElse) {
+                    // Emit IF_ELSE
+                    IRInstruction elseInstr(IROpcode::IF_ELSE);
+                    emit(std::move(elseInstr));
+                    for (size_t i = bodyIndex + 1; i < n.children.size(); i++) gen(*n.children[i]);
+                }
+                
+                // Emit IF_END
+                IRInstruction ifEnd(IROpcode::IF_END);
+                emit(std::move(ifEnd));
+            } else {
+                // Low-level IR: use jumps and labels
+                IRRef elseL   = mkLabel();
+                IRRef endL    = mkLabel();
 
-            emitJF(condRef, elseL);
-            if (!n.children.empty()) gen(*n.children[0]);
+                emitJF(condRef, elseL);
+                if (bodyIndex < n.children.size()) gen(*n.children[bodyIndex]);
 
-            bool hasElse = n.children.size() > 1;
-            if (hasElse) emitJump(endL);
-            emitLabel(elseL);
+                bool hasElse = n.children.size() > bodyIndex + 1;
+                if (hasElse) emitJump(endL);
+                emitLabel(elseL);
 
-            for (size_t i = 1; i < n.children.size(); i++) gen(*n.children[i]);
-            if (hasElse) emitLabel(endL);
+                for (size_t i = bodyIndex + 1; i < n.children.size(); i++) gen(*n.children[i]);
+                if (hasElse) emitLabel(endL);
+            }
             break;
         }
 
         case NodeType::ElseIfStmt: {
-            IRRef condRef = lowerExpr(n.value);
+            // First child is condition expression, second is body
+            IRRef condRef;
+            size_t bodyIndex = 0;
+            if (!n.children.empty() && n.children[0]->type != NodeType::Block) {
+                // Structured expression as first child
+                condRef = lowerExprNode(*n.children[0]);
+                bodyIndex = 1;
+            } else {
+                // Legacy string-based condition (fallback)
+                condRef = lowerExpr(n.value);
+                bodyIndex = 0;
+            }
+            
             IRRef skipL   = mkLabel();
 
             emitJF(condRef, skipL);
-            if (!n.children.empty()) gen(*n.children[0]);
+            if (bodyIndex < n.children.size()) gen(*n.children[bodyIndex]);
             emitLabel(skipL);
             break;
         }
@@ -423,13 +854,26 @@ class IRGenerator {
             loopEnd.push(endL);
 
             emitLabel(startL);
-            IRRef condRef = lowerExpr(n.value);
+            
+            // First child is condition expression, second is body
+            IRRef condRef;
+            size_t bodyIndex = 0;
+            if (!n.children.empty() && n.children[0]->type != NodeType::Block) {
+                // Structured expression as first child
+                condRef = lowerExprNode(*n.children[0]);
+                bodyIndex = 1;
+            } else {
+                // Legacy string-based condition (fallback)
+                condRef = lowerExpr(n.value);
+                bodyIndex = 0;
+            }
+            
             emitJF(condRef, endL);
 
-            if (!n.children.empty()) gen(*n.children[0]);
+            if (bodyIndex < n.children.size()) gen(*n.children[bodyIndex]);
 
             // elseif/other chains after the loop body
-            for (size_t i = 1; i < n.children.size(); i++) gen(*n.children[i]);
+            for (size_t i = bodyIndex + 1; i < n.children.size(); i++) gen(*n.children[i]);
 
             emitJump(startL);
             emitLabel(endL);
@@ -441,8 +885,7 @@ class IRGenerator {
 
         case NodeType::ForLoop: {
             std::string iterVar  = n.value;
-            std::string coll     = n.attrs.empty() ? "" : n.attrs[0];
-
+            
             IRRef startL = mkLabel();
             IRRef endL   = mkLabel();
             IRRef iterT  = mkTemp();  // iterator temp
@@ -451,8 +894,22 @@ class IRGenerator {
             loopStart.push(startL);
             loopEnd.push(endL);
 
+            // First child is collection expression, second is body
+            IRRef collRef;
+            size_t bodyIndex = 0;
+            if (!n.children.empty() && n.children[0]->type != NodeType::Block) {
+                // Structured expression as first child
+                collRef = lowerExprNode(*n.children[0]);
+                bodyIndex = 1;
+            } else {
+                // Legacy string-based collection (fallback)
+                std::string coll = n.attrs.empty() ? "" : n.attrs[0];
+                collRef = lowerExpr(coll);
+                bodyIndex = 0;
+            }
+
             // iter_init: iterT = iter(coll)
-            IRInstruction init(IROpcode::LOAD_VAR, iterT, {mkConst(coll)});
+            IRInstruction init(IROpcode::LOAD_VAR, iterT, {collRef});
             emit(std::move(init));
 
             emitLabel(startL);
@@ -468,7 +925,7 @@ class IRGenerator {
             IRInstruction stv(IROpcode::STORE_VAR, mkVar(iterVar), {itemT});
             emit(std::move(stv));
 
-            if (!n.children.empty()) gen(*n.children[0]);
+            if (bodyIndex < n.children.size()) gen(*n.children[bodyIndex]);
 
             emitJump(startL);
             emitLabel(endL);
@@ -479,7 +936,18 @@ class IRGenerator {
         }
 
         case NodeType::ReturnStmt: {
-            IRRef val = lowerExpr(n.value);
+            IRRef val;
+            if (!n.children.empty()) {
+                // Structured expression as child
+                val = lowerExprNode(*n.children[0]);
+            } else if (!n.value.empty()) {
+                // Legacy string-based expression (fallback)
+                val = lowerExpr(n.value);
+            } else {
+                // No return value (void return)
+                val = mkConst("");
+            }
+            
             IRInstruction i(IROpcode::RETURN);
             i.typedOperands = {val};
             emit(std::move(i));
@@ -635,6 +1103,8 @@ public:
         prog         = IRProgram();
         prog.backend = backend;
         prog.target  = backend;
+        // Use high-level IR for languages without goto
+        prog.useHighLevelIR = (backend == "PY" || backend == "JS" || backend == "Java");
         tc = lc = 0;
         gen(ast);
         return std::move(prog);
@@ -650,15 +1120,18 @@ IRProgram generateIR(const ASTNode& ast, const std::string& backend) {
 
 // ─── LIR text serialiser ────────────────────────────────────────────────────
 
-static std::string refStr(const IRRef& r) {
+static std::string refStr(const IRRef& r, SymbolTable* symbols = nullptr) {
+    if (symbols) {
+        return r.toStringWithSymbols(symbols);
+    }
     return r.toString();
 }
 
-static std::string instrToLIR(const IRInstruction& i) {
+static std::string instrToLIR(const IRInstruction& i, SymbolTable* symbols = nullptr) {
     std::ostringstream o;
 
     if (i.result.isValid())
-        o << refStr(i.result) << " = ";
+        o << refStr(i.result, symbols) << " = ";
 
     o << opcodeStr(i.opcode);
 
@@ -666,7 +1139,7 @@ static std::string instrToLIR(const IRInstruction& i) {
         o << ' ';
         for (size_t k = 0; k < i.typedOperands.size(); k++) {
             if (k) o << ", ";
-            o << refStr(i.typedOperands[k]);
+            o << refStr(i.typedOperands[k], symbols);
         }
     } else if (!i.operands.empty()) {
         // legacy string operands fallback
@@ -683,12 +1156,15 @@ static std::string instrToLIR(const IRInstruction& i) {
 
 std::string generateIRText(const IRProgram& program) {
     std::ostringstream o;
-    o << "; AC LIR  backend=" << program.backend << "\n\n";
+    o << "; AC LIR  backend=" << program.backend << "\n";
+    o << "; Symbol Table: " << program.symbols.size() << " symbols\n";
+    o << "; Arena: " << program.arena.totalUsed() << " / " << program.arena.totalAllocated() 
+      << " bytes used (" << program.arena.numBlocks() << " blocks)\n\n";
 
     if (!program.globalInit.empty()) {
         o << "section .global:\n";
         for (auto& i : program.globalInit)
-            o << "  " << instrToLIR(i) << '\n';
+            o << "  " << instrToLIR(i, const_cast<SymbolTable*>(&program.symbols)) << '\n';
         o << '\n';
     }
 
@@ -700,7 +1176,7 @@ std::string generateIRText(const IRProgram& program) {
         }
         o << ") -> " << typeStr(fn.returnType) << " {\n";
         for (auto& i : fn.instructions)
-            o << "  " << instrToLIR(i) << '\n';
+            o << "  " << instrToLIR(i, const_cast<SymbolTable*>(&program.symbols)) << '\n';
         o << "}\n\n";
     }
 

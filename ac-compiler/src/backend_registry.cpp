@@ -3,18 +3,10 @@
 #include <string>
 #include <algorithm>
 
-// Forward declarations for generator functions
-std::string generatePython(const ASTNode& ast);
-std::string generateJS(const ASTNode& ast);
-std::string generateHTML(const ASTNode& ast);
-std::string generateJava(const ASTNode& ast);
-std::string generateCpp(const ASTNode& ast);
-std::string generateC(const ASTNode& ast);
-std::string generateAsm(const ASTNode& ast);
-std::string generateRs(const ASTNode& ast);
-std::string generateGo(const ASTNode& ast);
-std::string generateV(const ASTNode& ast);
-std::string generateBny(const ASTNode& ast);
+// Dummy generator function - not used anymore (unified IR codegen handles all backends)
+std::string dummyGenerator(const ASTNode& ast) {
+    return "";
+}
 
 // Static member definition
 std::unordered_map<std::string, BackendRegistry::BackendInfo> BackendRegistry::backends;
@@ -41,40 +33,40 @@ std::string resolveLibraryPath(const std::string& libName) {
 void BackendRegistry::initializeStandardBackends() {
     if (!backends.empty()) return; // Already initialized
     
-    // Register all standard backends
-    registerBackend("PY", ".py", generatePython, 
+    // Register all standard backends (generator function not used - unified IR codegen handles all)
+    registerBackend("PY", ".py", dummyGenerator, 
         [](const std::string& outFile) { return "python3 " + outFile; });
     
-    registerBackend("JS", ".js", generateJS, 
+    registerBackend("JS", ".js", dummyGenerator, 
         [](const std::string& outFile) { return "node " + outFile; });
     
-    registerBackend("HTML", ".html", generateHTML, 
+    registerBackend("HTML", ".html", dummyGenerator, 
         [](const std::string& outFile) { return "xdg-open " + outFile; });
     
-    registerBackend("Java", ".java", generateJava, 
+    registerBackend("Java", ".java", dummyGenerator, 
         [](const std::string& outFile) { return "javac " + outFile + " && java Main"; });
     
-    registerBackend("C++", ".cpp", generateCpp, 
+    registerBackend("C++", ".cpp", dummyGenerator, 
         [](const std::string& outFile) { return "g++ " + outFile + " -I.. -o /tmp/ac_out && /tmp/ac_out"; });
     
-    registerBackend("CPP", ".cpp", generateCpp, 
+    registerBackend("CPP", ".cpp", dummyGenerator, 
         [](const std::string& outFile) { return "g++ " + outFile + " -I.. -o /tmp/ac_out && /tmp/ac_out"; });
     
-    registerBackend("C", ".c", generateC, 
+    registerBackend("C", ".c", dummyGenerator, 
         [](const std::string& outFile) { return "gcc " + outFile + " -I.. -o /tmp/ac_out && /tmp/ac_out"; });
     
-    registerBackend("ASM", ".s", generateAsm, 
+    registerBackend("ASM", ".s", dummyGenerator, 
         [](const std::string& outFile) { return "gcc " + outFile + " -I.. -o /tmp/ac_out && /tmp/ac_out"; });
     
-    registerBackend("RS", ".rs", generateRs, 
+    registerBackend("RS", ".rs", dummyGenerator, 
         [](const std::string& outFile) { return "rustc " + outFile + " -o /tmp/ac_out && /tmp/ac_out"; });
     
-    registerBackend("GO", ".go", generateGo, 
+    registerBackend("GO", ".go", dummyGenerator, 
         [](const std::string& outFile) { return "go run " + outFile; });
     
-    registerBackend("V", ".v", generateV, 
+    registerBackend("V", ".v", dummyGenerator, 
         [](const std::string& outFile) { return "cd /tmp/v && /usr/local/bin/v run " + outFile; });
     
-    registerBackend("BNY", ".acb", generateBny, 
+    registerBackend("BNY", ".acb", dummyGenerator, 
         [](const std::string& outFile) { return outFile; });  // Direct execution of binary
 }

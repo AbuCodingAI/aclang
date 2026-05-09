@@ -60,15 +60,20 @@ static void serializeIRRef(std::ofstream& f, const AC_IR::IRRef& ref) {
     writeU8(f, (uint8_t)ref.kind);
     writeU32(f, ref.id);
     writeStr(f, ref.name);
+    
+    // Write presence flag first, then type and data
     if (ref.value.type != AC_IR::IRType::VOID) {
+        writeU8(f, 1); // presence flag
         writeU8(f, (uint8_t)ref.value.type);
         switch (ref.value.type) {
             case AC_IR::IRType::INT:
                 writeU32(f, (uint32_t)std::get<int>(ref.value.data));
                 break;
-            case AC_IR::IRType::FLOAT:
-                f.write((char*)&std::get<double>(ref.value.data), 8);
+            case AC_IR::IRType::FLOAT: {
+                double val = std::get<double>(ref.value.data);
+                f.write((char*)&val, 8);
                 break;
+            }
             case AC_IR::IRType::STRING:
                 writeStr(f, std::get<std::string>(ref.value.data));
                 break;
@@ -78,6 +83,8 @@ static void serializeIRRef(std::ofstream& f, const AC_IR::IRRef& ref) {
             default:
                 break;
         }
+    } else {
+        writeU8(f, 0); // no value
     }
 }
 
@@ -137,15 +144,21 @@ static AC_IR::IRRef deserializeIRRef(std::ifstream& f) {
     ref.kind = (AC_IR::IRRef::Kind)readU8(f);
     ref.id = readU32(f);
     ref.name = readStr(f);
-    if (readU8(f)) {
+    
+    // Read presence flag
+    uint8_t hasValue = readU8(f);
+    if (hasValue) {
         ref.value.type = (AC_IR::IRType)readU8(f);
         switch (ref.value.type) {
             case AC_IR::IRType::INT:
                 ref.value.data = (int)readU32(f);
                 break;
-            case AC_IR::IRType::FLOAT:
-                f.read((char*)&std::get<double>(ref.value.data), 8);
+            case AC_IR::IRType::FLOAT: {
+                double val;
+                f.read((char*)&val, 8);
+                ref.value.data = val;
                 break;
+            }
             case AC_IR::IRType::STRING:
                 ref.value.data = readStr(f);
                 break;
@@ -163,7 +176,7 @@ static AC_IR::IRInstruction deserializeIRInstruction(std::ifstream& f) {
     AC_IR::IROpcode opcode = (AC_IR::IROpcode)readU8(f);
     uint8_t opCount = readU8(f);
     std::vector<AC_IR::IRRef> operands;
-    for (int i = 0; i < opCount; i++) {
+    for (uint32_t i = 0; i < opCount; i++) {
         operands.push_back(deserializeIRRef(f));
     }
     AC_IR::IRRef result;
@@ -184,12 +197,14 @@ static AC_IR::IRFunction deserializeIRFunction(std::ifstream& f) {
     std::string name = readStr(f);
     AC_IR::IRFunction func(name);
     uint8_t paramCount = readU8(f);
-    for (int i = 0; i < paramCount; i++) {
+    for (uint32_t i = 0; i < paramCount; i++) {
         func.parameters.push_back(readStr(f));
     }
     func.returnType = (AC_IR::IRType)readU8(f);
     uint32_t instrCount = readU32(f);
-    for (int i = 0; i < instrCount; i++) {
+    // Safety limit to prevent infinite loops on corrupted data
+    if (instrCount > 100000) throw std::runtime_error("Corrupt LIR: excessive instruction count");
+    for (uint32_t i = 0; i < instrCount; i++) {
         func.instructions.push_back(deserializeIRInstruction(f));
     }
     return func;
@@ -215,12 +230,16 @@ inline AC_IR::IRProgram loadLIRCache(const std::string& lirFile) {
     program.backend = backend;
     
     uint32_t funcCount = readU32(f);
-    for (int i = 0; i < funcCount; i++) {
+    // Safety limit to prevent infinite loops on corrupted data
+    if (funcCount > 1000) throw std::runtime_error("Corrupt LIR: excessive function count");
+    for (uint32_t i = 0; i < funcCount; i++) {
         program.functions.push_back(deserializeIRFunction(f));
     }
     
     uint32_t globalCount = readU32(f);
-    for (int i = 0; i < globalCount; i++) {
+    // Safety limit to prevent infinite loops on corrupted data
+    if (globalCount > 10000) throw std::runtime_error("Corrupt LIR: excessive global instruction count");
+    for (uint32_t i = 0; i < globalCount; i++) {
         program.globalInit.push_back(deserializeIRInstruction(f));
     }
     

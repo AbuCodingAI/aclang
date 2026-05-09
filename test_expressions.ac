@@ -1,0 +1,19 @@
+AC->PY
+
+<mainloop>
+    x = 5
+    y = 10
+    z = x + y @ 2
+    Term.display z
+    
+    IF z > 20
+        Term.display $Greater than 20$
+    OTHER
+        Term.display $Not greater than 20$
+    
+    counter = 0
+    WHILST counter < 3
+        Term.display counter
+        counter = counter + 1
+    /kill
+<mainloop>

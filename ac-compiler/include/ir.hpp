@@ -3,6 +3,8 @@
 #include <vector>
 #include <memory>
 #include <variant>
+#include <unordered_map>
+#include <algorithm>
 
 // Forward declaration
 struct ASTNode;
@@ -15,6 +17,9 @@ struct ASTNode;
 
 namespace AC_IR {
 
+// Forward declaration
+class SymbolTable;
+
 enum class IROpcode {
     // Control flow
     LABEL,
@@ -23,6 +28,15 @@ enum class IROpcode {
     JUMP_IF_FALSE,
     CALL,
     RETURN,
+    
+    // High-level control flow (for languages without goto)
+    IF_BEGIN,      // Start of if statement
+    IF_ELSE,       // Else clause
+    IF_END,        // End of if statement
+    WHILE_BEGIN,   // Start of while loop
+    WHILE_END,     // End of while loop
+    FOR_BEGIN,     // Start of for loop
+    FOR_END,       // End of for loop
     
     // Data operations
     LOAD_CONST,
@@ -99,21 +113,21 @@ struct IRValue {
     IRValue(bool b) : type(IRType::BOOL), data(b) {}
 };
 
-// NEW: Typed reference to values/variables/temps
+// Integerized IR Reference - uses integer IDs for optimal performance
+// Requirements: 2.1, 2.2, 2.3, 2.4, 2.5
 struct IRRef {
     enum class Kind { 
-        TEMP,      // Temporary value (t0, t1, etc.)
-        VAR,       // Named variable
-        CONST,     // Constant value
-        LABEL,     // Jump label
-        FUNCTION,  // Function reference
+        TEMP,      // Temporary value: id = 0, 1, 2, ... (not "t0", "t1")
+        VAR,       // Named variable: id = symbol table index (not string name)
+        CONST,     // Constant value: embedded in value field
+        LABEL,     // Jump label: id = 0, 1, 2, ... (not "L0", "L1")
+        FUNCTION,  // Function reference: id = symbol table index
         NONE       // No reference (for instructions without result)
     };
     
     Kind kind;
-    int id;              // For TEMP (t0, t1), LABEL (L0, L1)
-    std::string name;    // For VAR, FUNCTION
-    IRValue value;       // For CONST
+    int id;              // Integer ID for TEMP (0,1,2...), LABEL (0,1,2...), VAR (symbol index)
+    IRValue value;       // For CONST only - embedded constant value
     
     // Default constructor
     IRRef() : kind(Kind::NONE), id(0) {}
@@ -126,12 +140,17 @@ struct IRRef {
         return ref;
     }
     
-    static IRRef var(const std::string& varName) { 
+    // VAR now uses integer ID (symbol table index) instead of string name
+    static IRRef var(int symbolId) { 
         IRRef ref;
         ref.kind = Kind::VAR;
-        ref.name = varName;
+        ref.id = symbolId;
         return ref;
     }
+    
+    // Legacy: VAR from string name (for backward compatibility during transition)
+    // This should be replaced with symbol table lookups
+    static IRRef varLegacy(const std::string& varName);
     
     static IRRef constant(const IRValue& val) { 
         IRRef ref;
@@ -147,12 +166,16 @@ struct IRRef {
         return ref;
     }
     
-    static IRRef func(const std::string& funcName) { 
+    // FUNCTION now uses integer ID (symbol table index) instead of string name
+    static IRRef func(int symbolId) { 
         IRRef ref;
         ref.kind = Kind::FUNCTION;
-        ref.name = funcName;
+        ref.id = symbolId;
         return ref;
     }
+    
+    // Legacy: FUNCTION from string name (for backward compatibility during transition)
+    static IRRef funcLegacy(const std::string& funcName);
     
     static IRRef none() {
         return IRRef();
@@ -161,11 +184,12 @@ struct IRRef {
     // Helper to check if this is a valid reference
     bool isValid() const { return kind != Kind::NONE; }
     
-    // Helper to get string representation
+    // Helper to get string representation (for debugging only)
+    // String conversion only happens here - all internal operations use integers
     std::string toString() const {
         switch (kind) {
             case Kind::TEMP: return "t" + std::to_string(id);
-            case Kind::VAR: return name;
+            case Kind::VAR: return "v" + std::to_string(id);  // Show as v0, v1, v2... (symbol index)
             case Kind::CONST: {
                 if (value.type == IRType::INT) return std::to_string(std::get<int>(value.data));
                 if (value.type == IRType::FLOAT) return std::to_string(std::get<double>(value.data));
@@ -174,11 +198,14 @@ struct IRRef {
                 return "const";
             }
             case Kind::LABEL: return "L" + std::to_string(id);
-            case Kind::FUNCTION: return name;
+            case Kind::FUNCTION: return "f" + std::to_string(id);  // Show as f0, f1, f2... (symbol index)
             case Kind::NONE: return "<none>";
         }
         return "<unknown>";
     }
+    
+    // Helper to get string representation with symbol table (for better debugging)
+    std::string toStringWithSymbols(SymbolTable* symbols) const;
 };
 
 struct IRInstruction {
@@ -209,6 +236,213 @@ struct IRInstruction {
         : opcode(op), typedOperands(std::move(ops)) {}
 };
 
+// Symbol Table with Integer Indexing
+// Requirements: 15.1, 15.2, 15.3, 15.4, 15.5
+// Maps variable names to sequential integer indices for O(1) lookup
+class SymbolTable {
+public:
+    struct Symbol {
+        std::string name;
+        IRType type;
+        int scope;  // Scope depth (0 = global, 1+ = nested)
+    };
+    
+private:
+    std::vector<Symbol> symbols;                           // Index → Symbol (sequential 0,1,2...)
+    std::unordered_map<std::string, std::vector<int>> nameToIds;  // Name → [indices] (for scoping)
+    int currentScope;
+    
+public:
+    SymbolTable() : currentScope(0) {}
+    
+    // Intern a symbol: add to table and return its integer index
+    // If symbol already exists in current scope, return existing index
+    int intern(const std::string& name, IRType type = IRType::VOID) {
+        // Check if symbol exists in current scope
+        auto it = nameToIds.find(name);
+        if (it != nameToIds.end()) {
+            for (int id : it->second) {
+                if (symbols[id].scope == currentScope) {
+                    return id;  // Already exists in current scope
+                }
+            }
+        }
+        
+        // Add new symbol
+        int id = static_cast<int>(symbols.size());
+        symbols.push_back({name, type, currentScope});
+        nameToIds[name].push_back(id);
+        return id;
+    }
+    
+    // Lookup symbol by name: returns index or -1 if not found
+    // Searches from current scope upward to global scope
+    int lookup(const std::string& name) const {
+        auto it = nameToIds.find(name);
+        if (it == nameToIds.end()) {
+            return -1;  // Not found
+        }
+        
+        // Search from current scope upward
+        for (int scope = currentScope; scope >= 0; --scope) {
+            for (int id : it->second) {
+                if (symbols[id].scope == scope) {
+                    return id;
+                }
+            }
+        }
+        
+        return -1;  // Not found
+    }
+    
+    // Get symbol name by index
+    const std::string& getName(int id) const {
+        if (id >= 0 && id < static_cast<int>(symbols.size())) {
+            return symbols[id].name;
+        }
+        static const std::string empty;
+        return empty;
+    }
+    
+    // Get symbol by index
+    const Symbol& getSymbol(int id) const {
+        return symbols[id];
+    }
+    
+    // Enter a new scope (increment scope depth)
+    void enterScope() {
+        currentScope++;
+    }
+    
+    // Exit current scope (decrement scope depth, remove symbols from exited scope)
+    void exitScope() {
+        if (currentScope > 0) {
+            // Remove symbols from current scope
+            for (auto& pair : nameToIds) {
+                auto& ids = pair.second;
+                ids.erase(
+                    std::remove_if(ids.begin(), ids.end(),
+                        [this](int id) { return symbols[id].scope == currentScope; }),
+                    ids.end()
+                );
+            }
+            currentScope--;
+        }
+    }
+    
+    // Get current scope depth
+    int getCurrentScope() const {
+        return currentScope;
+    }
+    
+    // Get total number of symbols
+    size_t size() const {
+        return symbols.size();
+    }
+    
+    // Clear all symbols
+    void clear() {
+        symbols.clear();
+        nameToIds.clear();
+        currentScope = 0;
+    }
+};
+
+// Arena Allocator for IR Memory Management
+// Requirements: 3.2, 3.4, 3.5
+// Allocates memory in large blocks (64KB default) to eliminate per-instruction allocation overhead
+class Arena {
+public:
+    struct Block {
+        std::unique_ptr<char[]> data;
+        size_t size;
+        size_t used;
+        
+        Block(size_t sz) : data(new char[sz]), size(sz), used(0) {}
+    };
+    
+private:
+    std::vector<Block> blocks;
+    size_t blockSize;  // Default: 64KB
+    
+public:
+    // Constructor with configurable block size (default 64KB)
+    explicit Arena(size_t blockSz = 65536) : blockSize(blockSz) {
+        // Pre-allocate first block
+        blocks.emplace_back(blockSize);
+    }
+    
+    // Allocate memory from arena with alignment
+    void* allocate(size_t size, size_t alignment = 8) {
+        // Align size to alignment boundary
+        size_t alignedSize = (size + alignment - 1) & ~(alignment - 1);
+        
+        // Try to allocate from current block
+        if (!blocks.empty()) {
+            Block& current = blocks.back();
+            size_t alignedUsed = (current.used + alignment - 1) & ~(alignment - 1);
+            
+            if (alignedUsed + alignedSize <= current.size) {
+                void* ptr = current.data.get() + alignedUsed;
+                current.used = alignedUsed + alignedSize;
+                return ptr;
+            }
+        }
+        
+        // Need new block
+        size_t newBlockSize = std::max(blockSize, alignedSize);
+        blocks.emplace_back(newBlockSize);
+        Block& newBlock = blocks.back();
+        void* ptr = newBlock.data.get();
+        newBlock.used = alignedSize;
+        return ptr;
+    }
+    
+    // Allocate typed object (placement new)
+    template<typename T, typename... Args>
+    T* create(Args&&... args) {
+        void* mem = allocate(sizeof(T), alignof(T));
+        return new (mem) T(std::forward<Args>(args)...);
+    }
+    
+    // Reset arena (keep blocks, reset used counters)
+    void reset() {
+        for (auto& block : blocks) {
+            block.used = 0;
+        }
+    }
+    
+    // Clear all blocks (free memory)
+    void clear() {
+        blocks.clear();
+        // Re-allocate first block
+        blocks.emplace_back(blockSize);
+    }
+    
+    // Get total allocated memory
+    size_t totalAllocated() const {
+        size_t total = 0;
+        for (const auto& block : blocks) {
+            total += block.size;
+        }
+        return total;
+    }
+    
+    // Get total used memory
+    size_t totalUsed() const {
+        size_t total = 0;
+        for (const auto& block : blocks) {
+            total += block.used;
+        }
+        return total;
+    }
+    
+    // Get number of blocks
+    size_t numBlocks() const {
+        return blocks.size();
+    }
+};
+
 struct IRFunction {
     std::string name;
     std::vector<std::string> parameters;
@@ -233,10 +467,19 @@ struct IRFunction {
 };
 
 struct IRProgram {
-    std::vector<IRFunction> functions;
-    std::vector<IRInstruction> globalInit;
-    std::string backend;  // Target backend (PY, JS, RS, etc.)
-    std::string target;   // Same as backend (for compatibility)
+    // NEW: Symbol table and arena allocator for integerized IR
+    SymbolTable symbols;                    // Shared symbol table for all functions
+    Arena arena;                            // Arena allocator for IR memory
+    
+    std::vector<IRFunction> functions;      // All functions (flat array storage)
+    std::vector<IRInstruction> globalInit;  // Global initialization (flat array storage)
+    std::string backend;                    // Target backend (PY, JS, RS, etc.)
+    std::string target;                     // Same as backend (for compatibility)
+    bool useHighLevelIR = false;            // Use structured control flow instead of jumps
+    
+    // Global counters for temporaries and labels
+    int globalTempCount = 0;
+    int globalLabelCount = 0;
     
     IRProgram() = default;
     

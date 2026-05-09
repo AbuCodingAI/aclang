@@ -1,0 +1,10 @@
+AC->Java
+
+Make add func(a, b)
+    return a + b
+
+<mainloop>
+    result = add(5, 3)
+    Term.display result
+    /kill
+<mainloop>

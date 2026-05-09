@@ -1,7 +1,7 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -O2
 
-SRC = src/main.cpp src/lexer.cpp src/parser.cpp src/backend_registry.cpp src/ir.cpp src/codegen_py.cpp src/codegen_js.cpp src/codegen_html.cpp src/codegen_java.cpp src/codegen_cpp.cpp src/codegen_c.cpp src/codegen_asm.cpp src/codegen_rs.cpp src/codegen_go.cpp src/codegen_v.cpp src/codegen_bny.cpp
+SRC = src/main.cpp src/lexer.cpp src/parser.cpp src/backend_registry.cpp src/ir.cpp src/ir_codegen.cpp src/exp_bny.cpp
 OUT = ac
 
 all: $(OUT)

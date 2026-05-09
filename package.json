@@ -1,7 +1,7 @@
 {
   "name": "aclang",
-  "version": "0.1.6",
-  "description": "AC Language Compiler v0.1.6 - A multi-target compiler for the AC programming language, note, this is more advanced than version 1",
+  "version": "0.1.7",
+  "description": "AC Language Compiler v0.1.7 - A multi-target compiler for the AC programming language, note, this is more advanced than version 1",
   "bin": {
     "ac": "bin/ac",
     "install-backends": "scripts/install-backends.js"

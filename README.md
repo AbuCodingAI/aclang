@@ -379,9 +379,9 @@ Embed raw target language code:
 ```ac
 configure event-listener
     use listener to establish rule
-        on value=space
+        on value is space
             jump(player)
-        on value=w
+        on value is w
             moveUp(player)
 ```
 

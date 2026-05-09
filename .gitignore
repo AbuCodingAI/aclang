@@ -6,3 +6,5 @@
 .windsurf/
 /examples/pong.ac
 node_modules/
+context.md
+.aider*

@@ -1,0 +1,29 @@
+AC->PY
+
+<StartHere>
+    * Test Pratt parser with various expressions *
+    
+    * Simple arithmetic *
+    x = 2 + 3
+    y = 5 - 2
+    z = 3 * 4
+    w = 10 / 2
+    
+    * Operator precedence *
+    result1 = 2 + 3 * 4
+    result2 = (2 + 3) * 4
+    
+    * Comparison operators *
+    a = 5 > 3
+    b = 10 < 20
+    c = 5 is 5
+    
+    * Unary operators *
+    neg = -5
+    notval = not True
+    
+    * Complex expression *
+    complex = 2 + 3 * 4 - 5 / 2
+    
+    display $Tests complete$
+<EndHere>

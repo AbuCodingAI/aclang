@@ -1,32 +1,31 @@
 .section .rodata
     fmt_int: .asciz "%d\n"
     fmt_str: .asciz "%s\n"
-
+    input_fmt: .asciz "%255s"
+.section .bss
+    input_buffer: .space 256
+.section .rodata
+.section .rodata
+.str_0: .asciz "Starting up..."
+.section .text
 .section .text
 .globl main
-
 main:
     push %rbp
     mov %rsp, %rbp
     sub $256, %rsp
-.L0:
-    lea .str_2(%rip), %rdi
+    lea .str_0(%rip), %rdi
     xor %eax, %eax
     call printf
-.section .rodata
-.str_2: .asciz "Starting up..."
-.section .text
-    mov $120, %eax
-    mov %eax, -8(%rbp)  # result
+    # Unknown operand: result
     lea fmt_int(%rip), %rdi
-    mov -8(%rbp), %esi
+    mov %rax, %rsi
     xor %eax, %eax
     call printf
     mov $0, %edi
     call exit
-    jmp .L0
-.L1:
-    xor %eax, %eax
+    xor %rax, %rax
     add $256, %rsp
     pop %rbp
     ret
+.section .note.GNU-stack,"",@progbits

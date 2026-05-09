@@ -59,6 +59,257 @@ class Parser {
         return advance();
     }
 
+    // Pratt Parser for expressions
+    // Precedence table:
+    // 1: OR
+    // 2: AND
+    // 3: ==, !=, <, >, <=, >=, is
+    // 4: +, -
+    // 5: *, /, %, @
+    // 6: unary -, NOT
+    // 7: function calls, indexing
+    
+    int getPrecedence(TokenType op) {
+        switch (op) {
+            // Precedence 1: OR
+            case TokenType::IDENTIFIER:
+                if (peek().value == "OR" || peek().value == "or") return 1;
+                // Check for other operators
+                {
+                    const std::string& val = peek().value;
+                    if (val == "+" || val == "-") return 4;
+                    if (val == "*" || val == "/" || val == "%") return 5;
+                }
+                return 0;  // Not an operator
+            
+            // Precedence 2: AND
+            case TokenType::KW_NOT:
+                if (peek().value == "AND" || peek().value == "and") return 2;
+                return 0;
+            
+            // Precedence 3: Comparisons
+            case TokenType::KW_IS:
+            case TokenType::NOT_EQUAL:
+            case TokenType::LT:
+            case TokenType::GT:
+            case TokenType::LTE:
+            case TokenType::GTE:
+                return 3;
+            
+            // Precedence 4: Addition/Subtraction
+            case TokenType::PLUS_EQUAL:  // When used as + in expression context
+            case TokenType::MINUS_EQUAL: // When used as - in expression context
+                return 4;
+            
+            // Precedence 5: Multiplication/Division
+            case TokenType::MULTIPLY:
+            case TokenType::SLASH:
+            case TokenType::AT:
+                return 5;
+            
+            default:
+                return 0;
+        }
+    }
+    
+    bool isRightAssociative(TokenType op) {
+        // All operators are left-associative in AC
+        return false;
+    }
+    
+    // Parse prefix expression (literals, identifiers, unary operators, parenthesized expressions)
+    NodePtr parsePrefix() {
+        // Unary minus
+        if (at(TokenType::IDENTIFIER) && peek().value == "-") {
+            advance();
+            auto operand = parseExpression(6); // Precedence 6 for unary
+            auto node = std::make_unique<ASTNode>(NodeType::UnaryExpr, "-");
+            node->children.push_back(std::move(operand));
+            return node;
+        }
+        
+        // Unary NOT
+        if (at(TokenType::KW_NOT)) {
+            advance();
+            auto operand = parseExpression(6); // Precedence 6 for unary
+            auto node = std::make_unique<ASTNode>(NodeType::UnaryExpr, "NOT");
+            node->children.push_back(std::move(operand));
+            return node;
+        }
+        
+        // Parenthesized expression
+        if (at(TokenType::LPAREN)) {
+            advance();
+            auto expr = parseExpression(0);
+            expect(TokenType::RPAREN, "Expected ')' after expression");
+            return expr;
+        }
+        
+        // Number literal
+        if (at(TokenType::NUMBER)) {
+            auto tok = advance();
+            auto node = std::make_unique<ASTNode>(NodeType::LiteralExpr, tok.value);
+            // Determine if INT or FLOAT
+            if (tok.value.find('.') != std::string::npos) {
+                node->attrs.push_back("FLOAT");
+            } else {
+                node->attrs.push_back("INT");
+            }
+            return node;
+        }
+        
+        // String literal
+        if (at(TokenType::STRING)) {
+            auto tok = advance();
+            auto node = std::make_unique<ASTNode>(NodeType::LiteralExpr, tok.value);
+            node->attrs.push_back("STRING");
+            return node;
+        }
+        
+        // Boolean literals
+        if (at(TokenType::KW_TRUE)) {
+            advance();
+            auto node = std::make_unique<ASTNode>(NodeType::LiteralExpr, "true");
+            node->attrs.push_back("BOOL");
+            return node;
+        }
+        
+        if (at(TokenType::KW_FALSE)) {
+            advance();
+            auto node = std::make_unique<ASTNode>(NodeType::LiteralExpr, "false");
+            node->attrs.push_back("BOOL");
+            return node;
+        }
+        
+        // Identifier (variable or function call)
+        if (at(TokenType::IDENTIFIER)) {
+            auto tok = advance();
+            
+            // Function call: func(args)
+            if (at(TokenType::LPAREN)) {
+                advance();
+                auto node = std::make_unique<ASTNode>(NodeType::CallExpr, tok.value);
+                
+                // Parse arguments
+                while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
+                    node->children.push_back(parseExpression(0));
+                    if (at(TokenType::COMMA)) advance();
+                }
+                
+                expect(TokenType::RPAREN, "Expected ')' after function arguments");
+                return node;
+            }
+            
+            // Array indexing: arr[index]
+            if (at(TokenType::LBRACKET)) {
+                advance();
+                auto arrayNode = std::make_unique<ASTNode>(NodeType::Identifier, tok.value);
+                auto indexExpr = parseExpression(0);
+                expect(TokenType::RBRACKET, "Expected ']' after array index");
+                
+                auto node = std::make_unique<ASTNode>(NodeType::IndexExpr, tok.value);
+                node->children.push_back(std::move(arrayNode));
+                node->children.push_back(std::move(indexExpr));
+                return node;
+            }
+            
+            // Simple identifier
+            auto node = std::make_unique<ASTNode>(NodeType::Identifier, tok.value);
+            return node;
+        }
+        
+        // List literal
+        if (at(TokenType::LBRACKET)) {
+            return parseListLiteral();
+        }
+        
+        // Tuple/Dict literal
+        if (at(TokenType::LBRACE)) {
+            return parseTupleLiteral();
+        }
+        
+        // If we can't parse a prefix, return nullptr
+        return nullptr;
+    }
+    
+    // Parse infix expression (binary operators)
+    NodePtr parseInfix(NodePtr left, TokenType op) {
+        int prec = getPrecedence(op);
+        std::string opStr;
+        
+        // Get operator string
+        if (op == TokenType::IDENTIFIER) {
+            opStr = peek().value;
+            advance();
+        } else if (op == TokenType::KW_IS) {
+            opStr = "is";
+            advance();
+        } else if (op == TokenType::NOT_EQUAL) {
+            opStr = "#=";
+            advance();
+        } else if (op == TokenType::LT) {
+            opStr = "<";
+            advance();
+        } else if (op == TokenType::GT) {
+            opStr = ">";
+            advance();
+        } else if (op == TokenType::LTE) {
+            opStr = "<=";
+            advance();
+        } else if (op == TokenType::GTE) {
+            opStr = ">=";
+            advance();
+        } else if (op == TokenType::MULTIPLY) {
+            opStr = "*";
+            advance();
+        } else if (op == TokenType::SLASH) {
+            opStr = "/";
+            advance();
+        } else if (op == TokenType::AT) {
+            opStr = "@";
+            advance();
+        } else {
+            // Unknown operator
+            return left;
+        }
+        
+        // Parse right operand with appropriate precedence
+        auto right = parseExpression(prec + (isRightAssociative(op) ? 0 : 1));
+        
+        // Create binary expression node
+        auto node = std::make_unique<ASTNode>(NodeType::BinaryExpr, opStr);
+        node->children.push_back(std::move(left));
+        node->children.push_back(std::move(right));
+        return node;
+    }
+    
+    // Main Pratt parser entry point
+    NodePtr parseExpression(int precedence = 0) {
+        // Parse prefix
+        auto left = parsePrefix();
+        if (!left) return nullptr;
+        
+        // Parse infix operators
+        while (true) {
+            TokenType op = peek().type;
+            int prec = getPrecedence(op);
+            
+            // Stop if precedence is too low or we hit a terminator
+            if (prec <= precedence || 
+                at(TokenType::NEWLINE) || 
+                at(TokenType::END_OF_FILE) ||
+                at(TokenType::RPAREN) ||
+                at(TokenType::RBRACKET) ||
+                at(TokenType::COMMA)) {
+                break;
+            }
+            
+            left = parseInfix(std::move(left), op);
+        }
+        
+        return left;
+    }
+
 public:
     explicit Parser(std::vector<Token> toks) : tokens(std::move(toks)) {}
 
@@ -216,66 +467,72 @@ private:
         // configure event-listener
         if (at(TokenType::KW_CONFIGURE)) {
             advance(); // consume configure
-            // Skip "event-listener" tokens without calling parseStatement
-            // Consume: event, -, listener
-            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                advance();
-            }
+            expect(TokenType::KW_EVENT_LISTENER, "Expected 'event-listener'");
             skipNewlines();
             
             auto node = std::make_unique<ASTNode>(NodeType::EventListener);
             
             // Parse the nested block: use listener to establish rule
-            if (at(TokenType::INDENT)) {
-                advance();
-                // Skip "use listener to establish rule" line
-                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                    advance();
-                }
-                skipNewlines();
-                
-                // Skip the INDENT token before the key bindings
-                if (at(TokenType::INDENT)) {
-                    advance();
-                }
-                
-                // Now parse the key bindings - directly handle them here
-                while (at(TokenType::KW_ON) && !at(TokenType::DEDENT)) {
-                    advance(); // consume ON
-                    std::string key;
-                    if (at(TokenType::KW_VALUE)) {
-                        advance();
-                        if (at(TokenType::ASSIGN)) advance();
-                        if (at(TokenType::IDENTIFIER)) key = advance().value;
-                    }
-                    skipNewlines();
-                    auto keyBinding = std::make_unique<ASTNode>(NodeType::KeyBinding, key);
-                    
-                    // Parse the function call on the next line (indented)
-                    if (at(TokenType::INDENT)) {
-                        advance();
-                        skipNewlines();
-                        if (at(TokenType::IDENTIFIER)) {
-                            std::string funcName = advance().value;
-                            std::string args;
-                            if (at(TokenType::LPAREN)) {
-                                advance();
-                                while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
-                                    args += advance().value;
-                                }
-                                if (at(TokenType::RPAREN)) advance();
-                            }
-                            keyBinding->attrs.push_back(funcName + "(" + args + ")");
-                        }
-                        skipNewlines();
-                        if (at(TokenType::DEDENT)) advance();
-                    }
-                    node->children.push_back(std::move(keyBinding));
-                    skipNewlines();
-                }
-                
-                if (at(TokenType::DEDENT)) advance();
+            if (!at(TokenType::INDENT)) {
+                throw SYNTAX_ERROR("Expected indentation after 'configure event-listener'", peek().line, peek().col);
             }
+            advance(); // consume INDENT
+            
+            // Skip "use listener to establish rule" line
+            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
+                advance();
+            }
+            skipNewlines();
+            
+            // Expect INDENT before key bindings
+            if (!at(TokenType::INDENT)) {
+                throw SYNTAX_ERROR("Expected indentation before key bindings", peek().line, peek().col);
+            }
+            advance(); // consume INDENT
+            
+            // Now parse the key bindings - must have at least one
+            int bindingCount = 0;
+            while (at(TokenType::KW_ON) && !at(TokenType::DEDENT)) {
+                advance(); // consume ON
+                
+                // Strict: on value is <key>
+                expect(TokenType::KW_VALUE, "Expected 'value' after 'on'");
+                expect(TokenType::KW_IS, "Expected 'is' after 'value'");
+                std::string key = expect(TokenType::IDENTIFIER, "Expected key identifier").value;
+                
+                skipNewlines();
+                auto keyBinding = std::make_unique<ASTNode>(NodeType::KeyBinding, key);
+                
+                // Parse the block on the next line (indented) - can contain any statements
+                // Don't manually advance INDENT - let parseBlock() handle it via expectIndent()
+                if (at(TokenType::INDENT)) {
+                    // Parse a full block of statements (not just a function call)
+                    auto block = parseBlock();
+                    // Move all children from the parsed block to the keyBinding
+                    for (auto& child : block->children) {
+                        keyBinding->children.push_back(std::move(child));
+                    }
+                }
+                node->children.push_back(std::move(keyBinding));
+                bindingCount++;
+                skipNewlines();
+            }
+            
+            if (bindingCount == 0) {
+                throw SYNTAX_ERROR("Event listener must contain at least one 'on' binding", peek().line, peek().col);
+            }
+            
+            // Consume the DEDENT after key bindings
+            if (!at(TokenType::DEDENT)) {
+                throw SYNTAX_ERROR("Expected dedent after key bindings", peek().line, peek().col);
+            }
+            advance();
+            // Consume the second DEDENT (from "use listener to establish rule" level)
+            if (!at(TokenType::DEDENT)) {
+                throw SYNTAX_ERROR("Expected dedent after event listener block", peek().line, peek().col);
+            }
+            advance();
+            
             return node;
         }
 
@@ -322,27 +579,29 @@ private:
         // display $string$ (screen output)
         if (at(TokenType::KW_DISPLAY)) {
             advance();
-            std::string val;
-            if (at(TokenType::STRING)) val = "$" + advance().value + "$";
-            else if (at(TokenType::IDENTIFIER)) val = advance().value;
-            return std::make_unique<ASTNode>(NodeType::DisplayStmt, val);
+            
+            // Parse display expression using Pratt parser
+            auto displayExpr = parseExpression(0);
+            
+            auto node = std::make_unique<ASTNode>(NodeType::DisplayStmt, "");
+            if (displayExpr) {
+                node->children.push_back(std::move(displayExpr));
+            }
+            return node;
         }
 
         // return expr
         if (at(TokenType::KW_RETURN)) {
             advance();
-            // if next is fn, it's a multiply expression
-            if (at(TokenType::KW_FN)) {
-                auto fnNode = parseFnExpr();
-                auto ret = std::make_unique<ASTNode>(NodeType::ReturnStmt, fnNode->value);
-                return ret;
+            
+            // Parse return expression using Pratt parser
+            auto returnExpr = parseExpression(0);
+            
+            auto node = std::make_unique<ASTNode>(NodeType::ReturnStmt, "");
+            if (returnExpr) {
+                node->children.push_back(std::move(returnExpr));
             }
-            std::string val;
-            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                if (at(TokenType::STRING)) val += "$" + advance().value + "$";
-                else val += advance().value;
-            }
-            return std::make_unique<ASTNode>(NodeType::ReturnStmt, val);
+            return node;
         }
 
         // True / False boolean literals as standalone statements or assignments
@@ -435,30 +694,34 @@ private:
 
     NodePtr parseIf() {
         advance(); // consume IF
-        std::string cond;
-        while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-            if (at(TokenType::STRING))
-                cond += "$" + advance().value + "$ ";
-            else
-                cond += advance().value + " ";
+        
+        // Parse condition using Pratt parser
+        auto condExpr = parseExpression(0);
+        if (!condExpr) {
+            throw SYNTAX_ERROR("Expected condition after IF", peek().line, peek().col);
         }
-        auto node = std::make_unique<ASTNode>(NodeType::IfStmt, cond);
+        
+        auto node = std::make_unique<ASTNode>(NodeType::IfStmt, "");
+        node->children.push_back(std::move(condExpr)); // Condition as first child
         skipNewlines();
-        node->children.push_back(parseBlock());
+        node->children.push_back(parseBlock()); // Body as second child
 
         // Collect ELSEIF / OTHER chain
         while (true) {
             skipNewlines();
             if (at(TokenType::KW_ELSEIF)) {
                 advance();
-                std::string elseifCond;
-                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                    if (at(TokenType::STRING)) elseifCond += "$" + advance().value + "$ ";
-                    else elseifCond += advance().value + " ";
+                
+                // Parse ELSEIF condition using Pratt parser
+                auto elseifCondExpr = parseExpression(0);
+                if (!elseifCondExpr) {
+                    throw SYNTAX_ERROR("Expected condition after ELSEIF", peek().line, peek().col);
                 }
-                auto elseifNode = std::make_unique<ASTNode>(NodeType::ElseIfStmt, elseifCond);
+                
+                auto elseifNode = std::make_unique<ASTNode>(NodeType::ElseIfStmt, "");
+                elseifNode->children.push_back(std::move(elseifCondExpr)); // Condition as first child
                 skipNewlines();
-                elseifNode->children.push_back(parseBlock());
+                elseifNode->children.push_back(parseBlock()); // Body as second child
                 node->children.push_back(std::move(elseifNode));
                 continue;
             }
@@ -478,45 +741,54 @@ private:
 
     NodePtr parseFor() {
         advance(); // consume FOR
-        // FOR item in list  ->  value = "item", attrs[0] = "list"
+        // FOR item in list  ->  value = "item", children[0] = list expression
         std::string item;
         if (at(TokenType::IDENTIFIER)) item = advance().value;
         if (at(TokenType::KW_IN)) advance(); // consume 'in'
-        std::string list;
-        while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-            if (at(TokenType::STRING)) list += "$" + advance().value + "$";
-            else list += advance().value;
+        
+        // Parse list expression using Pratt parser
+        auto listExpr = parseExpression(0);
+        if (!listExpr) {
+            throw SYNTAX_ERROR("Expected collection expression after 'in'", peek().line, peek().col);
         }
+        
         auto node = std::make_unique<ASTNode>(NodeType::ForLoop, item);
-        node->attrs.push_back(list);
+        node->children.push_back(std::move(listExpr)); // Collection expression as first child
         skipNewlines();
-        node->children.push_back(parseBlock());
+        node->children.push_back(parseBlock()); // Body as second child
         return node;
     }
 
     NodePtr parseWhilst() {
         advance(); // consume WHILST
-        std::string cond;
-        while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-            if (at(TokenType::STRING)) cond += "$" + advance().value + "$ ";
-            else cond += advance().value + " ";
+        
+        // Parse condition using Pratt parser
+        auto condExpr = parseExpression(0);
+        if (!condExpr) {
+            throw SYNTAX_ERROR("Expected condition after WHILST", peek().line, peek().col);
         }
-        auto node = std::make_unique<ASTNode>(NodeType::WhilstLoop, cond);
+        
+        auto node = std::make_unique<ASTNode>(NodeType::WhilstLoop, "");
+        node->children.push_back(std::move(condExpr)); // Condition as first child
         skipNewlines();
-        node->children.push_back(parseBlock());
+        node->children.push_back(parseBlock()); // Body as second child
+        
         // Collect else-if/other chains in the same level
         while (true) {
             skipNewlines();
             if (at(TokenType::KW_ELSEIF)) {
                 advance();
-                std::string cond2;
-                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                    if (at(TokenType::STRING)) cond2 += "$" + advance().value + "$ ";
-                    else cond2 += advance().value + " ";
+                
+                // Parse ELSEIF condition using Pratt parser
+                auto elseifCondExpr = parseExpression(0);
+                if (!elseifCondExpr) {
+                    throw SYNTAX_ERROR("Expected condition after ELSEIF", peek().line, peek().col);
                 }
-                auto elseifNode = std::make_unique<ASTNode>(NodeType::ElseIfStmt, cond2);
+                
+                auto elseifNode = std::make_unique<ASTNode>(NodeType::ElseIfStmt, "");
+                elseifNode->children.push_back(std::move(elseifCondExpr)); // Condition as first child
                 skipNewlines();
-                elseifNode->children.push_back(parseBlock());
+                elseifNode->children.push_back(parseBlock()); // Body as second child
                 node->children.push_back(std::move(elseifNode));
                 continue;
             }
@@ -954,16 +1226,14 @@ private:
                 default: nodeType = NodeType::AssignStmt; break;
             }
             
-            std::string val;
-            if (at(TokenType::STRING)) {
-                val = "$" + advance().value + "$";
+            // Parse right-hand side expression using Pratt parser
+            auto rhsExpr = parseExpression(0);
+            if (!rhsExpr) {
+                throw SYNTAX_ERROR("Expected expression after compound assignment operator", peek().line, peek().col);
             }
-            else {
-                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
-                    val += advance().value;
-            }
+            
             auto node = std::make_unique<ASTNode>(nodeType, name);
-            node->attrs.push_back(val);
+            node->children.push_back(std::move(rhsExpr));
             return node;
         }
 
@@ -998,23 +1268,33 @@ private:
             // range N
             if (at(TokenType::KW_RANGE)) {
                 advance();
-                std::string n;
-                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) n += advance().value;
+                auto rangeExpr = parseExpression(0);
+                if (!rangeExpr) {
+                    throw SYNTAX_ERROR("Expected expression after range", peek().line, peek().col);
+                }
                 auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
-                node->attrs.push_back("__range__" + n);
+                node->attrs.push_back("__range__");
+                node->children.push_back(std::move(rangeExpr));
                 return node;
             }
             // sequence(x, y)
             if (at(TokenType::KW_SEQUENCE)) {
                 advance();
                 expect(TokenType::LPAREN, "Expected ( after sequence");
-                std::string x, y;
-                while (!at(TokenType::COMMA) && !at(TokenType::END_OF_FILE)) x += advance().value;
-                if (at(TokenType::COMMA)) advance();
-                while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) y += advance().value;
-                if (at(TokenType::RPAREN)) advance();
+                auto xExpr = parseExpression(0);
+                if (!xExpr) {
+                    throw SYNTAX_ERROR("Expected first argument in sequence", peek().line, peek().col);
+                }
+                expect(TokenType::COMMA, "Expected comma in sequence");
+                auto yExpr = parseExpression(0);
+                if (!yExpr) {
+                    throw SYNTAX_ERROR("Expected second argument in sequence", peek().line, peek().col);
+                }
+                expect(TokenType::RPAREN, "Expected ) after sequence");
                 auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
-                node->attrs.push_back("__sequence__" + x + "," + y);
+                node->attrs.push_back("__sequence__");
+                node->children.push_back(std::move(xExpr));
+                node->children.push_back(std::move(yExpr));
                 return node;
             }
             // function call with keyword args: name = func(key=val, key=val) or func(arg1, arg2)
@@ -1071,20 +1351,15 @@ private:
                 node->children.push_back(std::move(funcCall));
                 return node;
             }
-            std::string val;
-            if (at(TokenType::STRING)) { val = "$" + advance().value + "$"; }
-            else if (at(TokenType::KW_TRUE) || at(TokenType::KW_FALSE)) {
-                // boolean assignment
-                std::string bval = advance().value;
-                std::string lower = bval;
-                for (auto& ch : lower) ch = std::tolower(ch);
-                val = lower; // normalize to lowercase
-            } else {
-                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
-                    val += advance().value;
+            
+            // General expression - use Pratt parser
+            auto rhsExpr = parseExpression(0);
+            if (!rhsExpr) {
+                throw SYNTAX_ERROR("Expected expression after assignment", peek().line, peek().col);
             }
+            
             auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
-            node->attrs.push_back(val);
+            node->children.push_back(std::move(rhsExpr));
             return node;
         }
 

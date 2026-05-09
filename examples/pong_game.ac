@@ -1,24 +1,32 @@
 AC->PY
 use ilib widgets
 
-Make draw_game func(canvas, ball_x, ball_y, paddle1_y, paddle2_y)
+Make draw_game func(canvas, ball_x, ball_y, p1_y, p2_y)
     canvas.clear
     canvas.line(x1=400, y1=0, x2=400, y2=600, fill=$gray$)
-    canvas.rect(x1=10, y1=paddle1_y, x2=20, y2=paddle1_y + 100, fill=$white$)
-    canvas.rect(x1=780, y1=paddle2_y, x2=790, y2=paddle2_y + 100, fill=$white$)
+    canvas.rect(x1=10, y1=p1_y, x2=20, y2=p1_y + 100, fill=$white$)
+    canvas.rect(x1=780, y1=p2_y, x2=790, y2=p2_y + 100, fill=$white$)
     canvas.circle(x=ball_x, y=ball_y, radius=5, fill=$yellow$)
 
-Make move_paddle1_up func()
-        paddle1_y -= 20
-    
-Make move_paddle1_down func()
-        paddle1_y += 20
+Make move_paddle1_up func(y)
+    IF y > 0
+        y -= 20
+    return y
 
-Make move_paddle2_up func()
-        paddle2_y -= 20
-    
-Make move_paddle2_down func()
-        paddle2_y += 20
+Make move_paddle1_down func(y)
+    IF y < 500
+        y += 20
+    return y
+
+Make move_paddle2_up func(y)
+    IF y > 0
+        y -= 20
+    return y
+
+Make move_paddle2_down func(y)
+    IF y < 500
+        y += 20
+    return y
 
 <mainloop>
     root = Screen(title=$Pong Game$, geometry=$800x600$)
@@ -35,16 +43,16 @@ Make move_paddle2_down func()
     score2 = 0
     game_running = true
     
-    configure event-listener *event listener*
+    configure event-listener
         use listener to establish rule
-            on value=KEY_W 
-                move_paddle1_up()
-            on value=KEY_S 
-                move_paddle1_down()
-            on value=KEY_UP 
-                move_paddle2_up()
-            on value=KEY_DOWN 
-                move_paddle2_down()
+            on value is w
+                paddle1_y = move_paddle1_up(paddle1_y)
+            on value is s
+                paddle1_y = move_paddle1_down(paddle1_y)
+            on value is up
+                paddle2_y = move_paddle2_up(paddle2_y)
+            on value is down
+                paddle2_y = move_paddle2_down(paddle2_y)
 
     WHILST game_running is true
         draw_game(canvas, ball_x, ball_y, paddle1_y, paddle2_y)
@@ -53,17 +61,27 @@ Make move_paddle2_down func()
         ball_y += ball_dy
         
         IF ball_y < 0
-            ball_dy = 0 - ball_dy
+            ball_dy @= -1
         
-        IF ball_y > 600
-            ball_dy = 0 - ball_dy
+        ELSEIF ball_y > 600
+            ball_dy @= -1
+        
+        IF ball_x < 30
+            IF ball_y > paddle1_y
+                IF ball_y < paddle1_y + 100
+                    ball_dx @= -1
+        
+        IF ball_x > 770
+            IF ball_y > paddle2_y
+                IF ball_y < paddle2_y + 100
+                    ball_dx @= -1
         
         IF ball_x < 0
             score2 += 1
             ball_x = 400
             ball_y = 300
         
-        IF ball_x > 800
+        ELSEIF ball_x > 800
             score1 += 1
             ball_x = 400
             ball_y = 300
@@ -71,10 +89,11 @@ Make move_paddle2_down func()
         IF score1 is 5
             game_running = false
         
-        IF score2 is 5
+        ELSEIF score2 is 5
             game_running = false
         
         root.update
+        root.after(16)
     
     /kill
 <mainloop>

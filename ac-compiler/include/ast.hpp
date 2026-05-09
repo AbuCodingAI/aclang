@@ -49,7 +49,10 @@ enum class NodeType {
     EventListener,  // configure event-listener
     WhenBlock,      // when many hitbox overlap
     SpawnStmt,      // SpawnTerrain etc
-    BinaryExpr,     // fn a*(b-c) — multiply/arithmetic
+    BinaryExpr,     // fn a*(b-c) — multiply/arithmetic (legacy string-based)
+    UnaryExpr,      // Structured unary expression: op operand
+    CallExpr,       // Structured function call: func(args)
+    LiteralExpr,    // Structured literal: int, float, string, bool, null
     UseLibStmt,     // use ilib <libname>
     RangeExpr,      // range N  → [0..N], N must be Numeral Pos
     SequenceExpr,   // sequence(x,y) → [x..y], breaks if x > y
@@ -73,3 +76,27 @@ struct ASTNode {
     ASTNode(NodeType t, std::string v = "")
         : type(t), value(std::move(v)), inferredType(nullptr) {}
 };
+
+// Structured expression nodes for Pratt parser
+
+// Binary expression: left op right
+// For BinaryExpr nodes:
+// - value: operator as string (+, -, *, /, %, @, <, >, <=, >=, ==, !=, is, not, AND, OR)
+// - children[0]: left operand
+// - children[1]: right operand
+// Note: BinaryExpr is used for both legacy string-based and new structured expressions
+
+// Unary expression: op operand
+// For UnaryExpr nodes:
+// - value: operator as string (-, NOT)
+// - children[0]: operand
+
+// Function call: func(arg1, arg2, ...)
+// For CallExpr nodes:
+// - value: function name
+// - children: argument expressions
+
+// Literal expression: int, float, string, bool, null
+// For LiteralExpr nodes:
+// - value: literal value as string
+// - attrs[0]: type ("INT", "FLOAT", "STRING", "BOOL", "NULL")

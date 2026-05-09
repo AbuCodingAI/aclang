@@ -2,6 +2,9 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <map>
+#include <functional>
+#include <unordered_map>
 using namespace std;
 
 
@@ -9,13 +12,7 @@ using namespace std;
 
 int main() {
     while (true) {
-        vector<int> nums = [&]{ vector<int> _r; for(int _i=0;_i<=(int)(5);_i++) _r.push_back(_i); return _r; }();
-        vector<int> seq = [&]{ if((2)>(6)) throw runtime_error("Preposterous: sequence start > end"); vector<int> _r; for(int _i=(2);_i<=(6);_i++) _r.push_back(_i); return _r; }();
-        vector<string> items = {"apple", "banana", "cherry"};
-        const vector<string> fixed = {"a", "b", "c"};
-        items.insert(items.begin(), "mango");
-        items.push_back("grape");
-        exit(0);
+        logic.pushScope(/*args*/)
     }
 return 0;
 }

@@ -1,0 +1,13 @@
+AC->PY
+
+Make fibonacci func(n)
+    IF n <= 1
+        return n
+    OTHER
+        return fibonacci(n - 1) + fibonacci(n - 2)
+
+<mainloop>
+    result = fibonacci(10)
+    Term.display result
+    /kill
+<mainloop>

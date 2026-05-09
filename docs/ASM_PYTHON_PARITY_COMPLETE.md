@@ -173,7 +173,7 @@ Make factorial func(n)
     
     configure event-listener
         use listener to establish rule
-            on value=space
+            on value is space
                 Term.display $Space pressed!$
     
     /kill

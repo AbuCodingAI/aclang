@@ -3,8 +3,8 @@
 #include "../include/error.hpp"
 #include "../include/backend_registry.hpp"
 #include "../include/ir.hpp"
+#include "../include/exp_bny.hpp"
 #include "acc_cache.hpp"
-#include "ir_cache.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -17,22 +17,13 @@ std::vector<Token> lex(const std::string& source);
 NodePtr parse(const std::vector<Token>& tokens);
 
 // IR-based compilation (defined in ir.cpp inside AC_IR namespace)
-namespace AC_IR { IRProgram generateIR(const ASTNode& ast, const std::string& backend); }
+namespace AC_IR { 
+    IRProgram generateIR(const ASTNode& ast, const std::string& backend);
+    std::string generateIRText(const IRProgram& program);
+}
 
-// Legacy direct codegens (for fallback)
-std::string generatePython(const ASTNode& ast);
-std::string generateJS(const ASTNode& ast);
-std::string generateHTML(const ASTNode& ast);
-std::string generateJava(const ASTNode& ast);
-std::string generateCpp(const ASTNode& ast);
-std::string generateC(const ASTNode& ast);
-std::string generateAsm(const ASTNode& ast);
-std::string generateRs(const ASTNode& ast);
-std::string generateGo(const ASTNode& ast);
-std::string generateV(const ASTNode& ast);
-std::string generateBny(const ASTNode& ast);
-
-// IR JSON generator and codegen implementation
+// Unified IR-based code generator (defined in ir_codegen.cpp)
+std::string generateFromIR(const AC_IR::IRProgram& ir);
 
 static std::string readFile(const std::string& path) {
     std::ifstream f(path);
@@ -63,7 +54,7 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--version" || arg == "-v") {
-            std::cout << "AC Compiler v0.1.6\n";
+            std::cout << "AC Compiler v0.1.7\n";
             return 0;
         }
     }
@@ -125,12 +116,8 @@ int main(int argc, char* argv[]) {
         NodePtr ast;
         AC_IR::IRProgram irProgram;
         
-        // Try to load from LIR cache first (fastest path)
-        if (!forceCompile && lirCacheIsValid(inputFile, lirFile, backend)) {
-            irProgram = loadLIRCache(lirFile);
-        }
-        
-        // If LIR cache miss, try AST cache
+        // LIR cache disabled - causes segfaults with binary serialization
+        // Generate IR from AST directly
         if (!irProgram.functions.size()) {
             if (!forceCompile && cacheIsValid(inputFile, accFile)) {
                 ast = loadCache(accFile);
@@ -146,17 +133,36 @@ int main(int argc, char* argv[]) {
             // Generate IR from AST
             irProgram = AC_IR::generateIR(*ast, backend);
             
-            // Save LIR cache
-            saveLIRCache(lirFile, irProgram, backend);
+            // Save text-based LIR (not binary cache)
+            std::string lirContent = AC_IR::generateIRText(irProgram);
+            writeFile(lirFile, lirContent);
         }
         
-        // Generate target code from AST using backend
+        // Generate target code from IR using unified codegen
         if (!BackendRegistry::hasBackend(backend)) {
             throw BACKEND_ERROR("Unknown backend: " + backend);
         }
         
         const auto& backendInfo = BackendRegistry::getBackend(backend);
-        std::string code = backendInfo.generator(*ast);
+        
+        // Generate code from IR
+        std::string code;
+        
+        if (backend == "BNY") {
+            // BNY: Direct binary generation (experimental)
+            // Skip ASM, .o files, and external linker entirely
+            std::string outFile = inputFile.substr(0, inputFile.rfind('.')) + backendInfo.extension;
+            
+            if (!generateBinaryFromIR(irProgram, outFile)) {
+                throw std::runtime_error("Failed to generate binary. exp_bny only supports Linux x86-64 currently.");
+            }
+            
+            std::cout << "Generated: " << outFile << " (IR: " << lirFile << ") [exp_bny]\n";
+            return 0;
+        } else {
+            // All other backends: use unified IR codegen
+            code = generateFromIR(irProgram);
+        }
         
         // Output target file
         std::string outFile = inputFile.substr(0, inputFile.rfind('.')) + backendInfo.extension;

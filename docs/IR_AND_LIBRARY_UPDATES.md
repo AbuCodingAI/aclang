@@ -135,9 +135,9 @@ AC->PY
 <mainloop>
     configure event-listener
         use listener to establish rule
-            on value=space
+            on value is space
                 jump()
-            on value=a
+            on value is a
                 move_left()
     
     # If space is pressed, jump() is called

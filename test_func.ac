@@ -1,0 +1,13 @@
+AC->PY
+
+<mainloop>
+     Make factorial func(n)
+          IF n = 0
+               return 1
+          OTHER
+               return n
+     
+     result = factorial(5)
+     Term.display result
+     /kill
+<mainloop>

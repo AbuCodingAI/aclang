@@ -3,7 +3,7 @@ AC->BNY
     x=Term.ask $Which is better, 67 or 21$
     IF x is $67$
         Term.display $You are a Gen Alpha$
-    ELSE IF x is 21
+    ELSEIF x is 21
         Term.display $You are a Gen Z$
     OTHER
         Term.display $Choose 67 or 21$

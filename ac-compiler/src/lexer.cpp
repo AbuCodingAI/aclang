@@ -52,6 +52,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"destroy",  TokenType::KW_DESTROY},
     {"programLoop", TokenType::KW_PROGRAM_LOOP},
     {"configure", TokenType::KW_CONFIGURE},
+    {"event-listener", TokenType::KW_EVENT_LISTENER},
     {"listener", TokenType::KW_LISTENER},
     {"establish", TokenType::KW_ESTABLISH},
     {"rule", TokenType::KW_RULE},
@@ -262,7 +263,7 @@ public:
             if (std::isalpha(src[pos]) || src[pos] == '_') {
                 int sc = col;
                 std::string word;
-                while (pos < src.size() && (std::isalnum(src[pos]) || src[pos] == '_')) {
+                while (pos < src.size() && (std::isalnum(src[pos]) || src[pos] == '_' || src[pos] == '-')) {
                     word += src[pos++]; col++;
                 }
                 auto it = KEYWORDS.find(word);

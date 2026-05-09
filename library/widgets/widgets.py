@@ -20,6 +20,13 @@ class Screen:
     def update(self):
         self.root.update()
     
+    def after(self, ms, func=None):
+        """Schedule a function to be called after ms milliseconds, or just delay"""
+        if func:
+            self.root.after(ms, func)
+        else:
+            self.root.after(ms)
+    
     def destroy(self):
         self.root.destroy()
 

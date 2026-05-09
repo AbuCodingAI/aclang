@@ -5,6 +5,7 @@
 #include <sstream>
 #include <vector>
 #include <cctype>
+#include <set>
 #include <functional>
 #include <map>
 
@@ -12,6 +13,7 @@ class PythonCodeGen : public BaseCodeGen {
     std::ostringstream out;
     int indentLevel = 0;
     std::map<std::string, TypePtr> varTypes;
+    bool inEventListener = false;
 
     void emit(const std::string& line) {
         out << std::string(indentLevel * 4, ' ') << line << "\n";
@@ -118,16 +120,6 @@ class PythonCodeGen : public BaseCodeGen {
         // #= -> !=
         for (size_t p = 0; (p = r.find("#=", p)) != std::string::npos;)
             r.replace(p, 2, "!="), p += 2;
-        
-        // In AC, single = in condition context means ==
-        // Replace = with == (but not #=, !=, <=, >=)
-        for (size_t p = 0; p < r.size(); p++) {
-            if (r[p] == '=' && (p == 0 || (r[p-1] != '#' && r[p-1] != '!' && r[p-1] != '<' && r[p-1] != '>')) &&
-                (p+1 >= r.size() || r[p+1] != '=')) {
-                r.insert(p, "=");
-                p++;
-            }
-        }
         
         // is -> == (AC equality keyword; Python's `is` is identity, so we use ==)
         for (size_t p = 0; (p = r.find(" is ", p)) != std::string::npos;)
@@ -249,16 +241,118 @@ class PythonCodeGen : public BaseCodeGen {
         for (auto& x : b) if (x == name) return true;
         return false;
     }
+    
+    // Generate Python code from structured expression AST nodes
+    std::string generateExpressionCode(const ASTNode& expr) {
+        switch (expr.type) {
+            case NodeType::LiteralExpr: {
+                // Literal values: int, float, string, bool
+                if (!expr.attrs.empty()) {
+                    const std::string& typeStr = expr.attrs[0];
+                    if (typeStr == "INT" || typeStr == "FLOAT") {
+                        return expr.value;
+                    } else if (typeStr == "STRING") {
+                        // Escape and quote the string
+                        std::string escaped;
+                        for (char c : expr.value) {
+                            if (c == '"') escaped += "\\\"";
+                            else if (c == '\\') escaped += "\\\\";
+                            else if (c == '\n') escaped += "\\n";
+                            else if (c == '\t') escaped += "\\t";
+                            else escaped += c;
+                        }
+                        return "\"" + escaped + "\"";
+                    } else if (typeStr == "BOOL") {
+                        return (expr.value == "true") ? "True" : "False";
+                    }
+                }
+                return expr.value;
+            }
+            
+            case NodeType::Identifier: {
+                // Variable reference
+                return expr.value;
+            }
+            
+            case NodeType::BinaryExpr: {
+                // Binary operation: left op right
+                if (expr.children.size() >= 2) {
+                    std::string left = generateExpressionCode(*expr.children[0]);
+                    std::string right = generateExpressionCode(*expr.children[1]);
+                    std::string op = expr.value;
+                    
+                    // Translate AC operators to Python
+                    if (op == "@") op = "*";  // @ is multiplication in AC
+                    else if (op == "#=") op = "!=";  // #= is not-equal in AC
+                    else if (op == "is") op = "==";  // is is equality in AC (not identity)
+                    else if (op == "AND" || op == "and") op = "and";
+                    else if (op == "OR" || op == "or") op = "or";
+                    
+                    return left + " " + op + " " + right;
+                }
+                // Fallback: treat as string expression (legacy compatibility)
+                return translateExpr(expr.value);
+            }
+            
+            case NodeType::UnaryExpr: {
+                // Unary operation: op operand
+                if (!expr.children.empty()) {
+                    std::string operand = generateExpressionCode(*expr.children[0]);
+                    if (expr.value == "-") {
+                        return "-" + operand;
+                    } else if (expr.value == "NOT") {
+                        return "not " + operand;
+                    }
+                }
+                return "";
+            }
+            
+            case NodeType::CallExpr: {
+                // Function call: func(args)
+                std::string funcName = expr.value;
+                std::string args;
+                for (size_t i = 0; i < expr.children.size(); i++) {
+                    if (i > 0) args += ", ";
+                    args += generateExpressionCode(*expr.children[i]);
+                }
+                return funcName + "(" + args + ")";
+            }
+            
+            case NodeType::IndexExpr: {
+                // Array indexing: array[index]
+                if (expr.children.size() >= 2) {
+                    std::string arr = generateExpressionCode(*expr.children[0]);
+                    std::string idx = generateExpressionCode(*expr.children[1]);
+                    // AC uses 1-based indexing, Python uses 0-based
+                    // If index is a constant integer, subtract 1
+                    if (expr.children[1]->type == NodeType::LiteralExpr && 
+                        !expr.children[1]->attrs.empty() && 
+                        expr.children[1]->attrs[0] == "INT") {
+                        try {
+                            int idxVal = std::stoi(idx);
+                            return arr + "[" + std::to_string(idxVal - 1) + "]";
+                        } catch (...) {
+                            // Not a constant, use runtime conversion
+                            return arr + "[" + idx + " - 1]";
+                        }
+                    }
+                    return arr + "[" + idx + " - 1]";
+                }
+                // Fallback: use variable name
+                return expr.value;
+            }
+            
+            default:
+                // Fallback: treat as variable or constant
+                if (!expr.value.empty()) {
+                    return expr.value;
+                }
+                return "";
+        }
+    }
 
     void genBlock(const ASTNode& node) {
-        if (node.children.empty()) { emit("pass"); return; }
-        bool hasContent = false;
-        for (auto& c : node.children) {
-            if (c->type != NodeType::Block || !c->children.empty()) {
-                hasContent = true; break;
-            }
-        }
-        if (!hasContent) { emit("pass"); return; }
+        if (node.children.empty()) { return; }
         for (auto& c : node.children) genNode(*c);
     }
 
@@ -294,12 +388,8 @@ class PythonCodeGen : public BaseCodeGen {
                 emitRaw("    def bind(self, key, callback):");
                 emitRaw("        self.bindings[key] = callback");
                 emitRaw("    def trigger(self, key):");
-                emitRaw("        # Automatically trigger if binding exists, otherwise do nothing");
                 emitRaw("        if key in self.bindings:");
                 emitRaw("            self.bindings[key]()");
-                emitRaw("    def check_and_trigger(self, key):");
-                emitRaw("        # Check and trigger - if no binding, do absolutely nothing");
-                emitRaw("        self.trigger(key)");
                 emitRaw("");
                 emitRaw("ac_event_listener = EventListener()");
             }
@@ -327,11 +417,51 @@ class PythonCodeGen : public BaseCodeGen {
             }
             emitRaw("");
             
+            // Collect all variables that functions modify (need to be global)
+            std::set<std::string> globalVars;
+            std::function<void(const ASTNode&)> collectGlobals = [&](const ASTNode& n) {
+                if (n.type == NodeType::FuncDef) {
+                    // Check what variables this function modifies
+                    if (!n.children.empty() && n.children[0]->type == NodeType::Block) {
+                        for (auto& stmt : n.children[0]->children) {
+                            if (stmt->type == NodeType::PlusEqualStmt || stmt->type == NodeType::MinusEqualStmt ||
+                                stmt->type == NodeType::MultiplyEqualStmt || stmt->type == NodeType::AtEqualStmt ||
+                                stmt->type == NodeType::DivideEqualStmt || stmt->type == NodeType::AssignStmt) {
+                                // Check if this variable is NOT a parameter
+                                bool isParam = false;
+                                for (auto& param : n.attrs) {
+                                    if (param == stmt->value) {
+                                        isParam = true;
+                                        break;
+                                    }
+                                }
+                                if (!isParam) {
+                                    globalVars.insert(stmt->value);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (auto& c : n.children) collectGlobals(*c);
+            };
+            for (auto& c : node.children) collectGlobals(*c);
+            
+            // Generate global variable declarations
+            for (auto& varName : globalVars) {
+                emit(varName + " = None");
+            }
+            if (!globalVars.empty()) emitRaw("");
+            
             // Recursively collect and generate ALL function definitions from entire program
             std::function<void(const ASTNode&)> collectFuncs = [&](const ASTNode& n) {
-                if (n.type == NodeType::FuncDef) genNode(n);
-                for (auto& c : n.children) collectFuncs(*c);
+                if (n.type == NodeType::FuncDef) {
+                    genNode(n);
+                }
+                for (auto& c : n.children) {
+                    collectFuncs(*c);
+                }
             };
+            
             for (auto& c : node.children) {
                 collectFuncs(*c);
             }
@@ -359,8 +489,22 @@ class PythonCodeGen : public BaseCodeGen {
             
             emitRaw("def main():");
             indentLevel++;
-            emit("while True:");
-            indentLevel++;
+            
+            // First, emit ALL function definitions from entire program
+            std::function<void(const ASTNode&)> emitFuncs = [&](const ASTNode& n) {
+                if (n.type == NodeType::FuncDef) {
+                    genNode(n);
+                }
+                for (auto& c : n.children) {
+                    emitFuncs(*c);
+                }
+            };
+            
+            for (auto& c : node.children) {
+                emitFuncs(*c);
+            }
+            
+            // Then emit mainloop body
             for (auto& c : mainloopBlock->children) {
                 // If widgets is used and we hit /kill, add root.mainloop before it
                 if (usesWidgets && c->type == NodeType::KillStmt) {
@@ -368,7 +512,6 @@ class PythonCodeGen : public BaseCodeGen {
                 }
                 genNode(*c);
             }
-            indentLevel--;
             indentLevel--;
             emitRaw("");
             emitRaw("if __name__ == \"__main__\":");
@@ -425,6 +568,14 @@ class PythonCodeGen : public BaseCodeGen {
             break;
 
         case NodeType::AssignStmt: {
+            // Check if we have a structured expression as child (new Pratt parser)
+            if (!node.children.empty()) {
+                std::string rhsCode = generateExpressionCode(*node.children[0]);
+                emit(node.value + " = " + rhsCode);
+                break;
+            }
+            
+            // Legacy string-based handling (fallback)
             if (!node.attrs.empty()) {
                 std::string val = node.attrs[0];
                 if (val.substr(0, 8) == "__list__") {
@@ -518,31 +669,56 @@ class PythonCodeGen : public BaseCodeGen {
         }
 
         case NodeType::PlusEqualStmt:
-            if (!node.attrs.empty()) {
+            if (!node.children.empty()) {
+                // Structured expression as child
+                std::string rhsCode = generateExpressionCode(*node.children[0]);
+                emit(node.value + " += " + rhsCode);
+            } else if (!node.attrs.empty()) {
+                // Legacy string-based (fallback)
                 emit(node.value + " += " + quoteIfString(node.attrs[0]));
             }
             break;
 
         case NodeType::MinusEqualStmt:
-            if (!node.attrs.empty()) {
+            if (!node.children.empty()) {
+                // Structured expression as child
+                std::string rhsCode = generateExpressionCode(*node.children[0]);
+                emit(node.value + " -= " + rhsCode);
+            } else if (!node.attrs.empty()) {
+                // Legacy string-based (fallback)
                 emit(node.value + " -= " + quoteIfString(node.attrs[0]));
             }
             break;
 
         case NodeType::MultiplyEqualStmt:
-            if (!node.attrs.empty()) {
+            if (!node.children.empty()) {
+                // Structured expression as child
+                std::string rhsCode = generateExpressionCode(*node.children[0]);
+                emit(node.value + " *= " + rhsCode);
+            } else if (!node.attrs.empty()) {
+                // Legacy string-based (fallback)
                 emit(node.value + " *= " + quoteIfString(node.attrs[0]));
             }
             break;
 
         case NodeType::DivideEqualStmt:
-            if (!node.attrs.empty()) {
+            if (!node.children.empty()) {
+                // Structured expression as child
+                std::string rhsCode = generateExpressionCode(*node.children[0]);
+                emit(node.value + " /= " + rhsCode);
+            } else if (!node.attrs.empty()) {
+                // Legacy string-based (fallback)
                 emit(node.value + " /= " + quoteIfString(node.attrs[0]));
             }
             break;
 
         case NodeType::AtEqualStmt:
-            if (!node.attrs.empty()) {
+            if (!node.children.empty()) {
+                // Structured expression as child
+                std::string rhsCode = generateExpressionCode(*node.children[0]);
+                emit(node.value + " *= " + rhsCode);  // @ is multiplication
+            } else if (!node.attrs.empty()) {
+                // Legacy string-based (fallback)
                 emit(node.value + " *= " + quoteIfString(node.attrs[0]));
             }
             break;
@@ -671,6 +847,26 @@ class PythonCodeGen : public BaseCodeGen {
             }
             emit("def " + node.value + "(" + args + "):");
             indentLevel++;
+            // Add global declarations for variables modified in function (but NOT parameters)
+            if (!node.children.empty() && node.children[0]->type == NodeType::Block) {
+                for (auto& stmt : node.children[0]->children) {
+                    if (stmt->type == NodeType::PlusEqualStmt || stmt->type == NodeType::MinusEqualStmt ||
+                        stmt->type == NodeType::MultiplyEqualStmt || stmt->type == NodeType::AtEqualStmt ||
+                        stmt->type == NodeType::DivideEqualStmt || stmt->type == NodeType::AssignStmt) {
+                        // Check if this variable is NOT a parameter
+                        bool isParam = false;
+                        for (auto& param : node.attrs) {
+                            if (param == stmt->value) {
+                                isParam = true;
+                                break;
+                            }
+                        }
+                        if (!isParam) {
+                            emit("global " + stmt->value);
+                        }
+                    }
+                }
+            }
             if (!node.children.empty()) genBlock(*node.children[0]);
             else emit("pass");
             indentLevel--;
@@ -680,48 +876,113 @@ class PythonCodeGen : public BaseCodeGen {
         case NodeType::IfStmt: {
             if (node.value == "OTHER") {
                 emit("else:");
+                indentLevel++;
+                for (auto& c : node.children) genNode(*c);
+                indentLevel--;
             } else {
-                std::string cond = translateCondition(node.value);
+                std::string cond;
+                size_t bodyIndex = 0;
+                
+                // Check if first child is a structured expression (new Pratt parser)
+                if (!node.children.empty() && node.children[0]->type != NodeType::Block) {
+                    cond = generateExpressionCode(*node.children[0]);
+                    bodyIndex = 1;  // Body starts at index 1
+                } else {
+                    // Legacy string-based condition (fallback)
+                    cond = translateCondition(node.value);
+                    bodyIndex = 0;  // Body starts at index 0
+                }
+                
                 emit("if " + cond + ":");
-            }
-            indentLevel++;
-            if (!node.children.empty()) genBlock(*node.children[0]);
-            else emit("pass");
-            indentLevel--;
-            
-            // Handle ELSEIF and OTHER blocks (they are additional children)
-            for (size_t i = 1; i < node.children.size(); i++) {
-                genNode(*node.children[i]);
+                indentLevel++;
+                // Only process the body (first block child)
+                if (bodyIndex < node.children.size()) {
+                    genNode(*node.children[bodyIndex]);
+                }
+                indentLevel--;
+                // Process remaining children (ELSEIF/OTHER) at the same indent level
+                for (size_t i = bodyIndex + 1; i < node.children.size(); i++) {
+                    genNode(*node.children[i]);
+                }
             }
             break;
         }
 
         case NodeType::ElseIfStmt: {
-            std::string cond = translateCondition(node.value);
+            std::string cond;
+            size_t bodyIndex = 0;
+            
+            // Check if first child is a structured expression (new Pratt parser)
+            if (!node.children.empty() && node.children[0]->type != NodeType::Block) {
+                cond = generateExpressionCode(*node.children[0]);
+                bodyIndex = 1;  // Body starts at index 1
+            } else {
+                // Legacy string-based condition (fallback)
+                cond = translateCondition(node.value);
+                bodyIndex = 0;  // Body starts at index 0
+            }
+            
             emit("elif " + cond + ":");
             indentLevel++;
-            if (!node.children.empty()) genBlock(*node.children[0]);
-            else emit("pass");
+            for (size_t i = bodyIndex; i < node.children.size(); i++) {
+                genNode(*node.children[i]);
+            }
             indentLevel--;
             break;
         }
 
         case NodeType::ForLoop: {
-            std::string lst = node.attrs.empty() ? "[]" : translateExpr(node.attrs[0]);
+            std::string lst;
+            size_t bodyIndex = 0;
+            
+            // Check if first child is a structured expression (new Pratt parser)
+            if (!node.children.empty() && node.children[0]->type != NodeType::Block) {
+                lst = generateExpressionCode(*node.children[0]);
+                bodyIndex = 1;  // Body starts at index 1
+            } else {
+                // Legacy string-based list (fallback)
+                lst = node.attrs.empty() ? "[]" : translateExpr(node.attrs[0]);
+                bodyIndex = 0;  // Body starts at index 0
+            }
+            
             emit("for " + node.value + " in " + lst + ":");
             indentLevel++;
-            if (!node.children.empty()) genBlock(*node.children[0]);
-            else emit("pass");
+            if (bodyIndex < node.children.size()) {
+                genBlock(*node.children[bodyIndex]);
+            } else {
+                emit("pass");
+            }
             indentLevel--;
             break;
         }
 
         case NodeType::WhilstLoop: {
-            std::string cond = translateCondition(node.value);
+            std::string cond;
+            size_t bodyIndex = 0;
+            
+            // Check if first child is a structured expression (new Pratt parser)
+            if (!node.children.empty() && node.children[0]->type != NodeType::Block) {
+                cond = generateExpressionCode(*node.children[0]);
+                bodyIndex = 1;  // Body starts at index 1
+            } else {
+                // Legacy string-based condition (fallback)
+                cond = translateCondition(node.value);
+                bodyIndex = 0;  // Body starts at index 0
+            }
+            
+            // Simplify "x == True" to just "x" and "x == False" to "not x"
+            if (cond.find(" == True") != std::string::npos) {
+                cond = cond.substr(0, cond.find(" == True"));
+            } else if (cond.find(" == False") != std::string::npos) {
+                std::string var = cond.substr(0, cond.find(" == False"));
+                cond = "not " + var;
+            }
+            
             emit("while " + cond + ":");
             indentLevel++;
-            if (!node.children.empty()) genBlock(*node.children[0]);
-            else emit("pass");
+            for (size_t i = bodyIndex; i < node.children.size(); i++) {
+                genNode(*node.children[i]);
+            }
             indentLevel--;
             break;
         }
@@ -772,14 +1033,52 @@ class PythonCodeGen : public BaseCodeGen {
         }
 
         case NodeType::EventListener:
-            // Generate event listener setup
+            // Generate event listener setup with native keyboard binding
+            emit("# Setup keyboard event bindings");
             for (auto& child : node.children) {
                 if (child->type == NodeType::KeyBinding) {
                     std::string key = child->value;
-                    std::string callback = child->attrs.empty() ? "" : child->attrs[0];
-                    if (!callback.empty()) {
-                        emit("ac_event_listener.bind('" + key + "', lambda: " + callback + ")");
+                    // Collect variables that are assigned in the callback (need nonlocal)
+                    std::set<std::string> assignedVars;
+                    std::function<void(const ASTNode&)> collectAssignedVars = [&](const ASTNode& n) {
+                        if (n.type == NodeType::AssignStmt || n.type == NodeType::PlusEqualStmt ||
+                            n.type == NodeType::MinusEqualStmt || n.type == NodeType::MultiplyEqualStmt ||
+                            n.type == NodeType::AtEqualStmt || n.type == NodeType::DivideEqualStmt) {
+                            assignedVars.insert(n.value);
+                        }
+                        for (auto& c : n.children) collectAssignedVars(*c);
+                    };
+                    for (auto& stmt : child->children) {
+                        collectAssignedVars(*stmt);
                     }
+                    
+                    // Generate proper function definition for the key binding
+                    emit("def _callback_" + key + "():");
+                    indentLevel++;
+                    // Add nonlocal declarations for assigned variables
+                    for (const auto& var : assignedVars) {
+                        emit("nonlocal " + var);
+                    }
+                    // Generate all nested statements from the KeyBinding
+                    for (auto& stmt : child->children) {
+                        genNode(*stmt);
+                    }
+                    indentLevel--;
+                    emit("ac_event_listener.bind('" + key + "', _callback_" + key + ")");
+                    // Map AC key names to tkinter key events - use proper function instead of lambda
+                    std::string tk_key;
+                    if (key == "up") tk_key = "<Up>";
+                    else if (key == "down") tk_key = "<Down>";
+                    else if (key == "left") tk_key = "<Left>";
+                    else if (key == "right") tk_key = "<Right>";
+                    else if (key == "space") tk_key = "<space>";
+                    else tk_key = "<Key-" + key + ">";
+                    // Generate tkinter binding function
+                    emit("def _tk_" + key + "(e):");
+                    indentLevel++;
+                    emit("ac_event_listener.trigger('" + key + "')");
+                    indentLevel--;
+                    emit("root.root.bind('" + tk_key + "', _tk_" + key + ")");
                 }
             }
             break;
@@ -809,36 +1108,7 @@ class PythonCodeGen : public BaseCodeGen {
         if (name == "mainloop") {
             emit("def main():");
             indentLevel++;
-
-            bool hasStartHere = false;
-            for (auto& c : node.children)
-                if (c->type == NodeType::TagBlock && c->value == "StartHere")
-                    { hasStartHere = true; break; }
-
-            if (hasStartHere) {
-                // emit setup code before StartHere once
-                for (auto& c : node.children) {
-                    if (c->type == NodeType::TagBlock && c->value == "StartHere") break;
-                    genNode(*c);
-                }
-                // StartHere body loops forever
-                emit("while True:");
-                indentLevel++;
-                for (auto& c : node.children) {
-                    if (c->type == NodeType::TagBlock && c->value == "StartHere") {
-                        for (auto& inner : c->children) genNode(*inner);
-                        break;
-                    }
-                }
-                indentLevel--;
-            } else {
-                // no StartHere — whole mainloop body loops forever
-                emit("while True:");
-                indentLevel++;
-                for (auto& c : node.children) genNode(*c);
-                indentLevel--;
-            }
-
+            for (auto& c : node.children) genNode(*c);
             indentLevel--;
             emitRaw("");
             emit("if __name__ == \"__main__\":");

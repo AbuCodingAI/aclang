@@ -1,0 +1,11 @@
+AC->PY
+
+<mainloop>
+    * This is a comment *
+    x = 5 * 3
+    display x
+    Term.display x
+    y = 5 @ 3
+    display y
+    /kill
+<mainloop>
