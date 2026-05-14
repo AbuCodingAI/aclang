@@ -1,7 +1,7 @@
 {
   "name": "aclang",
   "version": "0.2.0",
-  "description": "AC Language Compiler v0.2.0 - A multi-target compiler for the AC programming language with float support, constant folding, copy propagation, caret error messages, and a cross-backend test suite",
+  "description": "AC Language Compiler — a multi-target language that compiles to Python, JavaScript, C++, Java, Rust, Go, V, ASM, and native binary (BNY). Features: Pratt parser, unified IR, ELSEIF chains, hash-based IR cache, DWARF debug info, and and/or keyword aliases.",
   "bin": {
     "ac": "bin/ac",
     "install-backends": "scripts/install-backends.js"
@@ -10,13 +10,19 @@
     "install": "node scripts/install.js",
     "build": "cd ac-compiler && make",
     "install-backends": "node scripts/install-backends.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "bash tests/run.sh"
   },
   "keywords": [
     "compiler",
     "ac-language",
+    "aclang",
     "multi-target",
-    "cross-platform"
+    "cross-platform",
+    "programming-language",
+    "transpiler",
+    "native-binary",
+    "python-codegen",
+    "javascript-codegen"
   ],
   "author": "Abu",
   "license": "MIT",
@@ -24,9 +30,12 @@
     "type": "git",
     "url": "https://github.com/AbuCodingAI/aclang.git"
   },
+  "homepage": "https://github.com/AbuCodingAI/aclang#readme",
+  "bugs": {
+    "url": "https://github.com/AbuCodingAI/aclang/issues"
+  },
   "engines": {
-    "node": ">=14.0.0",
-    "python": ">=3.6.0"
+    "node": ">=14.0.0"
   },
   "os": [
     "linux",
@@ -38,20 +47,23 @@
     "arm64"
   ],
   "files": [
-    "ac-compiler/",
-    "docs/",
+    "bin/",
+    "scripts/",
     "examples/",
     "library/",
-    "scripts/",
-    "website/",
+    "ac-compiler/ac",
+    "ac-compiler/Makefile",
+    "ac-compiler/setup.sh",
+    "ac-compiler/setup.bat",
+    "ac-compiler/install.py",
+    "ac-compiler/ac_repl.py",
+    "ac-compiler/src/",
+    "ac-compiler/include/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "LANGUAGE_QUALITY_ROADMAP.md"
   ],
   "publishConfig": {
     "access": "public"
-  },
-  "dependencies": {
-    "aclang": "^0.1.5",
-    "vercel": "^53.1.0"
   }
 }

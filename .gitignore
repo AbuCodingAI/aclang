@@ -1,6 +1,8 @@
 *.acc
 *.lir
 *.datac
+*.pyc
+__pycache__/
 .kiro/
 .vscode/
 .windsurf/
