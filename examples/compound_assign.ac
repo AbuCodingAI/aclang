@@ -1,0 +1,11 @@
+AC->PY
+
+<mainloop>
+    x = 1
+    x |= 0
+    Term.display x
+    y = 1
+    y |= 1
+    Term.display y
+    /kill
+<mainloop>

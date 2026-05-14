@@ -1,0 +1,23 @@
+AC->PY
+
+<mainloop>
+    a = 5
+    b = 10
+    IF a is b
+        Term.display $equal$
+    OTHER
+        Term.display $not equal$
+    IF a #= b
+        Term.display $different$
+    OTHER
+        Term.display $same$
+    IF a #< b
+        Term.display $a ge b$
+    OTHER
+        Term.display $a lt b$
+    IF b #> a
+        Term.display $b le a$
+    OTHER
+        Term.display $b gt a$
+    /kill
+<mainloop>

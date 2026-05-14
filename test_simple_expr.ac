@@ -1,9 +1,0 @@
-AC->PY
-
-<mainloop>
-     x = 5
-     y = 10
-     z = x + y
-     Term.display z
-     /kill
-<mainloop>

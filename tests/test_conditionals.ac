@@ -1,0 +1,19 @@
+AC->PY
+
+<mainloop>
+    n = 3
+    IF n is 1
+        Term.display $one$
+    ELSEIF n is 2
+        Term.display $two$
+    ELSEIF n is 3
+        Term.display $three$
+    OTHER
+        Term.display $other$
+    x = 7
+    IF x is 7
+        Term.display $lucky$
+    OTHER
+        Term.display $unlucky$
+    /kill
+<mainloop>

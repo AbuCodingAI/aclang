@@ -1,0 +1,13 @@
+AC->PY
+
+<mainloop>
+    a = 1
+    b = 0
+    Term.display a & b
+    Term.display a and b
+    Term.display a or b
+    Term.display a | b
+    Term.display a #| b
+    Term.display # a
+    /kill
+<mainloop>

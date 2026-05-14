@@ -1,0 +1,11 @@
+AC->PY
+
+<mainloop>
+    a = 10
+    b = 3
+    Term.display a + b
+    Term.display a - b
+    Term.display a @ b
+    Term.display a / b
+    /kill
+<mainloop>

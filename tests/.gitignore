@@ -1,0 +1,10 @@
+*.py
+*.js
+*.cpp
+*.rs
+*.go
+*.java
+*.v
+*.s
+*.asm
+ac-cache/

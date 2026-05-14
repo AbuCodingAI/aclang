@@ -1,0 +1,8 @@
+AC->PY
+
+<mainloop>
+    Term.display $hello$
+    Term.display $world$
+    Term.display $AC language$
+    /kill
+<mainloop>

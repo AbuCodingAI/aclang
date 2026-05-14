@@ -1,247 +1,206 @@
+// ir_cache.hpp — Binary cache for AC_IR::IRProgram
+// Invalidation: FNV-64 hash of (source_content + '\0' + backend_name)
+// Format: magic(4) + version(1) + hash(8) + IRProgram binary data
 #pragma once
-// .lir — AC IR Cache
-// Serializes/deserializes the IR to skip lex+parse+IR generation on unchanged files.
-// Invalidation: if .ac file is newer than .lir, regenerate.
-// Format: binary, little-endian
-//   Header: magic(4) + version(1) + backend_len(1) + backend + func_count(4)
-//   Each function: name_len(2) + name + param_count(1) + params + instr_count(4) + instructions
-//   Each instruction: opcode(1) + operand_count(1) + operands
 
 #include "../include/ir.hpp"
-#include "../include/ast.hpp"
 #include <fstream>
 #include <string>
-#include <sys/stat.h>
 #include <cstdint>
-#include <stdexcept>
+#include <memory>
 
-// Reuse helpers from acc_cache.hpp
-extern "C" {
-#include "acc_cache.hpp"
+static const char IRC_MAGIC[4] = {'A','C','I','R'};
+static const uint8_t IRC_VERSION = 2;
+
+// ── FNV-1a 64-bit hash ────────────────────────────────────────────────────────
+inline uint64_t fnv64(const std::string& data) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (unsigned char c : data) { h ^= c; h *= 0x00000100000001B3ULL; }
+    return h;
 }
 
-static const char LIR_MAGIC[4] = {'A','C','L','1'};
-static const uint8_t LIR_VERSION = 1;
-
-// ── Timestamp check ──────────────────────────────────────────────────────────
-
-inline bool lirCacheIsValid(const std::string& acFile, const std::string& lirFile, const std::string& backend) {
-    time_t acMod  = fileModTime(acFile);
-    time_t lirMod = fileModTime(lirFile);
-    if (lirMod == 0 || lirMod < acMod) return false;
-    
-    // Read and verify LIR header
-    std::ifstream f(lirFile, std::ios::binary);
-    if (!f) return false;
-    
-    char magic[4];
-    f.read(magic, 4);
-    if (std::string(magic, 4) != std::string(LIR_MAGIC, 4)) return false;
-    
-    uint8_t ver = 0;
-    f.read((char*)&ver, 1);
-    if (ver != LIR_VERSION) return false;
-    
-    // Read backend length and verify
-    uint8_t backendLen = 0;
-    f.read((char*)&backendLen, 1);
-    std::string storedBackend(backendLen, '\0');
-    f.read(&storedBackend[0], backendLen);
-    if (storedBackend != backend) return false;
-    
-    return true;
+inline uint64_t hashForCache(const std::string& source, const std::string& backend) {
+    return fnv64(source + '\0' + backend);
 }
 
-// ── Write helpers ─────────────────────────────────────────────────────────────
+// ── Serialization primitives ──────────────────────────────────────────────────
+namespace irc {
 
-static void writeU32(std::ofstream& f, uint32_t v) { f.write((char*)&v, 4); }
+static void wU8 (std::ofstream& f, uint8_t  v) { f.write((char*)&v,1); }
+static void wI32(std::ofstream& f, int32_t  v) { f.write((char*)&v,4); }
+static void wU32(std::ofstream& f, uint32_t v) { f.write((char*)&v,4); }
+static void wU64(std::ofstream& f, uint64_t v) { f.write((char*)&v,8); }
+static void wF64(std::ofstream& f, double   v) { f.write((char*)&v,8); }
+static void wStr(std::ofstream& f, const std::string& s) {
+    uint16_t len=(uint16_t)s.size(); f.write((char*)&len,2); f.write(s.data(),len);
+}
 
-static void serializeIRRef(std::ofstream& f, const AC_IR::IRRef& ref) {
-    writeU8(f, (uint8_t)ref.kind);
-    writeU32(f, ref.id);
-    writeStr(f, ref.name);
-    
-    // Write presence flag first, then type and data
-    if (ref.value.type != AC_IR::IRType::VOID) {
-        writeU8(f, 1); // presence flag
-        writeU8(f, (uint8_t)ref.value.type);
-        switch (ref.value.type) {
-            case AC_IR::IRType::INT:
-                writeU32(f, (uint32_t)std::get<int>(ref.value.data));
-                break;
-            case AC_IR::IRType::FLOAT: {
-                double val = std::get<double>(ref.value.data);
-                f.write((char*)&val, 8);
-                break;
-            }
-            case AC_IR::IRType::STRING:
-                writeStr(f, std::get<std::string>(ref.value.data));
-                break;
-            case AC_IR::IRType::BOOL:
-                writeU8(f, std::get<bool>(ref.value.data) ? 1 : 0);
-                break;
-            default:
-                break;
-        }
-    } else {
-        writeU8(f, 0); // no value
+static void wValue(std::ofstream& f, const AC_IR::IRValue& v) {
+    wU8(f,(uint8_t)v.type);
+    using namespace AC_IR;
+    switch (v.type) {
+    case IRType::INT:    wI32(f, std::get<int>(v.data)); break;
+    case IRType::FLOAT:  wF64(f, std::get<double>(v.data)); break;
+    case IRType::STRING: wStr(f, std::get<std::string>(v.data)); break;
+    case IRType::BOOL:   wU8(f,  std::get<bool>(v.data) ? 1 : 0); break;
+    default: break;
     }
 }
 
-static void serializeIRInstruction(std::ofstream& f, const AC_IR::IRInstruction& instr) {
-    writeU8(f, (uint8_t)instr.opcode);
-    writeU8(f, (uint8_t)instr.typedOperands.size());
-    for (const auto& op : instr.typedOperands) {
-        serializeIRRef(f, op);
-    }
-    if (instr.result.isValid()) {
-        writeU8(f, 1);
-        serializeIRRef(f, instr.result);
-    } else {
-        writeU8(f, 0);
-    }
-    writeStr(f, instr.comment);
-    writeU32(f, instr.lineNumber);
+static void wRef(std::ofstream& f, const AC_IR::IRRef& r) {
+    wU8(f,(uint8_t)r.kind); wI32(f,r.id); wValue(f,r.value);
 }
 
-static void serializeIRFunction(std::ofstream& f, const AC_IR::IRFunction& func) {
-    writeStr(f, func.name);
-    writeU8(f, (uint8_t)func.parameters.size());
-    for (const auto& p : func.parameters) {
-        writeStr(f, p);
-    }
-    writeU8(f, (uint8_t)func.returnType);
-    writeU32(f, (uint32_t)func.instructions.size());
-    for (const auto& instr : func.instructions) {
-        serializeIRInstruction(f, instr);
+static void wInstr(std::ofstream& f, const AC_IR::IRInstruction& ins) {
+    wU8(f,(uint8_t)ins.opcode);
+    wRef(f, ins.result);
+    uint8_t nc = (uint8_t)std::min((size_t)255, ins.typedOperands.size());
+    wU8(f, nc);
+    for (size_t i = 0; i < nc; i++) wRef(f, ins.typedOperands[i]);
+}
+
+// ── Deserialization primitives ────────────────────────────────────────────────
+
+static uint8_t  rU8 (std::ifstream& f) { uint8_t  v; f.read((char*)&v,1); return v; }
+static int32_t  rI32(std::ifstream& f) { int32_t  v; f.read((char*)&v,4); return v; }
+static uint32_t rU32(std::ifstream& f) { uint32_t v; f.read((char*)&v,4); return v; }
+static uint64_t rU64(std::ifstream& f) { uint64_t v; f.read((char*)&v,8); return v; }
+static double   rF64(std::ifstream& f) { double   v; f.read((char*)&v,8); return v; }
+static std::string rStr(std::ifstream& f) {
+    uint16_t len; f.read((char*)&len,2);
+    std::string s(len,'\0'); f.read(&s[0],len); return s;
+}
+
+static AC_IR::IRValue rValue(std::ifstream& f) {
+    auto type = (AC_IR::IRType)rU8(f);
+    using namespace AC_IR;
+    switch (type) {
+    case IRType::INT:    return IRValue(rI32(f));
+    case IRType::FLOAT:  return IRValue(rF64(f));
+    case IRType::STRING: return IRValue(rStr(f));
+    case IRType::BOOL:   return IRValue(rU8(f) != 0);
+    default: return IRValue();
     }
 }
 
-inline void saveLIRCache(const std::string& lirFile, const AC_IR::IRProgram& program, const std::string& backend) {
-    std::ofstream f(lirFile, std::ios::binary);
+static AC_IR::IRRef rRef(std::ifstream& f) {
+    AC_IR::IRRef r;
+    r.kind  = (AC_IR::IRRef::Kind)rU8(f);
+    r.id    = rI32(f);
+    r.value = rValue(f);
+    return r;
+}
+
+static AC_IR::IRInstruction rInstr(std::ifstream& f) {
+    auto op  = (AC_IR::IROpcode)rU8(f);
+    auto res = rRef(f);
+    uint8_t nc = rU8(f);
+    std::vector<AC_IR::IRRef> ops; ops.reserve(nc);
+    for (int i = 0; i < nc; i++) ops.push_back(rRef(f));
+    return AC_IR::IRInstruction(op, res, std::move(ops));
+}
+
+} // namespace irc
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+inline void saveIRCache(const std::string& ircFile, uint64_t hash,
+                        const AC_IR::IRProgram& prog) {
+    std::ofstream f(ircFile, std::ios::binary);
     if (!f) return;
-    
-    f.write(LIR_MAGIC, 4);
-    writeU8(f, LIR_VERSION);
-    writeU8(f, (uint8_t)backend.size());
-    f.write(backend.data(), backend.size());
-    writeU32(f, (uint32_t)program.functions.size());
-    for (const auto& func : program.functions) {
-        serializeIRFunction(f, func);
+    using namespace irc;
+
+    f.write(IRC_MAGIC, 4);
+    wU8(f, IRC_VERSION);
+    wU64(f, hash);
+    wStr(f, prog.backend);
+    wU8(f, prog.useHighLevelIR ? 1 : 0);
+
+    // Symbol table
+    uint32_t sc = (uint32_t)prog.symbols.size();
+    wU32(f, sc);
+    for (uint32_t i = 0; i < sc; i++) {
+        const auto& sym = prog.symbols.getSymbol((int)i);
+        wStr(f, sym.name);
+        wU8(f, (uint8_t)sym.type);
+        wI32(f, sym.scope);
     }
-    writeU32(f, (uint32_t)program.globalInit.size());
-    for (const auto& instr : program.globalInit) {
-        serializeIRInstruction(f, instr);
+
+    // Functions
+    wU32(f, (uint32_t)prog.functions.size());
+    for (auto& fn : prog.functions) {
+        wStr(f, fn.name);
+        wU8(f, (uint8_t)fn.returnType);
+        wI32(f, fn.tempCount);
+        wI32(f, fn.labelCount);
+        uint8_t np = (uint8_t)std::min((size_t)255, fn.parameters.size());
+        wU8(f, np);
+        for (size_t i = 0; i < np; i++) wStr(f, fn.parameters[i]);
+        wU32(f, (uint32_t)fn.instructions.size());
+        for (auto& ins : fn.instructions) wInstr(f, ins);
     }
+
+    // Global init
+    wU32(f, (uint32_t)prog.globalInit.size());
+    for (auto& ins : prog.globalInit) wInstr(f, ins);
+
+    wI32(f, prog.globalTempCount);
+    wI32(f, prog.globalLabelCount);
 }
 
-// ── Read helpers ──────────────────────────────────────────────────────────────
+// Returns nullptr on cache miss or corrupt data
+inline std::unique_ptr<AC_IR::IRProgram> loadIRCache(const std::string& ircFile,
+                                                      uint64_t expectedHash) {
+    std::ifstream f(ircFile, std::ios::binary);
+    if (!f) return nullptr;
+    using namespace irc;
 
-static uint32_t readU32(std::ifstream& f) { uint32_t v; f.read((char*)&v, 4); return v; }
+    char magic[4]; f.read(magic, 4);
+    if (std::string(magic,4) != std::string(IRC_MAGIC,4)) return nullptr;
+    if (rU8(f) != IRC_VERSION) return nullptr;
+    if (rU64(f) != expectedHash) return nullptr;
 
-static AC_IR::IRRef deserializeIRRef(std::ifstream& f) {
-    AC_IR::IRRef ref;
-    ref.kind = (AC_IR::IRRef::Kind)readU8(f);
-    ref.id = readU32(f);
-    ref.name = readStr(f);
-    
-    // Read presence flag
-    uint8_t hasValue = readU8(f);
-    if (hasValue) {
-        ref.value.type = (AC_IR::IRType)readU8(f);
-        switch (ref.value.type) {
-            case AC_IR::IRType::INT:
-                ref.value.data = (int)readU32(f);
-                break;
-            case AC_IR::IRType::FLOAT: {
-                double val;
-                f.read((char*)&val, 8);
-                ref.value.data = val;
-                break;
-            }
-            case AC_IR::IRType::STRING:
-                ref.value.data = readStr(f);
-                break;
-            case AC_IR::IRType::BOOL:
-                ref.value.data = (bool)readU8(f);
-                break;
-            default:
-                break;
-        }
-    }
-    return ref;
-}
+    auto prog = std::make_unique<AC_IR::IRProgram>();
+    prog->backend        = rStr(f);
+    prog->useHighLevelIR = rU8(f) != 0;
+    prog->target         = prog->backend;
 
-static AC_IR::IRInstruction deserializeIRInstruction(std::ifstream& f) {
-    AC_IR::IROpcode opcode = (AC_IR::IROpcode)readU8(f);
-    uint8_t opCount = readU8(f);
-    std::vector<AC_IR::IRRef> operands;
-    for (uint32_t i = 0; i < opCount; i++) {
-        operands.push_back(deserializeIRRef(f));
+    // Symbol table
+    uint32_t sc = rU32(f);
+    if (sc > 100000) return nullptr;
+    for (uint32_t i = 0; i < sc; i++) {
+        std::string name = rStr(f);
+        auto type  = (AC_IR::IRType)rU8(f);
+        rI32(f); // scope (intern rebuilds incrementally)
+        prog->symbols.intern(name, type);
     }
-    AC_IR::IRRef result;
-    if (readU8(f)) {
-        result = deserializeIRRef(f);
-    }
-    std::string comment = readStr(f);
-    uint32_t lineNumber = readU32(f);
-    
-    AC_IR::IRInstruction instr(opcode, operands);
-    instr.result = result;
-    instr.comment = comment;
-    instr.lineNumber = lineNumber;
-    return instr;
-}
 
-static AC_IR::IRFunction deserializeIRFunction(std::ifstream& f) {
-    std::string name = readStr(f);
-    AC_IR::IRFunction func(name);
-    uint8_t paramCount = readU8(f);
-    for (uint32_t i = 0; i < paramCount; i++) {
-        func.parameters.push_back(readStr(f));
+    // Functions
+    uint32_t fc = rU32(f);
+    if (fc > 10000) return nullptr;
+    for (uint32_t fi = 0; fi < fc; fi++) {
+        AC_IR::IRFunction fn(rStr(f));
+        fn.returnType  = (AC_IR::IRType)rU8(f);
+        fn.tempCount   = rI32(f);
+        fn.labelCount  = rI32(f);
+        uint8_t np = rU8(f);
+        for (int i = 0; i < np; i++) fn.parameters.push_back(rStr(f));
+        uint32_t ic = rU32(f);
+        if (ic > 1000000) return nullptr;
+        fn.instructions.reserve(ic);
+        for (uint32_t i = 0; i < ic; i++) fn.instructions.push_back(rInstr(f));
+        prog->functions.push_back(std::move(fn));
     }
-    func.returnType = (AC_IR::IRType)readU8(f);
-    uint32_t instrCount = readU32(f);
-    // Safety limit to prevent infinite loops on corrupted data
-    if (instrCount > 100000) throw std::runtime_error("Corrupt LIR: excessive instruction count");
-    for (uint32_t i = 0; i < instrCount; i++) {
-        func.instructions.push_back(deserializeIRInstruction(f));
-    }
-    return func;
-}
 
-// Returns empty program if cache is invalid or corrupt
-inline AC_IR::IRProgram loadLIRCache(const std::string& lirFile) {
-    std::ifstream f(lirFile, std::ios::binary);
-    if (!f) return AC_IR::IRProgram();
-    
-    char magic[4];
-    f.read(magic, 4);
-    if (std::string(magic, 4) != std::string(LIR_MAGIC, 4)) return AC_IR::IRProgram();
-    
-    uint8_t ver = readU8(f);
-    if (ver != LIR_VERSION) return AC_IR::IRProgram();
-    
-    uint8_t backendLen = readU8(f);
-    std::string backend(backendLen, '\0');
-    f.read(&backend[0], backendLen);
-    
-    AC_IR::IRProgram program;
-    program.backend = backend;
-    
-    uint32_t funcCount = readU32(f);
-    // Safety limit to prevent infinite loops on corrupted data
-    if (funcCount > 1000) throw std::runtime_error("Corrupt LIR: excessive function count");
-    for (uint32_t i = 0; i < funcCount; i++) {
-        program.functions.push_back(deserializeIRFunction(f));
-    }
-    
-    uint32_t globalCount = readU32(f);
-    // Safety limit to prevent infinite loops on corrupted data
-    if (globalCount > 10000) throw std::runtime_error("Corrupt LIR: excessive global instruction count");
-    for (uint32_t i = 0; i < globalCount; i++) {
-        program.globalInit.push_back(deserializeIRInstruction(f));
-    }
-    
-    return program;
+    // Global init
+    uint32_t gc = rU32(f);
+    if (gc > 1000000) return nullptr;
+    prog->globalInit.reserve(gc);
+    for (uint32_t i = 0; i < gc; i++) prog->globalInit.push_back(rInstr(f));
+
+    prog->globalTempCount  = rI32(f);
+    prog->globalLabelCount = rI32(f);
+
+    if (!f) return nullptr; // truncated file
+    return prog;
 }

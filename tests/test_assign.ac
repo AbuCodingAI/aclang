@@ -1,0 +1,14 @@
+AC->PY
+
+<mainloop>
+    x = 5
+    x += 3
+    Term.display x
+    x -= 2
+    Term.display x
+    x @= 4
+    Term.display x
+    x /= 2
+    Term.display x
+    /kill
+<mainloop>

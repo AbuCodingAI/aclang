@@ -1,13 +1,13 @@
 AC->BNY
 
 Make fibonacci func(n)
-    IF n <= 1
+    IF n #> 1
         return n
     OTHER
         return fibonacci(n - 1) + fibonacci(n - 2)
 
 Make factorial func(n)
-    IF n <= 1
+    IF n #> 1
         return 1
     OTHER
         return n @ factorial(n - 1)
@@ -15,7 +15,7 @@ Make factorial func(n)
 Make sumNumbers func(limit)
     sum = 0
     i = 1
-    WHILST i <= limit
+    WHILST i #> limit
         sum += i
         i += 1
     return sum
@@ -25,7 +25,7 @@ Make power func(base, exp)
         return 1
     result = 1
     i = 1
-    WHILST i <= exp
+    WHILST i #> exp
         result @= base
         i += 1
     return result

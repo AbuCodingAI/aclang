@@ -5,6 +5,7 @@
 #include <variant>
 #include <unordered_map>
 #include <algorithm>
+#include "type.hpp"
 
 // Forward declaration
 struct ASTNode;
@@ -62,6 +63,9 @@ enum class IROpcode {
     AND,
     OR,
     NOT,
+    XOR,   // Boolean XOR: (a!=0) != (b!=0)
+    XNOR,  // Boolean XNOR: (a!=0) == (b!=0)
+    XSUB,  // Inclusive range count: |a - b| + 1
     
     // Memory
     ALLOC,
@@ -104,13 +108,22 @@ enum class IRType {
 
 struct IRValue {
     IRType type;
+    Type   acType;   // semantic AC type (from type.hpp); Unknown for non-literal values
     std::variant<int, double, std::string, bool> data;
-    
+
     IRValue() : type(IRType::VOID) {}
-    IRValue(int i) : type(IRType::INT), data(i) {}
-    IRValue(double d) : type(IRType::FLOAT), data(d) {}
-    IRValue(std::string s) : type(IRType::STRING), data(std::move(s)) {}
-    IRValue(bool b) : type(IRType::BOOL), data(b) {}
+    IRValue(int i)
+        : type(IRType::INT),
+          acType(Type::Numeral(i >= 0 ? NumeralSubtype::PosInt : NumeralSubtype::NegInt)),
+          data(i) {}
+    IRValue(double d)
+        : type(IRType::FLOAT),
+          acType(Type::Numeral(d >= 0.0 ? NumeralSubtype::PosDec : NumeralSubtype::NegDec)),
+          data(d) {}
+    IRValue(std::string s)
+        : type(IRType::STRING), acType(Type::String()), data(std::move(s)) {}
+    IRValue(bool b)
+        : type(IRType::BOOL), acType(Type::Boolean()), data(b) {}
 };
 
 // Integerized IR Reference - uses integer IDs for optimal performance

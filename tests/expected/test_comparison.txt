@@ -1,0 +1,4 @@
+not equal
+different
+a lt b
+b gt a

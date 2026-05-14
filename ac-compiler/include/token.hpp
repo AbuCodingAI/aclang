@@ -13,8 +13,6 @@ enum class TokenType {
     NOT_EQUAL,      // #=
     LT,             // <
     GT,             // >
-    LTE,            // <=
-    GTE,            // >=
     MULTIPLY,       // * inside fn...fn context
     AT,             // @ (default multiplication operator)
     AMPERSAND,      // &
@@ -37,6 +35,13 @@ enum class TokenType {
     MULTIPLY_EQUAL, // *=
     DIVIDE_EQUAL,   // /=
     AT_EQUAL,       // @= (compound multiplication)
+    PIPE,           // |  (XOR)
+    PIPE_EQUAL,     // |= (XOR-assign)
+    HASH,           // #  (unary NOT)
+    HASH_GT,        // #> (NOT greater → <=)
+    HASH_LT,        // #< (NOT less → >=)
+    HASH_PIPE,      // #| (XNOR)
+    KW_XSUB,        // xsub (inclusive range count: |a-b|+1)
 
     // Keywords
     KW_IF,

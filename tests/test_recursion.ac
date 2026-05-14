@@ -1,0 +1,20 @@
+AC->PY
+
+Make factorial func(n)
+    IF n #> 1
+        return 1
+    OTHER
+        return n @ factorial(n - 1)
+
+Make fib func(n)
+    IF n #> 1
+        return n
+    OTHER
+        return fib(n - 1) + fib(n - 2)
+
+<mainloop>
+    Term.display factorial(5)
+    Term.display factorial(10)
+    Term.display fib(8)
+    /kill
+<mainloop>

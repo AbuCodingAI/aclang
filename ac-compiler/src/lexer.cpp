@@ -1,4 +1,4 @@
-#include "../include/token.hpp"
+#include "../include/ac.hpp"
 #include <vector>
 #include <string>
 #include <sstream>
@@ -45,6 +45,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"range",    TokenType::KW_RANGE},
     {"sequence", TokenType::KW_SEQUENCE},
     {"is",       TokenType::KW_IS},
+    {"xsub",     TokenType::KW_XSUB},
     {"pass",     TokenType::KW_PASS},
     {"skip",     TokenType::KW_SKIP},
     {"break",    TokenType::KW_BREAK},
@@ -241,10 +242,25 @@ public:
                 continue;
             }
 
-            // #= (not equal)
-            if (src[pos] == '#' && pos+1 < src.size() && src[pos+1] == '=') {
-                tokens.emplace_back(TokenType::NOT_EQUAL, "#=", line, col);
-                pos += 2; col += 2;
+            // # family: #=, #>, #<, #|, #  (not-equal, not-gt, not-lt, xnor, unary-not)
+            if (src[pos] == '#') {
+                int sc = col;
+                if (pos+1 < src.size() && src[pos+1] == '=') {
+                    tokens.emplace_back(TokenType::NOT_EQUAL, "#=", line, sc);
+                    pos += 2; col += 2;
+                } else if (pos+1 < src.size() && src[pos+1] == '>') {
+                    tokens.emplace_back(TokenType::HASH_GT, "#>", line, sc);
+                    pos += 2; col += 2;
+                } else if (pos+1 < src.size() && src[pos+1] == '<') {
+                    tokens.emplace_back(TokenType::HASH_LT, "#<", line, sc);
+                    pos += 2; col += 2;
+                } else if (pos+1 < src.size() && src[pos+1] == '|') {
+                    tokens.emplace_back(TokenType::HASH_PIPE, "#|", line, sc);
+                    pos += 2; col += 2;
+                } else {
+                    tokens.emplace_back(TokenType::HASH, "#", line, sc);
+                    pos += 1; col += 1;
+                }
                 continue;
             }
 
@@ -321,15 +337,17 @@ public:
                         tokens.emplace_back(TokenType::AMPERSAND, "&",  line, sc);
                     }
                     break;
+                case '|':
+                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::PIPE_EQUAL, "|=", line, sc); }
+                    else tokens.emplace_back(TokenType::PIPE, "|", line, sc);
+                    break;
                 case '^': tokens.emplace_back(TokenType::IDENTIFIER,"^",  line, sc); break;
                 case '%': tokens.emplace_back(TokenType::IDENTIFIER,"%",  line, sc); break;
                 case '<':
-                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::LTE, "<=", line, sc); }
-                    else tokens.emplace_back(TokenType::LT, "<", line, sc);
+                    tokens.emplace_back(TokenType::LT, "<", line, sc);
                     break;
                 case '>':
-                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::GTE, ">=", line, sc); }
-                    else tokens.emplace_back(TokenType::GT, ">", line, sc);
+                    tokens.emplace_back(TokenType::GT, ">", line, sc);
                     break;
                 case '[': tokens.emplace_back(TokenType::LBRACKET,  "[",  line, sc); break;
                 case ']': tokens.emplace_back(TokenType::RBRACKET,  "]",  line, sc); break;

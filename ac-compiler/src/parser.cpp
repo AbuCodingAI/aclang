@@ -1,13 +1,17 @@
-#include "../include/token.hpp"
-#include "../include/ast.hpp"
-#include "../include/tags.hpp"
-#include "../include/error.hpp"
+#include "../include/ac.hpp"
 #include <vector>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
 class Parser {
+public:
+    struct ParseError {
+        int line, col;
+        std::string message, context;
+    };
+
+private:
     std::vector<Token> tokens;
     size_t pos = 0;
     // tag open/close tracking: stack of open tag names
@@ -15,9 +19,13 @@ class Parser {
     // custom tags defined by `def tag <name>`
     std::unordered_set<std::string> customTags;
 
+    // Error recovery support
+    std::vector<ParseError> errors;
+    int maxErrors = 10;
+
     Token& peek() { return tokens[pos]; }
 
-    Token& peekAhead(size_t offset) { 
+    Token& peekAhead(size_t offset) {
         if (pos + offset < tokens.size()) return tokens[pos + offset];
         return tokens.back();
     }
@@ -28,6 +36,27 @@ class Parser {
     Token& advance() { return tokens[pos++]; }
 
     bool at(TokenType t) { return peek().type == t; }
+
+    void reportError(const std::string& msg, const std::string& ctx = "") {
+        errors.push_back({peek().line, peek().col, msg, ctx});
+        if ((int)errors.size() >= maxErrors) {
+            throw std::runtime_error("Too many parse errors");
+        }
+    }
+
+    // Advance until a safe synchronization point so parsing can resume.
+    void synchronize() {
+        while (!at(TokenType::END_OF_FILE)) {
+            TokenType t = peek().type;
+            // Stop AT a newline/dedent so the caller's skipNewlines() can consume it
+            if (t == TokenType::NEWLINE || t == TokenType::DEDENT) return;
+            // Stop AT statement-starting keywords
+            if (t == TokenType::KW_IF    || t == TokenType::KW_FOR    ||
+                t == TokenType::KW_WHILST || t == TokenType::KW_MAKE   ||
+                t == TokenType::KW_RETURN || t == TokenType::TAG_OPEN) return;
+            advance();
+        }
+    }
 
     void skipNewlines() {
         while (at(TokenType::NEWLINE)) advance();
@@ -55,58 +84,73 @@ class Parser {
     }
 
     Token expect(TokenType t, const std::string& msg) {
-        if (!at(t)) throw SYNTAX_ERROR(msg, peek().line, peek().col);
+        if (!at(t)) {
+            reportError(msg, "got '" + peek().value + "'");
+            synchronize();
+            // Return a dummy token so callers can continue
+            return Token(t, "", peek().line, peek().col);
+        }
         return advance();
     }
 
     // Pratt Parser for expressions
     // Precedence table:
     // 1: OR
-    // 2: AND
-    // 3: ==, !=, <, >, <=, >=, is
-    // 4: +, -
-    // 5: *, /, %, @
-    // 6: unary -, NOT
-    // 7: function calls, indexing
-    
+    // 2: XOR, XNOR  (|, #|)
+    // 3: AND  (&, keyword AND)
+    // 4: ==, !=, <, >, is, #>(≤), #<(≥)
+    // 5: +, -
+    // 6: *, /, %, @
+    // 7: unary -, #(NOT)
+    // 8: function calls, indexing
+
     int getPrecedence(TokenType op) {
         switch (op) {
             // Precedence 1: OR
             case TokenType::IDENTIFIER:
                 if (peek().value == "OR" || peek().value == "or") return 1;
+                if (peek().value == "and") return 3;
                 // Check for other operators
                 {
                     const std::string& val = peek().value;
-                    if (val == "+" || val == "-") return 4;
-                    if (val == "*" || val == "/" || val == "%") return 5;
+                    if (val == "+" || val == "-") return 5;
+                    if (val == "*" || val == "/" || val == "%") return 6;
                 }
                 return 0;  // Not an operator
-            
-            // Precedence 2: AND
+
+            // Precedence 2: XOR / XNOR
+            case TokenType::PIPE:
+            case TokenType::HASH_PIPE:
+                return 2;
+
+            // Precedence 3: AND
+            case TokenType::AMPERSAND:
+                return 3;
             case TokenType::KW_NOT:
-                if (peek().value == "AND" || peek().value == "and") return 2;
+                if (peek().value == "AND" || peek().value == "and") return 3;
                 return 0;
-            
-            // Precedence 3: Comparisons
+
+            // Precedence 4: Comparisons (#> = ≤, #< = ≥)
             case TokenType::KW_IS:
             case TokenType::NOT_EQUAL:
             case TokenType::LT:
             case TokenType::GT:
-            case TokenType::LTE:
-            case TokenType::GTE:
-                return 3;
-            
-            // Precedence 4: Addition/Subtraction
+            case TokenType::HASH_GT:
+            case TokenType::HASH_LT:
+                return 4;
+
+            // Precedence 5: Addition/Subtraction/xsub
             case TokenType::PLUS_EQUAL:  // When used as + in expression context
             case TokenType::MINUS_EQUAL: // When used as - in expression context
-                return 4;
-            
-            // Precedence 5: Multiplication/Division
+            case TokenType::KW_XSUB:
+                return 5;
+
+            // Precedence 6: Multiplication/Division
             case TokenType::MULTIPLY:
             case TokenType::SLASH:
             case TokenType::AT:
-                return 5;
-            
+                return 6;
+
             default:
                 return 0;
         }
@@ -122,16 +166,25 @@ class Parser {
         // Unary minus
         if (at(TokenType::IDENTIFIER) && peek().value == "-") {
             advance();
-            auto operand = parseExpression(6); // Precedence 6 for unary
+            auto operand = parseExpression(7); // Precedence 7 for unary
             auto node = std::make_unique<ASTNode>(NodeType::UnaryExpr, "-");
             node->children.push_back(std::move(operand));
             return node;
         }
         
-        // Unary NOT
+        // Unary NOT (keyword)
         if (at(TokenType::KW_NOT)) {
             advance();
-            auto operand = parseExpression(6); // Precedence 6 for unary
+            auto operand = parseExpression(7); // Precedence 7 for unary
+            auto node = std::make_unique<ASTNode>(NodeType::UnaryExpr, "NOT");
+            node->children.push_back(std::move(operand));
+            return node;
+        }
+
+        // Unary # (boolean NOT)
+        if (at(TokenType::HASH)) {
+            advance();
+            auto operand = parseExpression(7); // Precedence 7 for unary
             auto node = std::make_unique<ASTNode>(NodeType::UnaryExpr, "NOT");
             node->children.push_back(std::move(operand));
             return node;
@@ -228,8 +281,24 @@ class Parser {
             return parseTupleLiteral();
         }
         
-        // If we can't parse a prefix, return nullptr
-        return nullptr;
+        // If we hit a natural expression terminator, there is simply no expression here.
+        // Return nullptr to let callers decide if this is an error.
+        {
+            TokenType t = peek().type;
+            if (t == TokenType::NEWLINE   || t == TokenType::DEDENT     ||
+                t == TokenType::END_OF_FILE || t == TokenType::RPAREN   ||
+                t == TokenType::RBRACKET  || t == TokenType::RBRACE     ||
+                t == TokenType::COMMA     || t == TokenType::COLON) {
+                return nullptr;
+            }
+        }
+
+        // An unexpected token in the middle of an expression: report and return dummy.
+        reportError("Unexpected token '" + peek().value + "' in expression");
+        synchronize();
+        auto dummy = std::make_unique<ASTNode>(NodeType::LiteralExpr, "0");
+        dummy->attrs.push_back("INT");
+        return dummy;
     }
     
     // Parse infix expression (binary operators)
@@ -253,12 +322,6 @@ class Parser {
         } else if (op == TokenType::GT) {
             opStr = ">";
             advance();
-        } else if (op == TokenType::LTE) {
-            opStr = "<=";
-            advance();
-        } else if (op == TokenType::GTE) {
-            opStr = ">=";
-            advance();
         } else if (op == TokenType::MULTIPLY) {
             opStr = "*";
             advance();
@@ -268,13 +331,33 @@ class Parser {
         } else if (op == TokenType::AT) {
             opStr = "@";
             advance();
+        } else if (op == TokenType::PIPE) {
+            opStr = "|";
+            advance();
+        } else if (op == TokenType::HASH_PIPE) {
+            opStr = "#|";
+            advance();
+        } else if (op == TokenType::HASH_GT) {
+            opStr = "#>";
+            advance();
+        } else if (op == TokenType::HASH_LT) {
+            opStr = "#<";
+            advance();
+        } else if (op == TokenType::AMPERSAND) {
+            opStr = "&";
+            advance();
+        } else if (op == TokenType::KW_XSUB) {
+            opStr = "xsub";
+            advance();
         } else {
             // Unknown operator
             return left;
         }
         
         // Parse right operand with appropriate precedence
-        auto right = parseExpression(prec + (isRightAssociative(op) ? 0 : 1));
+        // Left-assoc: pass opPrec so right grabs only strictly-higher-prec ops (nextPrec > opPrec)
+        // Right-assoc: pass opPrec-1 so right also grabs same-prec ops (nextPrec >= opPrec)
+        auto right = parseExpression(prec - (isRightAssociative(op) ? 1 : 0));
         
         // Create binary expression node
         auto node = std::make_unique<ASTNode>(NodeType::BinaryExpr, opStr);
@@ -316,17 +399,47 @@ public:
     NodePtr parse() {
         auto program = std::make_unique<ASTNode>(NodeType::Program);
         skipAll();
-        while (!at(TokenType::END_OF_FILE)) {
-            auto node = parseStatement();
-            if (node) program->children.push_back(std::move(node));
-            skipAll();
+        try {
+            while (!at(TokenType::END_OF_FILE)) {
+                auto node = parseStatement();
+                if (node) program->children.push_back(std::move(node));
+                skipAll();
+            }
+        } catch (const std::runtime_error& e) {
+            // "Too many parse errors" — stop parsing and return partial AST
+            std::string msg = e.what();
+            if (msg != "Too many parse errors") {
+                errors.push_back({peek().line, peek().col, msg, ""});
+            }
         }
         return program;
     }
 
+    bool hasErrors() const { return !errors.empty(); }
+
+    const std::vector<ParseError>& getErrors() const { return errors; }
+
 private:
     NodePtr parseStatement() {
         skipNewlines(); // Changed from skipAll() - only skip newlines, not indents
+        if (at(TokenType::END_OF_FILE)) return nullptr;
+        try {
+        return parseStatementInner();
+        } catch (const std::runtime_error& e) {
+            // "Too many parse errors" — rethrow so the outer parse() loop can stop
+            throw;
+        } catch (const ACError& e) {
+            // ACError from throws inside parsers that weren't converted yet
+            errors.push_back({peek().line, peek().col, e.what(), ""});
+            if ((int)errors.size() >= maxErrors) {
+                throw std::runtime_error("Too many parse errors");
+            }
+            synchronize();
+            return nullptr;
+        }
+    }
+
+    NodePtr parseStatementInner() {
         if (at(TokenType::END_OF_FILE)) return nullptr;
 
         // Backend declaration
@@ -1108,6 +1221,15 @@ private:
                 return node;
             }
 
+            // display/print-style methods: use Pratt parser for the full argument expression
+            // (e.g. "Term.display (2+3)*4" must not stop at the inner ")")
+            if (prop == "display" || prop == "print" || prop == "log" || prop == "write") {
+                auto argExpr = parseExpression(0);
+                auto node = std::make_unique<ASTNode>(NodeType::MethodCall, name + "." + prop);
+                if (argExpr) node->children.push_back(std::move(argExpr));
+                return node;
+            }
+
             // method call: Name.method(args)
             if (at(TokenType::LPAREN)) {
                 advance();
@@ -1214,7 +1336,7 @@ private:
         }
 
         // Compound assignment: name += value, etc.
-        if (at(TokenType::PLUS_EQUAL) || at(TokenType::MINUS_EQUAL) || at(TokenType::MULTIPLY_EQUAL) || at(TokenType::DIVIDE_EQUAL) || at(TokenType::AT_EQUAL)) {
+        if (at(TokenType::PLUS_EQUAL) || at(TokenType::MINUS_EQUAL) || at(TokenType::MULTIPLY_EQUAL) || at(TokenType::DIVIDE_EQUAL) || at(TokenType::AT_EQUAL) || at(TokenType::PIPE_EQUAL)) {
             TokenType opType = advance().type;
             NodeType nodeType;
             switch (opType) {
@@ -1223,6 +1345,7 @@ private:
                 case TokenType::MULTIPLY_EQUAL: nodeType = NodeType::MultiplyEqualStmt; break;
                 case TokenType::DIVIDE_EQUAL: nodeType = NodeType::DivideEqualStmt; break;
                 case TokenType::AT_EQUAL: nodeType = NodeType::AtEqualStmt; break;
+                case TokenType::PIPE_EQUAL: nodeType = NodeType::XorEqualStmt; break;
                 default: nodeType = NodeType::AssignStmt; break;
             }
             
@@ -1369,7 +1492,20 @@ private:
     }
 };
 
+// Global storage for parse errors from the last parse() call.
+// main.cpp reads this after calling parse().
+struct ParseErrorRecord {
+    int line, col;
+    std::string message, context;
+};
+std::vector<ParseErrorRecord> g_parseErrors;
+
 NodePtr parse(const std::vector<Token>& tokens) {
+    g_parseErrors.clear();
     Parser p(tokens);
-    return p.parse();
+    auto ast = p.parse();
+    for (const auto& e : p.getErrors()) {
+        g_parseErrors.push_back({e.line, e.col, e.message, e.context});
+    }
+    return ast;
 }

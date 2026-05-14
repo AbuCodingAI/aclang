@@ -1,0 +1,20 @@
+AC->PY
+
+Make add func(a, b)
+    return a + b
+
+Make square func(n)
+    return n @ n
+
+Make max func(a, b)
+    IF a #< b
+        return a
+    OTHER
+        return b
+
+<mainloop>
+    Term.display add(3, 4)
+    Term.display square(5)
+    Term.display max(10, 7)
+    /kill
+<mainloop>

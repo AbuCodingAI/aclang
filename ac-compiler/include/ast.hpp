@@ -22,6 +22,7 @@ enum class NodeType {
     MultiplyEqualStmt, // x *= y  
     DivideEqualStmt, // x /= y
     AtEqualStmt,     // x @= y (compound multiplication since * is comment)
+    XorEqualStmt,    // x |= y (compound XOR)
     IfStmt,         // IF condition body [OTHER body]
     ElseIfStmt,     // ELSEIF condition body
     ForLoop,        // FOR item in list

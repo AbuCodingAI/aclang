@@ -1,8 +1,19 @@
-# AC Language Compiler
+# AC Language Compiler v0.2
 
-**A beginner-friendly compiled language that targets 11+ backends, including native x86-64 binaries.**
+**A beginner-friendly compiled language that targets 12 backends, including native x86-64 binaries.**
 
 AC is a clean, readable programming language that compiles to multiple targets - from Python scripts to native machine code. Write once, compile anywhere.
+
+## What's new in v0.2
+
+- **Float support** — All backends (`double`/`float64`/`f64`) with correct type propagation
+- **Constant folding** — Compile-time evaluation of constant expressions
+- **Copy propagation + DCE** — Cleaner, shorter output with no intermediate temporaries
+- **Caret error messages** — Errors now show the offending source line with a `^` pointer
+- **Cache moved to `ac-cache/`** — AST cache now lives in `ac-cache/` next to source; `--no-cache` to disable
+- **Java class naming** — Generated Java class name now matches the output filename stem
+- **C++ `#include <vector>`** — Fixed for-loop array output in C++ backend
+- **Test suite** — `ac-compiler/test/test_backends.py`: 69 tests across 7 backends, 0 failures
 
 ---
 
@@ -425,7 +436,8 @@ Computing 2^20...              1048576 ✓
 ## 📦 File Extensions
 
 - `.ac` - AC source files
-- `.acc` - Compiled cache files
+- `ac-cache/*.acc` - Cached AST (auto-generated, safe to delete)
+- `ac-cache/*.lir` - Cached IR text (auto-generated, safe to delete)
 - `.acb` - Native binary executables (BNY backend)
 
 ---
@@ -459,11 +471,12 @@ Target Output (.py, .js, .c, .acb, etc.)
 ## 🎓 Advanced Features
 
 ### Caching System
-The compiler caches parsed AST to `.acc` files for faster recompilation:
+The compiler caches parsed AST in `ac-cache/` next to the source file for faster recompilation:
 ```bash
-./ac mycode.ac        # First run: parses and caches
-./ac mycode.ac        # Subsequent runs: uses cache
-./ac mycode.ac -f     # Force recompile
+./ac mycode.ac           # First run: parses and writes ac-cache/mycode.acc
+./ac mycode.ac           # Subsequent runs: reads from cache
+./ac mycode.ac --force   # Force recompile (ignore cache)
+./ac mycode.ac --no-cache  # Skip cache entirely (no read or write)
 ```
 
 ### Compile-Only Mode
