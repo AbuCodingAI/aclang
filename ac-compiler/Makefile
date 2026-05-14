@@ -16,9 +16,12 @@ else
 	sudo cp $(OUT) /usr/local/bin/ac
 endif
 
+windows:
+	x86_64-w64-mingw32-g++ -std=c++17 -O2 -static $(SRC) -o ac.exe
+
 clean:
 ifeq ($(OS),Windows_NT)
 	rm -f $(OUT).exe
 else
-	rm -f $(OUT)
+	rm -f $(OUT) ac.exe
 endif

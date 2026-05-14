@@ -10,6 +10,13 @@
 #include <cstdio>
 #include <sys/stat.h>
 
+#ifdef _WIN32
+  #include <direct.h>
+  #define ac_mkdir(path) _mkdir(path)
+#else
+  #define ac_mkdir(path) mkdir(path, 0755)
+#endif
+
 // Forward declarations
 std::vector<Token> lex(const std::string& source);
 NodePtr parse(const std::vector<Token>& tokens);
@@ -200,7 +207,7 @@ int main(int argc, char* argv[]) {
         if (!noCache) {
             struct stat st;
             if (stat(cacheDir.c_str(), &st) != 0)
-                mkdir(cacheDir.c_str(), 0755);
+                ac_mkdir(cacheDir.c_str());
         }
 
         std::string accFile = noCache ? "" : (cacheDir + "/" + baseName + ".acc");

@@ -52,6 +52,7 @@
     "examples/",
     "library/",
     "ac-compiler/ac",
+    "ac-compiler/ac.exe",
     "ac-compiler/Makefile",
     "ac-compiler/setup.sh",
     "ac-compiler/setup.bat",
