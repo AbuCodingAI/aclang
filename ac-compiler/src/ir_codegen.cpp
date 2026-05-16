@@ -19,17 +19,52 @@
 using namespace AC_IR;
 
 // ─── FFI file reader ─────────────────────────────────────────────────────────
-// Reads library/<libName>/ffi/<libName>_ffi.<ext> relative to cwd.
-static std::string readFFIFile(const std::string &libName, const std::string &ext)
+// Reads library/<libName>/ffi/<libName>_ffi.<ext>.
+// Tries cwd-relative first, then binary-relative so "ac examples/foo.ac" works.
+// Optional out-param foundLibDir: set to the absolute library/<libName> directory.
+static std::string readFFIFile(const std::string &libName, const std::string &ext,
+                               std::string *foundLibDir = nullptr)
 {
-    std::string path = "library/" + libName + "/ffi/" + libName + "_ffi." + ext;
-    FILE *f = std::fopen(path.c_str(), "r");
-    if (!f) return "";
-    std::string content;
-    char buf[4096];
-    while (std::fgets(buf, sizeof(buf), f)) content += buf;
-    std::fclose(f);
-    return content;
+    auto tryBase = [&](const std::string &base) -> std::string {
+        std::string path = base + "/library/" + libName + "/ffi/" + libName + "_ffi." + ext;
+        FILE *f = std::fopen(path.c_str(), "r");
+        if (!f) return "";
+        std::string content;
+        char buf[4096];
+        while (std::fgets(buf, sizeof(buf), f)) content += buf;
+        std::fclose(f);
+        if (foundLibDir) {
+            std::string rawDir = base + "/library/" + libName;
+#ifndef _WIN32
+            char realBuf[4096] = {};
+            *foundLibDir = realpath(rawDir.c_str(), realBuf) ? std::string(realBuf) : rawDir;
+#else
+            char realBuf[4096] = {};
+            *foundLibDir = _fullpath(realBuf, rawDir.c_str(), sizeof(realBuf)) ? std::string(realBuf) : rawDir;
+#endif
+        }
+        return content;
+    };
+
+    // 1. cwd-relative (works when run from project root)
+    std::string result = tryBase(".");
+    if (!result.empty()) return result;
+
+#ifndef _WIN32
+    // 2. binary-relative: <bindir>/../ (works when "ac" is run from any directory)
+    char exeBuf[4096] = {};
+    ssize_t len = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf) - 1);
+    if (len > 0) {
+        exeBuf[len] = '\0';
+        std::string binDir(exeBuf);
+        auto slash = binDir.rfind('/');
+        if (slash != std::string::npos) binDir = binDir.substr(0, slash);
+        result = tryBase(binDir + "/..");
+        if (!result.empty()) return result;
+    }
+#endif
+
+    return "";
 }
 
 // Parses a Go FFI file into two parts for inlining:
@@ -123,12 +158,16 @@ static void declareParams(const std::string &params, std::set<std::string> &decl
 // Strips any "AcMath." prefix before comparing (for Java backend).
 static bool isIntReturningMathFunc(const char* s) {
     if (strncmp(s, "AcMath.", 7) == 0) s += 7;
-    return strcmp(s, "math_to_int")   == 0
-        || strcmp(s, "math_abs_int")  == 0
-        || strcmp(s, "math_mod_int")  == 0
-        || strcmp(s, "math_gcd")      == 0
-        || strcmp(s, "math_lcm")      == 0
-        || strcmp(s, "math_is_prime") == 0;
+    // Handle both underscore-style (math_gcd) and dot-style (math.gcd)
+    const char* name = s;
+    if (strncmp(s, "math.", 5) == 0) name = s + 5;
+    else if (strncmp(s, "math_", 5) == 0) name = s + 5;
+    return strcmp(name, "to_int")   == 0
+        || strcmp(name, "abs_int")  == 0
+        || strcmp(name, "mod_int")  == 0
+        || strcmp(name, "gcd")      == 0
+        || strcmp(name, "lcm")      == 0
+        || strcmp(name, "is_prime") == 0;
 }
 
 // Reformat "p1, p2" → "TYPE p1, TYPE p2"
@@ -460,8 +499,15 @@ class PythonStrategy : public BackendStrategy
         emitRaw(out, "import sys");
         for (auto& [lt, ln] : pendingImports_) {
             if (lt == "ilib") {
-                std::string ffi = readFFIFile(ln, "py");
+                std::string foundLibDir;
+                std::string ffi = readFFIFile(ln, "py", &foundLibDir);
                 if (!ffi.empty()) {
+                    // Inject absolute library dir so generated file works from any cwd.
+                    // math_ffi.py checks globals().get('_ac_<lib>_lib_dir') before os.getcwd().
+                    if (!foundLibDir.empty()) {
+                        std::string varName = "_ac_" + ln + "_lib_dir";
+                        out << varName << " = r'" << foundLibDir << "'\n";
+                    }
                     // Emit selective-import comment if symbols were specified
                     std::string key = lt + ":" + ln;
                     auto it = importSymbols_.find(key);
@@ -735,9 +781,11 @@ class JavaScriptStrategy : public BackendStrategy
         emit(out, indent, "_acTrigger(" + key + ");");
     }
 
+    bool dotCallSyntax() const override { return true; }
+
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "null", false);
+        return commonRef(r, sym, "true", "false", "null");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1007,9 +1055,11 @@ class HTMLStrategy : public BackendStrategy
         emit(out, indent, "_acTrigger(" + key + ");");
     }
 
+    bool dotCallSyntax() const override { return true; }
+
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "null", false);
+        return commonRef(r, sym, "true", "false", "null");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1558,9 +1608,11 @@ class CppStrategy : public BackendStrategy
         emitRaw(out, "");
     }
 
+    bool dotCallSyntax() const override { return true; }
+
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "nullptr", false);
+        return commonRef(r, sym, "true", "false", "nullptr");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1817,13 +1869,13 @@ class JavaStrategy : public BackendStrategy
         const char* s = v.c_str();
         if (strncmp(s, "AcMath.", 7) == 0) s += 7;
         if (isIntReturningMathFunc(s)) return false;
-        return strncmp(s, "math_", 5) == 0 || strncmp(s, "stat_", 5) == 0;
+        return strncmp(s, "math_", 5) == 0 || strncmp(s, "math.", 5) == 0 || strncmp(s, "stat_", 5) == 0;
     }
     static bool isFloatReturningFunc(const std::string &fn) {
         const char* s = fn.c_str();
         if (strncmp(s, "AcMath.", 7) == 0) s += 7;
         if (isIntReturningMathFunc(s)) return false;
-        return strncmp(s, "math_", 5) == 0 || strncmp(s, "stat_", 5) == 0;
+        return strncmp(s, "math_", 5) == 0 || strncmp(s, "math.", 5) == 0 || strncmp(s, "stat_", 5) == 0;
     }
     bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v) || isKnownFloatName(v); }
 
@@ -1856,10 +1908,13 @@ class JavaStrategy : public BackendStrategy
         emitRaw(out, "}  // class " + className);
     }
 
+    bool dotCallSyntax() const override { return true; }
+
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
         std::string s = commonRef(r, sym);
-        if (r.kind == IRRef::Kind::VAR && isKnownFloatName(s))
+        // Dot-style (math.pi, math.sin): go to the `math` namespace class directly
+        if (r.kind == IRRef::Kind::VAR && isKnownFloatName(s) && s.find('.') == std::string::npos)
             return "AcMath." + s;
         return s;
     }
@@ -2118,7 +2173,8 @@ class RustStrategy : public BackendStrategy
         if (v.find('(') != std::string::npos) return false;
         if (isIntReturningMathFunc(v.c_str())) return false;
         return v == "math_pi" || v == "math_e" || v == "math_tau" || v == "math_em" || v == "math_inf"
-            || v.rfind("math_", 0) == 0
+            || v == "math.pi"  || v == "math.e"  || v == "math.tau" || v == "math.em" || v == "math.inf"
+            || v.rfind("math_", 0) == 0 || v.rfind("math.", 0) == 0
             || v.rfind("stat_", 0) == 0;
     }
     bool isFloatVal(const std::string &v) const {
@@ -2150,9 +2206,11 @@ class RustStrategy : public BackendStrategy
         emitRaw(out, "");
     }
 
+    bool dotCallSyntax() const override { return true; }
+
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "None", false);
+        return commonRef(r, sym, "true", "false", "None");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -2223,6 +2281,7 @@ class RustStrategy : public BackendStrategy
     static bool isFloatReturningFunc(const std::string &fn) {
         if (isIntReturningMathFunc(fn.c_str())) return false;
         if (fn.rfind("math_", 0) == 0) return true;
+        if (fn.rfind("math.", 0) == 0) return true;
         if (fn.rfind("stat_", 0) == 0) return true;
         return false;
     }
@@ -2230,7 +2289,7 @@ class RustStrategy : public BackendStrategy
                   const std::string &func, const std::string &args) override
     {
         // math_to_int takes f64 — cast integer args explicitly
-        std::string actualArgs = (func == "math_to_int") ? args + " as f64" : args;
+        std::string actualArgs = (func == "math_to_int" || func == "math.to_int") ? args + " as f64" : args;
         std::string call = func + "(" + actualArgs + ")";
         if (res.empty()) {
             emit(out, indent, call + ";");
@@ -2470,12 +2529,14 @@ class GoStrategy : public BackendStrategy
         if (v.find('(') != std::string::npos) return false;
         if (isIntReturningMathFunc(v.c_str())) return false;
         return v == "math_pi" || v == "math_e" || v == "math_tau" || v == "math_em" || v == "math_inf"
-            || v.rfind("math_", 0) == 0
+            || v == "math.pi"  || v == "math.e"  || v == "math.tau" || v == "math.em" || v == "math.inf"
+            || v.rfind("math_", 0) == 0 || v.rfind("math.", 0) == 0
             || v.rfind("stat_", 0) == 0;
     }
     static bool isFloatReturningFunc(const std::string &fn) {
         if (isIntReturningMathFunc(fn.c_str())) return false;
         if (fn.rfind("math_", 0) == 0) return true;
+        if (fn.rfind("math.", 0) == 0) return true;
         if (fn.rfind("stat_", 0) == 0) return true;
         return false;
     }
@@ -2545,9 +2606,11 @@ class GoStrategy : public BackendStrategy
             if (!w.empty()) out << w;
     }
 
+    bool dotCallSyntax() const override { return true; }
+
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "nil", false);
+        return commonRef(r, sym, "true", "false", "nil");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -2850,9 +2913,11 @@ class VStrategy : public BackendStrategy
         emitRaw(out, "");
     }
 
+    bool dotCallSyntax() const override { return true; }
+
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "none", false);
+        return commonRef(r, sym, "true", "false", "none");
     }
 
     std::string decl(const std::string &var, const std::string &val)

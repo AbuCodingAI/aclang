@@ -1,0 +1,89 @@
+AC->PY
+
+use ilib math
+
+* AC Terminal Calculator: arithmetic, trig, logs, constants, memory *
+
+<mainloop>
+    Term.display $======================================$
+    Term.display $       AC  Terminal  Calculator       $
+    Term.display $======================================$
+    Term.display $  type help for commands, quit to exit$
+    Term.display $======================================$
+
+    ans     = 0.0
+    mem     = 0.0
+    h1      = 0.0
+    h2      = 0.0
+    h3      = 0.0
+    running = 1
+
+    WHILST running is 1
+        line = Term.ask $> $
+
+        IF line is $quit$
+            Term.display $Goodbye!$
+            running = 0
+
+        ELSEIF line is $help$
+            Term.display $$
+            Term.display $  ARITHMETIC    + - * / @ (power)$
+            Term.display $  TRIG          sin(x) cos(x) tan(x)$
+            Term.display $  INVERSE TRIG  asin(x) acos(x) atan(x)$
+            Term.display $  ROOTS         sqrt(x) cbrt(x) hypot(a,b)$
+            Term.display $  LOGS          ln(x)  log(base,x)  log2(x)  log10(x)$
+            Term.display $  ROUNDING      floor(x) ceil(x) round(x)$
+            Term.display $  CONVERSION    deg2rad(x)  rad2deg(x)$
+            Term.display $  CONSTANTS     pi  e  tau  em$
+            Term.display $  RECALL        ans  h1  h2  h3$
+            Term.display $  MEMORY        ms=store  mr=recall  mc=clear$
+            Term.display $  COMMANDS      hist  consts  degrees  radians  quit$
+            Term.display $$
+
+        ELSEIF line is $hist$
+            Term.display $  --- History ---$
+            Term.display h1
+            Term.display h2
+            Term.display h3
+
+        ELSEIF line is $consts$
+            Term.display $  pi  (π)  =$
+            Term.display math.pi
+            Term.display $  e        =$
+            Term.display math.e
+            Term.display $  tau (τ)  =$
+            Term.display math.tau
+            Term.display $  em  (γ)  =$
+            Term.display math.em
+
+        ELSEIF line is $degrees$
+            result = math.rad2deg(ans)
+            Term.display result
+
+        ELSEIF line is $radians$
+            result = math.deg2rad(ans)
+            Term.display result
+
+        ELSEIF line is $ms$
+            mem = ans
+            Term.display $  Stored:$
+            Term.display mem
+
+        ELSEIF line is $mr$
+            Term.display $  Memory:$
+            Term.display mem
+
+        ELSEIF line is $mc$
+            mem = 0.0
+            Term.display $  Memory cleared$
+
+        OTHER
+            result = eval(line)
+            h3 = h2
+            h2 = h1
+            h1 = result
+            ans = result
+            Term.display result
+
+    /kill
+<mainloop>

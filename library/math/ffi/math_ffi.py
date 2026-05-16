@@ -1,5 +1,5 @@
 import ctypes as _ct, os as _os, platform as _pl
-_acmath_lib = _os.path.join(_os.getcwd(), 'library', 'math', 'acmath.dll' if _pl.system() == 'Windows' else 'libacmath.so')
+_acmath_lib = _os.path.join(globals().get('_ac_math_lib_dir', _os.path.join(_os.getcwd(), 'library', 'math')), 'acmath.dll' if _pl.system() == 'Windows' else 'libacmath.so')
 _m = _ct.CDLL(_os.path.normpath(_acmath_lib))
 _D = _ct.c_double; _I = _ct.c_int64; _INT = _ct.c_int; _CS = _ct.c_char_p
 def _d1(n):  f=getattr(_m,n); f.argtypes=[_D];       f.restype=_D;  return f

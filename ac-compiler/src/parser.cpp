@@ -1270,6 +1270,20 @@ private:
     NodePtr parseIdentifierStatement() {
         std::string name = advance().value;
 
+        // using header <libname>  — flat import (same as: use ilib <libname>)
+        // Allows writing  sin(x), pi  directly without the math. prefix.
+        if (name == "using" && at(TokenType::IDENTIFIER) && peek().value == "header") {
+            advance(); // consume "header"
+            std::string libname;
+            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
+                libname += advance().value;
+            // trim whitespace
+            auto notSpace = [](char c){ return !std::isspace((unsigned char)c); };
+            libname.erase(libname.begin(), std::find_if(libname.begin(), libname.end(), notSpace));
+            libname.erase(std::find_if(libname.rbegin(), libname.rend(), notSpace).base(), libname.end());
+            return std::make_unique<ASTNode>(NodeType::UseLibStmt, "ilib:" + libname);
+        }
+
         // Function call without object prefix: jump(Character)
         if (at(TokenType::LPAREN)) {
             advance();
