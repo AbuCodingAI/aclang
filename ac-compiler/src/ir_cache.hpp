@@ -10,7 +10,7 @@
 #include <memory>
 
 static const char IRC_MAGIC[4] = {'A','C','I','R'};
-static const uint8_t IRC_VERSION = 2;
+static const uint8_t IRC_VERSION = 4; // bumped: classOwner on IRFunction, CLASS_BEGIN/END opcodes
 
 // ── FNV-1a 64-bit hash ────────────────────────────────────────────────────────
 inline uint64_t fnv64(const std::string& data) {
@@ -20,7 +20,9 @@ inline uint64_t fnv64(const std::string& data) {
 }
 
 inline uint64_t hashForCache(const std::string& source, const std::string& backend) {
-    return fnv64(source + '\0' + backend);
+    // Include build timestamp so any recompile of the compiler invalidates all caches
+    static const char BUILD_ID[] = __DATE__ " " __TIME__;
+    return fnv64(source + '\0' + backend + '\0' + BUILD_ID);
 }
 
 // ── Serialization primitives ──────────────────────────────────────────────────
@@ -126,10 +128,12 @@ inline void saveIRCache(const std::string& ircFile, uint64_t hash,
         wI32(f, sym.scope);
     }
 
-    // Functions
+    // ── Section: definitions (functions) ────────────────────────────────────
+    wStr(f, "defs");
     wU32(f, (uint32_t)prog.functions.size());
     for (auto& fn : prog.functions) {
         wStr(f, fn.name);
+        wStr(f, fn.classOwner);
         wU8(f, (uint8_t)fn.returnType);
         wI32(f, fn.tempCount);
         wI32(f, fn.labelCount);
@@ -140,9 +144,15 @@ inline void saveIRCache(const std::string& ircFile, uint64_t hash,
         for (auto& ins : fn.instructions) wInstr(f, ins);
     }
 
-    // Global init
-    wU32(f, (uint32_t)prog.globalInit.size());
-    for (auto& ins : prog.globalInit) wInstr(f, ins);
+    // ── Section: data (imports, global consts) ───────────────────────────────
+    wStr(f, "data");
+    wU32(f, (uint32_t)prog.dataSection.size());
+    for (auto& ins : prog.dataSection) wInstr(f, ins);
+
+    // ── Section: main (mainloop body) ───────────────────────────────────────
+    wStr(f, "main");
+    wU32(f, (uint32_t)prog.mainSection.size());
+    for (auto& ins : prog.mainSection) wInstr(f, ins);
 
     wI32(f, prog.globalTempCount);
     wI32(f, prog.globalLabelCount);
@@ -175,28 +185,48 @@ inline std::unique_ptr<AC_IR::IRProgram> loadIRCache(const std::string& ircFile,
         prog->symbols.intern(name, type);
     }
 
-    // Functions
-    uint32_t fc = rU32(f);
-    if (fc > 10000) return nullptr;
-    for (uint32_t fi = 0; fi < fc; fi++) {
-        AC_IR::IRFunction fn(rStr(f));
-        fn.returnType  = (AC_IR::IRType)rU8(f);
-        fn.tempCount   = rI32(f);
-        fn.labelCount  = rI32(f);
-        uint8_t np = rU8(f);
-        for (int i = 0; i < np; i++) fn.parameters.push_back(rStr(f));
-        uint32_t ic = rU32(f);
-        if (ic > 1000000) return nullptr;
-        fn.instructions.reserve(ic);
-        for (uint32_t i = 0; i < ic; i++) fn.instructions.push_back(rInstr(f));
-        prog->functions.push_back(std::move(fn));
+    // ── Sections ─────────────────────────────────────────────────────────────
+    // Read three sections in order: defs, data, main
+    for (int sec = 0; sec < 3; sec++) {
+        std::string secName = rStr(f);
+
+        if (secName == "defs") {
+            uint32_t fc = rU32(f);
+            if (fc > 10000) return nullptr;
+            for (uint32_t fi = 0; fi < fc; fi++) {
+                std::string fnName  = rStr(f);
+                std::string fnOwner = rStr(f);
+                AC_IR::IRFunction fn(fnName, fnOwner);
+                fn.returnType  = (AC_IR::IRType)rU8(f);
+                fn.tempCount   = rI32(f);
+                fn.labelCount  = rI32(f);
+                uint8_t np = rU8(f);
+                for (int i = 0; i < np; i++) fn.parameters.push_back(rStr(f));
+                uint32_t ic = rU32(f);
+                if (ic > 1000000) return nullptr;
+                fn.instructions.reserve(ic);
+                for (uint32_t i = 0; i < ic; i++) fn.instructions.push_back(rInstr(f));
+                prog->functions.push_back(std::move(fn));
+            }
+        } else if (secName == "data") {
+            uint32_t dc = rU32(f);
+            if (dc > 1000000) return nullptr;
+            prog->dataSection.reserve(dc);
+            for (uint32_t i = 0; i < dc; i++) prog->dataSection.push_back(rInstr(f));
+        } else if (secName == "main") {
+            uint32_t mc = rU32(f);
+            if (mc > 1000000) return nullptr;
+            prog->mainSection.reserve(mc);
+            for (uint32_t i = 0; i < mc; i++) prog->mainSection.push_back(rInstr(f));
+        } else {
+            return nullptr; // unknown section — cache corrupt
+        }
     }
 
-    // Global init
-    uint32_t gc = rU32(f);
-    if (gc > 1000000) return nullptr;
-    prog->globalInit.reserve(gc);
-    for (uint32_t i = 0; i < gc; i++) prog->globalInit.push_back(rInstr(f));
+    // Reconstruct globalInit = data + main (codegen compatibility)
+    prog->globalInit.reserve(prog->dataSection.size() + prog->mainSection.size());
+    for (auto& ins : prog->dataSection) prog->globalInit.push_back(ins);
+    for (auto& ins : prog->mainSection) prog->globalInit.push_back(ins);
 
     prog->globalTempCount  = rI32(f);
     prog->globalLabelCount = rI32(f);

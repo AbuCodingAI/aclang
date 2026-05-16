@@ -32,7 +32,7 @@ enum class NodeType {
     TupleLiteral,   // {$a, b$}
     DictLiteral,    // {key: value, key2: value2}
     IndexExpr,      // list[1] (1-based)
-    DisplayStmt,    // display $string$ (screen output)
+    DisplayStmt,    // should be Term.display $string$ (screen output)
     ObjDecl,        // Obj.Name
     PropAssign,     // Name.prop = value
     MethodCall,     // Name.method(args)
@@ -48,7 +48,6 @@ enum class NodeType {
     Identifier,
     ForeignBlock,   // <Foreign> raw passthrough 
     EventListener,  // configure event-listener
-    WhenBlock,      // when many hitbox overlap
     SpawnStmt,      // SpawnTerrain etc
     BinaryExpr,     // fn a*(b-c) — multiply/arithmetic (legacy string-based)
     UnaryExpr,      // Structured unary expression: op operand
@@ -65,6 +64,8 @@ enum class NodeType {
     FunctionCall,   // func arg1 arg2 arg3 (multiple arguments)
     KeyBinding,     // on value=key function_call
     InputStmt,      // input <keybind> → send ghost/simulated input
+    EvalExpr,       // eval(expr) → evaluate string as AC expression, returns value
+    BundleDef,      // bundle X — class/struct definition (body has FuncDef + AssignStmt)
 };
 
 struct ASTNode {

@@ -2,12 +2,61 @@
 #include <sstream>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <vector>
 #include <string>
 #include <memory>
 #include <cstdio>
+#include <cstring>
+#ifdef _WIN32
+#include <direct.h>
+#define ac_getcwd _getcwd
+#else
+#include <unistd.h>
+#define ac_getcwd getcwd
+#endif
 
 using namespace AC_IR;
+
+// ─── FFI file reader ─────────────────────────────────────────────────────────
+// Reads library/<libName>/ffi/<libName>_ffi.<ext> relative to cwd.
+static std::string readFFIFile(const std::string &libName, const std::string &ext)
+{
+    std::string path = "library/" + libName + "/ffi/" + libName + "_ffi." + ext;
+    FILE *f = std::fopen(path.c_str(), "r");
+    if (!f) return "";
+    std::string content;
+    char buf[4096];
+    while (std::fgets(buf, sizeof(buf), f)) content += buf;
+    std::fclose(f);
+    return content;
+}
+
+// Parses a Go FFI file into two parts for inlining:
+//   cgoBlock   — everything from the CGO comment up to and including `import "C"`
+//   wrapperCode — everything after (skipping `import "unsafe"` standalone lines,
+//                 skipping the `package` declaration line)
+static void parseGoFFI(const std::string &libName,
+                       std::string &cgoBlock,
+                       std::string &wrapperCode)
+{
+    cgoBlock.clear(); wrapperCode.clear();
+    std::string content = readFFIFile(libName, "go");
+    if (content.empty()) return;
+    std::istringstream ss(content);
+    std::string line;
+    bool pastCImport = false;
+    while (std::getline(ss, line)) {
+        if (line.rfind("package ", 0) == 0) continue;  // skip package line
+        if (!pastCImport) {
+            cgoBlock += line + "\n";
+            if (line == "import \"C\"") pastCImport = true;
+        } else {
+            if (line == "import \"unsafe\"") continue;  // merged into regular imports
+            wrapperCode += line + "\n";
+        }
+    }
+}
 
 // ─── shared helpers ──────────────────────────────────────────────────────────
 
@@ -53,6 +102,33 @@ static std::string fmtDouble(double d)
 static std::string stripQuotes(const std::string &s)
 {
     return looksString(s) ? s.substr(1, s.size() - 2) : s;
+}
+
+// Pre-populate a declared set with parameter names from "p1, p2, ..." so that
+// assignments to params emit plain "n = val" instead of "TYPE n = val".
+static void declareParams(const std::string &params, std::set<std::string> &declared)
+{
+    if (params.empty()) return;
+    std::istringstream ss(params);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        size_t s = tok.find_first_not_of(" \t");
+        size_t e = tok.find_last_not_of(" \t");
+        if (s != std::string::npos)
+            declared.insert(tok.substr(s, e - s + 1));
+    }
+}
+
+// Math library functions that return integers, not floats.
+// Strips any "AcMath." prefix before comparing (for Java backend).
+static bool isIntReturningMathFunc(const char* s) {
+    if (strncmp(s, "AcMath.", 7) == 0) s += 7;
+    return strcmp(s, "math_to_int")   == 0
+        || strcmp(s, "math_abs_int")  == 0
+        || strcmp(s, "math_mod_int")  == 0
+        || strcmp(s, "math_gcd")      == 0
+        || strcmp(s, "math_lcm")      == 0
+        || strcmp(s, "math_is_prime") == 0;
 }
 
 // Reformat "p1, p2" → "TYPE p1, TYPE p2"
@@ -117,11 +193,49 @@ static std::string suffixTypedParams(const std::string &params, const std::strin
     }
     return result;
 }
+// Reformat "p1, p2" → "mut p1: TYPE, mut p2: TYPE"  (Rust mutable params)
+static std::string rustMutTypedParams(const std::string &params, const std::string &typeName)
+{
+    if (params.empty())
+        return "";
+    std::istringstream ss(params);
+    std::string result, token;
+    bool first = true;
+    while (std::getline(ss, token, ','))
+    {
+        size_t a = token.find_first_not_of(' ');
+        size_t b = token.find_last_not_of(' ');
+        std::string name = (a == std::string::npos) ? "" : token.substr(a, b - a + 1);
+        if (!first)
+            result += ", ";
+        result += "mut " + name + ": " + typeName;
+        first = false;
+    }
+    return result;
+}
 
 // Common ref formatter (all backends except ASM share this)
+// Escape a raw string for embedding in a double-quoted literal.
+static std::string escapeStr(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
 static std::string commonRef(const IRRef &r, SymbolTable *sym,
-                             const std::string &trueVal = "true",
-                             const std::string &falseVal = "false")
+                             const std::string &trueVal  = "true",
+                             const std::string &falseVal = "false",
+                             const std::string &nullVal  = "null")
 {
     if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::FUNCTION)
         return r.toStringWithSymbols(sym);
@@ -142,7 +256,9 @@ static std::string commonRef(const IRRef &r, SymbolTable *sym,
             std::string s = std::get<std::string>(r.value.data);
             if (s.size() >= 2 && s.front() == '$' && s.back() == '$')
                 s = s.substr(1, s.size() - 2);
-            return "\"" + s + "\"";
+            // null literal → backend-specific null
+            if (s == "null") return nullVal;
+            return "\"" + escapeStr(s) + "\"";
         }
     }
     return "0";
@@ -161,6 +277,13 @@ public:
     virtual void emitFooter(std::ostringstream &out) {}
     // Called before emitHeader so strategies can adapt to the output filename stem
     virtual void setOutputStem(const std::string &) {}
+    // Full output base path (e.g. "examples/math_number") — used by backends that need
+    // to compute paths relative to the output file's directory.
+    virtual void setOutputBase(const std::string &) {}
+
+    // True for backends that call functions with dot syntax (obj.method / lib.func).
+    // False (default) for backends that need lib_func underscore naming.
+    virtual bool dotCallSyntax() const { return false; }
 
     virtual std::string formatRef(const IRRef &r, SymbolTable *sym) = 0;
 
@@ -173,7 +296,15 @@ public:
                           const std::string &func, const std::string &args) = 0;
     virtual void emitReturn(std::ostringstream &out, int &indent, const std::string &val) = 0;
     virtual void emitPrint(std::ostringstream &out, int &indent, const std::string &val) = 0;
+    // style: "bold", "italic", "header", "link", "title" — default falls back to plain print
+    virtual void emitStyledPrint(std::ostringstream &out, int &indent,
+                                 const std::string &val, const std::string &style)
+    {
+        emitPrint(out, indent, val);
+    }
     virtual void emitHalt(std::ostringstream &out, int &indent) = 0;
+    virtual void emitEval(std::ostringstream &out, int &indent,
+                          const std::string &res, const std::string &expr) = 0;
     virtual void emitForeign(std::ostringstream &out, int &indent, const std::string &code)
     {
         emitRaw(out, stripQuotes(code));
@@ -190,6 +321,42 @@ public:
     virtual void emitAlloc(std::ostringstream &out, int &indent,
                            const std::string &var, const std::string &allocType,
                            const std::string &content) {}
+    virtual void emitLoadIndex(std::ostringstream &out, int &indent,
+                               const std::string &result, const std::string &arr,
+                               const std::string &idx) {}
+    virtual void emitStoreIndex(std::ostringstream &out, int &indent,
+                                const std::string &arr, const std::string &idx,
+                                const std::string &val) {}
+    virtual void emitInput(std::ostringstream &out, int &indent,
+                           const std::string &result, const std::string &prompt) {}
+    // libType: "ilib", "elib", "clib"; libName: the library name (no prefix)
+    virtual void emitLibImport(std::ostringstream &out, const std::string &libType,
+                               const std::string &libName) {}
+
+    // Called before emitHeader so strategies can adapt to what opcodes are used
+    virtual void setNeedsInput(bool) {}
+
+    // Called before emitHeader with all ilib/elib/clib imports found in the program.
+    // Strategies that need file-scope includes (C, C++) emit them in emitHeader.
+    // Others emit them on-demand in emitLibImport.
+    virtual void setPendingImports(const std::vector<std::pair<std::string,std::string>>&) {}
+
+    // Optional: per-library selective symbol list from "from ilib X use a,b,c".
+    // Key = "ilib:math", value = {"sin","cos",...}. Empty set = import all.
+    virtual void setImportSymbols(const std::unordered_map<std::string,std::set<std::string>>&) {}
+
+    // Called before emitting any function to declare which global vars the function writes to
+    virtual void setPendingGlobals(const std::vector<std::string> &) {}
+
+    // Raise a runtime error with the given message string
+    virtual void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) {}
+
+    // Event system — called when EVENT_BIND / EVENT_TRIGGER opcodes are present
+    virtual void setNeedsEvents(bool) {}
+    virtual void emitEventBind(std::ostringstream &out, int &indent,
+                               const std::string &key, const std::string &callback) {}
+    virtual void emitEventTrigger(std::ostringstream &out, int &indent,
+                                  const std::string &key) {}
 
     virtual void emitLabel(std::ostringstream &out, int indent, const std::string &label) = 0;
     virtual void emitJump(std::ostringstream &out, int indent, const std::string &label) = 0;
@@ -199,33 +366,131 @@ public:
                                 const std::string &cond, const std::string &label) {}
 
     virtual void emitFunctionBegin(std::ostringstream &out, int &indent,
-                                   const std::string &name, const std::string &params) = 0;
+                                   const std::string &name, const std::string &params,
+                                   const std::string &classOwner = "") = 0;
     virtual void emitFunctionEnd(std::ostringstream &out, int &indent) = 0;
     virtual void emitMainBegin(std::ostringstream &out, int &indent) = 0;
     virtual void emitMainEnd(std::ostringstream &out, int &indent) = 0;
+
+    // Class/bundle support
+    virtual void emitClassBegin(std::ostringstream &out, int &indent,
+                                const std::string &name) { (void)out; (void)indent; (void)name; }
+    virtual void emitClassEnd(std::ostringstream &out, int &indent) { (void)out; (void)indent; }
+    // Return true if the backend cannot emit field-default instructions inside a class body.
+    virtual bool suppressClassBody() const { return false; }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ── shared helpers ────────────────────────────────────────────────────────────
+
+// Convert "key1:val1,key2:val2" dict content to raw {key, value} pairs.
+// Dollar-sign strings like $Alice$ are stored as-is; bare identifiers too.
+static std::vector<std::pair<std::string,std::string>> parseDictPairs(const std::string& content) {
+    std::vector<std::pair<std::string,std::string>> out;
+    std::string s = content;
+    while (!s.empty()) {
+        auto comma = s.find(',');
+        std::string pair = comma == std::string::npos ? s : s.substr(0, comma);
+        s = comma == std::string::npos ? "" : s.substr(comma + 1);
+        auto colon = pair.find(':');
+        if (colon != std::string::npos)
+            out.push_back({pair.substr(0, colon), pair.substr(colon + 1)});
+    }
+    return out;
+}
+
+// Format a dict KEY: always a string in the target language.
+// bare 'name' → "name";  '$Alice$' → "Alice"
+static std::string fmtDictKey(const std::string& k) {
+    if (k.size() >= 2 && k.front() == '$' && k.back() == '$')
+        return "\"" + k.substr(1, k.size() - 2) + "\"";
+    return "\"" + k + "\"";
+}
+
+// Format a dict VALUE: $..$ → quoted string; number/bool/var → as-is.
+static std::string fmtDictVal(const std::string& v) {
+    if (v.size() >= 2 && v.front() == '$' && v.back() == '$')
+        return "\"" + v.substr(1, v.size() - 2) + "\"";
+    return v;
+}
+
 // 1. PYTHON  (AC->PY)
 // ═══════════════════════════════════════════════════════════════════════════
 
 class PythonStrategy : public BackendStrategy
 {
+    std::set<std::string> globalVars_;
+    std::vector<std::string> pendingGlobals_;
+    bool needsEvents_ = false;
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
+    std::unordered_map<std::string,std::set<std::string>> importSymbols_;
+
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
         out << std::string(indent * 4, ' ') << line << "\n";
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
 
+    void setNeedsEvents(bool v) override { needsEvents_ = v; }
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imp) override
+    {
+        pendingImports_ = imp;
+    }
+    void setImportSymbols(const std::unordered_map<std::string,std::set<std::string>>& s) override
+    {
+        importSymbols_ = s;
+    }
+
+    // Build a comment listing the selectively imported symbols.
+    static std::string selectiveImportComment(const std::set<std::string>& syms) {
+        std::string s = "# selective: use ";
+        bool first = true;
+        for (auto& sym : syms) { if (!first) s += ", "; s += sym; first = false; }
+        return s + "\n";
+    }
+
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "# Generated by AC Compiler (AC->PY)");
-        emitRaw(out, "import sys\n");
+        emitRaw(out, "import sys");
+        for (auto& [lt, ln] : pendingImports_) {
+            if (lt == "ilib") {
+                std::string ffi = readFFIFile(ln, "py");
+                if (!ffi.empty()) {
+                    // Emit selective-import comment if symbols were specified
+                    std::string key = lt + ":" + ln;
+                    auto it = importSymbols_.find(key);
+                    if (it != importSymbols_.end() && !it->second.empty())
+                        out << selectiveImportComment(it->second);
+                    out << ffi;
+                }
+            }
+        }
+        if (needsEvents_) {
+            emitRaw(out, "_ac_events = {}");
+            emitRaw(out, "def _ac_bind(key, fn): _ac_events[key] = fn");
+            emitRaw(out, "def _ac_trigger(key):");
+            emitRaw(out, "    if key in _ac_events: _ac_events[key]()");
+        }
+        emitRaw(out, "");
     }
+
+    void emitEventBind(std::ostringstream &out, int &indent,
+                       const std::string &key, const std::string &callback) override
+    {
+        emit(out, indent, "_ac_bind(" + key + ", " + callback + ")");
+    }
+    void emitEventTrigger(std::ostringstream &out, int &indent,
+                          const std::string &key) override
+    {
+        emit(out, indent, "_ac_trigger(" + key + ")");
+    }
+
+    bool dotCallSyntax() const override { return true; }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "True", "False");
+        return commonRef(r, sym, "True", "False", "None");
     }
 
     void emitStoreVar(std::ostringstream &out, int &indent, const std::string &var, const std::string &val) override
@@ -271,6 +536,11 @@ class PythonStrategy : public BackendStrategy
     {
         emit(out, indent, "sys.exit(0)");
     }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        emit(out, indent, res + " = float(eval(" + expr + "))");
+    }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
     {
@@ -298,10 +568,40 @@ class PythonStrategy : public BackendStrategy
     }
     void emitForEnd(std::ostringstream &out, int &indent) override { indent--; }
     void emitAlloc(std::ostringstream &out, int &indent,
-                   const std::string &var, const std::string & /*type*/,
+                   const std::string &var, const std::string &type,
                    const std::string &content) override
     {
-        emit(out, indent, var + " = [" + content + "]");
+        if (type == "dict") {
+            std::string d = "{";
+            bool first = true;
+            for (auto& [k, v] : parseDictPairs(content)) {
+                if (!first) d += ", ";
+                d += fmtDictKey(k) + ": " + fmtDictVal(v);
+                first = false;
+            }
+            emit(out, indent, var + " = " + d + "}");
+        } else if (type == "tuple") {
+            emit(out, indent, var + " = (" + content + ",)");
+        } else {
+            emit(out, indent, var + " = [" + content + "]");
+        }
+    }
+    void emitLoadIndex(std::ostringstream &out, int &indent,
+                       const std::string &result, const std::string &arr,
+                       const std::string &idx) override
+    {
+        emit(out, indent, result + " = " + arr + "[" + idx + "]");
+    }
+    void emitStoreIndex(std::ostringstream &out, int &indent,
+                        const std::string &arr, const std::string &idx,
+                        const std::string &val) override
+    {
+        emit(out, indent, arr + "[" + idx + "] = " + val);
+    }
+    void emitInput(std::ostringstream &out, int &indent,
+                   const std::string &result, const std::string &prompt) override
+    {
+        emit(out, indent, result + " = input(" + prompt + ")");
     }
 
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -326,16 +626,50 @@ class PythonStrategy : public BackendStrategy
             emit(out, indent, "if not (" + cond + "): pass  # goto " + label);
     }
 
-    void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+    void setPendingGlobals(const std::vector<std::string> &g) override
     {
-        emit(out, indent, "def " + name + "(" + params + "):");
+        pendingGlobals_ = g;
+    }
+
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        emit(out, indent, "raise Exception(\"Preposterous: \" + str(" + msg + "))");
+    }
+
+    void emitFunctionBegin(std::ostringstream &out, int &indent,
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
+    {
+        // init → __init__ for Python classes
+        std::string pyName = (!classOwner.empty() && name == "init") ? "__init__" : name;
+        emit(out, indent, "def " + pyName + "(" + params + "):");
         indent++;
+        for (auto &g : pendingGlobals_)
+            emit(out, indent, "global " + g);
+        pendingGlobals_.clear();
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
         indent--;
         emitRaw(out, "");
+    }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        emitRaw(out, "class " + name + ":");
+        indent++;
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        indent--;
+        emitRaw(out, "");
+    }
+    void emitLibImport(std::ostringstream &out, const std::string &libType,
+                       const std::string &libName) override
+    {
+        // ilib: handled in emitHeader via setPendingImports (FFI file inlined there)
+        if (libType == "elib")
+            emitRaw(out, "import " + libName);
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -352,6 +686,8 @@ class PythonStrategy : public BackendStrategy
 class JavaScriptStrategy : public BackendStrategy
 {
     std::set<std::string> declared;
+    bool needsEvents_ = false;
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
 
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
@@ -359,10 +695,39 @@ class JavaScriptStrategy : public BackendStrategy
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
 
+    void setNeedsEvents(bool v) override { needsEvents_ = v; }
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imp) override
+    {
+        pendingImports_ = imp;
+    }
+
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "// Generated by AC Compiler (AC->JS)");
-        emitRaw(out, "'use strict';\n");
+        emitRaw(out, "'use strict';");
+        for (auto& [lt, ln] : pendingImports_) {
+            if (lt == "ilib") {
+                std::string ffi = readFFIFile(ln, "js");
+                if (!ffi.empty()) out << ffi;
+            }
+        }
+        if (needsEvents_) {
+            emitRaw(out, "const _acEvents = {};");
+            emitRaw(out, "function _acBind(key, fn) { _acEvents[key] = fn; }");
+            emitRaw(out, "function _acTrigger(key) { if (_acEvents[key]) _acEvents[key](); }");
+        }
+        emitRaw(out, "");
+    }
+
+    void emitEventBind(std::ostringstream &out, int &indent,
+                       const std::string &key, const std::string &callback) override
+    {
+        emit(out, indent, "_acBind(" + key + ", " + callback + ");");
+    }
+    void emitEventTrigger(std::ostringstream &out, int &indent,
+                          const std::string &key) override
+    {
+        emit(out, indent, "_acTrigger(" + key + ");");
     }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
@@ -426,6 +791,15 @@ class JavaScriptStrategy : public BackendStrategy
     {
         emit(out, indent, "process.exit(0);");
     }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')()')()"));
+    }
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        emit(out, indent, "throw new Error(\"Preposterous: \" + String(" + msg + "));");
+    }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
     {
@@ -465,10 +839,40 @@ class JavaScriptStrategy : public BackendStrategy
         emit(out, indent, "}");
     }
     void emitAlloc(std::ostringstream &out, int &indent,
-                   const std::string &var, const std::string & /*type*/,
+                   const std::string &var, const std::string &type,
                    const std::string &content) override
     {
-        emit(out, indent, "let " + var + " = [" + content + "];");
+        if (type == "dict") {
+            std::string d = "{";
+            bool first = true;
+            for (auto& [k, v] : parseDictPairs(content)) {
+                if (!first) d += ", ";
+                d += fmtDictKey(k) + ": " + fmtDictVal(v);
+                first = false;
+            }
+            emit(out, indent, "let " + var + " = " + d + "};");
+        } else if (type == "tuple") {
+            emit(out, indent, "let " + var + " = [" + content + "];");
+        } else {
+            emit(out, indent, "let " + var + " = [" + content + "];");
+        }
+    }
+    void emitLoadIndex(std::ostringstream &out, int &indent,
+                       const std::string &result, const std::string &arr,
+                       const std::string &idx) override
+    {
+        emit(out, indent, "let " + result + " = " + arr + "[" + idx + "];");
+    }
+    void emitStoreIndex(std::ostringstream &out, int &indent,
+                        const std::string &arr, const std::string &idx,
+                        const std::string &val) override
+    {
+        emit(out, indent, arr + "[" + idx + "] = " + val + ";");
+    }
+    void emitInput(std::ostringstream &out, int &indent,
+                   const std::string &result, const std::string &prompt) override
+    {
+        emit(out, indent, "let " + result + " = require('readline-sync').question(" + prompt + ");");
     }
 
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -494,10 +898,21 @@ class JavaScriptStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         declared.clear();
-        emit(out, indent, "function " + name + "(" + params + ") {");
+        // Strip 'self' from JS method params — JS uses 'this' implicitly
+        std::string jsParams = params;
+        if (!classOwner.empty()) {
+            if (jsParams.rfind("self, ", 0) == 0) jsParams = jsParams.substr(6);
+            else if (jsParams == "self") jsParams = "";
+        }
+        std::string jsName = (!classOwner.empty() && name == "init") ? "constructor" : name;
+        if (classOwner.empty())
+            emit(out, indent, "function " + jsName + "(" + jsParams + ") {");
+        else
+            emit(out, indent, jsName + "(" + jsParams + ") {");
         indent++;
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
@@ -506,6 +921,25 @@ class JavaScriptStrategy : public BackendStrategy
         emit(out, indent, "}");
         emitRaw(out, "");
         declared.clear();
+    }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        emit(out, indent, "class " + name + " {");
+        indent++;
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        indent--;
+        emit(out, indent, "}");
+        emitRaw(out, "");
+    }
+    void emitLibImport(std::ostringstream &out, const std::string &libType,
+                       const std::string &libName) override
+    {
+        // ilib: handled in emitHeader via setPendingImports (FFI file inlined there)
+        if (libType == "elib")
+            emitRaw(out, "const " + libName + " = require('" + libName + "');");
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -527,12 +961,15 @@ class JavaScriptStrategy : public BackendStrategy
 class HTMLStrategy : public BackendStrategy
 {
     std::set<std::string> declared;
+    bool needsEvents_ = false;
 
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
         out << std::string(indent * 4, ' ') << line << "\n";
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
+
+    void setNeedsEvents(bool v) override { needsEvents_ = v; }
 
     void emitHeader(std::ostringstream &out) override
     {
@@ -541,11 +978,28 @@ class HTMLStrategy : public BackendStrategy
         emitRaw(out, "<body><pre id=\"_out\"></pre>\n<script>");
         emitRaw(out, "'use strict';");
         emitRaw(out, "const _el = document.getElementById('_out');");
-        emitRaw(out, "function _print(v) { _el.textContent += String(v) + '\\n'; }\n");
+        emitRaw(out, "function _print(v) { _el.textContent += String(v) + '\\n'; }");
+        if (needsEvents_) {
+            emitRaw(out, "const _acEvents = {};");
+            emitRaw(out, "function _acBind(key, fn) { _acEvents[key] = fn; document.addEventListener('keydown', function(e) { if (e.key === key) fn(); }); }");
+            emitRaw(out, "function _acTrigger(key) { if (_acEvents[key]) _acEvents[key](); }");
+        }
+        emitRaw(out, "");
     }
     void emitFooter(std::ostringstream &out) override
     {
         emitRaw(out, "</script>\n</body>\n</html>");
+    }
+
+    void emitEventBind(std::ostringstream &out, int &indent,
+                       const std::string &key, const std::string &callback) override
+    {
+        emit(out, indent, "_acBind(" + key + ", " + callback + ");");
+    }
+    void emitEventTrigger(std::ostringstream &out, int &indent,
+                          const std::string &key) override
+    {
+        emit(out, indent, "_acTrigger(" + key + ");");
     }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
@@ -603,9 +1057,34 @@ class HTMLStrategy : public BackendStrategy
     {
         emit(out, indent, "_print(" + val + ");");
     }
+    void emitStyledPrint(std::ostringstream &out, int &indent,
+                         const std::string &val, const std::string &style) override
+    {
+        if (style == "title")
+            emit(out, indent, "_el.ownerDocument.title = " + val + ";");
+        else if (style == "bold")
+            emit(out, indent, "_el.innerHTML += '<b>' + " + val + " + '</b>\\n';");
+        else if (style == "italic")
+            emit(out, indent, "_el.innerHTML += '<i>' + " + val + " + '</i>\\n';");
+        else if (style == "header")
+            emit(out, indent, "_el.innerHTML += '<h2>' + " + val + " + '</h2>\\n';");
+        else if (style == "link")
+            emit(out, indent, "_el.innerHTML += '<a href=\"#\">' + " + val + " + '</a>\\n';");
+        else
+            emit(out, indent, "_print(" + val + ");");
+    }
     void emitHalt(std::ostringstream &out, int &indent) override
     {
         emit(out, indent, "// program halted");
+    }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')()')()"));
+    }
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        emit(out, indent, "throw new Error(\"Preposterous: \" + String(" + msg + "));");
     }
     void emitForeign(std::ostringstream &out, int &indent, const std::string &code) override
     {
@@ -678,10 +1157,20 @@ class HTMLStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         declared.clear();
-        emit(out, indent, "function " + name + "(" + params + ") {");
+        std::string jsParams = params;
+        if (!classOwner.empty()) {
+            if (jsParams.rfind("self, ", 0) == 0) jsParams = jsParams.substr(6);
+            else if (jsParams == "self") jsParams = "";
+        }
+        std::string jsName = (!classOwner.empty() && name == "init") ? "constructor" : name;
+        if (classOwner.empty())
+            emit(out, indent, "function " + jsName + "(" + jsParams + ") {");
+        else
+            emit(out, indent, jsName + "(" + jsParams + ") {");
         indent++;
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
@@ -690,6 +1179,18 @@ class HTMLStrategy : public BackendStrategy
         emit(out, indent, "}");
         emitRaw(out, "");
         declared.clear();
+    }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        emit(out, indent, "class " + name + " {");
+        indent++;
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        indent--;
+        emit(out, indent, "}");
+        emitRaw(out, "");
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -712,8 +1213,19 @@ class CStrategy : public BackendStrategy
 {
     std::set<std::string> declared;
     std::set<std::string> floatVars;
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
 
-    bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v); }
+    static bool isKnownFloatName(const std::string &v) {
+        if (v.find('(') != std::string::npos) return false;
+        if (isIntReturningMathFunc(v.c_str())) return false;
+        return v == "math_pi" || v == "math_e" || v == "math_tau" || v == "math_em" || v == "math_inf"
+            || v.rfind("math_", 0) == 0
+            || v.rfind("stat_", 0) == 0
+            || v.rfind("ac_",   0) == 0;
+    }
+    bool isFloatVal(const std::string &v) const {
+        return looksFloat(v) || floatVars.count(v) || isKnownFloatName(v);
+    }
 
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
@@ -721,20 +1233,33 @@ class CStrategy : public BackendStrategy
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
 
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imports) override
+    {
+        pendingImports_ = imports;
+    }
+
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "/* Generated by AC Compiler (AC->C) */");
         emitRaw(out, "#include <stdio.h>");
         emitRaw(out, "#include <stdlib.h>");
         emitRaw(out, "#include <string.h>");
-        emitRaw(out, "#include <stdint.h>\n");
+        emitRaw(out, "#include <stdint.h>");
+        // Emit ilib C headers at file scope before main()
+        for (auto& [lt, ln] : pendingImports_) {
+            if (lt == "ilib") {
+                emitRaw(out, "#include \"library/" + ln + "/" + ln + "_c.h\"");
+                emitRaw(out, "// Link: gcc output.c -L./library/" + ln + " -lac" + ln);
+            }
+        }
+        emitRaw(out, "");
         emitRaw(out, "typedef long long ac_int;");
         emitRaw(out, "typedef const char* ac_str;\n");
     }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "1", "0");
+        return commonRef(r, sym, "1", "0", "NULL");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -778,15 +1303,30 @@ class CStrategy : public BackendStrategy
             expr = "(ac_int)(" + lhs + " " + op + " " + rhs + ")";
         emit(out, indent, decl(res, expr));
     }
+    // Returns true for function names known to return double (math library pattern)
+    static bool isFloatReturningFunc(const std::string &fn) {
+        if (isIntReturningMathFunc(fn.c_str())) return false;
+        if (fn.rfind("math_", 0) == 0) return true;   // math_sin, math_sqrt, ...
+        if (fn.rfind("stat_", 0) == 0) return true;   // stat_avg, stat_median, ...
+        if (fn.rfind("ac_",   0) == 0) return true;   // ac_sin, ac_sqrt, ...
+        return false;
+    }
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                   const std::string &func, const std::string &args) override
     {
         std::string call = func + "(" + args + ")";
-        emit(out, indent, res.empty() ? call + ";" : decl(res, call));
+        if (res.empty()) {
+            emit(out, indent, call + ";");
+        } else if (isFloatReturningFunc(func) && declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "double " + res + " = " + call + ";");
+        } else {
+            emit(out, indent, decl(res, call));
+        }
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        emit(out, indent, val.empty() ? "return 0;" : "return " + val + ";");
+        if (!val.empty()) emit(out, indent, "return " + val + ";");
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
@@ -800,6 +1340,20 @@ class CStrategy : public BackendStrategy
     void emitHalt(std::ostringstream &out, int &indent) override
     {
         emit(out, indent, "exit(0);");
+    }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        if (declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "double " + res + " = ac_eval(" + expr + ");");
+        } else {
+            emit(out, indent, res + " = ac_eval(" + expr + ");");
+        }
+    }
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        emit(out, indent, "fprintf(stderr, \"Preposterous: %s\\n\", " + msg + "); exit(1);");
     }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
@@ -829,6 +1383,51 @@ class CStrategy : public BackendStrategy
         emit(out, indent, "}");
     }
 
+    void emitForBegin(std::ostringstream &out, int &indent,
+                      const std::string &iterVar, const std::string &collection) override
+    {
+        emit(out, indent, "for (size_t _fi = 0; _fi < sizeof(" + collection + ")/sizeof(" + collection + "[0]); _fi++) {");
+        emit(out, indent + 1, "ac_int " + iterVar + " = " + collection + "[_fi];");
+        declared.insert(iterVar);
+        indent++;
+    }
+    void emitForEnd(std::ostringstream &out, int &indent) override
+    {
+        indent--;
+        emit(out, indent, "}");
+    }
+    void emitAlloc(std::ostringstream &out, int &indent,
+                   const std::string &var, const std::string &type,
+                   const std::string &content) override
+    {
+        if (type == "dict")
+            emit(out, indent, "/* dict " + var + " = {" + content + "} */");
+        else
+            emit(out, indent, "ac_int " + var + "[] = {" + content + "};");
+    }
+    void emitLoadIndex(std::ostringstream &out, int &indent,
+                       const std::string &result, const std::string &arr,
+                       const std::string &idx) override
+    {
+        emit(out, indent, decl(result, arr + "[" + idx + "]"));
+    }
+    void emitStoreIndex(std::ostringstream &out, int &indent,
+                        const std::string &arr, const std::string &idx,
+                        const std::string &val) override
+    {
+        emit(out, indent, arr + "[" + idx + "] = " + val + ";");
+    }
+    void emitInput(std::ostringstream &out, int &indent,
+                   const std::string &result, const std::string &prompt) override
+    {
+        emit(out, indent, "printf(\"%s\", " + prompt + ");");
+        emit(out, indent, "char _buf_" + result + "[4096];");
+        emit(out, indent, "fgets(_buf_" + result + ", sizeof(_buf_" + result + "), stdin);");
+        emit(out, indent, "_buf_" + result + "[strcspn(_buf_" + result + ", \"\\n\")] = 0;");
+        emit(out, indent, "ac_str " + result + " = _buf_" + result + ";");
+        declared.insert(result);
+    }
+
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
     {
         out << label << ":;\n"; // semicolon needed so label can precede end of block
@@ -849,13 +1448,27 @@ class CStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         declared.clear(); floatVars.clear();
-        std::string tparams = typedParams(params, "ac_int");
-        if (tparams.empty())
-            tparams = "void";
-        emit(out, indent, "ac_int " + name + "(" + tparams + ") {");
+        // C methods: ClassName_methodName(ClassName* self, ...)
+        std::string cParams = params;
+        std::string cName   = name;
+        if (!classOwner.empty()) {
+            std::string selfParam = classOwner + "* self";
+            if (cParams.rfind("self, ", 0) == 0)
+                cParams = selfParam + ", " + cParams.substr(6);
+            else if (cParams == "self")
+                cParams = selfParam;
+            else
+                cParams = selfParam + (cParams.empty() ? "" : ", " + cParams);
+            cName = (name == "init") ? classOwner + "_init" : classOwner + "_" + name;
+        }
+        declareParams(params, declared);
+        std::string tparams = !classOwner.empty() ? cParams : typedParams(params, "ac_int");
+        if (tparams.empty()) tparams = "void";
+        emit(out, indent, "ac_int " + cName + "(" + tparams + ") {");
         indent++;
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
@@ -865,15 +1478,38 @@ class CStrategy : public BackendStrategy
         emitRaw(out, "");
         declared.clear(); floatVars.clear();
     }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        // C: opaque struct — field defaults can't be struct initialisers, suppress body
+        currentClass_ = name;
+        emitRaw(out, "/* bundle " + name + " */");
+        emitRaw(out, "typedef struct " + name + " { long long _tag; } " + name + ";");
+        emitRaw(out, "");
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        currentClass_ = "";
+        (void)indent;
+    }
+    bool suppressClassBody() const override { return true; }
+    std::string currentClass_;
+    void emitLibImport(std::ostringstream &out, const std::string &libType,
+                       const std::string &libName) override
+    {
+        // ilib handled in emitHeader via setPendingImports
+        if (libType == "clib")
+            emitRaw(out, "#include <" + libName + ".h>");
+    }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
         declared.clear(); floatVars.clear();
-        emit(out, indent, "int main(void) {");
+        emit(out, indent, "int main()");
+        emit(out, indent, "{");
         indent++;
     }
     void emitMainEnd(std::ostringstream &out, int &indent) override
     {
-        emit(out, indent, "return 0;");
         indent--;
         emit(out, indent, "}");
     }
@@ -887,6 +1523,7 @@ class CppStrategy : public BackendStrategy
 {
     std::set<std::string> declared;
     std::set<std::string> floatVars;
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
 
     bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v); }
 
@@ -896,20 +1533,29 @@ class CppStrategy : public BackendStrategy
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
 
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imports) override
+    {
+        pendingImports_ = imports;
+    }
+
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "// Generated by AC Compiler (AC->CPP)");
         emitRaw(out, "#include <iostream>");
         emitRaw(out, "#include <string>");
         emitRaw(out, "#include <vector>");
+        emitRaw(out, "#include <map>");
         emitRaw(out, "#include <cstdio>");
         emitRaw(out, "#include <cstdlib>");
-        emitRaw(out, "using namespace std;\n");
+        // Emit ilib includes at file scope before main()
+        for (auto& [lt, ln] : pendingImports_)
+            emitRaw(out, "#include \"library/" + ln + "/" + ln + ".hpp\"");
+        emitRaw(out, "");
     }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym);
+        return commonRef(r, sym, "true", "false", "nullptr");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -967,11 +1613,25 @@ class CppStrategy : public BackendStrategy
         if (isFloatVal(val))
             emit(out, indent, "printf(\"%.16g\\n\", (double)(" + val + "));");
         else
-            emit(out, indent, "cout << " + val + " << \"\\n\";");
+            emit(out, indent, "std::cout << " + val + " << \"\\n\";");
     }
     void emitHalt(std::ostringstream &out, int &indent) override
     {
         emit(out, indent, "exit(0);");
+    }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        if (declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "double " + res + " = math_eval(" + expr + ");");
+        } else {
+            emit(out, indent, res + " = math_eval(" + expr + ");");
+        }
+    }
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        emit(out, indent, "std::cerr << \"Preposterous: \" << " + msg + " << std::endl; exit(1);");
     }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
@@ -1012,10 +1672,42 @@ class CppStrategy : public BackendStrategy
         emit(out, indent, "}");
     }
     void emitAlloc(std::ostringstream &out, int &indent,
-                   const std::string &var, const std::string & /*type*/,
+                   const std::string &var, const std::string &type,
                    const std::string &content) override
     {
-        emit(out, indent, "std::vector<long long> " + var + " = {" + content + "};");
+        if (type == "dict") {
+            std::string d = "std::map<std::string,std::string> " + var + " = {";
+            bool first = true;
+            for (auto& [k, v] : parseDictPairs(content)) {
+                if (!first) d += ", ";
+                d += "{" + fmtDictKey(k) + ", " + fmtDictVal(v) + "}";
+                first = false;
+            }
+            emit(out, indent, d + "};");
+            declared.insert(var);
+        } else {
+            emit(out, indent, "std::vector<long long> " + var + " = {" + content + "};");
+            declared.insert(var);
+        }
+    }
+    void emitLoadIndex(std::ostringstream &out, int &indent,
+                       const std::string &result, const std::string &arr,
+                       const std::string &idx) override
+    {
+        emit(out, indent, decl(result, arr + "[" + idx + "]"));
+    }
+    void emitStoreIndex(std::ostringstream &out, int &indent,
+                        const std::string &arr, const std::string &idx,
+                        const std::string &val) override
+    {
+        emit(out, indent, arr + "[" + idx + "] = " + val + ";");
+    }
+    void emitInput(std::ostringstream &out, int &indent,
+                   const std::string &result, const std::string &prompt) override
+    {
+        emit(out, indent, "std::cout << " + prompt + ";");
+        emit(out, indent, "std::string " + result + "; std::getline(std::cin, " + result + ");");
+        declared.insert(result);
     }
 
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -1046,11 +1738,21 @@ class CppStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         declared.clear(); floatVars.clear();
-        std::string tparams = typedParams(params, "long long");
-        emit(out, indent, "long long " + name + "(" + tparams + ") {");
+        std::string cppParams = params;
+        std::string cppName   = name;
+        if (!classOwner.empty()) {
+            if (cppParams.rfind("self, ", 0) == 0) cppParams = cppParams.substr(6);
+            else if (cppParams == "self") cppParams = "";
+            cppName = (name == "init") ? classOwner : name; // init → constructor
+        }
+        declareParams(cppParams, declared);
+        std::string tparams = typedParams(cppParams, "long long");
+        std::string retType = (!classOwner.empty() && name == "init") ? "" : "long long ";
+        emit(out, indent, retType + cppName + "(" + tparams + ") {");
         indent++;
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
@@ -1059,6 +1761,26 @@ class CppStrategy : public BackendStrategy
         emit(out, indent, "}");
         emitRaw(out, "");
         declared.clear(); floatVars.clear();
+    }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        emit(out, indent, "class " + name + " {");
+        emit(out, indent, "public:");
+        indent++;
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        indent--;
+        emit(out, indent, "};");
+        emitRaw(out, "");
+    }
+    void emitLibImport(std::ostringstream &out, const std::string &libType,
+                       const std::string &libName) override
+    {
+        // ilib handled in emitHeader via setPendingImports
+        if (libType == "clib")
+            emitRaw(out, "#include <" + libName + ">");
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -1083,8 +1805,22 @@ class JavaStrategy : public BackendStrategy
     std::set<std::string> declared;
     std::set<std::string> floatVars;
     std::string className = "Main";
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
 
-    bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v); }
+    static bool isKnownFloatName(const std::string &v) {
+        if (v.find('(') != std::string::npos) return false;
+        const char* s = v.c_str();
+        if (strncmp(s, "AcMath.", 7) == 0) s += 7;
+        if (isIntReturningMathFunc(s)) return false;
+        return strncmp(s, "math_", 5) == 0 || strncmp(s, "stat_", 5) == 0;
+    }
+    static bool isFloatReturningFunc(const std::string &fn) {
+        const char* s = fn.c_str();
+        if (strncmp(s, "AcMath.", 7) == 0) s += 7;
+        if (isIntReturningMathFunc(s)) return false;
+        return strncmp(s, "math_", 5) == 0 || strncmp(s, "stat_", 5) == 0;
+    }
+    bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v) || isKnownFloatName(v); }
 
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
@@ -1093,10 +1829,21 @@ class JavaStrategy : public BackendStrategy
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
 
     void setOutputStem(const std::string &stem) override { className = stem; }
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imp) override
+    {
+        pendingImports_ = imp;
+    }
 
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "// Generated by AC Compiler (AC->Java)");
+        // ilib FFI classes emitted before main class (Java allows multiple non-public classes per file)
+        for (auto& [lt, ln] : pendingImports_) {
+            if (lt == "ilib") {
+                std::string ffi = readFFIFile(ln, "java");
+                if (!ffi.empty()) out << ffi << "\n";
+            }
+        }
         emitRaw(out, "public class " + className + " {\n");
     }
     void emitFooter(std::ostringstream &out) override
@@ -1106,7 +1853,10 @@ class JavaStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym);
+        std::string s = commonRef(r, sym);
+        if (r.kind == IRRef::Kind::VAR && isKnownFloatName(s))
+            return "AcMath." + s;
+        return s;
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1153,8 +1903,16 @@ class JavaStrategy : public BackendStrategy
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                   const std::string &func, const std::string &args) override
     {
+        // func already has AcMath. prefix from formatRef (function name is VAR kind)
         std::string call = func + "(" + args + ")";
-        emit(out, indent, res.empty() ? call + ";" : decl(res, call));
+        if (res.empty()) {
+            emit(out, indent, call + ";");
+        } else if (isFloatReturningFunc(func) && declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "double " + res + " = " + call + ";");
+        } else {
+            emit(out, indent, decl(res, call));
+        }
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
@@ -1170,6 +1928,20 @@ class JavaStrategy : public BackendStrategy
     void emitHalt(std::ostringstream &out, int &indent) override
     {
         emit(out, indent, "System.exit(0);");
+    }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        if (declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "double " + res + " = AcMath.math_eval(" + expr + ");");
+        } else {
+            emit(out, indent, res + " = AcMath.math_eval(" + expr + ");");
+        }
+    }
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        emit(out, indent, "throw new RuntimeException(\"Preposterous: \" + " + msg + ");");
     }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
@@ -1211,10 +1983,37 @@ class JavaStrategy : public BackendStrategy
         emit(out, indent, "}");
     }
     void emitAlloc(std::ostringstream &out, int &indent,
-                   const std::string &var, const std::string & /*type*/,
+                   const std::string &var, const std::string &type,
                    const std::string &content) override
     {
-        emit(out, indent, "long[] " + var + " = {" + content + "};");
+        if (type == "dict") {
+            emit(out, indent, "java.util.Map<String,String> " + var + " = new java.util.HashMap<>();");
+            for (auto& [k, v] : parseDictPairs(content))
+                emit(out, indent, var + ".put(" + fmtDictKey(k) + ", " + fmtDictVal(v) + ");");
+            declared.insert(var);
+        } else {
+            emit(out, indent, "long[] " + var + " = {" + content + "};");
+            declared.insert(var);
+        }
+    }
+    void emitLoadIndex(std::ostringstream &out, int &indent,
+                       const std::string &result, const std::string &arr,
+                       const std::string &idx) override
+    {
+        emit(out, indent, decl(result, arr + "[(int)(" + idx + ")]"));
+    }
+    void emitStoreIndex(std::ostringstream &out, int &indent,
+                        const std::string &arr, const std::string &idx,
+                        const std::string &val) override
+    {
+        emit(out, indent, arr + "[(int)(" + idx + ")] = " + val + ";");
+    }
+    void emitInput(std::ostringstream &out, int &indent,
+                   const std::string &result, const std::string &prompt) override
+    {
+        emit(out, indent, "System.out.print(" + prompt + ");");
+        emit(out, indent, "String " + result + " = new java.util.Scanner(System.in).nextLine();");
+        declared.insert(result);
     }
 
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -1240,11 +2039,24 @@ class JavaStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         declared.clear(); floatVars.clear();
-        std::string tparams = typedParams(params, "long");
-        emit(out, indent, "static long " + name + "(" + tparams + ") {");
+        std::string jParams = params;
+        std::string jName   = name;
+        bool isConstructor  = !classOwner.empty() && name == "init";
+        if (!classOwner.empty()) {
+            if (jParams.rfind("self, ", 0) == 0) jParams = jParams.substr(6);
+            else if (jParams == "self") jParams = "";
+            jName = isConstructor ? classOwner : name;
+        }
+        declareParams(jParams, declared);
+        std::string tparams = typedParams(jParams, "long");
+        std::string sig = isConstructor
+            ? classOwner + "(" + tparams + ")"
+            : "static long " + jName + "(" + tparams + ")";
+        emit(out, indent, sig + " {");
         indent++;
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
@@ -1253,6 +2065,25 @@ class JavaStrategy : public BackendStrategy
         emit(out, indent, "}");
         emitRaw(out, "");
         declared.clear(); floatVars.clear();
+    }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        emit(out, indent, "class " + name + " {");
+        indent++;
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        indent--;
+        emit(out, indent, "}");
+        emitRaw(out, "");
+    }
+    void emitLibImport(std::ostringstream &out, const std::string &libType,
+                       const std::string &libName) override
+    {
+        // ilib: handled in emitHeader via setPendingImports (FFI class inlined there)
+        if (libType == "elib")
+            emitRaw(out, "import " + libName + ";");
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -1276,8 +2107,18 @@ class RustStrategy : public BackendStrategy
     std::set<std::string> declared;
     std::set<std::string> floatVars;
     bool lastWasReturn = false;
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
 
-    bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v); }
+    static bool isKnownFloatName(const std::string &v) {
+        if (v.find('(') != std::string::npos) return false;
+        if (isIntReturningMathFunc(v.c_str())) return false;
+        return v == "math_pi" || v == "math_e" || v == "math_tau" || v == "math_em" || v == "math_inf"
+            || v.rfind("math_", 0) == 0
+            || v.rfind("stat_", 0) == 0;
+    }
+    bool isFloatVal(const std::string &v) const {
+        return looksFloat(v) || floatVars.count(v) || isKnownFloatName(v);
+    }
 
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
@@ -1285,15 +2126,28 @@ class RustStrategy : public BackendStrategy
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
 
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imp) override
+    {
+        pendingImports_ = imp;
+    }
+
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "// Generated by AC Compiler (AC->RS)");
-        emitRaw(out, "#![allow(unused_variables, unused_mut, unused_assignments, non_snake_case)]\n");
+        emitRaw(out, "#![allow(unused_variables, unused_mut, unused_assignments, non_snake_case)]");
+        emitRaw(out, "use std::io::Write;");
+        for (auto& [lt, ln] : pendingImports_) {
+            if (lt == "ilib") {
+                std::string ffi = readFFIFile(ln, "rs");
+                if (!ffi.empty()) { emitRaw(out, ""); out << ffi; }
+            }
+        }
+        emitRaw(out, "");
     }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym);
+        return commonRef(r, sym, "true", "false", "None");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1316,11 +2170,23 @@ class RustStrategy : public BackendStrategy
     {
         emit(out, indent, decl(var, val));
     }
+    // Ensure a value string is usable as f64 in a Rust expression.
+    // Numeric integer literals get ".0" appended; variables/exprs get "as f64".
+    static std::string toRustF64(const std::string &v) {
+        if (looksFloat(v)) return v;
+        if (looksNumeric(v)) return v + ".0";  // e.g. "0" → "0.0"
+        return "(" + v + ") as f64";
+    }
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, char op) override
     {
-        bool isFloat = isFloatVal(lhs) || isFloatVal(rhs);
-        std::string expr = lhs + " " + op + " " + rhs;
+        bool lhsFloat = isFloatVal(lhs), rhsFloat = isFloatVal(rhs);
+        bool isFloat = lhsFloat || rhsFloat;
+        // In Rust, mixing integer and float types in arithmetic is a compile error.
+        // When the result is float, ensure both operands are f64.
+        std::string elhs = (isFloat && !lhsFloat) ? toRustF64(lhs) : lhs;
+        std::string erhs = (isFloat && !rhsFloat) ? toRustF64(rhs) : rhs;
+        std::string expr = elhs + " " + op + " " + erhs;
         bool isNew = declared.insert(res).second;
         if (isNew && isFloat)
         {
@@ -1349,11 +2215,26 @@ class RustStrategy : public BackendStrategy
             expr = "(" + lhs + " " + op + " " + rhs + ") as i64";
         emit(out, indent, decl(res, expr));
     }
+    static bool isFloatReturningFunc(const std::string &fn) {
+        if (isIntReturningMathFunc(fn.c_str())) return false;
+        if (fn.rfind("math_", 0) == 0) return true;
+        if (fn.rfind("stat_", 0) == 0) return true;
+        return false;
+    }
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                   const std::string &func, const std::string &args) override
     {
-        std::string call = func + "(" + args + ")";
-        emit(out, indent, res.empty() ? call + ";" : decl(res, call));
+        // math_to_int takes f64 — cast integer args explicitly
+        std::string actualArgs = (func == "math_to_int") ? args + " as f64" : args;
+        std::string call = func + "(" + actualArgs + ")";
+        if (res.empty()) {
+            emit(out, indent, call + ";");
+        } else if (isFloatReturningFunc(func) && declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "let mut " + res + ": f64 = " + call + ";");
+        } else {
+            emit(out, indent, decl(res, call));
+        }
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
@@ -1373,6 +2254,22 @@ class RustStrategy : public BackendStrategy
     {
         lastWasReturn = false;
         emit(out, indent, "std::process::exit(0);");
+    }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        lastWasReturn = false;
+        if (declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "let mut " + res + ": f64 = math_eval(" + expr + ".as_str());");
+        } else {
+            emit(out, indent, res + " = math_eval(" + expr + ".as_str());");
+        }
+    }
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        lastWasReturn = false;
+        emit(out, indent, "eprintln!(\"Preposterous: {}\", " + msg + "); std::process::exit(1);");
     }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
@@ -1416,10 +2313,39 @@ class RustStrategy : public BackendStrategy
         emit(out, indent, "}");
     }
     void emitAlloc(std::ostringstream &out, int &indent,
-                   const std::string &var, const std::string & /*type*/,
+                   const std::string &var, const std::string &type,
                    const std::string &content) override
     {
-        emit(out, indent, "let " + var + " = vec![" + content + "];");
+        if (type == "dict") {
+            emit(out, indent, "let mut " + var + ": std::collections::HashMap<&str,&str> = std::collections::HashMap::new();");
+            for (auto& [k, v] : parseDictPairs(content))
+                emit(out, indent, var + ".insert(" + fmtDictKey(k) + ", " + fmtDictVal(v) + ");");
+            declared.insert(var);
+        } else {
+            emit(out, indent, "let mut " + var + " = vec![" + content + "];");
+            declared.insert(var);
+        }
+    }
+    void emitLoadIndex(std::ostringstream &out, int &indent,
+                       const std::string &result, const std::string &arr,
+                       const std::string &idx) override
+    {
+        emit(out, indent, decl(result, arr + "[(" + idx + ") as usize]"));
+    }
+    void emitStoreIndex(std::ostringstream &out, int &indent,
+                        const std::string &arr, const std::string &idx,
+                        const std::string &val) override
+    {
+        emit(out, indent, arr + "[(" + idx + ") as usize] = " + val + ";");
+    }
+    void emitInput(std::ostringstream &out, int &indent,
+                   const std::string &result, const std::string &prompt) override
+    {
+        emit(out, indent, "print!(\"{}\", " + prompt + ");");
+        emit(out, indent, "let mut _buf_" + result + " = String::new();");
+        emit(out, indent, "std::io::stdin().read_line(&mut _buf_" + result + ").unwrap();");
+        emit(out, indent, "let " + result + " = _buf_" + result + ".trim().to_string();");
+        declared.insert(result);
     }
 
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -1450,12 +2376,29 @@ class RustStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         declared.clear(); floatVars.clear();
         lastWasReturn = false;
-        std::string tparams = suffixTypedParams(params, "i64");
-        emit(out, indent, "fn " + name + "(" + tparams + ") -> i64 {");
+        std::string rParams = params;
+        std::string rName   = name;
+        if (!classOwner.empty()) {
+            if (rParams.rfind("self, ", 0) == 0) rParams = rParams.substr(6);
+            else if (rParams == "self") rParams = "";
+            rName = (name == "init") ? "new" : name;
+        }
+        declareParams(rParams, declared);
+        std::string tparams = rustMutTypedParams(rParams, "i64");
+        bool isNew = !classOwner.empty() && name == "init";
+        if (isNew) {
+            emit(out, indent, "pub fn new(" + tparams + ") -> Self {");
+        } else if (!classOwner.empty()) {
+            std::string sep = tparams.empty() ? "" : ", ";
+            emit(out, indent, "pub fn " + rName + "(&mut self" + sep + tparams + ") -> i64 {");
+        } else {
+            emit(out, indent, "fn " + rName + "(" + tparams + ") -> i64 {");
+        }
         indent++;
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
@@ -1467,6 +2410,28 @@ class RustStrategy : public BackendStrategy
         emit(out, indent, "}");
         emitRaw(out, "");
         declared.clear(); floatVars.clear();
+    }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        emit(out, indent, "struct " + name + " { _tag: i64 }");
+        emitRaw(out, "");
+        emit(out, indent, "impl " + name + " {");
+        indent++;
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        indent--;
+        emit(out, indent, "}");
+        emitRaw(out, "");
+    }
+    bool suppressClassBody() const override { return true; } // field defaults can't go inside impl
+    void emitLibImport(std::ostringstream &out, const std::string &libType,
+                       const std::string &libName) override
+    {
+        // ilib: handled in emitHeader via setPendingImports (FFI file inlined there)
+        if (libType == "elib")
+            emitRaw(out, "extern crate " + libName + ";");
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -1491,8 +2456,25 @@ class GoStrategy : public BackendStrategy
     std::set<std::string> declared;
     std::set<std::string> floatVars;
     bool needsOS = false;
+    bool needsInput_ = false;
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
+    // Relative path from output file's directory to project root (e.g. ".." for examples/)
+    std::string relRoot_ = ".";
 
-    bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v); }
+    static bool isKnownFloatName(const std::string &v) {
+        if (v.find('(') != std::string::npos) return false;
+        if (isIntReturningMathFunc(v.c_str())) return false;
+        return v == "math_pi" || v == "math_e" || v == "math_tau" || v == "math_em" || v == "math_inf"
+            || v.rfind("math_", 0) == 0
+            || v.rfind("stat_", 0) == 0;
+    }
+    static bool isFloatReturningFunc(const std::string &fn) {
+        if (isIntReturningMathFunc(fn.c_str())) return false;
+        if (fn.rfind("math_", 0) == 0) return true;
+        if (fn.rfind("stat_", 0) == 0) return true;
+        return false;
+    }
+    bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v) || isKnownFloatName(v); }
 
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
@@ -1500,21 +2482,67 @@ class GoStrategy : public BackendStrategy
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
 
+    void setNeedsInput(bool v) override { needsInput_ = v; }
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imp) override
+    {
+        pendingImports_ = imp;
+    }
+    void setOutputBase(const std::string &base) override
+    {
+        // Count directory components in 'base' to build the relative root path.
+        // e.g. "examples/foo" has 1 slash → 1 depth → relRoot_ = ".."
+        //      "foo" has 0 slashes → depth 0 → relRoot_ = "."
+        int depth = 0;
+        for (char c : base)
+            if (c == '/' || c == '\\') depth++;
+        relRoot_ = ".";
+        for (int i = 0; i < depth; i++)
+            relRoot_ = relRoot_ == "." ? ".." : "../" + relRoot_;
+    }
+
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "// Generated by AC Compiler (AC->GO)");
-        emitRaw(out, "package main\n");
+        emitRaw(out, "package main");
+        // CGO blocks must appear between package and regular import
+        bool hasCGO = false;
+        std::vector<std::string> wrapperBlocks;
+        for (auto& [lt, ln] : pendingImports_) {
+            if (lt == "ilib") {
+                std::string cgoBlock, wrappers;
+                parseGoFFI(ln, cgoBlock, wrappers);
+                if (!cgoBlock.empty()) {
+                    // Replace ${SRCDIR}/library/ln with ${SRCDIR}/<relRoot_>/library/ln
+                    // so the path resolves correctly regardless of where the .go file lives.
+                    std::string from = "${SRCDIR}/library/" + ln;
+                    std::string to   = "${SRCDIR}/" + relRoot_ + "/library/" + ln;
+                    size_t pos = 0;
+                    while ((pos = cgoBlock.find(from, pos)) != std::string::npos) {
+                        cgoBlock.replace(pos, from.size(), to);
+                        pos += to.size();
+                    }
+                    hasCGO = true;
+                    out << "\n" << cgoBlock;
+                    wrapperBlocks.push_back(wrappers);
+                }
+            }
+        }
+        emitRaw(out, "");
         emitRaw(out, "import (");
+        if (needsInput_) emitRaw(out, "    \"bufio\"");
         emitRaw(out, "    \"fmt\"");
         emitRaw(out, "    \"os\"");
+        if (needsInput_) emitRaw(out, "    \"strings\"");
+        if (hasCGO)      emitRaw(out, "    \"unsafe\"");
         emitRaw(out, ")\n");
-        // Helper: convert int64 boolean result
         emitRaw(out, "func _b(b bool) int64 { if b { return 1 }; return 0 }\n");
+        for (auto& w : wrapperBlocks)
+            if (!w.empty()) out << w;
     }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym);
+        return commonRef(r, sym, "true", "false", "nil");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1565,12 +2593,24 @@ class GoStrategy : public BackendStrategy
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                   const std::string &func, const std::string &args) override
     {
-        std::string call = func + "(" + args + ")";
-        emit(out, indent, res.empty() ? call : decl(res, call));
+        // math_to_int takes float64 — cast integer args explicitly
+        std::string actualArgs = (func == "math_to_int") ? "float64(" + args + ")" : args;
+        std::string call = func + "(" + actualArgs + ")";
+        if (res.empty()) {
+            emit(out, indent, call);
+        } else if (isFloatReturningFunc(func) && declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "var " + res + " float64 = " + call);
+        } else {
+            emit(out, indent, decl(res, call));
+        }
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        emit(out, indent, val.empty() ? "return 0" : "return " + val);
+        // Suppress bare empty returns — they are IR safety fallthroughs, not real returns.
+        // Go functions that always exit via os.Exit or explicit return don't need them.
+        if (!val.empty())
+            emit(out, indent, "return " + val);
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
@@ -1579,6 +2619,20 @@ class GoStrategy : public BackendStrategy
     void emitHalt(std::ostringstream &out, int &indent) override
     {
         emit(out, indent, "os.Exit(0)");
+    }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        if (declared.insert(res).second) {
+            floatVars.insert(res);
+            emit(out, indent, "var " + res + " float64 = math_eval(" + expr + ")");
+        } else {
+            emit(out, indent, res + " = math_eval(" + expr + ")");
+        }
+    }
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        emit(out, indent, "fmt.Fprintf(os.Stderr, \"Preposterous: %s\\n\", " + msg + "); os.Exit(1)");
     }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
@@ -1620,10 +2674,38 @@ class GoStrategy : public BackendStrategy
         emit(out, indent, "}");
     }
     void emitAlloc(std::ostringstream &out, int &indent,
-                   const std::string &var, const std::string & /*type*/,
+                   const std::string &var, const std::string &type,
                    const std::string &content) override
     {
-        emit(out, indent, var + " := []int64{" + content + "}");
+        if (type == "dict") {
+            emit(out, indent, var + " := map[string]string{}");
+            for (auto& [k, v] : parseDictPairs(content))
+                emit(out, indent, var + "[" + fmtDictKey(k) + "] = " + fmtDictVal(v));
+            declared.insert(var);
+        } else {
+            emit(out, indent, var + " := []int64{" + content + "}");
+            declared.insert(var);
+        }
+    }
+    void emitLoadIndex(std::ostringstream &out, int &indent,
+                       const std::string &result, const std::string &arr,
+                       const std::string &idx) override
+    {
+        emit(out, indent, decl(result, arr + "[" + idx + "]"));
+    }
+    void emitStoreIndex(std::ostringstream &out, int &indent,
+                        const std::string &arr, const std::string &idx,
+                        const std::string &val) override
+    {
+        emit(out, indent, arr + "[" + idx + "] = " + val);
+    }
+    void emitInput(std::ostringstream &out, int &indent,
+                   const std::string &result, const std::string &prompt) override
+    {
+        emit(out, indent, "fmt.Print(" + prompt + ")");
+        emit(out, indent, "_rdr_" + result + " := bufio.NewReader(os.Stdin)");
+        emit(out, indent, "_raw_" + result + ", _ := _rdr_" + result + ".ReadString('\\n')");
+        emit(out, indent, decl(result, "strings.TrimRight(_raw_" + result + ", \"\\r\\n\")"));
     }
 
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -1654,11 +2736,28 @@ class GoStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         declared.clear(); floatVars.clear();
-        std::string tparams = goTypedParams(params, "int64");
-        emit(out, indent, "func " + name + "(" + tparams + ") int64 {");
+        std::string gParams = params;
+        std::string gName   = name;
+        if (!classOwner.empty()) {
+            if (gParams.rfind("self, ", 0) == 0) gParams = gParams.substr(6);
+            else if (gParams == "self") gParams = "";
+            gName = (name == "init") ? "New" + classOwner : name;
+        }
+        declareParams(gParams, declared);
+        std::string tparams = goTypedParams(gParams, "int64");
+        bool isNew = !classOwner.empty() && name == "init";
+        if (isNew) {
+            emit(out, indent, "func New" + classOwner + "(" + tparams + ") *" + classOwner + " {");
+        } else if (!classOwner.empty()) {
+            std::string sep = tparams.empty() ? "" : ", ";
+            emit(out, indent, "func (self *" + classOwner + ") " + gName + "(" + tparams + ") int64 {");
+        } else {
+            emit(out, indent, "func " + gName + "(" + tparams + ") int64 {");
+        }
         indent++;
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
@@ -1668,6 +2767,24 @@ class GoStrategy : public BackendStrategy
         emit(out, indent, "}");
         emitRaw(out, "");
         declared.clear(); floatVars.clear();
+    }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        emit(out, indent, "type " + name + " struct { _tag int64 }");
+        emitRaw(out, "");
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        (void)out; (void)indent;
+    }
+    bool suppressClassBody() const override { return true; }
+    void emitLibImport(std::ostringstream &out, const std::string &libType,
+                       const std::string &libName) override
+    {
+        // ilib: handled in emitHeader via setPendingImports (CGO FFI inlined there)
+        if (libType == "elib")
+            emitRaw(out, "import \"" + libName + "\"");
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -1690,6 +2807,7 @@ class VStrategy : public BackendStrategy
 {
     std::set<std::string> declared;
     bool lastWasReturn = false;
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
 
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
@@ -1697,15 +2815,39 @@ class VStrategy : public BackendStrategy
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
 
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imp) override
+    {
+        pendingImports_ = imp;
+    }
+
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "// Generated by AC Compiler (AC->V)");
-        emitRaw(out, "module main\n");
+        emitRaw(out, "module main");
+        emitRaw(out, "import os");
+        for (auto& [lt, ln] : pendingImports_) {
+            if (lt == "ilib") {
+                std::string content = readFFIFile(ln, "v");
+                if (!content.empty()) {
+                    // Skip any leading "module" line — we're already in module main
+                    std::istringstream ss(content);
+                    std::string line2;
+                    bool first = true;
+                    out << "\n";
+                    while (std::getline(ss, line2)) {
+                        if (first && line2.rfind("module ", 0) == 0) { first = false; continue; }
+                        first = false;
+                        out << line2 << "\n";
+                    }
+                }
+            }
+        }
+        emitRaw(out, "");
     }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym);
+        return commonRef(r, sym, "true", "false", "none");
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1769,6 +2911,18 @@ class VStrategy : public BackendStrategy
         lastWasReturn = false;
         emit(out, indent, "exit(0)");
     }
+    void emitEval(std::ostringstream &out, int &indent,
+                  const std::string &res, const std::string &expr) override
+    {
+        lastWasReturn = false;
+        emit(out, indent, "mut " + res + " := f64(0) /* eval(" + expr + ") not supported in V backend */");
+        declared.insert(res);
+    }
+    void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
+    {
+        lastWasReturn = false;
+        emit(out, indent, "eprintln('Preposterous: ' + " + msg + "); exit(1)");
+    }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
     {
@@ -1809,16 +2963,41 @@ class VStrategy : public BackendStrategy
         emit(out, indent, "}");
     }
     void emitAlloc(std::ostringstream &out, int &indent,
-                   const std::string &var, const std::string & /*type*/,
+                   const std::string &var, const std::string &type,
                    const std::string &content) override
     {
-        // V requires explicit type on first element
-        std::string c = content;
-        size_t comma = c.find(',');
-        std::string vContent = comma != std::string::npos
-                                   ? "i64(" + c.substr(0, comma) + ")" + c.substr(comma)
-                                   : "i64(" + c + ")";
-        emit(out, indent, "mut " + var + " := [" + vContent + "]");
+        if (type == "dict") {
+            emit(out, indent, "mut " + var + " := map[string]string{}");
+            for (auto& [k, v] : parseDictPairs(content))
+                emit(out, indent, var + "[" + fmtDictKey(k) + "] = " + fmtDictVal(v));
+            declared.insert(var);
+        } else {
+            // V requires explicit type on first element
+            std::string c = content;
+            size_t comma = c.find(',');
+            std::string vContent = comma != std::string::npos
+                                       ? "i64(" + c.substr(0, comma) + ")" + c.substr(comma)
+                                       : "i64(" + c + ")";
+            emit(out, indent, "mut " + var + " := [" + vContent + "]");
+            declared.insert(var);
+        }
+    }
+    void emitLoadIndex(std::ostringstream &out, int &indent,
+                       const std::string &result, const std::string &arr,
+                       const std::string &idx) override
+    {
+        emit(out, indent, decl(result, arr + "[" + idx + "]"));
+    }
+    void emitStoreIndex(std::ostringstream &out, int &indent,
+                        const std::string &arr, const std::string &idx,
+                        const std::string &val) override
+    {
+        emit(out, indent, arr + "[" + idx + "] = " + val);
+    }
+    void emitInput(std::ostringstream &out, int &indent,
+                   const std::string &result, const std::string &prompt) override
+    {
+        emit(out, indent, decl(result, "os.input(" + prompt + ")"));
     }
 
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -1844,12 +3023,23 @@ class VStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         declared.clear();
         lastWasReturn = false;
-        std::string tparams = suffixTypedParams(params, "i64");
-        emit(out, indent, "fn " + name + "(" + tparams + ") i64 {");
+        std::string vParams = params;
+        std::string vName   = name;
+        if (!classOwner.empty()) {
+            if (vParams.rfind("self, ", 0) == 0) vParams = vParams.substr(6);
+            else if (vParams == "self") vParams = "";
+            vName = (name == "init") ? "init" : name;
+        }
+        std::string tparams = suffixTypedParams(vParams, "i64");
+        if (!classOwner.empty())
+            emit(out, indent, "fn (" + classOwner + ") " + vName + "(" + tparams + ") i64 {");
+        else
+            emit(out, indent, "fn " + vName + "(" + tparams + ") i64 {");
         indent++;
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
@@ -1861,6 +3051,24 @@ class VStrategy : public BackendStrategy
         emit(out, indent, "}");
         emitRaw(out, "");
         declared.clear();
+    }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        emit(out, indent, "struct " + name + " { _tag i64 }");
+        emitRaw(out, "");
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        (void)out; (void)indent;
+    }
+    bool suppressClassBody() const override { return true; }
+    void emitLibImport(std::ostringstream &out, const std::string &libType,
+                       const std::string &libName) override
+    {
+        // ilib: handled in emitHeader via setPendingImports (FFI file inlined there)
+        if (libType == "elib")
+            emitRaw(out, "import " + libName);
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -1886,6 +3094,7 @@ class AsmStrategy : public BackendStrategy
     std::map<std::string, int> slot;  // var/temp → rbp offset
     int nextSlot = 0;
     int strIdx = 0;
+    std::vector<std::pair<std::string,std::string>> pendingImports_;
 
     // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -1932,6 +3141,11 @@ class AsmStrategy : public BackendStrategy
         out << line << "\n";
     }
 
+    void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imp) override
+    {
+        pendingImports_ = imp;
+    }
+
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "; Generated by AC Compiler (AC->ASM)");
@@ -1939,6 +3153,20 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "");
         emitRaw(out, "    default rel");
         emitRaw(out, "    extern printf, exit");
+        // Emit extern declarations for ilib functions
+        for (auto& [lt, ln] : pendingImports_) {
+            if (lt == "ilib") {
+                std::string content = readFFIFile(ln, "asm");
+                if (!content.empty()) {
+                    std::istringstream ss(content);
+                    std::string aline;
+                    while (std::getline(ss, aline)) {
+                        if (aline.rfind("extern ", 0) == 0)
+                            emitRaw(out, "    " + aline);
+                    }
+                }
+            }
+        }
         emitRaw(out, "    global main");
         emitRaw(out, "");
         emitRaw(out, "section .data");
@@ -1961,7 +3189,7 @@ class AsmStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "1", "0");
+        return commonRef(r, sym, "1", "0", "0");
     }
 
     void emitStoreVar(std::ostringstream &out, int & /*indent*/, const std::string &var, const std::string &val) override
@@ -2161,6 +3389,17 @@ class AsmStrategy : public BackendStrategy
         out << "    xor edi, edi\n";
         out << "    call exit\n";
     }
+    void emitEval(std::ostringstream &out, int & /*indent*/,
+                  const std::string &res, const std::string &expr) override
+    {
+        out << "    ; eval(" << expr << ") — not implemented in ASM backend\n";
+        if (!res.empty()) out << "    mov qword [rbp-" << getSlot(res) << "], 0\n";
+    }
+    void emitRaise(std::ostringstream &out, int & /*indent*/, const std::string &) override
+    {
+        out << "    mov edi, 1\n";
+        out << "    call exit\n";
+    }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
     {
@@ -2214,20 +3453,36 @@ class AsmStrategy : public BackendStrategy
     }
 
     void emitFunctionBegin(std::ostringstream &out, int &indent,
-                           const std::string &name, const std::string &params) override
+                           const std::string &name, const std::string &params,
+                           const std::string &classOwner = "") override
     {
         slot.clear();
         nextSlot = 0;
+        (void)params; (void)indent;
+        std::string label = classOwner.empty() ? name : classOwner + "_" + name;
+        if (!classOwner.empty() && name == "init") label = classOwner + "_init";
         emitRaw(out, "");
-        emitRaw(out, name + ":");
+        emitRaw(out, label + ":");
         out << "    push rbp\n    mov rbp, rsp\n    sub rsp, 128\n";
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
+        (void)indent;
         out << "    xor eax, eax\n    leave\n    ret\n";
         slot.clear();
         nextSlot = 0;
     }
+    void emitClassBegin(std::ostringstream &out, int &indent,
+                        const std::string &name) override
+    {
+        (void)indent;
+        emitRaw(out, "; bundle " + name);
+    }
+    void emitClassEnd(std::ostringstream &out, int &indent) override
+    {
+        (void)out; (void)indent;
+    }
+    bool suppressClassBody() const override { return true; }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
         slot.clear();
@@ -2253,6 +3508,7 @@ class UnifiedIRCodeGen
     std::unique_ptr<BackendStrategy> strategy;
     std::ostringstream out;
     int indentLevel = 0;
+    std::set<std::string> globalVarNames_;
 
     std::string ref(const IRRef &r)
     {
@@ -2300,6 +3556,24 @@ class UnifiedIRCodeGen
                     content = content.substr(1, content.size() - 2);
                 strategy->emitAlloc(out, indentLevel, ref(i.result), allocType, content);
             }
+            break;
+
+        case IROpcode::LOAD_INDEX:
+            if (i.typedOperands.size() >= 2)
+                strategy->emitLoadIndex(out, indentLevel, ref(i.result),
+                                        ref(i.typedOperands[0]), ref(i.typedOperands[1]));
+            break;
+
+        case IROpcode::STORE_INDEX:
+            if (i.typedOperands.size() >= 3)
+                strategy->emitStoreIndex(out, indentLevel,
+                                         ref(i.typedOperands[0]), ref(i.typedOperands[1]),
+                                         ref(i.typedOperands[2]));
+            break;
+
+        case IROpcode::INPUT:
+            strategy->emitInput(out, indentLevel, ref(i.result),
+                                i.typedOperands.empty() ? "\"\"" : ref(i.typedOperands[0]));
             break;
 
         // ── arithmetic ─────────────────────────────────────────────────
@@ -2442,6 +3716,8 @@ class UnifiedIRCodeGen
         case IROpcode::CALL:
         {
             std::string func = i.typedOperands.empty() ? "" : ref(i.typedOperands[0]);
+            if (!strategy->dotCallSyntax())
+                for (char& c : func) if (c == '.') c = '_';
             std::string args;
             for (size_t j = 1; j < i.typedOperands.size(); j++)
             {
@@ -2449,7 +3725,8 @@ class UnifiedIRCodeGen
                     args += ", ";
                 args += ref(i.typedOperands[j]);
             }
-            strategy->emitCall(out, indentLevel, ref(i.result), func, args);
+            std::string res = (i.result.kind == IRRef::Kind::NONE) ? "" : ref(i.result);
+            strategy->emitCall(out, indentLevel, res, func, args);
             break;
         }
 
@@ -2457,6 +3734,13 @@ class UnifiedIRCodeGen
             strategy->emitReturn(out, indentLevel,
                                  i.typedOperands.empty() ? "" : ref(i.typedOperands[0]));
             break;
+
+        case IROpcode::EVAL:
+        {
+            std::string expr = i.typedOperands.empty() ? "\"\"" : ref(i.typedOperands[0]);
+            strategy->emitEval(out, indentLevel, ref(i.result), expr);
+            break;
+        }
 
         // ── I/O & special ──────────────────────────────────────────────
         case IROpcode::PRINT:
@@ -2469,19 +3753,58 @@ class UnifiedIRCodeGen
             if (i.typedOperands.empty())
                 break;
             std::string method = ref(i.typedOperands[0]);
+            // Resolve styled display variants: bold.display, italic.display, etc.
+            auto extractStyle = [](const std::string& m) -> std::string {
+                static const std::vector<std::string> styles =
+                    {"bold", "italic", "header", "link", "title"};
+                for (auto& s : styles)
+                    if (m == s + ".display" || m == "\"" + s + ".display\"")
+                        return s;
+                return "";
+            };
+            std::string displayStyle = extractStyle(method);
+
             if ((method == "\"Term.display\"" || method == "Term.display") &&
                 i.typedOperands.size() > 1)
             {
                 strategy->emitPrint(out, indentLevel, ref(i.typedOperands[1]));
+            }
+            else if (!displayStyle.empty() && i.typedOperands.size() > 1)
+            {
+                strategy->emitStyledPrint(out, indentLevel, ref(i.typedOperands[1]), displayStyle);
+            }
+            else if ((method == "\"import\"" || method == "import") &&
+                     i.typedOperands.size() > 1)
+            {
+                // use ilib/elib/clib <name> — emit backend-specific import
+                std::string raw = stripQuotes(ref(i.typedOperands[1]));
+                std::string libType = "ilib";
+                std::string libName = raw;
+                auto colon = raw.find(':');
+                if (colon != std::string::npos) {
+                    libType = raw.substr(0, colon);
+                    libName = raw.substr(colon + 1);
+                }
+                strategy->emitLibImport(out, libType, libName);
             }
             else if ((method == "\"foreign\"" || method == "foreign") &&
                      i.typedOperands.size() > 1)
             {
                 strategy->emitForeign(out, indentLevel, ref(i.typedOperands[1]));
             }
-            else if (i.typedOperands.size() > 1)
+            else if ((method == "\"raise\"" || method == "raise") &&
+                     i.typedOperands.size() > 1)
             {
-                // Generic lib call with result
+                strategy->emitRaise(out, indentLevel, ref(i.typedOperands[1]));
+            }
+            else
+            {
+                // Generic lib/object call.
+                // dotCallSyntax backends (Python): preserve dots — math.sin(x), d.bark().
+                // Other backends: replace dots with underscores — math_sin(x).
+                std::string func = stripQuotes(method);
+                if (!strategy->dotCallSyntax())
+                    for (char& c : func) if (c == '.') c = '_';
                 std::string args;
                 for (size_t j = 1; j < i.typedOperands.size(); j++)
                 {
@@ -2489,10 +3812,23 @@ class UnifiedIRCodeGen
                         args += ", ";
                     args += ref(i.typedOperands[j]);
                 }
-                strategy->emitCall(out, indentLevel, ref(i.result), stripQuotes(method), args);
+                std::string res = (i.result.kind == IRRef::Kind::NONE) ? "" : ref(i.result);
+                strategy->emitCall(out, indentLevel, res, func, args);
             }
             break;
         }
+
+        case IROpcode::EVENT_BIND:
+            if (i.typedOperands.size() >= 2)
+                strategy->emitEventBind(out, indentLevel,
+                                        ref(i.typedOperands[0]),
+                                        ref(i.typedOperands[1]));
+            break;
+
+        case IROpcode::EVENT_TRIGGER:
+            if (!i.typedOperands.empty())
+                strategy->emitEventTrigger(out, indentLevel, ref(i.typedOperands[0]));
+            break;
 
         case IROpcode::HALT:
             strategy->emitHalt(out, indentLevel);
@@ -2511,20 +3847,36 @@ class UnifiedIRCodeGen
     void genFunction(const IRFunction &func)
     {
         std::string params;
+        std::set<std::string> paramSet(func.parameters.begin(), func.parameters.end());
         for (size_t i = 0; i < func.parameters.size(); i++)
         {
             if (i > 0)
                 params += ", ";
             params += func.parameters[i];
         }
-        strategy->emitFunctionBegin(out, indentLevel, func.name, params);
+        // Tell strategy which global vars this function writes (for Python `global` decls)
+        if (!globalVarNames_.empty())
+        {
+            std::vector<std::string> pendingGlobals;
+            std::set<std::string> seen;
+            for (const auto &instr : func.instructions)
+                if (instr.opcode == IROpcode::STORE_VAR && instr.result.kind == IRRef::Kind::VAR)
+                {
+                    std::string name = ref(instr.result);
+                    if (!paramSet.count(name) && globalVarNames_.count(name) && seen.insert(name).second)
+                        pendingGlobals.push_back(name);
+                }
+            strategy->setPendingGlobals(pendingGlobals);
+        }
+        strategy->emitFunctionBegin(out, indentLevel, func.name, params, func.classOwner);
         for (const auto &instr : func.instructions)
             genInstr(instr);
         strategy->emitFunctionEnd(out, indentLevel);
     }
 
 public:
-    explicit UnifiedIRCodeGen(const IRProgram &program, const std::string &stem = "Main") : ir(program)
+    explicit UnifiedIRCodeGen(const IRProgram &program, const std::string &stem = "Main",
+                               const std::string &outputBase = "") : ir(program)
     {
         const std::string &b = program.backend;
         if (b == "PY")
@@ -2550,18 +3902,100 @@ public:
         else
             strategy = std::make_unique<PythonStrategy>();
         strategy->setOutputStem(stem);
+        strategy->setOutputBase(outputBase.empty() ? stem : outputBase);
     }
 
     std::string generate()
     {
+        // Pre-scan: collect global var names, check for INPUT / EVENT_BIND / LIB_CALL imports
+        bool hasInput  = false;
+        bool hasEvents = false;
+        std::vector<std::pair<std::string,std::string>> libImports;
+        std::set<std::string> seenImports;
+        std::unordered_map<std::string,std::set<std::string>> importSymbols; // libKey → {sym,...}
+
+        auto scanImport = [&](const IRInstruction& ins) {
+            if (ins.opcode != IROpcode::LIB_CALL || ins.typedOperands.empty()) return;
+            std::string method = ref(ins.typedOperands[0]);
+            if ((method == "\"import\"" || method == "import") && ins.typedOperands.size() > 1) {
+                std::string raw = stripQuotes(ref(ins.typedOperands[1]));
+                std::string libType = "ilib", libName = raw;
+                auto colon = raw.find(':');
+                if (colon != std::string::npos) {
+                    libType = raw.substr(0, colon);
+                    libName = raw.substr(colon + 1);
+                }
+                if (seenImports.insert(raw).second)
+                    libImports.push_back({libType, libName});
+                // Third operand: selective symbol list (from ilib X use a,b,c)
+                if (ins.typedOperands.size() > 2) {
+                    std::string symList = stripQuotes(ref(ins.typedOperands[2]));
+                    auto& symSet = importSymbols[raw];
+                    // parse comma-separated
+                    std::istringstream ss(symList);
+                    std::string sym;
+                    while (std::getline(ss, sym, ',')) {
+                        if (!sym.empty()) symSet.insert(sym);
+                    }
+                }
+            }
+        };
+
+        for (auto& fn : ir.functions)
+            for (auto& ins : fn.instructions) {
+                if (ins.opcode == IROpcode::INPUT)      hasInput  = true;
+                if (ins.opcode == IROpcode::EVENT_BIND) hasEvents = true;
+                scanImport(ins);
+            }
+        for (auto& ins : ir.globalInit) {
+            if (ins.opcode == IROpcode::INPUT)      hasInput  = true;
+            if (ins.opcode == IROpcode::EVENT_BIND) hasEvents = true;
+            if (ins.opcode == IROpcode::STORE_VAR && ins.result.kind == IRRef::Kind::VAR)
+                globalVarNames_.insert(ref(ins.result));
+            scanImport(ins);
+        }
+        strategy->setNeedsInput(hasInput);
+        strategy->setNeedsEvents(hasEvents);
+        strategy->setPendingImports(libImports);
+        strategy->setImportSymbols(importSymbols);
+
         strategy->emitHeader(out);
 
+        // Emit free (non-method) functions
         for (const auto &func : ir.functions)
-            genFunction(func);
+            if (func.classOwner.empty()) genFunction(func);
 
+        // First pass over globalInit: emit class definitions (with field defaults and methods)
+        {
+            bool inClass = false;
+            std::string curClass;
+            for (const auto &instr : ir.globalInit) {
+                if (instr.opcode == IROpcode::CLASS_BEGIN) {
+                    curClass = stripQuotes(ref(instr.typedOperands[0]));
+                    strategy->emitClassBegin(out, indentLevel, curClass);
+                    inClass = true;
+                } else if (instr.opcode == IROpcode::CLASS_END) {
+                    // Emit methods for this class before closing
+                    for (const auto &func : ir.functions)
+                        if (func.classOwner == curClass) genFunction(func);
+                    strategy->emitClassEnd(out, indentLevel);
+                    inClass = false; curClass = "";
+                } else if (inClass && !strategy->suppressClassBody()) {
+                    genInstr(instr); // field defaults inside class body
+                }
+            }
+        }
+
+        // Second pass: emit main body (skip class blocks)
         strategy->emitMainBegin(out, indentLevel);
-        for (const auto &instr : ir.globalInit)
-            genInstr(instr);
+        {
+            bool inClass = false;
+            for (const auto &instr : ir.globalInit) {
+                if (instr.opcode == IROpcode::CLASS_BEGIN) { inClass = true;  continue; }
+                if (instr.opcode == IROpcode::CLASS_END)   { inClass = false; continue; }
+                if (!inClass) genInstr(instr);
+            }
+        }
         strategy->emitMainEnd(out, indentLevel);
 
         strategy->emitFooter(out);
@@ -2571,8 +4005,9 @@ public:
 
 // ─── public API ──────────────────────────────────────────────────────────────
 
-std::string generateFromIR(const IRProgram &ir, const std::string &stem)
+std::string generateFromIR(const IRProgram &ir, const std::string &stem,
+                           const std::string &outputBase)
 {
-    UnifiedIRCodeGen gen(ir, stem);
+    UnifiedIRCodeGen gen(ir, stem, outputBase);
     return gen.generate();
 }

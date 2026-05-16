@@ -32,9 +32,8 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"overlap",  TokenType::KW_OVERLAP},
     {"True",     TokenType::KW_TRUE},
     {"False",    TokenType::KW_FALSE},
+    {"null",     TokenType::KW_NULL},
     {"on",       TokenType::KW_ON},
-    {"when",     TokenType::KW_WHEN},
-    {"When",     TokenType::KW_WHEN},
     {"many",     TokenType::KW_MANY},
     {"temp",     TokenType::KW_TEMP},
     {"func",     TokenType::KW_FUNC},
@@ -42,6 +41,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"ilib",     TokenType::KW_ILIB},
     {"elib",     TokenType::KW_ELIB},
     {"clib",     TokenType::KW_CLIB},
+    {"from",     TokenType::KW_FROM},
     {"range",    TokenType::KW_RANGE},
     {"sequence", TokenType::KW_SEQUENCE},
     {"is",       TokenType::KW_IS},
@@ -58,9 +58,11 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"establish", TokenType::KW_ESTABLISH},
     {"rule", TokenType::KW_RULE},
     {"value", TokenType::KW_VALUE},
-    {"input", TokenType::KW_INPUT},
-    {"bind", TokenType::KW_BIND},
-    {"to", TokenType::KW_TO},
+    {"eval",   TokenType::KW_EVAL},
+    {"input",  TokenType::KW_INPUT},
+    {"bind",   TokenType::KW_BIND},
+    {"to",     TokenType::KW_TO},
+    {"bundle", TokenType::KW_BUNDLE},
 };
 
 class Lexer {

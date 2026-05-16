@@ -15,7 +15,7 @@
 #include <stdexcept>
 
 static const char ACC_MAGIC[4] = {'A','C','C','1'};
-static const uint8_t ACC_VERSION = 2;
+static const uint8_t ACC_VERSION = 4; // bumped: null keyword, event system, condition structured children required
 
 // ── Timestamp check ──────────────────────────────────────────────────────────
 

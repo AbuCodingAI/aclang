@@ -90,7 +90,14 @@ enum class IROpcode {
     EVENT_TRIGGER,
     
     // Library calls
-    LIB_CALL
+    LIB_CALL,
+
+    // Native built-ins
+    EVAL,           // eval(expr) → evaluate string as AC expression
+
+    // Class/bundle support
+    CLASS_BEGIN,    // start of a bundle/class definition
+    CLASS_END       // end of a bundle/class definition
 };
 
 enum class IRType {
@@ -458,15 +465,17 @@ public:
 
 struct IRFunction {
     std::string name;
+    std::string classOwner;  // non-empty if this is a method of a bundle (e.g. "Dog")
     std::vector<std::string> parameters;
     std::vector<IRInstruction> instructions;
     IRType returnType;
-    
+
     // NEW: Counters for generating unique IDs
     int tempCount = 0;
     int labelCount = 0;
-    
-    IRFunction(std::string n) : name(std::move(n)), returnType(IRType::VOID) {}
+
+    IRFunction(std::string n, std::string owner = "")
+        : name(std::move(n)), classOwner(std::move(owner)), returnType(IRType::VOID) {}
     
     // Helper to allocate a new temp
     IRRef newTemp() {
@@ -483,13 +492,15 @@ struct IRProgram {
     // NEW: Symbol table and arena allocator for integerized IR
     SymbolTable symbols;                    // Shared symbol table for all functions
     Arena arena;                            // Arena allocator for IR memory
-    
-    std::vector<IRFunction> functions;      // All functions (flat array storage)
-    std::vector<IRInstruction> globalInit;  // Global initialization (flat array storage)
+
+    std::vector<IRFunction> functions;      // All functions — "definitions" section
+    std::vector<IRInstruction> globalInit;  // data + main combined (codegen compat)
+    std::vector<IRInstruction> dataSection; // imports, global consts — cache section
+    std::vector<IRInstruction> mainSection; // main loop body — cache section
     std::string backend;                    // Target backend (PY, JS, RS, etc.)
     std::string target;                     // Same as backend (for compatibility)
     bool useHighLevelIR = false;            // Use structured control flow instead of jumps
-    
+
     // Global counters for temporaries and labels
     int globalTempCount = 0;
     int globalLabelCount = 0;

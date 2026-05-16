@@ -51,9 +51,10 @@ private:
             // Stop AT a newline/dedent so the caller's skipNewlines() can consume it
             if (t == TokenType::NEWLINE || t == TokenType::DEDENT) return;
             // Stop AT statement-starting keywords
-            if (t == TokenType::KW_IF    || t == TokenType::KW_FOR    ||
-                t == TokenType::KW_WHILST || t == TokenType::KW_MAKE   ||
-                t == TokenType::KW_RETURN || t == TokenType::TAG_OPEN) return;
+            if (t == TokenType::KW_IF     || t == TokenType::KW_FOR    ||
+                t == TokenType::KW_WHILST  || t == TokenType::KW_MAKE   ||
+                t == TokenType::KW_BUNDLE  || t == TokenType::KW_RETURN ||
+                t == TokenType::TAG_OPEN) return;
             advance();
         }
     }
@@ -226,40 +227,73 @@ private:
             node->attrs.push_back("BOOL");
             return node;
         }
-        
+
         if (at(TokenType::KW_FALSE)) {
             advance();
             auto node = std::make_unique<ASTNode>(NodeType::LiteralExpr, "false");
             node->attrs.push_back("BOOL");
             return node;
         }
+
+        // Null literal
+        if (at(TokenType::KW_NULL)) {
+            advance();
+            auto node = std::make_unique<ASTNode>(NodeType::LiteralExpr, "null");
+            node->attrs.push_back("NULL");
+            return node;
+        }
         
         // Identifier (variable or function call)
         if (at(TokenType::IDENTIFIER)) {
             auto tok = advance();
-            
+
+            // Method call in expression: obj.method or obj.method(args) or obj.method $str$
+            if (at(TokenType::DOT)) {
+                advance(); // consume "."
+                std::string methodName = peek().type == TokenType::IDENTIFIER ? advance().value : "";
+                std::string fullName = tok.value + "." + methodName;
+                auto node = std::make_unique<ASTNode>(NodeType::MethodCall, fullName);
+                if (at(TokenType::LPAREN)) {
+                    advance();
+                    while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
+                        node->children.push_back(parseExpression(0));
+                        if (at(TokenType::COMMA)) advance();
+                    }
+                    if (at(TokenType::RPAREN)) advance();
+                } else if (at(TokenType::STRING)) {
+                    auto lit = std::make_unique<ASTNode>(NodeType::LiteralExpr, advance().value);
+                    lit->attrs.push_back("STRING");
+                    node->children.push_back(std::move(lit));
+                } else if (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE) &&
+                           !at(TokenType::RPAREN) && !at(TokenType::RBRACKET)) {
+                    auto argExpr = parseExpression(0);
+                    if (argExpr) node->children.push_back(std::move(argExpr));
+                }
+                return node;
+            }
+
             // Function call: func(args)
             if (at(TokenType::LPAREN)) {
                 advance();
                 auto node = std::make_unique<ASTNode>(NodeType::CallExpr, tok.value);
-                
+
                 // Parse arguments
                 while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
                     node->children.push_back(parseExpression(0));
                     if (at(TokenType::COMMA)) advance();
                 }
-                
+
                 expect(TokenType::RPAREN, "Expected ')' after function arguments");
                 return node;
             }
-            
+
             // Array indexing: arr[index]
             if (at(TokenType::LBRACKET)) {
                 advance();
                 auto arrayNode = std::make_unique<ASTNode>(NodeType::Identifier, tok.value);
                 auto indexExpr = parseExpression(0);
                 expect(TokenType::RBRACKET, "Expected ']' after array index");
-                
+
                 auto node = std::make_unique<ASTNode>(NodeType::IndexExpr, tok.value);
                 node->children.push_back(std::move(arrayNode));
                 node->children.push_back(std::move(indexExpr));
@@ -280,7 +314,18 @@ private:
         if (at(TokenType::LBRACE)) {
             return parseTupleLiteral();
         }
-        
+
+        // eval(expr) — native AC expression evaluator; usable in any expression context
+        if (at(TokenType::KW_EVAL)) {
+            advance();
+            expect(TokenType::LPAREN, "Expected ( after eval");
+            auto arg = parseExpression(0);
+            if (at(TokenType::RPAREN)) advance();
+            auto node = std::make_unique<ASTNode>(NodeType::EvalExpr, "");
+            if (arg) node->children.push_back(std::move(arg));
+            return node;
+        }
+
         // If we hit a natural expression terminator, there is simply no expression here.
         // Return nullptr to let callers decide if this is an error.
         {
@@ -517,6 +562,28 @@ private:
             return parseUse();
         }
 
+        // from ilib/elib/clib <name> use <symbol>[, <symbol>, ...]
+        // e.g.: from ilib math use sin, cos, sqrt
+        if (at(TokenType::KW_FROM)) {
+            advance(); // consume 'from'
+            std::string libType = "ilib";
+            if (at(TokenType::KW_ILIB))      { advance(); libType = "ilib"; }
+            else if (at(TokenType::KW_ELIB)) { advance(); libType = "elib"; }
+            else if (at(TokenType::KW_CLIB)) { advance(); libType = "clib"; }
+            std::string libName;
+            if (at(TokenType::IDENTIFIER)) libName = advance().value;
+            auto node = std::make_unique<ASTNode>(NodeType::UseLibStmt, libType + ":" + libName);
+            // Collect symbol list after 'use': sym1, sym2, sym3 ...
+            if (at(TokenType::KW_USE)) {
+                advance(); // consume 'use'
+                while (at(TokenType::IDENTIFIER)) {
+                    node->attrs.push_back(advance().value); // each requested symbol
+                    if (at(TokenType::COMMA)) advance(); else break;
+                }
+            }
+            return node;
+        }
+
         // save as name
         if (at(TokenType::KW_SAVE)) {
             advance();
@@ -575,6 +642,12 @@ private:
         if (at(TokenType::KW_MAKE)) {
             advance();
             return parseMake();
+        }
+
+        // bundle X — class/struct definition
+        if (at(TokenType::KW_BUNDLE)) {
+            advance();
+            return parseBundle();
         }
 
         // configure event-listener
@@ -649,21 +722,6 @@ private:
             return node;
         }
 
-        // when many ...
-        if (at(TokenType::KW_WHEN)) {
-            advance();
-            auto node = std::make_unique<ASTNode>(NodeType::WhenBlock);
-            // collect condition tokens until newline
-            std::string cond;
-            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                cond += advance().value + " ";
-            }
-            node->value = cond;
-            skipNewlines();
-            node->children.push_back(parseBlock());
-            return node;
-        }
-
         // range N — Numeral Pos only
         if (at(TokenType::KW_RANGE)) {
             advance();
@@ -686,6 +744,17 @@ private:
             if (at(TokenType::RPAREN)) advance();
             auto node = std::make_unique<ASTNode>(NodeType::SequenceExpr, x + "," + y);
             node->inferredType = std::make_shared<Type>(Type::makeList());
+            return node;
+        }
+
+        // eval(expr) — evaluate string as AC expression, returns value
+        if (at(TokenType::KW_EVAL)) {
+            advance();
+            expect(TokenType::LPAREN, "Expected ( after eval");
+            auto arg = parseExpression(0);
+            if (at(TokenType::RPAREN)) advance();
+            auto node = std::make_unique<ASTNode>(NodeType::EvalExpr, "");
+            if (arg) node->children.push_back(std::move(arg));
             return node;
         }
 
@@ -717,9 +786,8 @@ private:
             return node;
         }
 
-        // True / False boolean literals as standalone statements or assignments
-        if (at(TokenType::KW_TRUE) || at(TokenType::KW_FALSE)) {
-            // bare boolean — treat as expression
+        // True / False / null literals as standalone statements or assignments
+        if (at(TokenType::KW_TRUE) || at(TokenType::KW_FALSE) || at(TokenType::KW_NULL)) {
             std::string val = advance().value;
             return std::make_unique<ASTNode>(NodeType::BinaryExpr, val);
         }
@@ -1061,9 +1129,9 @@ private:
                 
                 // Parse key
                 std::string key;
-                while (!at(TokenType::COLON) && !at(TokenType::NEWLINE) && 
+                while (!at(TokenType::COLON) && !at(TokenType::NEWLINE) &&
                        !at(TokenType::RBRACE) && !at(TokenType::DEDENT) && !at(TokenType::END_OF_FILE)) {
-                    if (at(TokenType::STRING)) key += advance().value;
+                    if (at(TokenType::STRING)) key += "$" + advance().value + "$";
                     else key += advance().value;
                 }
                 
@@ -1073,13 +1141,16 @@ private:
                 }
                 advance(); // consume :
                 
-                // Parse value
+                // Parse value (stops at comma, newline, } or dedent)
                 std::string value;
-                while (!at(TokenType::NEWLINE) && !at(TokenType::RBRACE) && 
-                       !at(TokenType::DEDENT) && !at(TokenType::END_OF_FILE)) {
-                    if (at(TokenType::STRING)) value += advance().value;
+                while (!at(TokenType::NEWLINE) && !at(TokenType::COMMA) &&
+                       !at(TokenType::RBRACE) && !at(TokenType::DEDENT) &&
+                       !at(TokenType::END_OF_FILE)) {
+                    if (at(TokenType::STRING)) value += "$" + advance().value + "$";
                     else value += advance().value;
                 }
+                // consume trailing comma between entries
+                if (at(TokenType::COMMA)) advance();
                 
                 // Add to contents
                 if (!key.empty()) {
@@ -1181,6 +1252,18 @@ private:
         // Make X object / Make Screen object
         auto node = std::make_unique<ASTNode>(NodeType::ObjDecl, name);
         while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) advance();
+        return node;
+    }
+
+    NodePtr parseBundle() {
+        // bundle ClassName
+        //     field = value
+        //     Make method func(args)
+        //         body
+        std::string name = expect(TokenType::IDENTIFIER, "Expected class name after bundle").value;
+        auto node = std::make_unique<ASTNode>(NodeType::BundleDef, name);
+        skipNewlines();
+        node->children.push_back(parseBlock());
         return node;
     }
 
@@ -1475,12 +1558,23 @@ private:
                 return node;
             }
             
+            // dict-{ key:value\n... } syntax
+            if (at(TokenType::IDENTIFIER) && peek().value == "dict" &&
+                peekAhead(1).type == TokenType::IDENTIFIER && peekAhead(1).value == "-" &&
+                peekAhead(2).type == TokenType::LBRACE) {
+                advance(); advance(); // consume "dict" and "-"
+                auto dictNode = parseTupleLiteral();
+                auto assignNode = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
+                assignNode->attrs.push_back("__dict__" + dictNode->value);
+                return assignNode;
+            }
+
             // General expression - use Pratt parser
             auto rhsExpr = parseExpression(0);
             if (!rhsExpr) {
                 throw SYNTAX_ERROR("Expected expression after assignment", peek().line, peek().col);
             }
-            
+
             auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
             node->children.push_back(std::move(rhsExpr));
             return node;

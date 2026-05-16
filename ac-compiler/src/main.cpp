@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include <sys/stat.h>
+#ifndef _WIN32
+  #include <unistd.h>
+#endif
 
 #ifdef _WIN32
   #include <direct.h>
@@ -35,7 +38,8 @@ namespace AC_IR {
 }
 
 // Unified IR-based code generator (defined in ir_codegen.cpp)
-std::string generateFromIR(const AC_IR::IRProgram& ir, const std::string& stem = "Main");
+std::string generateFromIR(const AC_IR::IRProgram& ir, const std::string& stem = "Main",
+                           const std::string& outputBase = "");
 
 // Gating flag for <Foreign> raw-passthrough blocks.
 bool g_allow_foreign = false;
@@ -307,8 +311,62 @@ int main(int argc, char* argv[]) {
             std::string outFile = base + info.extension;
             size_t slash = base.find_last_of("/\\");
             std::string stem = (slash == std::string::npos) ? base : base.substr(slash + 1);
-            writeFile(outFile, generateFromIR(irProg, stem));
+            std::string content = generateFromIR(irProg, stem, base);
+            writeFile(outFile, content);
             std::cout << "Generated: " << outFile << "\n";
+
+            // C backend: auto-compile to binary using gcc
+            if (tgt == "C") {
+                // Extract link flags from the "// Link: ..." comment in the generated file
+                std::string linkFlags;
+                {
+                    std::istringstream ss(content);
+                    std::string line;
+                    while (std::getline(ss, line)) {
+                        const std::string prefix = "// Link: gcc ";
+                        if (line.rfind(prefix, 0) == 0) {
+                            // Grab everything after "gcc <file> "
+                            std::string rest = line.substr(prefix.length());
+                            auto sp = rest.find(' ');
+                            if (sp != std::string::npos) linkFlags = rest.substr(sp + 1);
+                            break;
+                        }
+                    }
+                }
+                // Determine cwd for absolute rpath
+                char cwdbuf[4096];
+                std::string cwd;
+#ifdef _WIN32
+                if (_getcwd(cwdbuf, sizeof(cwdbuf))) cwd = cwdbuf;
+#else
+                if (getcwd(cwdbuf, sizeof(cwdbuf))) cwd = cwdbuf;
+#endif
+                // Build: gcc file.c -L./libdir -llib -Wl,-rpath,/abs/libdir -o bin
+                std::string binFile = base;
+                std::string gccCmd = "gcc \"" + outFile + "\" -I. " + linkFlags;
+                // For each -L flag, add an absolute -Wl,-rpath so the binary runs anywhere
+                if (!cwd.empty()) {
+                    std::istringstream lf(linkFlags);
+                    std::string tok;
+                    while (lf >> tok) {
+                        if (tok.rfind("-L", 0) == 0) {
+                            std::string libpath = tok.substr(2);
+                            // Strip leading "./" if present before joining with cwd
+                            if (libpath.rfind("./", 0) == 0) libpath = libpath.substr(2);
+                            if (!libpath.empty() && libpath[0] != '/')
+                                libpath = cwd + "/" + libpath;
+                            gccCmd += " -Wl,-rpath,\"" + libpath + "\"";
+                        }
+                    }
+                }
+                gccCmd += " -o \"" + binFile + "\"";
+                int rc = std::system(gccCmd.c_str());
+                if (rc == 0)
+                    std::cout << "Compiled:  " << binFile << " [gcc]\n";
+                else
+                    std::cerr << "Warning: gcc compilation failed (exit " << rc << ")\n";
+            }
+
             return true;
         };
 
@@ -320,7 +378,12 @@ int main(int argc, char* argv[]) {
             std::cout << "Compiling " << inputFile << " to " << allBackends.size() << " backends...\n";
             int ok = 0, fail = 0;
             for (const auto& tgt : allBackends) {
-                if (compileOne(tgt)) ok++; else fail++;
+                try {
+                    if (compileOne(tgt)) ok++; else fail++;
+                } catch (const std::exception& ex) {
+                    std::cerr << tgt << ": " << ex.what() << "\n";
+                    fail++;
+                }
             }
             std::cout << ok << " succeeded";
             if (fail) std::cout << ", " << fail << " failed";

@@ -65,8 +65,8 @@ enum class TokenType {
     KW_OVERLAP,
     KW_TRUE,
     KW_FALSE,
+    KW_NULL,        // null → backend-specific null (None/null/nullptr/nil/none)
     KW_ON,
-    KW_WHEN,
     KW_MANY,
     KW_TEMP,
     KW_FUNC,
@@ -74,6 +74,7 @@ enum class TokenType {
     KW_ILIB,        // ilib (import library)
     KW_ELIB,        // elib (external library)
     KW_CLIB,        // clib (custom library)
+    KW_FROM,        // from (submodule import: from ilib math use statistics)
     KW_RANGE,       // range N  → [0..N], Numeral Pos only
     KW_SEQUENCE,    // sequence(x,y) → [x..y], breaks if x > y
     KW_IS,          // is  → equality comparison (==)
@@ -92,6 +93,8 @@ enum class TokenType {
     KW_INPUT,       // input (send ghost/simulated input)
     KW_BIND,        // bind (for keybinds: bind KEY_W to function)
     KW_TO,          // to (for keybinds: bind KEY_W to function)
+    KW_EVAL,        // eval(expr) → evaluate string as AC expression
+    KW_BUNDLE,      // bundle X — class/struct definition
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>
