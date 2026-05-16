@@ -432,16 +432,9 @@ class IRGenerator {
                 }
                 // No-arg property/constant reference: self.prop or lib.CONST
                 if (expr.children.empty()) {
-                    auto dot = mname.find('.');
-                    if (dot != std::string::npos) {
-                        std::string obj = mname.substr(0, dot);
-                        // self.X → property access, keep dot in symbol name
-                        if (obj == "self") return mkVar(mname);
-                        // lib.CONST → lib_CONST  (e.g. math.PI → math_PI)
-                        std::string varName = mname;
-                        for (char& c : varName) if (c == '.') c = '_';
-                        return mkVar(varName);
-                    }
+                    // Always preserve dots in the symbol name.
+                    // Backends that don't support dot syntax (C, Rust, Go, etc.)
+                    // replace dots in formatRef via commonRef(preserveDots=false).
                     return mkVar(mname);
                 }
                 // Function call: lib.func(args) → translated to lib_func in codegen

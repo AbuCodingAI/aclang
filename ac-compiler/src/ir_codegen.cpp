@@ -235,10 +235,15 @@ static std::string escapeStr(const std::string& s) {
 static std::string commonRef(const IRRef &r, SymbolTable *sym,
                              const std::string &trueVal  = "true",
                              const std::string &falseVal = "false",
-                             const std::string &nullVal  = "null")
+                             const std::string &nullVal  = "null",
+                             bool preserveDots = true)
 {
-    if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::FUNCTION)
-        return r.toStringWithSymbols(sym);
+    if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::FUNCTION) {
+        std::string name = r.toStringWithSymbols(sym);
+        if (!preserveDots)
+            for (char& c : name) if (c == '.') c = '_';
+        return name;
+    }
     if (r.kind == IRRef::Kind::TEMP)
         return "t" + std::to_string(r.id);
     if (r.kind == IRRef::Kind::LABEL)
@@ -732,7 +737,7 @@ class JavaScriptStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym);
+        return commonRef(r, sym, "true", "false", "null", false);
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1004,7 +1009,7 @@ class HTMLStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym);
+        return commonRef(r, sym, "true", "false", "null", false);
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1259,7 +1264,7 @@ class CStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "1", "0", "NULL");
+        return commonRef(r, sym, "1", "0", "NULL", false);
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -1555,7 +1560,7 @@ class CppStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "nullptr");
+        return commonRef(r, sym, "true", "false", "nullptr", false);
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -2147,7 +2152,7 @@ class RustStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "None");
+        return commonRef(r, sym, "true", "false", "None", false);
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -2542,7 +2547,7 @@ class GoStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "nil");
+        return commonRef(r, sym, "true", "false", "nil", false);
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -2847,7 +2852,7 @@ class VStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "true", "false", "none");
+        return commonRef(r, sym, "true", "false", "none", false);
     }
 
     std::string decl(const std::string &var, const std::string &val)
@@ -3189,7 +3194,7 @@ class AsmStrategy : public BackendStrategy
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "1", "0", "0");
+        return commonRef(r, sym, "1", "0", "0", false);
     }
 
     void emitStoreVar(std::ostringstream &out, int & /*indent*/, const std::string &var, const std::string &val) override

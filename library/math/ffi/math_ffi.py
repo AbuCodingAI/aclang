@@ -40,6 +40,31 @@ math_inf=_c0('ac_math_inf')()
 _m.ac_math_pi.argtypes=[_INT]; _m.ac_math_pi.restype=_D
 _m.ac_math_e.argtypes=[_INT]; _m.ac_math_e.restype=_D
 math_pi_digits=lambda n: _m.ac_math_pi(int(n)); math_e_digits=lambda n: _m.ac_math_e(int(n))
+
+# Precision constants — math.pi(n) / math.e(n) return the constant to n decimal places.
+# C library is limited to ~15 digits (IEEE double); beyond that we use a hardcoded 100-digit string.
+_PI_100 = "3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679"
+_E_100  = "2.7182818284590452353602874713526624977572470936999595749669676277240766303535475945713821785251664274"
+
+def _pi_prec(n):
+    n = int(n)
+    if n <= 0:  return _PI_100[:1]
+    if n <= 15: return str(_m.ac_math_pi(n))   # C library for small n (fast)
+    end = 2 + n  # "3." + n digits
+    return _PI_100[:min(end, len(_PI_100))]
+
+def _e_prec(n):
+    n = int(n)
+    if n <= 0:  return _E_100[:1]
+    if n <= 15: return str(_m.ac_math_e(n))
+    end = 2 + n
+    return _E_100[:min(end, len(_E_100))]
+
+class _PrecFloat(float):
+    """Float constant that is also callable: math.pi → value, math.pi(n) → n decimal places."""
+    def __new__(cls, val, fn): return float.__new__(cls, val)
+    def __init__(self, val, fn): self._fn = fn
+    def __call__(self, n): return self._fn(int(n))
 # Complex — Python has native complex, no FFI needed
 math_i = 1j
 def math_re(z): return float(z.real) if hasattr(z,'real') else float(z)
@@ -77,7 +102,7 @@ asin=math_asin; acos=math_acos; atan=math_atan; atan2=math_atan2
 sqrt=math_sqrt; cbrt=math_cbrt; floor=math_floor; ceil=math_ceil
 ln=math_ln; log=math_log; log2=math_log2; log10=math_log10
 hypot=math_hypot; clamp=math_clamp
-pi=math_pi; e=math_e; tau=math_tau; em=math_em
+pi=_PrecFloat(math_pi, _pi_prec); e=_PrecFloat(math_e, _e_prec); tau=math_tau; em=math_em
 i=math_i; re=math_re; im=math_im
 
 # Dot-call namespace — allows math.sin(x), math.pi, math.PI etc. in AC->PY output
@@ -96,7 +121,7 @@ math = _types.SimpleNamespace(
     abs_int=math_abs_int, mod_int=math_mod_int,
     gcd=math_gcd, lcm=math_lcm,
     is_prime=math_is_prime, eval=math_eval,
-    pi=math_pi, e=math_e, tau=math_tau, em=math_em, inf=math_inf,
+    pi=_PrecFloat(math_pi, _pi_prec), e=_PrecFloat(math_e, _e_prec), tau=math_tau, em=math_em, inf=math_inf,
     PI=math_PI, sigma=math_sigma, gradient=math_gradient,
     i=math_i, re=math_re, im=math_im,
 )
