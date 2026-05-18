@@ -1,0 +1,13 @@
+*.acc
+*.lir
+*.datac
+*.pyc
+__pycache__/
+.kiro/
+.vscode/
+.windsurf/
+/examples/pong.ac
+node_modules/
+context.md
+.aider*
+/AC+

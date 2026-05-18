@@ -1,6 +1,0 @@
-AC->PY
-
-<mainloop>
-    Term.display $Hello, World!$
-    /kill
-<mainloop>

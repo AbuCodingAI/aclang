@@ -1,0 +1,35 @@
+AC->BNY
+
+use ilib math
+
+/* Trigonometry: sin, cos, tan, inverses, degree/radian conversion */
+
+<mainloop>
+    Term.display $--- Degree / Radian Conversion ---$
+    Term.display math.deg2rad(180.0)
+    Term.display math.rad2deg(math.pi)
+
+    Term.display $--- sin / cos / tan at 0 and 30 deg ---$
+    a30 = math.deg2rad(30.0)
+    Term.display math.sin(0.0)
+    Term.display math.cos(0.0)
+    Term.display math.sin(a30)
+    Term.display math.cos(a30)
+    Term.display math.tan(a30)
+
+    Term.display $--- Reciprocal Trig ---$
+    a45 = math.deg2rad(45.0)
+    Term.display math.csc(a30)
+    Term.display math.sec(a30)
+    Term.display math.cot(a45)
+
+    Term.display $--- Inverse Trig (result in radians) ---$
+    Term.display math.asin(1.0)
+    Term.display math.acos(1.0)
+    Term.display math.atan(1.0)
+    Term.display math.atan2(1.0, 1.0)
+
+    Term.display $--- Pythagorean: sqrt(3^2 + 4^2) = 5 ---$
+    Term.display math.hypot(3.0, 4.0)
+    /kill
+<mainloop>

@@ -1,0 +1,34 @@
+AC->BNY
+
+/* Sieve of Eratosthenes — find all primes up to n */
+/* AC is 1-indexed: prime[k+1] holds the prime flag for number k */
+
+Make sieve func(n)
+    prime = []
+    j = 0
+    WHILST j #> n
+        prime.append(True)
+        j += 1
+    prime[1] = False
+    prime[2] = False
+    p = 2
+    WHILST p @ p #> n
+        IF prime[p + 1]
+            i = p @ p
+            WHILST i #> n
+                prime[i + 1] = False
+                i += p
+        p += 1
+    result = []
+    i = 2
+    WHILST i #> n
+        IF prime[i + 1]
+            result.append(i)
+        i += 1
+    return result
+
+<mainloop>
+    limit = 50
+    primes = sieve(limit)
+    Term.display primes
+<mainloop>

@@ -1,0 +1,44 @@
+AC->BNY
+
+use ilib math
+
+/* Number theory: GCD, LCM, primality, modular arithmetic, integer abs */
+
+Make collatz func(n)
+    /* Count steps until n reaches 1 via Collatz sequence */
+    steps = 0
+    WHILST n #= 1
+        IF math.mod_int(n, 2) is 0
+            n = n / 2
+            n = math.to_int(n)
+        OTHER
+            n = n @ 3 + 1
+        steps += 1
+    return steps
+
+<mainloop>
+    Term.display $--- GCD ---$
+    Term.display math.gcd(48, 18)
+    Term.display math.gcd(100, 75)
+    Term.display math.gcd(17, 13)
+
+    Term.display $--- LCM ---$
+    Term.display math.lcm(4, 6)
+    Term.display math.lcm(12, 18)
+
+    Term.display $--- Prime Check ---$
+    Term.display math.is_prime(2)
+    Term.display math.is_prime(17)
+    Term.display math.is_prime(15)
+    Term.display math.is_prime(97)
+
+    Term.display $--- Integer Abs and Mod ---$
+    Term.display math.abs_int(-99)
+    Term.display math.mod_int(17, 5)
+    Term.display math.mod_int(-7, 3)
+
+    Term.display $--- Collatz Steps ---$
+    Term.display collatz(6)
+    Term.display collatz(27)
+    /kill
+<mainloop>

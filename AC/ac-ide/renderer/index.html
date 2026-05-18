@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self' https://cdnjs.cloudflare.com; script-src 'self' https://cdnjs.cloudflare.com 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src 'self' data: https://cdnjs.cloudflare.com;" />
+  <title>AC IDE</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ══ Title Bar ══════════════════════════════════════════════════════════════ -->
+<div id="titlebar">
+  <div id="titlebar-drag">
+    <span id="titlebar-logo">▲</span>
+    <span id="titlebar-name">AC IDE</span>
+    <span id="titlebar-file"></span>
+  </div>
+  <div id="titlebar-controls">
+    <button class="tbtn" id="btn-min"  title="Minimize">&#8211;</button>
+    <button class="tbtn" id="btn-max"  title="Maximize">&#9633;</button>
+    <button class="tbtn close" id="btn-close" title="Close">&#10005;</button>
+  </div>
+</div>
+
+<!-- ══ Layout ════════════════════════════════════════════════════════════════ -->
+<div id="layout">
+
+  <!-- Activity Bar (icon rail) -->
+  <nav id="activitybar">
+    <button class="act-btn active" data-panel="explorer"  title="Examples">
+      <svg viewBox="0 0 16 16"><path d="M3 2h8l2 2v10H3V2zm5 6H5v1h3V8zm3 2H5v1h6v-1zm0-4H5v1h6V6z"/></svg>
+    </button>
+    <button class="act-btn" data-panel="help"     title="Help / Docs">
+      <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.5"/><text x="8" y="12" text-anchor="middle" font-size="9" fill="currentColor">?</text></svg>
+    </button>
+    <button class="act-btn" data-panel="shell"    title="Shell">
+      <svg viewBox="0 0 16 16"><path d="M2 3h12v10H2V3zm1 2 3 2.5L3 10m4 0h5"/></svg>
+    </button>
+    <button class="act-btn" data-panel="settings" title="Options">
+      <svg viewBox="0 0 16 16"><path d="M8 5a3 3 0 100 6A3 3 0 008 5zM1 8l1.5-1.5M13.5 8 15 6.5M8 1v2m0 10v2M3.5 3.5l1.5 1.5m6-1.5-1.5 1.5M1 9.5 2.5 8M13.5 8 15 9.5" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
+  </nav>
+
+  <!-- Sidebar panels -->
+  <aside id="sidebar">
+
+    <!-- Explorer / Examples -->
+    <div class="panel active" id="panel-explorer">
+      <div class="panel-header">
+        <span>EXAMPLES</span>
+        <button id="btn-new-file" title="New file">+</button>
+      </div>
+      <div class="panel-body" id="example-list"></div>
+    </div>
+
+    <!-- Help -->
+    <div class="panel" id="panel-help">
+      <div class="panel-header"><span>HELP &amp; DOCS</span></div>
+      <div class="panel-body help-body" id="help-content">
+        <div class="help-section">
+          <h3>AC Language</h3>
+          <p>AC is a multi-target compiled language. Write once, compile to 12 backends.</p>
+        </div>
+        <div class="help-section">
+          <h3>File Header</h3>
+          <pre>AC-&gt;BNY   ← native binary
+AC-&gt;PY    ← Python
+AC-&gt;JS    ← JavaScript
+AC-&gt;C     ← C
+AC-&gt;CPP   ← C++
+AC-&gt;Java  ← Java
+AC-&gt;RS    ← Rust
+AC-&gt;GO    ← Go</pre>
+        </div>
+        <div class="help-section">
+          <h3>Control Flow</h3>
+          <pre>IF x is 1
+    ...
+ELSEIF x is 2
+    ...
+OTHER
+    ...
+
+WHILST x &lt; 10
+    x += 1
+
+FOR item in list
+    ...</pre>
+        </div>
+        <div class="help-section">
+          <h3>Functions</h3>
+          <pre>Make greet func(name)
+    Term.display name
+    return name</pre>
+        </div>
+        <div class="help-section">
+          <h3>Try / Catch</h3>
+          <pre>try
+    risky()
+catch
+    report err
+    Term.display err
+after
+    cleanup()</pre>
+        </div>
+        <div class="help-section">
+          <h3>Math Library</h3>
+          <pre>use ilib math
+Term.display math.pi
+Term.display math.sin(x)
+Term.display math.sqrt(16.0)</pre>
+        </div>
+        <div class="help-section">
+          <h3>Operators</h3>
+          <pre>*   numeric multiply
+@   polymorphic multiply
+#=  not equal
++=  -=  *=  /=  @=
+|   XOR   |=  XOR-assign</pre>
+        </div>
+        <div class="help-section">
+          <h3>Keyboard Shortcuts</h3>
+          <pre>Ctrl+Enter   Run
+Ctrl+B       Build only
+Ctrl+S       Save
+Ctrl+O       Open file
+Ctrl+,       Settings</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Shell input -->
+    <div class="panel" id="panel-shell">
+      <div class="panel-header"><span>SHELL</span></div>
+      <div class="panel-body">
+        <div id="shell-history"></div>
+        <div id="shell-input-row">
+          <span class="shell-prompt">ac&gt;</span>
+          <input id="shell-input" type="text" placeholder="ac command or shell command…" autocomplete="off" spellcheck="false" />
+          <button id="shell-run-btn">▶</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Options / Settings -->
+    <div class="panel" id="panel-settings">
+      <div class="panel-header">
+        <span>OPTIONS</span>
+        <button id="btn-reset-opts" title="Reset to defaults">↺</button>
+      </div>
+      <div class="panel-body settings-body" id="settings-content">
+
+        <label class="opt-label">Theme</label>
+        <select class="opt-input" id="opt-theme">
+          <option value="dark">Dark (AC Night)</option>
+          <option value="light">Light</option>
+          <option value="midnight">Midnight</option>
+        </select>
+
+        <label class="opt-label">Font Size</label>
+        <input class="opt-input" id="opt-fontSize" type="number" min="10" max="28" value="14" />
+
+        <label class="opt-label">Tab Size</label>
+        <select class="opt-input" id="opt-tabSize">
+          <option value="2">2 spaces</option>
+          <option value="4" selected>4 spaces</option>
+          <option value="8">8 spaces</option>
+        </select>
+
+        <label class="opt-label">Default Backend</label>
+        <select class="opt-input" id="opt-backend">
+          <option value="BNY">BNY — native binary</option>
+          <option value="PY">PY — Python</option>
+          <option value="JS">JS — JavaScript</option>
+          <option value="C">C — C</option>
+          <option value="CPP">CPP — C++</option>
+          <option value="Java">Java — Java</option>
+          <option value="RS">RS — Rust</option>
+          <option value="GO">GO — Go</option>
+          <option value="V">V — V</option>
+          <option value="ASM">ASM — Assembly</option>
+        </select>
+
+        <label class="opt-label">Word Wrap</label>
+        <label class="toggle-wrap">
+          <input type="checkbox" id="opt-wordWrap" />
+          <span class="toggle"></span>
+        </label>
+
+        <label class="opt-label">Show Minimap</label>
+        <label class="toggle-wrap">
+          <input type="checkbox" id="opt-minimap" />
+          <span class="toggle"></span>
+        </label>
+
+        <label class="opt-label">Auto Save</label>
+        <label class="toggle-wrap">
+          <input type="checkbox" id="opt-autoSave" checked />
+          <span class="toggle"></span>
+        </label>
+
+        <label class="opt-label">Compiler Path</label>
+        <input class="opt-input" id="opt-compilerPath" type="text" placeholder="/path/to/ac" />
+
+        <button class="opt-save-btn" id="btn-save-opts">Save Options</button>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── Main editor area ─────────────────────────────────────────────────── -->
+  <main id="main">
+
+    <!-- Toolbar -->
+    <div id="toolbar">
+      <div class="toolbar-left">
+        <button class="tool-btn" id="btn-open"  title="Open (Ctrl+O)">
+          <svg viewBox="0 0 16 16"><path d="M2 4h5l1.5 1.5H14V13H2V4z" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+          Open
+        </button>
+        <button class="tool-btn" id="btn-save"  title="Save (Ctrl+S)">
+          <svg viewBox="0 0 16 16"><path d="M3 2h8l3 3v9H2V2h1zm3 0v4h5V2M5 12h6" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+          Save
+        </button>
+        <div class="separator"></div>
+        <select id="backend-select" title="Compilation backend">
+          <option value="BNY">BNY</option>
+          <option value="PY">PY</option>
+          <option value="JS">JS</option>
+          <option value="C">C</option>
+          <option value="CPP">CPP</option>
+          <option value="Java">Java</option>
+          <option value="RS">RS</option>
+          <option value="GO">GO</option>
+          <option value="V">V</option>
+          <option value="ASM">ASM</option>
+          <option value="HTML">HTML</option>
+        </select>
+      </div>
+      <div class="toolbar-center">
+        <button class="tool-btn run-btn" id="btn-run"   title="Compile &amp; Run (Ctrl+Enter)">
+          ▶  Run
+        </button>
+        <button class="tool-btn"         id="btn-build" title="Build only (Ctrl+B)">
+          ⚡ Build
+        </button>
+        <button class="tool-btn"         id="btn-all"   title="Compile all backends">
+          ◈ All
+        </button>
+        <button class="tool-btn stop-btn" id="btn-stop" title="Stop">
+          ■ Stop
+        </button>
+      </div>
+      <div class="toolbar-right">
+        <span id="status-dot" class="dot idle"></span>
+        <span id="status-text">Ready</span>
+      </div>
+    </div>
+
+    <!-- Editor -->
+    <div id="editor-container">
+      <div id="monaco-editor"></div>
+    </div>
+
+    <!-- Splitter -->
+    <div id="splitter"></div>
+
+    <!-- Output panel -->
+    <div id="output-panel">
+      <div id="output-tabs">
+        <button class="out-tab active" data-tab="output">Output</button>
+        <button class="out-tab"        data-tab="generated">Generated</button>
+        <button class="out-tab"        data-tab="ir">IR</button>
+        <button class="out-tab"        data-tab="compile-log">Compile Log</button>
+        <button class="out-clear"      id="btn-clear-out" title="Clear">✕</button>
+      </div>
+      <div id="output-body">
+        <div class="out-pane active" id="pane-output">
+          <pre id="output-text"></pre>
+        </div>
+        <div class="out-pane" id="pane-generated">
+          <pre id="generated-text"></pre>
+        </div>
+        <div class="out-pane" id="pane-ir">
+          <pre id="ir-text"></pre>
+        </div>
+        <div class="out-pane" id="pane-compile-log">
+          <pre id="log-text"></pre>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- Monaco Editor (CDN) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

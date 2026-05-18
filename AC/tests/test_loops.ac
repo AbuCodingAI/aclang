@@ -1,0 +1,17 @@
+AC->PY
+
+<mainloop>
+    i = 1
+    WHILST i #> 5
+        Term.display i
+        i += 1
+    free sum
+    free j
+    sum = 0
+    j = 1
+    WHILST j #> 10
+        sum += j
+        j += 1
+    Term.display sum
+    /kill
+<mainloop>

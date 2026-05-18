@@ -1,0 +1,6 @@
+AC->BNY
+
+<mainloop>
+    Term.display $Hello, World!$
+    /kill
+<mainloop>

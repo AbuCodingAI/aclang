@@ -1,0 +1,46 @@
+AC->BNY
+
+use ilib math
+
+/* Core math library demo: constants, powers, logs, rounding, conversions */
+
+<mainloop>
+    Term.display $--- Constants ---$
+    Term.display math.pi
+    Term.display math.e
+    Term.display math.tau
+    Term.display math.em
+
+    Term.display $--- Pi / E with precision ---$
+    Term.display math.pi(5)
+    Term.display math.e(4)
+
+    Term.display $--- Powers and Roots ---$
+    Term.display math.sqrt(16.0)
+    Term.display math.cbrt(27.0)
+    Term.display math.pow(2.0, 10.0)
+    Term.display math.hypot(3.0, 4.0)
+
+    Term.display $--- Logarithms ---$
+    Term.display math.ln(math.e)
+    Term.display math.log(10.0, 1000.0)
+    Term.display math.log(2.0, 1024.0)
+    Term.display math.log10(1000.0)
+    Term.display math.log2(1024.0)
+
+    Term.display $--- Rounding ---$
+    Term.display math.floor(4.9)
+    Term.display math.ceil(4.1)
+    Term.display math.round(4.5)
+    Term.display math.abs(-7.3)
+
+    Term.display $--- Clamp ---$
+    Term.display math.clamp(5.0, 0.0, 10.0)
+    Term.display math.clamp(-3.0, 0.0, 10.0)
+    Term.display math.clamp(15.0, 0.0, 10.0)
+
+    Term.display $--- Conversions ---$
+    Term.display math.to_int(3.99)
+    Term.display math.to_dec(42)
+    /kill
+<mainloop>

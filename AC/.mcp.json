@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "agentic-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-everything"
+      ],
+      "env": {
+        "OPENROUTER_API_KEY": ""
+      }
+    }
+  }
+}

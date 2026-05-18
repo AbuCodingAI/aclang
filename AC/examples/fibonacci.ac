@@ -1,0 +1,15 @@
+AC->BNY
+
+Make fib func(n)
+    IF n #> 1
+        return n
+    OTHER
+        return fib(n - 1) + fib(n - 2)
+
+<mainloop>
+    i = 0
+    WHILST i #> 10
+        Term.display fib(i)
+        i += 1
+    /kill
+<mainloop>
