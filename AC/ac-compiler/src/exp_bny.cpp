@@ -2026,11 +2026,28 @@ static std::string normalizeExtSym(const std::string& irName) {
 }
 
 static std::string libForSym(const std::string& exportName) {
+    // libc functions - dynamic linking
+    if (exportName == "printf" || exportName == "fprintf" || 
+        exportName == "scanf" || exportName == "fscanf" ||
+        exportName == "dlopen" || exportName == "dlsym" ||
+        exportName == "malloc" || exportName == "free" ||
+        exportName == "strlen" || exportName == "strcpy" ||
+        exportName == "strncpy")
+        return "libc.so.6";
+    
+    // pthread functions
+    if (exportName.rfind("pthread_", 0) == 0)
+        return "libpthread.so.0";
+    
+    // Camera/screen functions
     if (exportName.rfind("ac_camera_", 0) == 0 ||
         exportName.rfind("ac_sidebar_", 0) == 0 ||
         exportName.rfind("ac_screen_", 0) == 0)
         return "libaccamera.so";
+    
+    // Math library (libacmath)
     if (exportName.rfind("ac_", 0) == 0) return "libacmath.so";
+    
     return "";
 }
 
@@ -2682,6 +2699,22 @@ class BinaryCompiler {
         // ac_print_double is now inlined (emitPrintDoubleLinux) — no PLT needed on Linux
         // Only add PLT entry if explicitly requested via libacmath (e.g. math constants)
         (void)needsPrintDouble;
+        
+        // BNY Enhancement: Force-include libc for enhanced binary support
+        // Always available for dynamic linking: printf, dlopen, input support
+        std::vector<std::string> libcFuncs = {
+            "printf",      // Output
+            "dlopen",      // Dynamic library loading
+            "dlsym",       // Symbol resolution
+            "strlen"       // String operations
+        };
+        for (auto& func : libcFuncs) {
+            if (!seen.count(func)) {
+                result.push_back({func, func, "libc.so.6"});
+                seen.insert(func);
+            }
+        }
+        
         return result;
     }
 
