@@ -669,15 +669,8 @@ int main(int argc, char* argv[]) {
             const auto& info = BackendRegistry::getBackend(tgt);
 
             if (tgt == "BNY") {
-                std::string outFile = base + info.extension;
-                if (!generateBinaryFromIR(irProg, outFile, debugInfo, inputFile)) {
-                    std::cerr << "Preposterous: BackendError: Binary generation failed for BNY (Linux x86-64 only)\n";
-                    return false;
-                }
-                std::cout << "Generated: " << outFile << " [exp_bny]\n";
-#ifndef _WIN32
-                chmod(outFile.c_str(), 0755);
-#endif
+                std::string outFile = base + info.extension;  // For BNY IR codegen
+                // Binary generation is skipped for BNY - using C codegen instead
                 if (runAfterCompile && !compileAll) {
                     // Locate AC library root (same logic as ir_codegen FFI search)
                     std::string libRoot = "./library";
@@ -708,7 +701,7 @@ int main(int argc, char* argv[]) {
                     timedRun(runCmd);
                 }
                 printTiming();
-                return true;
+                // return true;  // Continue to IR codegen for BNY C generation
             }
 
             std::string outFile = base + info.extension;
@@ -776,6 +769,42 @@ int main(int argc, char* argv[]) {
                     if (doRun) timedRun("\"" + execPath(binFile) + "\"");
                 } else {
                     std::cerr << "Warning: gcc compilation failed (exit " << rc << ")\n";
+                }
+                printTiming();
+                return true;
+            }
+
+
+            // ── BNY: Compile generated C code with gcc + libc integration ──
+            if (tgt == "BNY") {
+                std::string binFile = base;
+                std::string gccCmd = "gcc \"" + outFile + "\" -I. -lm -ldl -lpthread";
+                // Add libacmath.so if it exists
+                // Link libacmath - try multiple paths
+                std::string libdir;
+                std::vector<std::string> tries = {
+                    "./library/ilib/math",
+                    "../library/ilib/math",
+                    srcDir + "/library/ilib/math",
+                    srcDir + "/../library/ilib/math"
+                };
+                for (auto& try_path : tries) {
+                    if (std::ifstream(try_path + "/libacmath.so")) {
+                        libdir = try_path;
+                        break;
+                    }
+                }
+                if (!libdir.empty()) {
+                    gccCmd += " -L\"" + libdir + "\" -lacmath";
+                    gccCmd += " -Wl,-rpath,\"" + libdir + "\"";
+                }
+                gccCmd += " -o \"" + binFile + "\"";
+                int rc = std::system(gccCmd.c_str());
+                if (rc == 0) {
+                    std::cout << "Compiled:  " << binFile << " [BNY/gcc]\n";
+                    if (doRun) timedRun("\"" + execPath(binFile) + "\"");
+                } else {
+                    std::cerr << "Warning: BNY compilation failed (exit " << rc << "). Check that gcc is installed.\n";
                 }
                 printTiming();
                 return true;

@@ -67,8 +67,16 @@ void BackendRegistry::initializeStandardBackends() {
     registerBackend("V", ".v", dummyGenerator, 
         [](const std::string& outFile) { return "cd /tmp/v && /usr/local/bin/v run " + outFile; });
     
-    registerBackend("BNY", ".acb", dummyGenerator,
-        [](const std::string& outFile) { return outFile; });  // Direct execution of binary
+    // BNY: Enhanced to generate C code + compile with gcc → native binary
+    // Full libc integration: input(), printf, dlopen/dlsym, pthread, math
+    registerBackend("BNY", ".c", dummyGenerator,
+        [](const std::string& outFile) { 
+            std::string exePath = outFile;
+            size_t dotPos = exePath.rfind(".c");
+            if (dotPos != std::string::npos) 
+                exePath = exePath.substr(0, dotPos);  // Remove .c extension
+            return exePath;  // Return path to compiled binary
+        });
 
     registerBackend("LIB", ".cpp", dummyGenerator,
         [](const std::string& outFile) { return ""; });  // No run step; compiled to .so/.dll
