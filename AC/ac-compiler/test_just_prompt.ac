@@ -1,0 +1,8 @@
+AC->BNY
+
+<mainloop>
+    Term.display $Before$
+    x = Term.ask $Prompt: $
+    Term.display $After$
+    /end
+<mainloop>

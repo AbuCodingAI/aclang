@@ -764,33 +764,7 @@ private:
             return;
         }
 
-        // Term.ask — read input, print prompt first, return result
-        if (method == "Term.ask") {
-            if (ins.typedOperands.size() >= 2) {
-                auto& prompt = ins.typedOperands[1];
-                // Print prompt first
-                if (prompt.kind == IRRef::Kind::CONST && prompt.value.type == IRType::STRING) {
-                    std::string s = std::get<std::string>(prompt.value.data);
-                    int sid = sp.add(s);
-                    em.mov_ri64_str(abi.argRegs[0], sid);
-                    em.mov_ri32(abi.argRegs[1], (int32_t)s.size());
-                    em.call("__ac_print_str__");
-                } else if (prompt.kind == IRRef::Kind::VAR
-                           && stringVarNames_.count(varName(prompt))) {
-                    load(prompt, abi.argRegs[0]);
-                    em.call("__ac_print_cstr__");
-                }
-            }
-            // Call __ac_input_int__ to read from stdin; result is in RAX
-            em.call("__ac_input_int__");
-            // Store the result (in RAX) to the destination variable
-            if (ins.result.isValid()) {
-                store(ins.result, R::RAX);
-            }
-            return;
-        }
-
-        // Default: Term.display — print operand[1]
+        // Term.display — print operand (LIB_CALL with "Term.display" method)
         if (ins.typedOperands.size() < 2) return;
         auto& val = ins.typedOperands[1];
         if (val.kind == IRRef::Kind::CONST && val.value.type == IRType::STRING) {
@@ -1124,6 +1098,33 @@ private:
                 }
             }
             break;
+
+        case IROpcode::INPUT: {
+            // INPUT: read integer from stdin (Term.ask)
+            // operand[0] = prompt string
+            if (!ops.empty()) {
+                auto& prompt = ops[0];
+                // Print prompt first
+                if (prompt.kind == IRRef::Kind::CONST && prompt.value.type == AC_IR::IRType::STRING) {
+                    std::string s = std::get<std::string>(prompt.value.data);
+                    int sid = sp.add(s);
+                    em.mov_ri64_str(abi.argRegs[0], sid);
+                    em.mov_ri32(abi.argRegs[1], (int32_t)s.size());
+                    em.call("__ac_print_str__");
+                } else if (prompt.kind == IRRef::Kind::VAR
+                           && stringVarNames_.count(varName(prompt))) {
+                    load(prompt, abi.argRegs[0]);
+                    em.call("__ac_print_cstr__");
+                }
+            }
+            // Call __ac_input_int__ to read from stdin; result is in RAX
+            em.call("__ac_input_int__");
+            // Store the result (in RAX) to the destination variable
+            if (ins.result.isValid()) {
+                store(ins.result, R::RAX);
+            }
+            break;
+        }
 
         case IROpcode::HALT:
             emitHalt();
@@ -1570,83 +1571,64 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
 }
 
 static void emitInputIntLinux(X64Emitter& em) {
-    // __ac_input_int__(): read integer from stdin, return in RAX
-    // The caller will store the result to the destination variable
+    // __ac_input_int__(): read integer from stdin via syscall, parse, return in RAX
     em.label("__ac_input_int__");
     em.push_rbp(); em.mov_rbp_rsp();
-    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14);
-    em.sub_rsp_i32(64); // 64-byte local buffer for stdin
+    em.push_r(R::R12); em.push_r(R::R13);
+    em.sub_rsp_i32(64);  // buffer for input (at [rbp-64])
 
-    // Read up to 32 bytes from stdin into [rbp-64]
-    em.lea_r_rbp32(R::RSI, -64);  // buffer
-    em.mov_ri32(R::RDI, 0);        // stdin fd = 0
-    em.mov_ri32(R::RDX, 32);       // read up to 32 bytes
+    // Syscall: read(0, buffer, 64) - read up to 64 bytes from stdin
+    em.lea_r_rbp32(R::RSI, -64);  // buffer address
+    em.mov_ri32(R::RDI, 0);        // fd = 0 (stdin)
+    em.mov_ri32(R::RDX, 64);       // count = 64
     em.mov_ri32(R::RAX, 0);        // syscall 0 = read
     em.syscall();
-    em.mov_rr(R::R14, R::RAX);     // r14 = bytes read
 
-    // Parse the integer from buffer [rbp-64]
-    em.lea_r_rbp32(R::R13, -64);   // r13 = buffer start
-    em.xor_rr(R::RAX, R::RAX);     // rax = 0 (result accumulator)
-    em.xor_rr(R::RBX, R::RBX);     // rbx = 0 (sign flag: 0=positive, 1=negative)
+    // RAX now has bytes read; save to R13
+    em.mov_rr(R::R13, R::RAX);
 
-    // Skip leading non-digits until we find a digit or minus sign
-    em.label("__ai_skip_junk__");
-    em.test_rr(R::R14, R::R14);    // check bytes remaining
-    em.jz("__ai_apply_sign__");
-    em.movzx_r64_ptr8(R::RCX, R::R13);
-    // Check if it's a minus sign (start of negative number)
-    em.cmp_r_i32(R::RCX, '-');
-    em.je("__ai_check_sign__");
-    // Check if it's a digit
+    // Parse integer from buffer [rbp-64]
+    // Start with result = 0 in RAX
+    em.xor_rr(R::RAX, R::RAX);
+    em.xor_rr(R::R12, R::R12);     // R12 = sign flag (0=pos, 1=neg)
+    em.lea_r_rbp32(R::RDI, -64);   // RDI = buffer pointer
+
+    // R12 = 0 (collecting digits), 1 (after first newline)
+    em.xor_rr(R::R12, R::R12);     // reset to 0 for digit collection
+
+    // Loop: for each byte in buffer
+    em.label("__read_loop__");
+    em.test_rr(R::R13, R::R13);    // check bytes remaining
+    em.jz("__read_done__");
+
+    em.movzx_r64_ptr8(R::RCX, R::RDI);  // load byte
+
+    // Check for newline (stop parsing after first line)
+    em.cmp_r_i32(R::RCX, '\n');
+    em.je("__read_done__");
+
+    // Check if digit (0-9)
     em.cmp_r_i32(R::RCX, '0');
-    em.jl("__ai_skip_next__");
+    em.jl("__read_skip__");
     em.cmp_r_i32(R::RCX, '9');
-    em.jg("__ai_skip_next__");
-    // It's a digit, start parsing
-    em.jmp("__ai_parse_digits__");
-    em.label("__ai_skip_next__");
-    em.inc_r(R::R13);
-    em.dec_r(R::R14);
-    em.jmp("__ai_skip_junk__");
+    em.jg("__read_skip__");
 
-    // Check for minus sign
-    em.label("__ai_check_sign__");
-    em.movzx_r64_ptr8(R::RCX, R::R13);
-    em.cmp_r_i32(R::RCX, '-');
-    em.jne("__ai_parse_digits__");
-    em.mov_ri32(R::RBX, 1); // set sign flag
-    em.inc_r(R::R13);
-    em.dec_r(R::R14);
-
-    // Parse digits: rax = rax * 10 + digit
-    em.label("__ai_parse_digits__");
-    em.test_rr(R::R14, R::R14);  // check if bytes remaining
-    em.jz("__ai_apply_sign__");
-    em.movzx_r64_ptr8(R::RCX, R::R13);
-    em.cmp_r_i32(R::RCX, '0');
-    em.jl("__ai_apply_sign__");
-    em.cmp_r_i32(R::RCX, '9');
-    em.jg("__ai_apply_sign__");
-    // rax = rax * 10 + digit
-    // Use: mov rdx, 10; imul rax, rdx; add rax, rcx-'0'
+    // Digit found: result = result * 10 + digit
     em.mov_ri32(R::RDX, 10);
-    em.imul_rr(R::RAX, R::RDX); // rax *= 10
-    em.sub_r_i32(R::RCX, '0');  // rcx -= '0'
-    em.add_rr(R::RAX, R::RCX);  // rax += rcx
-    em.inc_r(R::R13);
-    em.dec_r(R::R14);
-    em.jmp("__ai_parse_digits__");
+    em.imul_rr(R::RAX, R::RDX);    // rax *= 10
+    em.sub_r_i32(R::RCX, '0');     // digit = byte - '0'
+    em.add_rr(R::RAX, R::RCX);     // result += digit
 
-    // Apply sign if needed
-    em.label("__ai_apply_sign__");
-    em.test_rr(R::RBX, R::RBX);
-    em.jz("__ai_return__");
-    em.neg_r(R::RAX);
+    em.label("__read_skip__");
+    em.inc_r(R::RDI);              // next byte
+    em.dec_r(R::R13);              // decrement counter
+    em.jmp("__read_loop__");
 
-    em.label("__ai_return__");
+    em.label("__read_done__");
+    // RAX now contains the parsed integer
+
     em.add_rsp_i32(64);
-    em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_r(R::R13); em.pop_r(R::R12);
     em.pop_rbp();
     em.ret();
 }
@@ -2845,6 +2827,7 @@ class BinaryCompiler {
         // Always available for dynamic linking: printf, dlopen, input support
         std::vector<std::string> libcFuncs = {
             "printf",      // Output (via __ac_print_*)
+            "scanf",       // Input (via __ac_input_int__)
             "dlopen",      // Dynamic library loading
             "dlsym",       // Symbol resolution
             "strlen"       // String operations

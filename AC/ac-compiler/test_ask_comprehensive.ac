@@ -1,0 +1,10 @@
+AC->BNY
+
+<mainloop>
+    a = Term.ask $First: $
+    b = Term.ask $Second: $
+    sum = a + b
+    Term.display $Sum is: $
+    Term.display sum
+    /end
+<mainloop>

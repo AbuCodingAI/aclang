@@ -1,0 +1,7 @@
+AC->BNY
+
+<mainloop>
+    x = Term.ask $Number: $
+    Term.display x
+    /end
+<mainloop>
