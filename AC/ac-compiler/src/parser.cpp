@@ -876,13 +876,13 @@ private:
             if (baseExpr) node->children.push_back(std::move(baseExpr));
 
             expect(TokenType::LBRACE, "Expected '{' after LineUp expression");
-            skipNewlines();
+            skipAll(); // Skip newlines and indentation after opening brace
 
             while (!at(TokenType::RBRACE) && !at(TokenType::END_OF_FILE)) {
                 if (at(TokenType::IDENTIFIER) && peek().value == "default") {
                     advance(); // consume 'default'
                     expect(TokenType::COLON, "Expected ':' after 'default'");
-                    skipNewlines();
+                    skipAll();
                     auto stmt = parseStatementInner();
                     auto o = std::make_unique<ASTNode>(NodeType::CondOther);
                     if (stmt) o->children.push_back(std::move(stmt));
@@ -893,17 +893,17 @@ private:
                         throw SYNTAX_ERROR("Expected case value in LineUp", peek().line, peek().col);
                     }
                     expect(TokenType::COLON, "Expected ':' after case value");
-                    skipNewlines();
+                    skipAll();
                     auto stmt = parseStatementInner();
                     auto c = std::make_unique<ASTNode>(NodeType::CondCase);
                     c->children.push_back(std::move(caseExpr));
                     if (stmt) c->children.push_back(std::move(stmt));
                     node->children.push_back(std::move(c));
                 }
-                skipNewlines();
+                skipAll();
                 if (at(TokenType::COMMA)) {
                     advance();
-                    skipNewlines();
+                    skipAll();
                 }
             }
             expect(TokenType::RBRACE, "Expected '}' to close LineUp");
