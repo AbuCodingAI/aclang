@@ -596,6 +596,13 @@ private:
     NodePtr parseStatementInner() {
         if (at(TokenType::END_OF_FILE)) return nullptr;
 
+        // export — mark next statement (func, var, bundle) as exported
+        // Currently just consumed; future backends can implement export semantics
+        if (at(TokenType::KW_EXPORT)) {
+            advance(); // consume 'export'
+            return parseStatementInner();
+        }
+
         // 'catch' / 'after' are only valid as part of 'try ... catch ... after ...'
         if (at(TokenType::KW_CATCH) || at(TokenType::KW_AFTER)) {
             auto t = peek();
