@@ -1972,10 +1972,6 @@ class CStrategy : public BackendStrategy
         emitRaw(out, "typedef long long ac_int;");
         emitRaw(out, "typedef const char* ac_str;");
         emitRaw(out, "");
-        // Helper functions
-        emitRaw(out, "double ac_pow(double base, double exp) { extern double pow(double, double); return pow(base, exp); }");
-        emitRaw(out, "ac_int ac_length(ac_str s) { return (ac_int)strlen(s); }");
-        emitRaw(out, "");
     }
 
     std::string formatCallName(const std::string& n) const override {
@@ -6605,10 +6601,6 @@ public:
             strategy = std::make_unique<VStrategy>();
         else if (b == "ASM")
             strategy = std::make_unique<AsmStrategy>();
-        else if (b == "BNY")
-            // BNY: Generate C code with full libc integration
-            // Compiled with gcc → native binary with input(), dlopen, pthread support
-            strategy = std::make_unique<CStrategy>();
         else
             strategy = std::make_unique<PythonStrategy>();
         strategy->setOutputStem(stem);
