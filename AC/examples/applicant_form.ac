@@ -1,0 +1,55 @@
+AC->PY
+
+use ilib widgets
+use ilib os
+
+/* Callback: reads all form fields and appends a JSON entry to the output file */
+Make OnSubmit func()
+    n   = name_inp.get()
+    e   = email_inp.get()
+    ph  = phone_inp.get()
+    pos = pos_drop.get()
+    exp = exp_drop.get()
+
+    entry = ${"name":"$ + n + $","email":"$ + e + $","phone":"$ + ph + $","position":"$ + pos + $","experience":"$ + exp + $"}$
+
+    os.append_to($applicants.ndjson$, entry)
+    status_lbl.set($Saved! Entry appended to applicants.ndjson$)
+
+<mainloop>
+    root = Screen($Job Application Form$, $500x560$)
+
+    _h = display(root, $=== Job Application Form ===$)
+
+    _h = display(root, $Full Name:$)
+    name_inp = ask(root, 45)
+
+    _h = display(root, $Email Address:$)
+    email_inp = ask(root, 45)
+
+    _h = display(root, $Phone Number:$)
+    phone_inp = ask(root, 45)
+
+    _h = display(root, $Position Applied For:$)
+    pos_drop = dropdown(root, lazy)
+    pos_drop.add($Software Engineer$)
+    pos_drop.add($Product Manager$)
+    pos_drop.add($UX Designer$)
+    pos_drop.add($Data Scientist$)
+    pos_drop.add($DevOps Engineer$)
+    pos_drop.add($QA Engineer$)
+    pos_drop.pack
+
+    _h = display(root, $Experience Level:$)
+    exp_drop = dropdown(root, lazy)
+    exp_drop.add($Junior   (0-2 years)$)
+    exp_drop.add($Mid-Level (3-5 years)$)
+    exp_drop.add($Senior   (5+ years)$)
+    exp_drop.pack
+
+    status_lbl = display(root, $$)
+
+    _h = btn(root, $Submit Application$, OnSubmit)
+
+    root.mainloop
+<mainloop>

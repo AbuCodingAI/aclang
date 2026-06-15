@@ -1,13 +1,20 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -O2
+CXXFLAGS = -std=c++17 -Wall -O2 -MMD -MP
 
 SRC = src/main.cpp src/lexer.cpp src/parser.cpp src/backend_registry.cpp src/ir.cpp src/ir_codegen.cpp src/exp_bny.cpp
+OBJ = $(SRC:.cpp=.o)
+DEP = $(SRC:.cpp=.d)
 OUT = ac
 
 all: $(OUT)
 
-$(OUT): $(SRC)
-	$(CXX) $(CXXFLAGS) $(SRC) -o $(OUT)
+$(OUT): $(OBJ)
+	$(CXX) $(CXXFLAGS) $(OBJ) -o $(OUT)
+
+src/%.o: src/%.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+-include $(DEP)
 
 install: all
 ifeq ($(OS),Windows_NT)
@@ -21,7 +28,7 @@ windows:
 
 clean:
 ifeq ($(OS),Windows_NT)
-	rm -f $(OUT).exe
+	rm -f $(OUT).exe $(OBJ) $(DEP)
 else
-	rm -f $(OUT) ac.exe
+	rm -f $(OUT) ac.exe $(OBJ) $(DEP)
 endif

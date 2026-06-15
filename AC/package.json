@@ -1,6 +1,6 @@
 {
   "name": "aclang",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "AC Language Compiler — a multi-target language that compiles to Python, JavaScript, C++, Java, Rust, Go, V, ASM, and native binary (BNY). Features: Pratt parser, unified IR, ELSEIF chains, hash-based IR cache, DWARF debug info, and and/or keyword aliases.",
   "bin": {
     "ac": "bin/ac",
@@ -62,9 +62,14 @@
     "ac-compiler/include/",
     "README.md",
     "LICENSE",
-    "LANGUAGE_QUALITY_ROADMAP.md"
+    "docs/"
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "ffi-napi": "^4.0.3",
+    "node-addon-api": "^3.2.1",
+    "ref-napi": "^3.0.3"
   }
 }

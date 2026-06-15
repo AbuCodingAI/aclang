@@ -1,0 +1,60 @@
+; all.datac — unified school database
+; AbuDB datac format
+; types: string  int  float  bool  date(dd.mm.yy)  datetime(dd.mm.yy hh:mm)  deltat(hh:mm:ss)
+
+; ── Students ──────────────────────────────────────────────────────────────────
+
+class string property: name      ; primary key
+int sub.name: age
+int sub.name: grade
+string sub.name: house
+bool sub.name: enrolled          ; still attending?
+date sub.name: birthday          ; dd.mm.yy
+
+students {
+    name: "Alex",   age: 16, grade: 91, house: "Red",   enrolled: true,  birthday: 15.03.09
+    name: "Sam",    age: 17, grade: 88, house: "Blue",  enrolled: true,  birthday: 02.07.08
+    name: "Jordan", age: 15, grade: 97, house: "Red",   enrolled: true,  birthday: 30.11.10
+    name: "Taylor", age: 16, grade: 74, house: "Green", enrolled: false, birthday: 09.01.09
+    name: "Morgan", age: 17, grade: 82, house: "Blue",  enrolled: true,  birthday: 14.06.08
+}
+
+; ── Inventory ─────────────────────────────────────────────────────────────────
+
+class string property: item
+int sub.item: stock
+int sub.item: cost
+string sub.item: category
+
+inventory {
+    item: "Keyboard", stock: 42,  cost: 30,  category: "Hardware"
+    item: "Mouse",    stock: 58,  cost: 20,  category: "Hardware"
+    item: "Monitor",  stock: 15,  cost: 220, category: "Display"
+    item: "Cable",    stock: 120, cost: 8,   category: "Accessory"
+}
+
+; ── Scores ────────────────────────────────────────────────────────────────────
+
+class string property: player
+int sub.player: score
+int sub.player: level
+deltat sub.player: session_time  ; time played hh:mm:ss, not epoch
+
+scores {
+    player: "Alex",   score: 120, level: 5, session_time: 01:24:30
+    player: "Sam",    score: 90,  level: 4, session_time: 00:58:12
+    player: "Jordan", score: 150, level: 7, session_time: 02:10:05
+    player: "Taylor", score: 110, level: 5, session_time: 01:15:44
+}
+
+; ── Classes ───────────────────────────────────────────────────────────────────
+
+class string property: class
+string sub.class: student
+datetime sub.class: scheduled    ; dd.mm.yy hh:mm
+
+classes {
+    class: "Math",    student: "Alex",   scheduled: 21.05.26 09:00
+    class: "Science", student: "Jordan", scheduled: 21.05.26 10:30
+    class: "History", student: "Sam",    scheduled: 22.05.26 14:00
+}

@@ -1,0 +1,281 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "AC",
+  "scopeName": "source.ac",
+  "fileTypes": ["ac"],
+  "patterns": [
+    { "include": "#backend-declaration" },
+    { "include": "#block-comment" },
+    { "include": "#raw-string" },
+    { "include": "#string" },
+    { "include": "#ws-sentinel" },
+    { "include": "#def-tag" },
+    { "include": "#tag" },
+    { "include": "#slash-command" },
+    { "include": "#using-decl" },
+    { "include": "#longint-decl" },
+    { "include": "#alias-decl" },
+    { "include": "#raise-clause" },
+    { "include": "#control-flow" },
+    { "include": "#function-decl" },
+    { "include": "#type-cast" },
+    { "include": "#const-decl" },
+    { "include": "#cp-stmt" },
+    { "include": "#import" },
+    { "include": "#error-handling" },
+    { "include": "#builtin-io" },
+    { "include": "#constants" },
+    { "include": "#lazy-eval" },
+    { "include": "#types" },
+    { "include": "#operators" },
+    { "include": "#number" },
+    { "include": "#library-call" },
+    { "include": "#function-call" }
+  ],
+  "repository": {
+
+    "backend-declaration": {
+      "patterns": [
+        {
+          "match": "^(AC->)(BNY|PY|JS|C\\+\\+|CPP|Java|RS|GO|V|ASM|LIB|HTML|C)\\b",
+          "captures": {
+            "1": { "name": "keyword.other.backend-arrow.ac" },
+            "2": { "name": "constant.other.backend-target.ac" }
+          }
+        },
+        {
+          "match": "^(AC LIB)\\b",
+          "name": "keyword.other.backend-declaration.ac"
+        }
+      ]
+    },
+
+    "block-comment": {
+      "begin": "/\\*",
+      "end": "\\*/",
+      "name": "comment.block.ac"
+    },
+
+    "raw-string": {
+      "begin": "r\\$",
+      "end": "\\$",
+      "name": "string.quoted.other.raw.ac"
+    },
+
+    "string": {
+      "begin": "\\$",
+      "end": "\\$",
+      "name": "string.quoted.other.dollar.ac",
+      "patterns": [
+        { "match": "\\\\[ntr\\\\$]", "name": "constant.character.escape.ac" },
+        { "match": "\\{[^}]+\\}",    "name": "variable.other.interpolated.ac" }
+      ]
+    },
+
+    "ws-sentinel": {
+      "match": "\\\\ws\\b",
+      "name": "string.quoted.other.ws-sentinel.ac"
+    },
+
+    "def-tag": {
+      "match": "\\b(def)\\s+(tag)\\s+(<[A-Za-z_][A-Za-z0-9_]*>)",
+      "captures": {
+        "1": { "name": "keyword.other.def.ac" },
+        "2": { "name": "keyword.other.tag-keyword.ac" },
+        "3": { "name": "entity.name.tag.custom.ac" }
+      }
+    },
+
+    "tag": {
+      "match": "</?(?:mainloop|MAINLOOP|gui|GUI|screen|SCREEN|logic|LOGIC|object|OBJECT|Foreign|foreign|shutoff|StartHere|EndHere|bound|free|Free|Local|terrain)[^>]*>",
+      "name": "entity.name.tag.ac"
+    },
+
+    "slash-command": {
+      "match": "/(?:kill|stop|end|restart|reload|halt|break)(?=\\s|$|\\d|\\.)",
+      "name": "keyword.control.command.ac"
+    },
+
+    "using-decl": {
+      "match": "\\b(using)\\s+(header|namespace)\\s+([A-Za-z_][A-Za-z0-9_-]*)\\b",
+      "captures": {
+        "1": { "name": "keyword.other.using.ac" },
+        "2": { "name": "keyword.other.using-qualifier.ac" },
+        "3": { "name": "support.class.library.ac" }
+      }
+    },
+
+    "longint-decl": {
+      "match": "\\bmath\\.LongInt\\b",
+      "name": "storage.type.longint.ac"
+    },
+
+    "gooddec-decl": {
+      "match": "\\bmath\\.GoodDec\\b",
+      "name": "storage.type.gooddec.ac"
+    },
+
+    "alias-decl": {
+      "match": "\\b(alias)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(=)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.alias.ac" },
+        "2": { "name": "variable.other.alias-target.ac" },
+        "3": { "name": "keyword.operator.assignment.ac" },
+        "4": { "name": "variable.other.alias-source.ac" }
+      }
+    },
+
+    "raise-clause": {
+      "match": "\\b(raise)\\s+(ERR|Err|hint|Hint|toxic|Toxic)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.exception.ac" },
+        "2": { "name": "keyword.control.exception-type.ac" }
+      }
+    },
+
+    "control-flow": {
+      "match": "\\b(IF|ELSEIF|OTHER|WHILST|FOR|in|return|continue|pass|skip|range|sequence)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.ac" }
+      }
+    },
+
+    "function-decl": {
+      "match": "\\b(Make|make)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(func|object)\\b",
+      "captures": {
+        "1": { "name": "keyword.declaration.function.ac" },
+        "2": { "name": "entity.name.function.ac" },
+        "3": { "name": "keyword.declaration.function.ac" }
+      }
+    },
+
+    "type-cast": {
+      "match": "\\b(to_dec|to_int|to_string|to_bool)\\b",
+      "captures": {
+        "1": { "name": "storage.type.cast.ac" }
+      }
+    },
+
+    "import": {
+      "match": "\\b(use|from|ilib|elib|clib|flib|datac|bundle|free|destroy|save|as|dict|header|private|public)\\b",
+      "captures": {
+        "1": { "name": "keyword.other.import.ac" }
+      }
+    },
+
+    "const-decl": {
+      "match": "\\b(const)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(=)",
+      "captures": {
+        "1": { "name": "storage.modifier.const.ac" },
+        "2": { "name": "variable.other.constant.ac" },
+        "3": { "name": "keyword.operator.assignment.ac" }
+      }
+    },
+
+    "cp-stmt": {
+      "match": "\\b(cp)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(=)",
+      "captures": {
+        "1": { "name": "keyword.other.cp.ac" },
+        "2": { "name": "variable.other.ac" },
+        "3": { "name": "keyword.operator.assignment.ac" }
+      }
+    },
+
+    "error-handling": {
+      "match": "\\b(try|catch|after|raise|ERR|report)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.exception.ac" }
+      }
+    },
+
+    "builtin-io": {
+      "patterns": [
+        {
+          "match": "\\bTerm\\.(display|ask|print|log|write)\\b",
+          "captures": {
+            "0": { "name": "support.function.builtin.ac" },
+            "1": { "name": "support.function.method.ac" }
+          }
+        },
+        {
+          "match": "\\b(eval|input|alert|sure|print_page|lazy_eval|animate|is_obj)\\b",
+          "captures": {
+            "1": { "name": "support.function.builtin.ac" }
+          }
+        },
+        {
+          "match": "\\b(configure|event-listener|listener|establish|rule|value|on|bind|to)\\b",
+          "captures": {
+            "1": { "name": "keyword.other.event.ac" }
+          }
+        }
+      ]
+    },
+
+    "constants": {
+      "match": "\\b(True|TRUE|true|False|FALSE|false|null|nil)\\b",
+      "captures": {
+        "1": { "name": "constant.language.ac" }
+      }
+    },
+
+    "lazy-eval": {
+      "match": "\\blazy(?:_eval)?\\b",
+      "name": "keyword.other.lazy.ac"
+    },
+
+    "types": {
+      "match": "\\b(type|of|Overlap|overlap|many|at|temp|fn)\\b",
+      "captures": {
+        "1": { "name": "storage.type.modifier.ac" }
+      }
+    },
+
+    "operators": {
+      "patterns": [
+        { "match": "\\bis\\b",                       "name": "keyword.operator.equality.ac" },
+        { "match": "\\b(not|NOT)\\b",                "name": "keyword.operator.logical.not.ac" },
+        { "match": "\\b(and|AND)\\b",                "name": "keyword.operator.logical.and.ac" },
+        { "match": "\\b(or|OR)\\b",                  "name": "keyword.operator.logical.or.ac" },
+        { "match": "\\bmod\\b",                      "name": "keyword.operator.mod.ac" },
+        { "match": "\\bxsub\\b",                     "name": "keyword.operator.xsub.ac" },
+        { "match": "#=",                              "name": "keyword.operator.inequality.ac" },
+        { "match": "#>|#<",                          "name": "keyword.operator.comparison.ac" },
+        { "match": "#\\|",                           "name": "keyword.operator.bitwise.xnor.ac" },
+        { "match": "#(?![=|<>])",                    "name": "keyword.operator.logical.not.ac" },
+        { "match": "@=",                             "name": "keyword.operator.assignment.compound.ac" },
+        { "match": "\\+\\+|--|\\+=|-=|\\*=|/=|\\|=","name": "keyword.operator.assignment.compound.ac" },
+        { "match": "0<-",                            "name": "keyword.operator.output.ac" },
+        { "match": "=",                              "name": "keyword.operator.assignment.ac" },
+        { "match": "@",                              "name": "keyword.operator.multiply.ac" },
+        { "match": "\\*",                            "name": "keyword.operator.arithmetic.ac" },
+        { "match": "//",                             "name": "keyword.operator.arithmetic.idiv.ac" },
+        { "match": "\\+|-|/",                       "name": "keyword.operator.arithmetic.ac" },
+        { "match": "&",                              "name": "keyword.operator.logical.and.ac" },
+        { "match": "\\|",                            "name": "keyword.operator.bitwise.xor.ac" },
+        { "match": "<|>",                            "name": "keyword.operator.comparison.ac" }
+      ]
+    },
+
+    "number": {
+      "match": "\\b(0x[0-9A-Fa-f]+|\\d+\\.\\d*|\\.\\d+|\\d+)\\b",
+      "name": "constant.numeric.ac"
+    },
+
+    "library-call": {
+      "match": "\\b(math|gl|widgets|camera|maudio|os|stringm|regex|sidebar|stat|files|keybinds)\\.(\\w+)\\b",
+      "captures": {
+        "1": { "name": "support.class.library.ac" },
+        "2": { "name": "support.function.library.ac" }
+      }
+    },
+
+    "function-call": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*\\(",
+      "captures": {
+        "1": { "name": "entity.name.function.call.ac" }
+      }
+    }
+
+  }
+}

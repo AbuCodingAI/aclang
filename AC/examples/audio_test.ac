@@ -1,0 +1,30 @@
+AC->PY
+
+use ilib machine-audio
+
+<mainloop>
+
+    Term.display $=== AC Machine Audio Test ====$
+
+    tts_ready = maudio_tts_ok()
+    IF tts_ready is True
+        Term.display $TTS available — speaking...$
+        maudio_speak($Hello. I am AC. This is a text to speech test.$)
+        maudio_speak($The quick brown fox jumps over the lazy dog.$)
+    OTHER
+        Term.display $No TTS engine found.$
+
+    Term.display $Listening for 4 seconds — say something...$
+    heard = maudio_listen(4000)
+    IF heard is $$
+        Term.display $Nothing heard or STT unavailable.$
+    OTHER
+        Term.display $You said:$
+        Term.display heard
+
+    IF tts_ready is True
+        maudio_speak($Test complete.$)
+
+    Term.display $Done.$
+
+<mainloop>

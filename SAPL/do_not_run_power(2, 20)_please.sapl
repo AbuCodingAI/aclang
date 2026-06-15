@@ -1,0 +1,47 @@
+; Monster SAPL arithmetic
+; add = repeated succession
+; mult = repeated addition
+; power = repeated multiplication
+; tetration = repeated exponentiation
+
+succ(x) = x + 1
+
+add(a, b) = {
+    result = a
+
+    loopu b > 0
+        result = succ(result)
+        b = b - 1
+
+    result
+}
+
+mult(a, b) = {
+    result = 0
+
+    loopu b > 0
+        result = add(result, a)
+        b = b - 1
+
+    result
+}
+
+power(a, b) = {
+    result = 1
+
+    loopu b > 0
+        result = mult(result, a)
+        b = b - 1
+
+    result
+}
+
+tetration(a, b) = {
+    result = 1
+
+    loopu b > 0
+        result = power(a, result)
+        b = b - 1
+
+    result
+}

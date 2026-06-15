@@ -1,0 +1,68 @@
+AC->PY
+
+use ilib machine-audio
+use ilib os
+use ilib string-cheese
+
+/* Map spoken phrase to shell command */
+Make resolve func(s)
+    cmd = s
+    IF s.find($google$) > -1
+        cmd = $google-chrome$
+    ELSEIF s.find($chrome$) > -1
+        cmd = $google-chrome$
+    ELSEIF s.find($firefox$) > -1
+        cmd = $firefox$
+    ELSEIF s.find($mozilla$) > -1
+        cmd = $firefox$
+    ELSEIF s.find($nautilus$) > -1
+        cmd = $nautilus$
+    ELSEIF s.find($files$) > -1
+        cmd = $nautilus$
+    ELSEIF s.find($terminal$) > -1
+        cmd = $gnome-terminal$
+    ELSEIF s.find($console$) > -1
+        cmd = $gnome-terminal$
+    ELSEIF s.find($visual studio$) > -1
+        cmd = $code$
+    ELSEIF s.find($vscode$) > -1
+        cmd = $code$
+    ELSEIF s.find($code$) > -1
+        cmd = $code$
+    ELSEIF s.find($spotify$) > -1
+        cmd = $spotify$
+    ELSEIF s.find($discord$) > -1
+        cmd = $discord$
+    ELSEIF s.find($slack$) > -1
+        cmd = $slack$
+    ELSEIF s.find($vlc$) > -1
+        cmd = $vlc$
+    ELSEIF s.find($gimp$) > -1
+        cmd = $gimp$
+    ELSEIF s.find($steam$) > -1
+        cmd = $steam$
+    ELSEIF s.find($calculator$) > -1
+        cmd = $gnome-calculator$
+    return cmd
+
+<mainloop>
+    Term.display $=============================$
+    Term.display $  JARVIS — App Launcher$
+    Term.display $=============================$
+    Term.display $Say an app name to open it.$
+    Term.display $Ctrl+C to quit.$
+    Term.display $$
+
+    WHILST 5 is 5
+        Term.display $Listening...$
+        speech = maudio.listen(8000)
+        IF speech is $$
+            continue
+        low = speech.lower()
+        cmd = resolve(low)
+        Term.display cmd
+        rc = os.sbash(cmd)
+        IF rc < 0
+            Term.display $[BLOCKED] sbash refused that command.$
+        Term.display $$
+<mainloop>

@@ -1,0 +1,61 @@
+; demo.jasql — JaSQL feature showcase
+; Run with: python3 repl.py demo.jasql
+
+IMPORT data/all.datac
+
+; ── Basic queries ─────────────────────────────────────────────────────────────
+
+TAKE name, grade FROM students ORDER BY grade DESC
+
+TAKE name, grade FROM students ORDER BY grade DESC TOP 3
+
+; ── String concatenation + AS aliases ────────────────────────────────────────
+
+TAKE name + " (" + house + ")" AS label FROM students ORDER BY label ASC
+
+TAKE name + ": grade " + grade AS summary FROM students ORDER BY grade DESC
+
+; ── Aggregates with aliases ───────────────────────────────────────────────────
+
+TAKE house, MEAN(grade) AS avg_grade, SIZE(*) AS count FROM students GROUP BY house ORDER BY avg_grade DESC
+
+; ── Subqueries ────────────────────────────────────────────────────────────────
+
+; students above average grade
+TAKE name, grade FROM students
+IF grade > (TAKE MEAN(grade) FROM students)
+
+; students who have a class scheduled
+TAKE name, grade FROM students
+IF name IN (TAKE student FROM classes)
+
+; ── JOIN ──────────────────────────────────────────────────────────────────────
+
+TAKE name + ": lvl " + level AS player, score AS pts, session_time FROM students
+JOIN scores ON name = player
+ORDER BY pts DESC
+
+; ── KEEP ALL (left join) ──────────────────────────────────────────────────────
+
+CONNECT students.name TO classes.student
+TAKE students.name, classes.class FROM students KEEP ALL, classes
+
+; ── Mutations ────────────────────────────────────────────────────────────────
+
+INSERT students { name: "Casey", age: 16, grade: 88, house: "Red", enrolled: true, birthday: 11.04.10 }
+
+UPDATE students SET grade += 5 IF house = "Red"
+
+TAKE name, grade FROM students ORDER BY grade DESC
+
+RM FROM students IF name = "Casey"
+
+; ── Indexes ───────────────────────────────────────────────────────────────────
+
+INDEX students ON house
+TAKE * FROM students IF house = "Blue"
+DROP INDEX students ON house
+
+; ── Persist ───────────────────────────────────────────────────────────────────
+
+ALLSAVE TO /tmp/demo_out.datac

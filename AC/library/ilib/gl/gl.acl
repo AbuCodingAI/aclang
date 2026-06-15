@@ -1,0 +1,17 @@
+# AC GL Library — lowering rules (ilib:gl)
+# Translates high-level gl:* IR calls to canonical ac_gl_* API calls.
+#
+# Format:  <gl:name> -> <ac_gl_name | expand:config-spec>
+#
+# Default fallback (no explicit rule needed for most entries):
+#   gl:X.Y  ->  ac_gl_X_Y   (dots replaced with underscores, ac_gl_ prepended)
+#
+# Explicit rules are only needed where the naming convention differs.
+
+# Object config expands one call into multiple ac_gl_obj_* calls
+# (item=, location=, color=, bare-color are each parsed separately)
+gl:obj.config           -> expand:config-spec
+
+# Queries: receiver differs from naming convention
+gl:obj.is               -> ac_gl_is_obj
+gl:obj.is_draw          -> ac_gl_is_draw

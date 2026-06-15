@@ -1,0 +1,83 @@
+# AC Math Library — lowering rules (ilib:math)
+# Maps math:* IR calls to the ac_math / ac_* C API.
+#
+# Math has irregular C naming (ac_sin not ac_math_sin), so all functions
+# are listed explicitly — the generic fallback (ac_math_X) is wrong here.
+
+# Constants (0-arg)
+math:pi             -> ac_math_pi_const
+math:e              -> ac_math_e_const
+math:tau            -> ac_math_tau_const
+math:em             -> ac_math_em_const
+math:phi            -> ac_math_phi_const
+math:inf            -> ac_math_inf
+
+# Constants with precision (1-arg)
+math:pi.prec        -> ac_math_pi
+math:e.prec         -> ac_math_e
+math:phi.prec       -> ac_math_phi
+
+# Trigonometry
+math:sin            -> ac_sin
+math:cos            -> ac_cos
+math:tan            -> ac_tan
+math:csc            -> ac_csc
+math:sec            -> ac_sec
+math:cot            -> ac_cot
+math:asin           -> ac_asin
+math:acos           -> ac_acos
+math:atan           -> ac_atan
+math:acsc           -> ac_acsc
+math:asec           -> ac_asec
+math:acot           -> ac_acot
+math:atan2          -> ac_atan2
+math:deg2rad        -> ac_deg2rad
+math:rad2deg        -> ac_rad2deg
+
+# Powers and roots
+math:pow            -> ac_pow
+math:sqrt           -> ac_sqrt
+math:cbrt           -> ac_cbrt
+math:hypot          -> ac_hypot
+
+# Rounding
+math:floor          -> ac_floor
+math:ceil           -> ac_ceil
+math:round          -> ac_round
+math:abs            -> ac_abs
+math:abs.int        -> ac_abs_int
+
+# Logarithms
+math:ln             -> ac_ln
+math:log            -> ac_log_base
+math:log2           -> ac_log2
+math:log10          -> ac_log10
+
+# Modulo
+math:mod            -> ac_mod
+math:mod.int        -> ac_mod_int
+
+# Type conversion
+math:to_int         -> ac_to_int
+math:to_dec         -> ac_to_dec
+
+# Number theory
+math:gcd            -> ac_gcd
+math:lcm            -> ac_lcm
+math:is_prime       -> ac_is_prime
+
+# Misc
+math:clamp          -> ac_clamp
+math:eval           -> ac_eval
+
+# Statistics
+math:stat.avg       -> ac_stat_avg
+math:stat.median    -> ac_stat_median
+math:stat.q1        -> ac_stat_q1
+math:stat.q3        -> ac_stat_q3
+math:stat.mode      -> ac_stat_mode
+math:stat.min       -> ac_stat_min
+math:stat.max       -> ac_stat_max
+math:sigma          -> ac_sigma
+math:product        -> ac_PI_product
+math:gradient       -> ac_gradient

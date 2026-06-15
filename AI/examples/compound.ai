@@ -1,0 +1,30 @@
+AI->VM
+
+/* Compound interest — exactly, no floating point drift */
+
+<mainloop>
+    principal = to_dec(1000.00)
+    rate      = to_dec(1.05)       /* 5% annual interest */
+    years     = 10
+
+    Term.display $Compound interest over 10 years:$
+    Term.display $Principal: 1000.00$
+    Term.display $Annual rate: 5%$
+    Term.display $$
+
+    balance = principal
+    y = 0
+    WHILST y #> years
+        balance = balance @ rate
+        y += 1
+        Term.display balance
+
+    Term.display $$
+    Term.display $Final balance:$
+    Term.display balance
+    profit = balance - principal
+    Term.display $Profit:$
+    Term.display profit
+
+    /kill
+<mainloop>

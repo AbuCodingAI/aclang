@@ -1,0 +1,81 @@
+AC->JS
+
+use ilib gl
+/*use ilib files*/
+
+<mainloop>
+    <gui>
+
+        <OBJECT>
+            obj.Character
+            Character.config item=square(50) - location=(x=center, y=screen-50) - white
+
+            obj.Cactus
+            Cactus.config item=geometry(100 width @ 300 height) - location=(x=right, y=screen-300) - brown
+
+            /* If no sprite found, the config colour above is used automatically 
+            IF # %Sprite.png
+                %.config
+            ELSEIF
+                Character.sprite = AC.search($CharacterSprite.png$)
+                Cactus.sprite = AC.search($CactusSprite.png$)
+                IF # %Sprite.png
+                    %.config */
+        <OBJECT>
+
+        <SCREEN>
+            Make Screen object 
+            Screen.OBJECT resize 1720x1080
+            background.config color=green
+            animate(60 fps)
+        <SCREEN>
+
+        <LOGIC>
+
+            /* ── Jump function ──────────────────────────────────────────── */
+            Make jump func(arg)
+                IF # is_obj(arg)
+                    raise ERR($That is not a valid object$)
+                OTHER
+                    arg.move_y -180
+                    arg.vertex(400, 600)
+                    arg.curveshape(-x^2)
+
+            /* ── Terrain tag — spawns and animates cactus obstacles ─── */
+            def tag <terrain>
+                terrain.generation()
+                    obj.Cactus
+                    Cactus.config item=geometry(100 width @ 300 height)
+
+                    IF Character.hitbox.coords overlap Cactus.hitbox.coords
+                        Cactus.CircleFall(1/4 RightDir)
+
+                    Terrain.ANIMATE
+                    RightDir at 60fps
+
+                    IF Cactus.CircleFell(1/4 RightDir) is True
+                        Cactus.regen()
+
+            <StartHere>
+                <terrain>
+                    terrain.generation()
+                <terrain>
+
+                /* ── Event listener — space bar triggers jump ─────── */
+                configure event-listener
+                    use listener to establish rule
+                        on value is space
+                            jump(Character)
+
+                /* ── Crowded hitbox: halve jump arc when many overlap */
+                WHILST many hitbox overlap
+                    temp.jump.vertex /= 2
+                    jump(Character)
+
+            <EndHere>
+
+        <LOGIC>
+
+    <gui>
+
+<mainloop>

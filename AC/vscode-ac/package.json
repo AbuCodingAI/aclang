@@ -1,0 +1,51 @@
+{
+  "name": "vscode-ac",
+  "displayName": "AC Language",
+  "description": "Syntax highlighting and file icons for the AC programming language",
+  "version": "0.3.1",
+  "publisher": "ac-lang",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "icon": "icons/ac-logo.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AbuCodingAI/aclang"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "ac",
+        "aliases": [
+          "AC",
+          "ac"
+        ],
+        "extensions": [
+          ".ac"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/ac-file.png",
+          "dark": "./icons/ac-file.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ac",
+        "scopeName": "source.ac",
+        "path": "./syntaxes/ac.tmLanguage.json"
+      }
+    ]
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^2.15.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "undici": "^5.28.4"
+  }
+}

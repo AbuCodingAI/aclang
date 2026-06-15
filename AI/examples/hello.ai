@@ -1,0 +1,15 @@
+AI->VM
+
+/* Hello World — the simplest AI program */
+
+<mainloop>
+    Term.display $Hello from AI!$
+    Term.display $Exact decimal arithmetic, zero floating-point error.$
+
+    x = to_dec(0.1)
+    y = to_dec(0.2)
+    Term.display $0.1 + 0.2 =$
+    Term.display x + y
+
+    /kill
+<mainloop>

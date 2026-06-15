@@ -1,0 +1,20 @@
+/* 
+   AOS Kernel Hardware Logic Layer
+   Author: Abu
+*/
+AC+ LIB
+Make boot_print func(char_code, offset)
+    /* Set up our absolute VRAM pointer */
+    reg 64box1 = 0xB8000
+    
+    /* Shift the pointer forward based on our screen character offset */
+    64box1 += offset
+    
+    /* Stream the raw text byte directly into hardware memory address */
+    64box1 << char_code
+    
+    /* Set text color attribute byte right next to the character (0x07 = Light Gray) */
+    reg 32vault = 0x07
+    64box1 + 1 << 32vault
+    
+    return nil

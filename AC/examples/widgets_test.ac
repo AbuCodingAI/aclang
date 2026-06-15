@@ -1,0 +1,39 @@
+AC->JS
+
+use ilib widgets
+
+Make OnClick func(arg)
+    /kill
+
+<mainloop>
+
+    root = Screen($AC Widget Demo$, $480x520$)
+
+    title_lbl = display(root, $=== AC Widgets Library ===$)
+
+    name_lbl = display(root, $Your name:$)
+
+    name_inp = ask(root, 30)
+
+    lang_lbl = display(root, $Favourite language:$)
+
+    lang_drop = dropdown(root)
+    lang_drop.add($AC$)
+    lang_drop.add($Python$)
+    lang_drop.add($Rust$)
+    lang_drop.add($Go$)
+
+    agree_ck = ckbtn(root, $I agree to everything$)
+
+    volume = slider(root, 0, 100, $horizontal$)
+
+    bar = advance(root, 200)
+    bar.set(42)
+
+    result_lbl = display(root, $Result: (click Submit)$)
+
+    greet_btn = btn(root, $Submit$, OnClick)
+
+    root.mainloop
+
+<mainloop>

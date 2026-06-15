@@ -1,0 +1,29 @@
+AI->VM
+
+/* Fibonacci sequence with exact decimal accumulation */
+
+Make fib func(n)
+    IF n #> 1
+        return n
+    OTHER
+        return fib(n - 1) + fib(n - 2)
+
+<mainloop>
+    Term.display $Fibonacci sequence (0 to 10):$
+
+    i = 0
+    WHILST i #> 10
+        Term.display fib(i)
+        i += 1
+
+    Term.display $$
+    Term.display $Sum of first 10 Fibonacci numbers:$
+    total = to_dec(0)
+    j = 0
+    WHILST j #> 10
+        total = total + fib(j)
+        j += 1
+    Term.display total
+
+    /kill
+<mainloop>

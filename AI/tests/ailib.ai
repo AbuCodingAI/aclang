@@ -1,0 +1,9 @@
+AC LIB
+
+Make double func(x)
+    result = x * 2
+    return result
+
+Make greet func(name)
+    msg = $Hello, $ + name + $!$
+    return msg

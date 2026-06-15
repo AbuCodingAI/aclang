@@ -42,7 +42,13 @@ enum class NodeType {
     CustomTagDef,   // def tag <name>
     TagBlock,       // <tagname> ... <tagname>
     RaiseStmt,      // raise ERR(msg)
-    KillStmt,       // /kill
+    RaiseClauseStmt, // raise Clause(msg) — generic clause output "Clause: msg"
+    LazyEvalExpr,    // lazy_eval(expr) — safe deferred evaluation
+    KillStmt,       // /kill    — hard terminate
+    StopStmt,       // /stop    — graceful stop (clean exit)
+    EndStmt,        // /end     — break out of enclosing loop; exit if at top level
+    RestartStmt,    // /restart — rerun program body once from top, skip on second pass
+    HaltStmt,       // /halt n  — pause execution for n seconds (/halt math.inf → /stop)
     StringLit,
     NumberLit,
     Identifier,
@@ -65,10 +71,19 @@ enum class NodeType {
     KeyBinding,     // on value=key function_call
     InputStmt,      // input <keybind> → send ghost/simulated input
     EvalExpr,       // eval(expr) → evaluate string as AC expression, returns value
-    BundleDef,      // bundle X — class/struct definition (body has FuncDef + AssignStmt)
+    BundleDef,      // bundle X — class/struct definition (body has BundleMember nodes)
+    BundleMember,   // bundle member: value=access("public"/"private"), child=actual member node
     TryCatchStmt,   // try body / catch report-var body / after body
+    CatchClause,    // catch [Type] [report var] body
+    AfterClause,    // after body
     FreeDecl,       // free x, y  — declare vars as globally scoped (like Python's global)
+    AliasDecl,      // alias x = y — bidirectional live binding between two variables
     TypeCoerceStmt, // dec/int/string/bool x [= expr]  — coerce x to type
+    ConstDecl,      // const x = expr — immutable binding
+    CopyStmt,       // cp x = y — explicit value copy
+    CondStmt,       // cond expr { is value: block } ... OTHER block
+    CondCase,       // is <expr> ... (child[0]=expr, child[1]=block)
+    CondOther,      // OTHER ... (child[0]=block)
 };
 
 struct ASTNode {
@@ -82,26 +97,27 @@ struct ASTNode {
         : type(t), value(std::move(v)), inferredType(nullptr) {}
 };
 
-// Structured expression nodes for Pratt parser
+/* Structured expression nodes for Pratt parser
 
-// Binary expression: left op right
-// For BinaryExpr nodes:
-// - value: operator as string (+, -, *, /, %, @, <, >, <=, >=, ==, !=, is, not, AND, OR)
-// - children[0]: left operand
-// - children[1]: right operand
-// Note: BinaryExpr is used for both legacy string-based and new structured expressions
+ Binary expression: left op right
+ For BinaryExpr nodes:
+ - value: operator as string (+, -, *, /, %, @, <, >, #>, #<, is, #=, not, AND, OR)
+ - children[0]: left operand
+ - children[1]: right operand
+ Note: BinaryExpr is used for both legacy string-based and new structured expressions
 
-// Unary expression: op operand
-// For UnaryExpr nodes:
-// - value: operator as string (-, NOT)
-// - children[0]: operand
+ Unary expression: op operand
+ For UnaryExpr nodes:
+ - value: operator as string (-, NOT)
+ - children[0]: operand
 
-// Function call: func(arg1, arg2, ...)
-// For CallExpr nodes:
-// - value: function name
-// - children: argument expressions
+ Function call: func(arg1, arg2, ...)
+ For CallExpr nodes:
+ - value: function name
+ - children: argument expressions
 
-// Literal expression: int, float, string, bool, null
-// For LiteralExpr nodes:
-// - value: literal value as string
-// - attrs[0]: type ("INT", "FLOAT", "STRING", "BOOL", "NULL")
+ Literal expression: int, float, string, bool, null
+ For LiteralExpr nodes:
+ - value: literal value as string
+ - attrs[0]: type ("INT", "FLOAT", "STRING", "BOOL", "NULL")
+*/

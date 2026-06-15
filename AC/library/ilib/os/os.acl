@@ -1,0 +1,16 @@
+# AC OS Library — lowering rules (ilib:os)
+# All calls use os.* dot notation → mapped via Python/JS os object.
+
+os:bash         -> os.bash
+os:sbash        -> os.sbash
+os:app_open     -> os.app_open
+os:mkfile       -> os.mkfile
+os:rmfile       -> os.rmfile
+os:mkdir        -> os.mkdir
+os:rmdir        -> os.rmdir
+os:exists       -> os.exists
+os:cwd          -> os.cwd
+os:env          -> os.env
+os:write_to     -> os.write_to
+os:append_to    -> os.append_to
+os:read         -> os.read

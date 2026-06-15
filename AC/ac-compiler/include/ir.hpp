@@ -4,7 +4,9 @@
 #include <memory>
 #include <variant>
 #include <unordered_map>
+#include <set>
 #include <algorithm>
+#include <cstdint>
 #include "type.hpp"
 
 // Forward declaration
@@ -50,6 +52,7 @@ enum class IROpcode {
     MUL,   // numeric multiply: int * int, dec * dec
     PMUL,  // polymorphic multiply: str @ n, list @ n, or numeric
     DIV,
+    IDIV,   // // integer division (truncates toward zero)
     MOD,
     
     // Comparison
@@ -82,7 +85,10 @@ enum class IROpcode {
     
     // Special
     NOP,
-    HALT,
+    HALT,            // /kill    — hard terminate
+    SOFT_HALT,       // /stop    — graceful exit (clean shutdown)
+    RESTART_PROGRAM, // /restart — marker replaced by restart-wrap pass in generateIR()
+    SLEEP,           // /halt n  — pause execution for n seconds
     
     // Function management
     FUNC_BEGIN,
@@ -95,6 +101,18 @@ enum class IROpcode {
     // Library calls
     LIB_CALL,
 
+    // Alias declaration: alias x = y — bidirectional live binding between two variables
+    ALIAS_DECL,
+
+    // const x = expr — immutable binding; backends emit language-level const/final/val
+    CONST_DECL,
+
+    // raise Clause(msg) — print "Clause: msg" to stderr; result.kind == NONE for fatal, CONST for msg
+    RAISE_CLAUSE,
+
+    // lazy_eval(expr) — safe deferred evaluation wrapped in try/catch
+    LAZY_EVAL,
+
     // Native built-ins
     EVAL,           // eval(expr) → evaluate string as AC expression
 
@@ -104,9 +122,13 @@ enum class IROpcode {
 
     // Exception handling
     TRY_BEGIN,      // start of try block
-    CATCH_BEGIN,    // start of catch block; operand[0] = exception variable name
+    CATCH_BEGIN,    // start of catch block; operand[0] = exception variable name, operand[1] = optional type name (string, may be empty)
     AFTER_BEGIN,    // start of finally/after block
-    TRY_END         // end of entire try/catch/after structure
+    TRY_END,        // end of entire try/catch/after structure
+
+    // Tag structure
+    TAG_BEGIN,      // start of a named tag block; operand[0] = string name of tag
+    TAG_END         // end of a named tag block; operand[0] = string name of tag
 };
 
 enum class IRType {
@@ -125,10 +147,12 @@ enum class IRType {
 struct IRValue {
     IRType type;
     Type   acType;   // semantic AC type (from type.hpp); Unknown for non-literal values
-    std::variant<int, double, std::string, bool> data;
+    std::variant<int64_t, double, std::string, bool> data;
 
     IRValue() : type(IRType::VOID) {}
     IRValue(int i)
+        : IRValue((int64_t)i) {}
+    IRValue(int64_t i)
         : type(IRType::INT),
           acType(Type::Numeral(i >= 0 ? NumeralSubtype::PosInt : NumeralSubtype::NegInt)),
           data(i) {}
@@ -217,10 +241,10 @@ struct IRRef {
     // String conversion only happens here - all internal operations use integers
     std::string toString() const {
         switch (kind) {
-            case Kind::TEMP: return "t" + std::to_string(id);
+            case Kind::TEMP: return "t_" + std::to_string(id);
             case Kind::VAR: return "v" + std::to_string(id);  // Show as v0, v1, v2... (symbol index)
             case Kind::CONST: {
-                if (value.type == IRType::INT) return std::to_string(std::get<int>(value.data));
+                if (value.type == IRType::INT) return std::to_string(std::get<int64_t>(value.data));
                 if (value.type == IRType::FLOAT) return std::to_string(std::get<double>(value.data));
                 if (value.type == IRType::STRING) return "\"" + std::get<std::string>(value.data) + "\"";
                 if (value.type == IRType::BOOL) return std::get<bool>(value.data) ? "true" : "false";
@@ -251,6 +275,7 @@ struct IRInstruction {
     IRType resultType = IRType::VOID;  // inferred type of result (wired from type.hpp)
     std::string comment;
     int lineNumber = 0;
+    std::vector<std::string> attrs;    // extra flags (e.g. "copy" for deep-copy STORE_VAR)
     
     // Old constructors (backward compatible)
     IRInstruction(IROpcode op) : opcode(op) {}
@@ -523,10 +548,13 @@ struct IRProgram {
     std::string backend;                    // Target backend (PY, JS, RS, etc.)
     std::string target;                     // Same as backend (for compatibility)
     bool useHighLevelIR = false;            // Use structured control flow instead of jumps
-
-    // Global counters for temporaries and labels
-    int globalTempCount = 0;
-    int globalLabelCount = 0;
+    bool hadExplicitMainloop = false;       // True when <mainloop> or <StartHere> was seen
+    bool hasRestart  = false;              // True if /restart was found (triggers wrap pass)
+    bool hasShutoff  = false;              // True if __ac_shutoff__ function exists
+    int  globalTempCount  = 0;             // Max temp ID used; set by IRGenerator after gen()
+    int  globalLabelCount = 0;             // Max label ID used; set by IRGenerator after gen()
+    std::set<std::string> importedLibs;   // lib names seen in UseLibStmt
+    std::set<std::string> constVars;      // variable names declared const (reassignment is fatal)
     
     IRProgram() = default;
     
@@ -537,10 +565,16 @@ struct IRProgram {
         }
         return nullptr;
     }
+    const IRFunction* findFunction(const std::string& name) const {
+        for (const auto& func : functions) {
+            if (func.name == name) return &func;
+        }
+        return nullptr;
+    }
 };
 
 // Free functions
-IRProgram generateIR(const ASTNode& ast, const std::string& backend);
+IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtimeMode = false);
 std::string generateIRText(const IRProgram& program);
 
 } // namespace AC_IR

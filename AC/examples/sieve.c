@@ -3,65 +3,72 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
 typedef long long ac_int;
 typedef const char* ac_str;
 
 ac_int sieve(ac_int n) {
     ac_int prime[] = {};
-    ac_int j = 0;
-L0:;
-    ac_int t0 = (ac_int)(j <= n);
-    if (!(t0)) goto L1;
-    prime_append(True);
-    j = j + 1;
-    goto L0;
-L1:;
+    ac_int j = (ac_int)(0);
+    __typeof__(limit) _ac_s0_limit = limit;
+    while (1) {
+        ac_int t_0 = (ac_int)(j <= n);
+        if (!(t_0)) break;
+        prime_append(True);
+        j = j + 1;
+    }
+    limit = _ac_s0_limit;
     prime[0] = 0;
     prime[1] = 0;
-    ac_int p = 2;
-L2:;
-    ac_int t2 = p * p;
-    ac_int t3 = (ac_int)(t2 <= n);
-    if (!(t3)) goto L3;
-    ac_int t4 = p + 1;
-    ac_int t5 = t4 - 1;
-    ac_int t6 = prime[t5];
-    if (!(t6)) goto L4;
-    ac_int i = p * p;
-L6:;
-    ac_int t8 = (ac_int)(i <= n);
-    if (!(t8)) goto L7;
-    ac_int t9 = i + 1;
-    ac_int t10 = t9 - 1;
-    prime[t10] = 0;
-    i = i + p;
-    goto L6;
-L7:;
-L4:;
-    p = p + 1;
-    goto L2;
-L3:;
+    ac_int p = (ac_int)(2);
+    __typeof__(limit) _ac_s0_limit = limit;
+    while (1) {
+        ac_int t_2 = p * p;
+        ac_int t_3 = (ac_int)(t_2 <= n);
+        if (!(t_3)) break;
+        ac_int t_4 = p + 1;
+        ac_int t_5 = t_4 - 1;
+        ac_int t_6 = prime[t_5];
+        if (t_6) {
+            ac_int i = p * p;
+            __typeof__(limit) _ac_s1_limit = limit;
+            while (1) {
+                ac_int t_8 = (ac_int)(i <= n);
+                if (!(t_8)) break;
+                ac_int t_9 = i + 1;
+                ac_int t_10 = t_9 - 1;
+                prime[t_10] = 0;
+                i = i + p;
+            }
+            limit = _ac_s1_limit;
+        }
+        p = p + 1;
+    }
+    limit = _ac_s0_limit;
     ac_int result[] = {};
     i = 2;
-L8:;
-    ac_int t13 = (ac_int)(i <= n);
-    if (!(t13)) goto L9;
-    ac_int t14 = i + 1;
-    ac_int t15 = t14 - 1;
-    ac_int t16 = prime[t15];
-    if (!(t16)) goto L10;
-    result_append(i);
-L10:;
-    i = i + 1;
-    goto L8;
-L9:;
+    __typeof__(limit) _ac_s0_limit = limit;
+    while (1) {
+        ac_int t_13 = (ac_int)(i <= n);
+        if (!(t_13)) break;
+        ac_int t_14 = i + 1;
+        ac_int t_15 = t_14 - 1;
+        ac_int t_16 = prime[t_15];
+        if (t_16) {
+            result_append(i);
+        }
+        i = i + 1;
+    }
+    limit = _ac_s0_limit;
     return result;
 }
 
 int main()
 {
-    ac_int limit = 50;
+    // <mainloop>
+    ac_int limit = (ac_int)(50);
     ac_int primes = sieve(limit);
     printf("%lld\n", (long long)(primes));
+    // <mainloop>
 }

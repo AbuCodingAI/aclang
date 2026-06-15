@@ -1,0 +1,4 @@
+AC->PY
+<mainloop>
+    Term.display $Hello$
+<mainloop>

@@ -1,0 +1,523 @@
+# SAPL
+
+Semantic Algebra Programming Language
+
+> "Beautiful until it orders a gyro."
+
+SAPL is an algebraic, array-oriented language inspired by APL-style semantics while remaining fully keyboard-typeable and human-readable.
+
+SAPL is primarily designed as:
+
+* A human-readable algebraic IR
+* A tensor/array semantic layer
+* A lowering target for AC*
+* A high-level mathematical transformation language
+
+Unlike classic APL, SAPL avoids custom glyph keyboards and instead uses ASCII-friendly symbolic and word-based operators.
+
+---
+
+# Core Philosophy
+
+SAPL focuses on:
+
+* Algebraic reduction
+* Whole-array transformations
+* Tensor/rank semantics
+* Semantic compression
+* Readable symbolic math
+* Exact decimal-friendly semantics
+
+SAPL intentionally does NOT focus heavily on:
+
+* OOP
+* Enterprise boilerplate
+* Verbose runtime architecture
+* Heavy mutable imperative programming
+
+---
+
+# Comparison
+
+| Concept        | APL   | SAPL     |
+| -------------- | ----- | -------- |
+| Sum reduce     | `+/x` | `E x`    |
+| Product reduce | `×/x` | `PI x`   |
+| Range/Iota     | `⍳10` | `I 1 10` |
+| Reverse        | `⌽x`  | `rev x`  |
+| Transpose      | `⍉A`  | `T A`    |
+| Shape          | `⍴x`  | `pw x`   |
+| Grade up       | `⍋x`  | `asc x`  |
+| Enclose        | `⊂x`  | `[x]`    |
+
+---
+
+# Example
+
+```sapl
+factorial(x) = PI I 1 x
+mean(x) = E x / pw x
+```
+
+---
+
+# Comments
+
+Single-line comments use `;`
+
+```sapl
+; this is a comment
+factorial(x) = PI I 1 x
+```
+
+---
+
+# Assignment
+
+Assignment uses `=`
+
+```sapl
+x = 5
+echo name = "SAPL" ; To assign a variable to a string you need echo
+```
+
+Comparison uses `cmp`
+
+```sapl
+x cmp 5
+```
+
+---
+
+# Functions
+
+Functions are declared using:
+
+```sapl
+name(args) = expression
+```
+
+Example:
+
+```sapl
+factorial(x) = PI I 1 x
+```
+
+Multi-line blocks:
+
+```sapl
+power(base, exp) = {
+    exp cmp 0: 1,
+    PI rep(base, exp)
+}
+```
+
+---
+
+# Core Operators
+
+## E — Sum Reduction
+
+```sapl
+E x
+```
+
+Sums all elements of `x`
+
+Equivalent to:
+
+```text
+x1 + x2 + x3 + ...
+```
+
+Example:
+
+```sapl
+E I 1 10
+```
+
+Result:
+
+```text
+55
+```
+
+---
+
+## PI — Product Reduction
+
+```sapl
+PI x
+```
+
+Multiplies all elements of `x`
+
+Example:
+
+```sapl
+PI I 1 5
+```
+
+Result:
+
+```text
+120
+```
+
+---
+
+# I — Interval / Range
+
+```sapl
+I a b
+```
+
+Creates an inclusive ascending interval from `a` to `b`
+
+Example:
+
+```sapl
+I 1 5
+```
+
+Result:
+
+```text
+[1 2 3 4 5]
+```
+
+Descending intervals:
+
+```sapl
+rev I 1 5
+```
+
+Result:
+
+```text
+[5 4 3 2 1]
+```
+
+---
+
+# rev — Reverse
+
+```sapl
+rev x
+```
+
+Reverses an array/vector.
+
+---
+
+# T — Transpose
+
+```sapl
+T x
+```
+
+Transposes matrices/tensors.
+
+---
+
+# pw — Shape
+
+```sapl
+pw x
+```
+
+Returns the shape/dimensions of `x`
+
+Example:
+
+```sapl
+pw [1 2 3]
+```
+
+Result:
+
+```text
+3
+```
+
+---
+
+# asc — Ascending Grade / Sort
+
+```sapl
+asc x
+```
+
+Ascending ordering/grade semantics.
+
+---
+
+# Enclosure
+
+```sapl
+[x]
+```
+
+Encloses/groups values into a single boxed structure.
+
+---
+
+# Parsing Rules
+
+Whitespace separates functions/operators.
+
+Example:
+
+```sapl
+PI I 1 x
+```
+
+Parses as:
+
+```text
+PI(I(1, x))
+```
+
+---
+
+# Comma Rule
+
+When one or both arguments contain multiple tokens, commas are required.
+
+Example:
+
+```sapl
+I 1, pw asc [x]
+```
+
+Parses as:
+
+```text
+I(1, pw(asc([x])))
+```
+
+---
+
+# Broadcasting
+
+SAPL supports automatic vector broadcasting.
+
+Example:
+
+```sapl
+ (data - avg) * (data - avg)
+```
+
+Broadcasts `avg` across `data`.
+
+---
+
+# Dimensions and Ranks
+
+SAPL supports:
+
+* Vectors
+* Matrices
+* Higher-dimensional tensors
+* Rank-aware operations
+* Tensor broadcasting
+
+---
+
+# Dictionaries
+
+SAPL dictionaries use:
+
+```sapl
+dict name {
+    key : value,
+    key : value,
+}
+```
+
+Example:
+
+```sapl
+dict users {
+    "abu" : 12,
+    "asker" : 42,
+}
+```
+
+---
+
+# Decimal Dictionary Representation
+
+SAPL and AC* may internally represent exact decimal values using exponent dictionaries.
+
+Example:
+
+```sapl
+dict decimal_example {
+    2:1,
+    1:2,
+    0:3,
+    -1:4,
+    -2:5,
+}
+```
+
+Represents:
+
+```text
+123.45
+```
+
+This avoids IEEE floating-point precision issues.
+
+---
+
+# Matrix Construction
+
+SAPL matrix construction uses `pw`
+
+Example:
+
+```sapl
+101 102 103 pw 28 45 31 3 1 3 92 78 85
+```
+
+Result:
+
+```text
+101 28 3 92
+102 45 1 78
+103 31 3 85
+```
+
+Rules:
+
+* Values before `pw` form the first column
+* Remaining values fill additional columns
+* Row count equals number of values before `pw`
+
+---
+
+# Output
+
+SAPL output uses:
+
+```sapl
+0<- x
+```
+
+Example:
+
+```sapl
+0<- factorial(5)
+```
+
+---
+
+# echo
+
+`echo` binds/labels values.
+
+Example:
+
+```sapl
+echo title="SAPL"
+0<- title ;Should output SAPL
+echo " Hello" title
+0<- title ;should output SAPLHello
+```
+
+# Example Program
+
+```sapl
+factorial(x) = PI I 1 x
+sqrt(x)=x^0.5
+sumNumbers(limit) = E I 1 limit
+mean(data) = E data / pw data
+
+0<- factorial(10)
+```
+
+---
+
+# Relationship to AC*
+
+AC* lowers naturally into SAPL.
+
+Example:
+
+AC*:
+
+```ac
+[1=>n] >> *
+```
+
+SAPL lowering:
+
+```sapl
+PI I 1 n
+```
+
+This makes SAPL an excellent algebraic lowering layer for:
+
+* Reductions
+* Array transforms
+* Tensor operations
+* Statistical operations
+* Semantic mathematical optimization
+
+---
+
+# Why SAPL Exists
+
+APL proved that symbolic array algebra is extremely powerful.
+
+SAPL attempts to preserve:
+
+* Algebraic elegance
+* Semantic compression
+* Array-first programming
+* Tensor semantics
+
+while removing:
+
+* Custom keyboard dependency
+* Glyph memorization
+* Unicode-heavy syntax
+* Ancient Helsinki cave rune aesthetics
+
+---
+
+# Famous SAPL Lines
+
+```sapl
+PI I 1 x
+```
+
+```sapl
+mean(x) = E x / pw x
+```
+
+```sapl
+sort desc data col 4
+```
+
+And the cursed Rosetta Stone:
+
+```sapl
+rev T I 1, pw asc [x]
+```
+
+Equivalent APL:
+
+```apl
+⌽⍉⍳⍴⊂⍋x
+```
+
+---
+
+# Final Notes
+
+SAPL is beautiful until it starts summoning IKEA tensor spirits.
+
+Use responsibly.

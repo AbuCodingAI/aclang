@@ -1,0 +1,21 @@
+use flib logic.acp  /* Imports local hardware printing subroutines */
+
+<mainloop>
+    stack memory_status byte
+    reg 64box2 = locate memory_status
+    
+    IF 64box2 is nil
+        /kill 
+    OTHER
+        /* Draw boot letters sequentially to VRAM using our offsets */
+        boot_print(76, 0)   /* Writes 'L' to the top left of the screen */
+        boot_print(79, 2)   /* Writes 'O' */
+        boot_print(65, 4)   /* Writes 'A' */
+        boot_print(68, 6)   /* Writes 'D' */
+    
+    /* Start an infinite loop to keep the OS running nicely on the screen */
+    status = 1
+    WHILST status #> 5
+        status = 1
+        
+<mainloop>

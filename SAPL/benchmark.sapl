@@ -1,0 +1,65 @@
+fibonacci(n) = {
+    n < 2: n,
+    fibonacci(n - 1) + fibonacci(n - 2)
+}
+
+factorial(x) = PI I 1 x
+
+sqrt(x)=x^0.5  
+
+;rev T I 1, pw asc [x] means ⌽⍉⍳⍴⊂⍋x btw, ⌽ is rev, ⍉ is T, ⍳ is I(range between 2 numbers, not iota), ⍴ is pw, ⍋ is asc, and ⊂ is [...]
+
+sumNumbers(limit) = E I 1 limit
+
+power(base, exp) = {
+    exp cmp 0: 1,
+    PI (base*(I 1 exp)) / PI I 1 exp
+}
+
+mean(data) = E data / pw data
+
+std_deviation(data) = {
+    avg = mean(data)
+    sq_deviations_sum = E((data - avg) * (data - avg))
+    variance = sq_deviations_sum / pw data
+    sqrt(variance)
+}
+
+echo title="=== SAPL Benchmark Execution ==="
+0<- title
+
+echo msg="Calculating Fibonacci(15):"
+0<- msg
+fib_res = fibonacci(15)
+0<- fib_res
+
+echo msg="Calculating Factorial(10):"
+0<- msg
+fact_res = factorial(10)
+0<- fact_res
+
+echo msg="Calculating Sum (1 to 1000):"
+0<- msg
+sum_res = sumNumbers(1000)
+0<- sum_res
+
+echo msg="Calculating Power (2^20):"
+0<- msg
+pow_res = power(2, 20)
+0<- pow_res
+
+echo msg="--- Running Statistics Unit ---"
+0<- msg
+dataset = [85.5, 92.0, 78.5, 90.0, 88.5]
+
+echo msg="Dataset Mean:"
+0<- msg
+0<- mean(dataset)
+
+echo msg="Population Standard Deviation:"
+0<- msg
+sigma = std_deviation(dataset)
+0<- sigma
+
+echo done="=== Benchmark Complete ==="
+0<- done

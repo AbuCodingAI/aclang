@@ -1,0 +1,6 @@
+AC->PY
+<mainloop>
+    Term.display 2 ^ 3
+    Term.display 5 ^ 2
+    Term.display 2 ^ 3 ^ 2
+<mainloop>

@@ -1,0 +1,11 @@
+class string property: item
+int sub.item: stock
+int sub.item: cost
+string sub.item: category
+
+inventory {
+    item: "Keyboard", stock: 42, cost: 30, category: "Hardware"
+    item: "Mouse", stock: 58, cost: 20, category: "Hardware"
+    item: "Monitor", stock: 15, cost: 220, category: "Display"
+    item: "Cable", stock: 120, cost: 8, category: "Accessory"
+}

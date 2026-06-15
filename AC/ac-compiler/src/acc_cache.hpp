@@ -1,7 +1,8 @@
 #pragma once
 // .acc — AC Cache
 // Serializes/deserializes the AST to skip lex+parse on unchanged files.
-// Invalidation: if .ac file is newer than .acc, regenerate.
+// Invalidation: if .ac file is newer than .acc, or the cache header version
+// differs from this compiler's ACC_VERSION, regenerate.
 // Format: binary, little-endian
 //   Header: magic(4) + version(1) + node_count(4)
 //   Each node: type(1) + value_len(2) + value + attr_count(1) + attrs + child_count(2)
@@ -15,7 +16,7 @@
 #include <stdexcept>
 
 static const char ACC_MAGIC[4] = {'A','C','C','1'};
-static const uint8_t ACC_VERSION = 4; // bumped: null keyword, event system, condition structured children required
+static const uint8_t ACC_VERSION = 6; // bumped: bound/free tags added
 
 // ── Timestamp check ──────────────────────────────────────────────────────────
 
@@ -28,7 +29,16 @@ inline time_t fileModTime(const std::string& path) {
 inline bool cacheIsValid(const std::string& acFile, const std::string& accFile) {
     time_t acMod  = fileModTime(acFile);
     time_t accMod = fileModTime(accFile);
-    return accMod > 0 && accMod >= acMod;
+    if (accMod <= 0 || accMod < acMod) return false;
+
+    std::ifstream f(accFile, std::ios::binary);
+    if (!f) return false;
+    char magic[4];
+    f.read(magic, 4);
+    if (!f || std::string(magic, 4) != std::string(ACC_MAGIC, 4)) return false;
+    uint8_t ver = 0;
+    f.read((char*)&ver, 1);
+    return f && ver == ACC_VERSION;
 }
 
 // ── Write helpers ─────────────────────────────────────────────────────────────
@@ -46,8 +56,11 @@ static void serializeNode(std::ofstream& f, const ASTNode& node) {
     writeStr(f, node.value);
     writeU8(f,  (uint8_t)node.attrs.size());
     for (auto& a : node.attrs) writeStr(f, a);
-    writeU16(f, (uint16_t)node.children.size());
-    for (auto& c : node.children) serializeNode(f, *c);
+    // Count non-null children
+    uint16_t validChildren = 0;
+    for (auto& c : node.children) if (c) validChildren++;
+    writeU16(f, validChildren);
+    for (auto& c : node.children) if (c) serializeNode(f, *c);
 }
 
 inline void saveCache(const std::string& accFile, const ASTNode& root) {

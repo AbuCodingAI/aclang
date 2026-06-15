@@ -1,0 +1,6 @@
+use datac "students.datac" as students
+
+i = 0
+whilst i < students_size
+    Term.display students_name[i]
+    i += 1

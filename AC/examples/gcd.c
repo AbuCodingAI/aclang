@@ -3,16 +3,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
 typedef long long ac_int;
 typedef const char* ac_str;
 
 ac_int gcd(ac_int a, ac_int b) {
     while (1) {
-        ac_int t0 = (ac_int)(a != b);
-        if (!(t0)) break;
-        ac_int t1 = (ac_int)(a >= b);
-        if (t1) {
+        ac_int t_0 = (ac_int)(a != b);
+        if (!(t_0)) break;
+        ac_int t_1 = (ac_int)(a >= b);
+        if (t_1) {
             a = a - b;
         } else {
             b = b - a;
@@ -23,11 +24,13 @@ ac_int gcd(ac_int a, ac_int b) {
 
 int main()
 {
-    ac_int t4 = gcd(48, 18);
-    printf("%lld\n", (long long)(t4));
-    ac_int t5 = gcd(100, 75);
-    printf("%lld\n", (long long)(t5));
-    ac_int t6 = gcd(17, 13);
-    printf("%lld\n", (long long)(t6));
-    exit(0);
+    // <mainloop>
+    ac_int t_4 = gcd(48, 18);
+    printf("%lld\n", (long long)(t_4));
+    ac_int t_5 = gcd(100, 75);
+    printf("%lld\n", (long long)(t_5));
+    ac_int t_6 = gcd(17, 13);
+    printf("%lld\n", (long long)(t_6));
+    abort();
+    // <mainloop>
 }

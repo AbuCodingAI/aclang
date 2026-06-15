@@ -1,0 +1,7 @@
+AI->VM
+x = 6 * 7
+y = 6 @ 7
+s = $ha$ @ 3
+Term.display x
+Term.display y
+Term.display s

@@ -1,0 +1,17 @@
+# AC Regex Library — lowering rules (ilib:regex)
+# Maps regex:* IR calls to the ac_regex_* C API.
+#
+# Default fallback: regex:X.Y -> ac_regex_X_Y
+# All functions follow the convention exactly.
+
+# regex:match        -> ac_regex_match        (fallback)
+# regex:test         -> ac_regex_test         (fallback)
+# regex:search       -> ac_regex_search       (fallback)
+# regex:replace      -> ac_regex_replace      (fallback)
+# regex:replace.all  -> ac_regex_replace_all  (fallback)
+# regex:escape       -> ac_regex_escape       (fallback)
+# regex:count        -> ac_regex_count        (fallback)
+# regex:find.all     -> ac_regex_find_all     (fallback)
+# regex:split        -> ac_regex_split        (fallback)
+# regex:groups       -> ac_regex_groups       (fallback)
+# regex:free.list    -> ac_regex_free_list    (fallback)

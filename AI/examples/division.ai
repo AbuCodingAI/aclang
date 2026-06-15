@@ -1,0 +1,37 @@
+AI->VM
+
+/* Exact division — terminating and non-terminating */
+
+<mainloop>
+    Term.display $--- Terminating ---$
+
+    a = to_dec(1)
+    b = to_dec(4)
+    Term.display $1 / 4 =$
+    Term.display a / b
+
+    c = to_dec(1)
+    d = to_dec(8)
+    Term.display $1 / 8 =$
+    Term.display c / d
+
+    e = to_dec(355)
+    f = to_dec(100)
+    Term.display $355 / 100 =$
+    Term.display e / f
+
+    Term.display $$
+    Term.display $--- Non-terminating (truncated at 20 digits) ---$
+
+    p = to_dec(1)
+    q = to_dec(3)
+    Term.display $1 / 3 =$
+    Term.display p / q
+
+    r = to_dec(2)
+    s = to_dec(7)
+    Term.display $2 / 7 =$
+    Term.display r / s
+
+    /kill
+<mainloop>

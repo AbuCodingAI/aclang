@@ -15,11 +15,11 @@ std::unordered_map<std::string, BackendRegistry::BackendInfo> BackendRegistry::b
 std::string resolveLibraryPath(const std::string& libName) {
     // Hardcoded camera library path for all backends
     if (libName == "camera") {
-        return "../library/camera/camera.hpp";
+        return "../library/ilib/camera/camera.hpp";
     }
-    
+
     // Default library paths
-    std::string path = "../library/" + libName + "/" + libName;
+    std::string path = "../library/ilib/" + libName + "/" + libName;
     
     // Determine extension based on backend
     // For C/C++ backends: .hpp or .h
@@ -67,6 +67,9 @@ void BackendRegistry::initializeStandardBackends() {
     registerBackend("V", ".v", dummyGenerator, 
         [](const std::string& outFile) { return "cd /tmp/v && /usr/local/bin/v run " + outFile; });
     
-    registerBackend("BNY", ".acb", dummyGenerator, 
+    registerBackend("BNY", ".acb", dummyGenerator,
         [](const std::string& outFile) { return outFile; });  // Direct execution of binary
+
+    registerBackend("LIB", ".cpp", dummyGenerator,
+        [](const std::string& outFile) { return ""; });  // No run step; compiled to .so/.dll
 }

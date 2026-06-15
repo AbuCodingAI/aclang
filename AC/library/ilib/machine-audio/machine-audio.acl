@@ -1,0 +1,40 @@
+# AC Machine Audio Library — lowering rules (ilib:machine-audio)
+# Maps maudio:* IR calls to the ac_maudio_* C API.
+#
+# Default fallback: maudio:X.Y -> ac_maudio_X_Y
+# All functions follow the convention so no explicit rules are needed,
+# but they are listed here for documentation.
+
+# Text-to-speech
+# maudio:say            -> ac_maudio_say           (fallback)
+# maudio:construct      -> ac_maudio_construct      (fallback)
+# maudio:voice          -> ac_maudio_set_voice      (exception — listed below)
+# maudio:rate           -> ac_maudio_speech_rate    (exception)
+# maudio:pitch          -> ac_maudio_speech_pitch   (exception)
+# maudio:amplitude      -> ac_maudio_speech_amplitude (exception)
+
+maudio:voice            -> ac_maudio_set_voice
+maudio:rate             -> ac_maudio_speech_rate
+maudio:pitch            -> ac_maudio_speech_pitch
+maudio:amplitude        -> ac_maudio_speech_amplitude
+
+# MP3 playback
+# maudio:load           -> ac_maudio_load_mp3       (exception)
+# maudio:play           -> ac_maudio_play           (fallback)
+# maudio:play.loop      -> ac_maudio_play_loop      (fallback)
+# maudio:pause          -> ac_maudio_pause          (fallback)
+# maudio:stop           -> ac_maudio_stop           (fallback)
+# maudio:reverb         -> ac_maudio_reverb         (fallback)
+# maudio:speed          -> ac_maudio_speed          (fallback)
+# maudio:decode         -> ac_maudio_decode         (fallback)
+# maudio:free           -> ac_maudio_free           (fallback)
+
+maudio:load             -> ac_maudio_load_mp3
+maudio:stop             -> maudio.stop
+maudio:speak            -> maudio.speak
+maudio:speak.async      -> maudio.speak_async
+maudio:listen           -> maudio.listen
+
+# Noise
+# maudio:noise          -> ac_maudio_static_noise   (exception)
+maudio:noise            -> ac_maudio_static_noise

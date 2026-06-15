@@ -1,0 +1,8 @@
+AC->PY
+
+use datac "students.datac" as students
+
+<mainloop>
+    Term.display $Loaded students:$
+    Term.display students
+<mainloop>

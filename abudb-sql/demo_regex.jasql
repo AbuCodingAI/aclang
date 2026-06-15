@@ -1,0 +1,44 @@
+; demo_regex.jasql — regex DSL inside JaSQL
+
+IMPORT classic-regex
+
+IMPORT data/all.datac
+
+; ── Condition operators ─────────────────────────────────────────────────────
+
+; Names that start with a vowel (full match, anchored)
+TAKE name, age FROM students IF name MATCH "[AEIOUaeiou].*"
+
+; Names where the house contains 'red' anywhere (partial, unanchored)
+TAKE name, house FROM students IF house SEARCH "(?i)red"
+
+; Exclude students whose name ends in a vowel
+TAKE name FROM students IF name NOT MATCH ".*[aeiouAEIOU]"
+
+; ── Expression functions ─────────────────────────────────────────────────────
+
+; Mask the middle of each name: keep first and last char
+TAKE name, regex.replace(name, "(?<=.)(.+)(?=.)", "***") AS masked FROM students
+
+; Count vowels in each name
+TAKE name, regex.count(name, "[aeiouAEIOU]") AS vowels FROM students ORDER BY vowels DESC
+
+; Extract the numeric part of scores (if score stored as string)
+TAKE player, regex.search(player, "[A-Z][a-z]+") AS first_name,
+     score FROM scores ORDER BY score DESC
+
+; Replace all digits in player names with # (hypothetical anonymisation)
+TAKE player, regex.replace_all(player, "[0-9]", "#") AS anon FROM scores
+
+; Capture groups: split player name into initial + rest
+TAKE player, regex.groups(player, "^(.)(.+)") AS parts FROM scores
+
+; ── Combined: filter + transform ─────────────────────────────────────────────
+
+; Students whose name starts with A–M, show name uppercased via replace_all
+TAKE name,
+     regex.replace_all(name, "[a-z]", "") AS caps_only,
+     grade
+FROM students
+IF name MATCH "[A-Ma-m].*"
+ORDER BY grade DESC

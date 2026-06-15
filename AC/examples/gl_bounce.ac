@@ -1,0 +1,56 @@
+AC->CPP
+
+use ilib gl
+
+/*  Bouncing ball demo — auto-animates, no keyboard required.
+    Ball moves right and bounces using CircleFall / CircleFell cycle.
+    Press Space to reset the ball.
+*/
+
+Make reset_ball func(arg)
+    IF # is_obj(arg)
+        raise ERR($Not a valid object$)
+    OTHER
+        arg.regen()
+
+<mainloop>
+    <gui>
+
+        <OBJECT>
+            obj.Ball
+            Ball.config item=square(28) - location=(x=center, y=center) - white
+
+            obj.Paddle
+            Paddle.config item=geometry(180 width @ 16 height) - location=(x=center, y=screen-50) - white
+        <OBJECT>
+
+        <SCREEN>
+            Make Screen object
+            Screen.OBJECT resize 800x600
+            background.config color=black
+            animate(60 fps)
+        <SCREEN>
+
+        <LOGIC>
+
+            configure event-listener
+                use listener to establish rule
+                    on value is space
+                        reset_ball(Ball)
+
+            <StartHere>
+                Ball.animate($right$, 300)
+                Ball.CircleFall(1/4 RightDir)
+
+                IF Ball.CircleFell(1/4 RightDir) is True
+                    Ball.regen()
+
+                IF Ball.hitbox.coords overlap Paddle.hitbox.coords
+                    Ball.CircleFall(1/4 RightDir)
+            <EndHere>
+
+        <LOGIC>
+
+    <gui>
+
+<mainloop>

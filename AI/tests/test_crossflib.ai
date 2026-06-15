@@ -1,0 +1,5 @@
+AI->AIBC
+use flib ../../AC/tests/mathlib.ac
+
+s = square(6)
+Term.display s

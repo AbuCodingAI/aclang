@@ -1,0 +1,5 @@
+AC LIB
+
+Make square func(x)
+    result = x * x
+    return result

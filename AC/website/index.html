@@ -3,21 +3,57 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AC Language - Multi-Backend Compiler</title>
+    <title>AC Programming Language | Write Once, Compile Anywhere</title>
     <link rel="icon" href="favicon.png" type="image/png">
     <style>
+        /* CORE TOKENS & SYSTEM VARIABLES */
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
+            scroll-behavior: smooth;
+        }
+
+        :root {
+            --bg-deep: #0a0a0f;
+            --bg-card: rgba(255, 255, 255, 0.02);
+            --border-glow: rgba(255, 255, 255, 0.06);
+            --ac-cyan: #00d4ff;
+            --ac-pink: #ff00ff;
+            --text-main: #ffffff;
+            --text-muted: #a0a0a5;
+            --transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-deep);
+            color: var(--text-main);
             line-height: 1.6;
-            color: #333;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* VIVID CYBER GRID EMBED */
+        .cyber-grid {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background-image: linear-gradient(rgba(255, 255, 255, 0.01) 1px, transparent 1px),
+                              linear-gradient(90deg, rgba(255, 255, 255, 0.01) 1px, transparent 1px);
+            background-size: 40px 40px;
+            z-index: -2;
+            pointer-events: none;
+        }
+
+        .ambient-glow {
+            position: absolute;
+            width: 800px;
+            height: 800px;
+            background: radial-gradient(circle, rgba(0, 212, 255, 0.05) 0%, rgba(0,0,0,0) 70%);
+            top: -300px;
+            left: -200px;
+            z-index: -1;
+            pointer-events: none;
         }
 
         .container {
@@ -26,33 +62,41 @@
             padding: 0 20px;
         }
 
+        /* NAVIGATION BAR ARCHITECTURE */
         header {
-            background: rgba(255, 255, 255, 0.1);
+            background: rgba(10, 10, 15, 0.7);
             backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border-glow);
+            position: fixed;
+            width: 100%;
+            top: 0;
+            z-index: 100;
             padding: 20px 0;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
         }
 
-        .nav {
+        .nav-wrapper {
             display: flex;
             justify-content: space-between;
             align-items: center;
         }
 
-        .logo {
+        .logo-block {
             display: flex;
             align-items: center;
             gap: 10px;
         }
 
-        .logo img {
+        .logo-block img {
             width: 40px;
             height: 40px;
+            object-fit: contain;
         }
 
-        .logo h1 {
-            color: #fff;
+        .logo-block h1 {
+            color: var(--text-main);
             font-size: 1.5rem;
+            letter-spacing: -0.5px;
         }
 
         nav ul {
@@ -62,60 +106,68 @@
         }
 
         nav a {
-            color: #fff;
+            color: var(--text-main);
             text-decoration: none;
-            transition: color 0.3s;
+            font-size: 0.95rem;
+            transition: var(--transition);
         }
 
         nav a:hover {
-            color: #00d4ff;
+            color: var(--ac-cyan);
         }
 
+        /* HERO MATRIX PANEL */
         .hero {
-            padding: 100px 0;
+            padding: 180px 0 100px 0;
             text-align: center;
-            color: #fff;
+            position: relative;
         }
 
         .hero h1 {
-            font-size: 3.5rem;
+            font-size: 4rem;
+            font-weight: 900;
             margin-bottom: 20px;
-            background: linear-gradient(90deg, #00d4ff, #ff00ff);
+            letter-spacing: -1.5px;
+            background: linear-gradient(90deg, var(--ac-cyan), var(--ac-pink));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
 
         .hero p {
-            font-size: 1.2rem;
-            max-width: 600px;
+            font-size: 1.25rem;
+            max-width: 700px;
             margin: 0 auto 30px;
-            color: #ccc;
+            color: var(--text-muted);
         }
 
-        .btn {
+        .btn-action {
             display: inline-block;
             padding: 12px 30px;
-            background: linear-gradient(90deg, #00d4ff, #0099cc);
-            color: #fff;
+            background: linear-gradient(90deg, var(--ac-cyan), #0099cc);
+            color: var(--text-main);
             text-decoration: none;
             border-radius: 25px;
-            transition: transform 0.3s, box-shadow 0.3s;
+            font-weight: 700;
+            box-shadow: 0 4px 20px rgba(0, 212, 255, 0.2);
+            transition: var(--transition);
         }
 
-        .btn:hover {
+        .btn-action:hover {
             transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(0, 212, 255, 0.3);
+            box-shadow: 0 10px 30px rgba(0, 212, 255, 0.4);
         }
 
+        /* FEATURES DISPLAY PLATFORM */
         .features {
             padding: 80px 0;
         }
 
         .section-title {
             text-align: center;
-            color: #fff;
             font-size: 2.5rem;
+            font-weight: 800;
             margin-bottom: 60px;
+            letter-spacing: -1px;
         }
 
         .features-grid {
@@ -125,191 +177,619 @@
         }
 
         .feature-card {
-            background: rgba(255, 255, 255, 0.05);
+            background: var(--bg-card);
+            border: 1px solid var(--border-glow);
             padding: 30px;
             border-radius: 15px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            transition: transform 0.3s;
+            backdrop-filter: blur(5px);
+            -webkit-backdrop-filter: blur(5px);
+            transition: var(--transition);
         }
 
         .feature-card:hover {
             transform: translateY(-5px);
+            background: rgba(255, 255, 255, 0.04);
+            border-color: rgba(0, 212, 255, 0.2);
         }
 
         .feature-card h3 {
-            color: #00d4ff;
+            color: var(--ac-cyan);
             margin-bottom: 15px;
+            font-size: 1.3rem;
         }
 
         .feature-card p {
-            color: #ccc;
+            color: var(--text-muted);
+            font-size: 0.95rem;
         }
 
+        /* CORE COMPILER CHANNELS */
         .backends {
             padding: 80px 0;
             background: rgba(0, 0, 0, 0.2);
+            border-top: 1px solid var(--border-glow);
+            border-bottom: 1px solid var(--border-glow);
         }
 
         .backends-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
             gap: 20px;
             text-align: center;
         }
 
         .backend-card {
-            background: rgba(255, 255, 255, 0.05);
+            background: var(--bg-card);
+            border: 1px solid var(--border-glow);
             padding: 20px;
             border-radius: 10px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            font-weight: 600;
+            transition: var(--transition);
         }
 
-        .backend-card h3 {
-            color: #fff;
-            margin-bottom: 10px;
+        .backend-card:hover {
+            border-color: var(--ac-cyan);
+            transform: scale(1.03);
         }
 
+        /* NATIVE BENCHMARK RUNNER PANE */
         .code-example {
             padding: 80px 0;
         }
 
+        .code-shell {
+            background: #07070a;
+            border-radius: 12px;
+            border: 1px solid var(--border-glow);
+            overflow: hidden;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+        }
+
+        .terminal-header {
+            background: #111116;
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border-glow);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .dot { width: 10px; height: 10px; border-radius: 50%; }
+        .dot-r { background: #ff5f56; }
+        .dot-y { background: #ffbd2e; }
+        .dot-g { background: #27c93f; }
+
+        .terminal-title {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            font-family: monospace;
+            margin-left: auto;
+        }
+
         .code-block {
-            background: #1a1a2e;
-            border-radius: 10px;
             padding: 30px;
             overflow-x: auto;
-            border: 1px solid rgba(255, 255, 255, 0.1);
         }
 
         .code-block pre {
-            color: #e0e0e0;
-            font-family: 'Courier New', monospace;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 0.95rem;
+            color: #e0e0e6;
+            line-height: 1.5;
+        }
+
+        /* PURE CSS SYNTAX TOKENS */
+        .tok-comment  { color: #6a9955; font-style: italic; }
+        .tok-keyword  { color: #ff79c6; font-weight: 700; }
+        .tok-string   { color: #f1fa8c; }
+        .tok-op       { color: #50fa7b; }
+        .tok-gate     { color: #bd93f9; font-weight: 700; }
+
+        /* CLI MATRIX BLOCK */
+        .cli-track {
+            padding: 0 0 80px 0;
+        }
+
+        .instruction-box {
+            background: #07070a;
+            border: 1px solid var(--border-glow);
+            border-radius: 12px;
+            padding: 30px;
+            overflow-x: auto;
+        }
+
+        .instruction-box pre {
+            font-family: monospace;
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+
+        .instruction-box .cmd {
+            color: var(--ac-cyan);
+        }
+
+        /* FOOTER MODULE */
+        footer {
+            background: rgba(0, 0, 0, 0.3);
+            border-top: 1px solid var(--border-glow);
+            padding: 40px 0;
+            text-align: center;
+            color: var(--text-muted);
             font-size: 0.9rem;
         }
 
-        footer {
-            background: rgba(0, 0, 0, 0.3);
-            padding: 40px 0;
-            text-align: center;
-            color: #ccc;
+        /* SANDBOX PLAYGROUND */
+        .playground { padding: 80px 0; }
+
+        .playground-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .btn-run {
+            padding: 10px 26px;
+            background: linear-gradient(90deg, var(--ac-cyan), #0099cc);
+            color: #000;
+            border: none;
+            border-radius: 20px;
+            font-weight: 700;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .btn-run:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0, 212, 255, 0.4);
+        }
+
+        .example-select {
+            background: var(--bg-card);
+            border: 1px solid var(--border-glow);
+            color: var(--text-main);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            cursor: pointer;
+            outline: none;
+        }
+
+        .example-select option { background: #111116; }
+
+        .repl-hint { color: var(--text-muted); font-size: 0.8rem; }
+
+        .playground-panes {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            border: 1px solid var(--border-glow);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+            height: 400px;
+        }
+
+        .repl-editor-pane {
+            display: flex;
+            flex-direction: column;
+            background: #07070a;
+            border-right: 1px solid var(--border-glow);
+        }
+
+        .repl-output-pane {
+            display: flex;
+            flex-direction: column;
+            background: #050508;
+        }
+
+        .repl-pane-bar {
+            background: #111116;
+            padding: 10px 20px;
+            border-bottom: 1px solid var(--border-glow);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: monospace;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+        }
+
+        #ac-editor {
+            flex: 1;
+            background: transparent;
+            color: #e0e0e6;
+            border: none;
+            outline: none;
+            padding: 20px;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 0.88rem;
+            line-height: 1.6;
+            resize: none;
+            tab-size: 4;
+        }
+
+        #ac-output {
+            flex: 1;
+            padding: 20px;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 0.88rem;
+            line-height: 1.6;
+            color: #7fff9a;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
         }
 
         @media (max-width: 768px) {
-            .hero h1 {
-                font-size: 2.5rem;
-            }
-
-            nav ul {
-                display: none;
-            }
+            .hero h1 { font-size: 2.5rem; }
+            nav ul { display: none; }
+            .hero { padding: 140px 0 60px 0; }
+            .playground-panes { grid-template-columns: 1fr; height: auto; }
+            #ac-editor { height: 260px; }
+            #ac-output { height: 200px; }
         }
     </style>
 </head>
 <body>
+
+    <div class="cyber-grid"></div>
+    <div class="ambient-glow"></div>
+
+    <!-- MAIN HEADER NAVIGATION -->
     <header>
-        <div class="container">
-            <nav class="nav">
-                <div class="logo">
-                    <img src="favicon.png" alt="AC Logo">
-                    <h1>AC Language</h1>
-                </div>
-                <nav>
-                    <ul>
-                        <li><a href="#features">Features</a></li>
-                        <li><a href="#backends">Backends</a></li>
-                        <li><a href="#install">Install</a></li>
-                        <li><a href="https://github.com/AbuCodingAI/aclang" target="_blank">GitHub</a></li>
-                    </ul>
-                </nav>
+        <div class="container nav-wrapper">
+            <div class="logo-block">
+                <img src="favicon.png" alt="AC Logo">
+                <h1>AC Language</h1>
+            </div>
+            <nav>
+                <ul>
+                    <li><a href="#features">Features</a></li>
+                    <li><a href="#backends">Backends</a></li>
+                    <li><a href="#benchmark">Sieve Benchmark</a></li>
+                    <li><a href="#install">Quick Start</a></li>
+                    <li><a href="#playground">Try It</a></li>
+                </ul>
             </nav>
         </div>
     </header>
 
+    <!-- HERO ENGINE PANEL -->
     <section class="hero">
         <div class="container">
-            <h1>AC Language</h1>
-            <p>A multi-backend compiler for the AC programming language. Write once, compile to 11+ targets including Python, JavaScript, C, C++, Rust, Go, Java, HTML, V, Assembly, and native binaries.</p>
-            <a href="https://www.npmjs.com/package/aclang" class="btn">Install via npm</a>
+            <h1>AC Programming Language</h1>
+            <p>A multi-backend compiler pipeline. Write clean, human-centric source files and compile directly across multiple target languages and performance layers.</p>
+            <a href="https://npmjs.com" class="btn-action">Install via npm</a>
         </div>
     </section>
 
+    <!-- SPECIFICATION TRACK FEATURES -->
     <section class="features" id="features">
         <div class="container">
-            <h2 class="section-title">Features</h2>
+            <h2 class="section-title">Core Specifications</h2>
             <div class="features-grid">
                 <div class="feature-card">
                     <h3>Multi-Target Compilation</h3>
-                    <p>Compile to 11+ different backends including Python, JavaScript, C, C++, Rust, Go, Java, HTML, V, Assembly, and native binaries.</p>
+                    <p>Translate source scripts out to Python, JavaScript, Go, C, C++, Rust, Java, HTML, V, and Assembly channels simultaneously.</p>
                 </div>
                 <div class="feature-card">
-                    <h3>Clean Syntax</h3>
-                    <p>Beginner-friendly syntax with clean, readable code. Easy to learn and use.</p>
+                    <h3>Human-Centric Grammar</h3>
+                    <p>Clean 1-indexed collection layouts, explicit <code>$</code> string containers, and formal english linguistic bounds like <code>WHILST</code>.</p>
                 </div>
                 <div class="feature-card">
-                    <h3>Native Binaries</h3>
-                    <p>Compile directly to native x86-64 executables with no dependencies.</p>
+                    <h3>Native Executables</h3>
+                    <p>Generate standalone x86-64 machine-code targets directly through the <code>BNY</code> compilation backend channel with no external dependencies.</p>
                 </div>
                 <div class="feature-card">
-                    <h3>Event System</h3>
-                    <p>GUI event listeners and key bindings for interactive applications.</p>
+                    <h3>Event Loop Architecture</h3>
+                    <p>Integrated GUI event listener modules, custom triggers, and hardware key bindings built directly for application scaling.</p>
                 </div>
                 <div class="feature-card">
-                    <h3>Widget System</h3>
-                    <p>Built-in UI components for creating graphical applications.</p>
+                    <h3>Widget Layer</h3>
+                    <p>Native user-interface component layout definitions for compiling visual windows and modular graphical layouts.</p>
                 </div>
                 <div class="feature-card">
                     <h3>Caching System</h3>
-                    <p>Fast recompilation with .acc and .lir cache files.</p>
+                    <p>Optimized recompilation paths via local intermediated tracking loops, outputting fast <code>.acc</code> and <code>.lir</code> caches.</p>
                 </div>
             </div>
         </div>
     </section>
 
+    <!-- DIRECT OUTPUT PIPELINE BACKENDS -->
     <section class="backends" id="backends">
         <div class="container">
-            <h2 class="section-title">Supported Backends</h2>
+            <h2 class="section-title">Supported Target Channels</h2>
             <div class="backends-grid">
+                <div class="backend-card">Native Binary</div>
+                <div class="backend-card">x86-64 Assembly</div>
+                <div class="backend-card">Go (Golang)</div>
                 <div class="backend-card">Python</div>
                 <div class="backend-card">JavaScript</div>
-                <div class="backend-card">C</div>
-                <div class="backend-card">C++</div>
-                <div class="backend-card">Rust</div>
-                <div class="backend-card">Go</div>
-                <div class="backend-card">Java</div>
-                <div class="backend-card">HTML</div>
-                <div class="backend-card">V</div>
-                <div class="backend-card">Assembly</div>
-                <div class="backend-card">Native Binary</div>
+                <div class="backend-card">C Language</div>
+                <div class="backend-card">C++ Engine</div>
+                <div class="backend-card">Rust Core</div>
+                <div class="backend-card">Java Virtual</div>
+                <div class="backend-card">HTML / CSS</div>
+                <div class="backend-card">V Language</div>
             </div>
         </div>
     </section>
 
-    <section class="code-example" id="install">
+    <!-- CRITICAL VERIFICATION BENCHMARK CODE -->
+    <section class="code-example" id="benchmark">
         <div class="container">
-            <h2 class="section-title">Quick Start</h2>
-            <div class="code-block">
-                <pre><code># Install via npm
+            <h2 class="section-title">Language Grammar Benchmark</h2>
+            <div class="code-shell">
+                <div class="terminal-header">
+                    <div class="dot dot-r"></div>
+                    <div class="dot dot-y"></div>
+                    <div class="dot dot-g"></div>
+                    <div class="terminal-title">sieve_benchmark.ac</div>
+                </div>
+                <div class="code-block">
+<pre><code><span class="tok-comment">/* Sieve of Eratosthenes — Find Primes Up to N */</span>
+<span class="tok-keyword">Make</span> sieve <span class="tok-keyword">func</span>(n)
+    prime = []
+    j = 0
+    <span class="tok-keyword">WHILST</span> j <span class="tok-op">#></span> n
+        prime.append(True)
+        j += 1
+    
+    prime[1] = False
+    prime[2] = False
+    p = 2
+    <span class="tok-keyword">WHILST</span> p <span class="tok-op">*</span> p <span class="tok-op">#></span> n
+        <span class="tok-keyword">IF</span> prime[p + 1]
+            i = p <span class="tok-op">*</span> p
+            <span class="tok-keyword">WHILST</span> i <span class="tok-op">#></span> n
+                prime[i + 1] = False
+                i += p
+        p += 1
+    result = []
+    i = 2
+    <span class="tok-keyword">WHILST</span> i <span class="tok-op">#></span> n
+        <span class="tok-keyword">IF</span> prime[i + 1]
+            result.append(i)
+        i += 1
+    <span class="tok-keyword">return</span> result
+
+<span class="tok-gate">&lt;mainloop&gt;</span>
+    limit = 50
+    primes = sieve(limit)
+    Term.display primes
+<span class="tok-gate">&lt;mainloop&gt;</span></code></pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CLI QUICKSTART INSTRUCTION BLOCK -->
+    <section class="cli-track" id="install">
+        <div class="container">
+            <h2 class="section-title">Quick Start Execution</h2>
+            <div class="instruction-box">
+<pre><code><span class="cmd"># Install the runtime toolchain globally</span>
 npm install -g aclang
 
-# Compile and run
+<span class="cmd"># Compile and execute an AC script natively</span>
 ac mycode.ac
 
-# Compile to specific target
-ac mycode.ac PY      # Python
-ac mycode.ac BNY     # Native binary
-ac mycode.ac ASM     # x86-64 assembly
+<span class="cmd"># Compile straight to highly efficient Go source structures</span>
+ac mycode.ac GO
 
-# Use the REPL
+<span class="cmd"># Build optimized machine code standalone native binaries</span>
+ac mycode.ac BNY
+
+<span class="cmd"># Launch the live interactive interpreter environment</span>
 ac-repl</code></pre>
             </div>
         </div>
     </section>
 
+    <!-- SANDBOX PLAYGROUND REPL -->
+    <section class="playground" id="playground">
+        <div class="container">
+            <h2 class="section-title">Try AC</h2>
+            <div class="playground-toolbar">
+                <button class="btn-run" onclick="runAC()">&#9654; Run</button>
+                <select class="example-select" onchange="loadExample(this.value)">
+                    <option value="">Load example...</option>
+                    <option value="hello">Hello World</option>
+                    <option value="fizzbuzz">FizzBuzz</option>
+                    <option value="fibonacci">Fibonacci</option>
+                    <option value="sieve">Sieve of Eratosthenes</option>
+                </select>
+                <span class="repl-hint">Ctrl+Enter to run &mdash; no install needed</span>
+            </div>
+            <div class="playground-panes">
+                <div class="repl-editor-pane">
+                    <div class="repl-pane-bar">
+                        <div class="dot dot-r"></div>
+                        <div class="dot dot-y"></div>
+                        <div class="dot dot-g"></div>
+                        <span style="margin-left:8px;">editor.ac</span>
+                    </div>
+                    <textarea id="ac-editor" spellcheck="false"></textarea>
+                </div>
+                <div class="repl-output-pane">
+                    <div class="repl-pane-bar">
+                        <span>output</span>
+                        <span id="run-status" style="margin-left:auto;font-size:0.75rem;"></span>
+                    </div>
+                    <div id="ac-output">// Click &#9654; Run or press Ctrl+Enter</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- FOOTER TERMINAL TIER -->
     <footer>
         <div class="container">
-            <p>AC Language - Write Once, Compile Anywhere</p>
-            <p>MIT License | <a href="https://github.com/AbuCodingAI/aclang" style="color: #00d4ff;">GitHub</a></p>
+            <p>AC Programming Language Engine &copy; 2026</p>
+            <p style="font-size: 0.8rem; color: rgba(255,255,255,0.15); margin-top: 5px;">Write Once, Compile Anywhere | Distributed under the MIT License.</p>
         </div>
     </footer>
+
+
+    <script>
+    const EXAMPLES = {
+        hello: `<mainloop>\n    Term.display $Hello, World!$\n    Term.display $AC v0.3.0 — write once, compile anywhere$\n<mainloop>`,
+        fizzbuzz: `<mainloop>\n    FOR i in range 20\n        IF i % 3 == 0 AND i % 5 == 0\n            Term.display $FizzBuzz$\n        ELSEIF i % 3 == 0\n            Term.display $Fizz$\n        ELSEIF i % 5 == 0\n            Term.display $Buzz$\n        OTHER\n            Term.display i\n<mainloop>`,
+        fibonacci: `Make fib func(n)\n    IF n #> 1\n        return n\n    return fib(n - 1) + fib(n - 2)\n\n<mainloop>\n    FOR i in range 10\n        Term.display fib(i)\n<mainloop>`,
+        sieve: `Make sieve func(n)\n    prime = []\n    j = 0\n    WHILST j #> n\n        prime.append(True)\n        j += 1\n    prime[1] = False\n    prime[2] = False\n    p = 2\n    WHILST p * p #> n\n        IF prime[p + 1]\n            i = p * p\n            WHILST i #> n\n                prime[i + 1] = False\n                i += p\n        p += 1\n    result = []\n    i = 2\n    WHILST i #> n\n        IF prime[i + 1]\n            result.append(i)\n        i += 1\n    return result\n\n<mainloop>\n    limit = 50\n    primes = sieve(limit)\n    Term.display primes\n<mainloop>`
+    };
+
+    function loadExample(key) {
+        if (key && EXAMPLES[key]) {
+            document.getElementById('ac-editor').value = EXAMPLES[key];
+            document.getElementById('ac-output').textContent = '// Click ▶ Run or press Ctrl+Enter';
+            document.getElementById('run-status').textContent = '';
+            document.getElementById('run-status').style.color = '';
+        }
+    }
+
+    function transpileAC(src) {
+        const lines = src.split('\n');
+        const out = [];
+        const stack = [-1];
+
+        function closeBlocksTo(lv) {
+            while (stack.length > 1 && stack[stack.length - 1] >= lv) {
+                out.push(' '.repeat(stack.pop()) + '}');
+            }
+        }
+
+        function xpr(s) {
+            return s
+                .replace(/\$([^$]*)\$/g, '"$1"')
+                .replace(/\bTrue\b/g, 'true')
+                .replace(/\bFalse\b/g, 'false')
+                .replace(/\bNone\b/g, 'null')
+                .replace(/\bAND\b/g, '&&')
+                .replace(/\bOR\b/g, '||')
+                .replace(/\bNOT(?=\s)/g, '!')
+                .replace(/#>/g, '<=')
+                .replace(/<#/g, '>=')
+                .replace(/\.append\(/g, '.push(')
+                .replace(/\blen\(([^)]+)\)/g, '($1).length')
+                .replace(/(\w+)\[([^\]]+)\]/g, '$1[($2)-1]');
+        }
+
+        for (const raw of lines) {
+            const t = raw.trim();
+            if (!t) { out.push(''); continue; }
+            if (t.startsWith('//')) continue;
+            if (t.startsWith('/*') || t === '*/') continue;
+
+            const ci = raw.search(/\S/);
+            const sp = ' '.repeat(ci);
+            let m;
+
+            if (/^<(mainloop|free|bound)>$/.test(t)) { closeBlocksTo(0); continue; }
+
+            if ((m = t.match(/^ELSEIF\s+(.+)$/))) {
+                while (stack.length > 1 && stack[stack.length - 1] > ci)
+                    out.push(' '.repeat(stack.pop()) + '}');
+                if (stack.length > 1 && stack[stack.length - 1] === ci) stack.pop();
+                out.push(sp + '} else if (' + xpr(m[1]) + ') {');
+                stack.push(ci);
+                continue;
+            }
+            if (t === 'OTHER') {
+                while (stack.length > 1 && stack[stack.length - 1] > ci)
+                    out.push(' '.repeat(stack.pop()) + '}');
+                if (stack.length > 1 && stack[stack.length - 1] === ci) stack.pop();
+                out.push(sp + '} else {');
+                stack.push(ci);
+                continue;
+            }
+
+            closeBlocksTo(ci);
+
+            if ((m = t.match(/^WHILST\s+(.+)$/))) {
+                out.push(sp + 'while (' + xpr(m[1]) + ') {');
+                stack.push(ci); continue;
+            }
+            if ((m = t.match(/^IF\s+(.+)$/))) {
+                out.push(sp + 'if (' + xpr(m[1]) + ') {');
+                stack.push(ci); continue;
+            }
+            if ((m = t.match(/^FOR\s+(\w+)\s+in\s+range\s+(.+)$/))) {
+                out.push(sp + 'for (var ' + m[1] + ' = 1; ' + m[1] + ' <= ' + xpr(m[2]) + '; ' + m[1] + '++) {');
+                stack.push(ci); continue;
+            }
+            if ((m = t.match(/^Make\s+(\w+)\s+func\(([^)]*)\)$/))) {
+                out.push(sp + 'function ' + m[1] + '(' + m[2] + ') {');
+                stack.push(ci); continue;
+            }
+            if ((m = t.match(/^return\s*(.*)$/))) {
+                out.push(sp + 'return ' + xpr(m[1]) + ';'); continue;
+            }
+            if ((m = t.match(/^Term\.display\s+(.+)$/))) {
+                out.push(sp + '__print(' + xpr(m[1]) + ');'); continue;
+            }
+            if ((m = t.match(/^(\w+)\[([^\]]+)\]\s*=\s*(.+)$/))) {
+                out.push(sp + m[1] + '[(' + m[2] + ')-1] = ' + xpr(m[3]) + ';'); continue;
+            }
+            if ((m = t.match(/^(\w+)\s*(\+=|-=|\*=|\/=|%=)\s*(.+)$/))) {
+                out.push(sp + m[1] + ' ' + m[2] + ' ' + xpr(m[3]) + ';'); continue;
+            }
+            if ((m = t.match(/^(\w+)\s*=\s*(.+)$/))) {
+                out.push(sp + 'var ' + m[1] + ' = ' + xpr(m[2]) + ';'); continue;
+            }
+            out.push(sp + xpr(t) + ';');
+        }
+
+        while (stack.length > 1) out.push(' '.repeat(stack.pop()) + '}');
+        return out.join('\n');
+    }
+
+    function runAC() {
+        const src = document.getElementById('ac-editor').value;
+        const outputEl = document.getElementById('ac-output');
+        const statusEl = document.getElementById('run-status');
+        outputEl.textContent = '';
+
+        let js = '';
+        try { js = transpileAC(src); }
+        catch (e) {
+            outputEl.textContent = 'Transpile error: ' + e.message;
+            statusEl.textContent = 'error'; statusEl.style.color = '#ff5f56'; return;
+        }
+
+        let result = '';
+        function __print(val) {
+            result += Array.isArray(val) ? '[' + val.join(', ') + ']\n' : String(val) + '\n';
+        }
+
+        try {
+            new Function('__print', js)(__print);
+            outputEl.textContent = result || '(no output)';
+            statusEl.textContent = 'ok'; statusEl.style.color = 'var(--ac-cyan)';
+        } catch (e) {
+            outputEl.textContent = 'Runtime error: ' + e.message + '\n\n-- generated JS --\n' + js;
+            statusEl.textContent = 'error'; statusEl.style.color = '#ff5f56';
+        }
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+        loadExample('hello');
+        const editor = document.getElementById('ac-editor');
+        editor.addEventListener('keydown', e => {
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                const s = editor.selectionStart;
+                editor.value = editor.value.slice(0, s) + '    ' + editor.value.slice(editor.selectionEnd);
+                editor.selectionStart = editor.selectionEnd = s + 4;
+            }
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) runAC();
+        });
+    });
+    </script>
 </body>
 </html>
+

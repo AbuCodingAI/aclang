@@ -1,0 +1,25 @@
+AI->VM
+
+/* Money calculation — tax and totals with exact decimal math */
+
+<mainloop>
+    price    = to_dec(19.99)
+    tax_rate = to_dec(1.08)
+    total    = price @ tax_rate
+
+    Term.display $Price:$
+    Term.display price
+    Term.display $Tax rate: 1.08 (8%)$
+    Term.display $Total (price * tax):$
+    Term.display total
+
+    Term.display $$
+    shipping = to_dec(4.99)
+    grand    = total + shipping
+    Term.display $Shipping:$
+    Term.display shipping
+    Term.display $Grand total:$
+    Term.display grand
+
+    /kill
+<mainloop>

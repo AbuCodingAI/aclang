@@ -1,0 +1,6 @@
+*.o
+*.a
+*.so
+datac_example
+__pycache__/
+*.pyc

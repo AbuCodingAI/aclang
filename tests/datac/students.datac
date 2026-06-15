@@ -1,0 +1,12 @@
+class string property: name
+int sub.name: age
+int sub.name: grade
+string sub.name: house
+
+students {
+    name: "Alex", age: 16, grade: 91, house: "Red"
+    name: "Sam", age: 17, grade: 88, house: "Blue"
+    name: "Jordan", age: 15, grade: 97, house: "Red"
+    name: "Taylor", age: 16, grade: 74, house: "Green"
+    name: "Morgan", age: 17, grade: 82, house: "Blue"
+}

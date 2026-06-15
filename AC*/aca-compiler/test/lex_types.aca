@@ -1,0 +1,9 @@
+<mainloop>
+    a = 25
+    b = 25.9
+    c = $hello\n$
+    d = r$hello\n$
+    e = True
+    f = false
+<mainloop>
+

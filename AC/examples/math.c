@@ -3,66 +3,68 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include "library/math/math_c.h"
-// Link: gcc output.c -L./library/math -lacmath
+#include <unistd.h>
+#include "/home/abu/Documents/kiro projects/AC/AC/library/ilib/math/math_c.h"
+// Link: gcc output.c -L"/home/abu/Documents/kiro projects/AC/AC/library/ilib/math" -lacmath -Wl,-rpath,"/home/abu/Documents/kiro projects/AC/AC/library/ilib/math"
 
 typedef long long ac_int;
 typedef const char* ac_str;
 
 int main()
 {
+    // <mainloop>
     printf("%s\n", "--- Constants ---");
-    printf("%.16g\n", (double)(math_pi));
-    printf("%.16g\n", (double)(math_e));
-    printf("%.16g\n", (double)(math_tau));
-    printf("%.16g\n", (double)(math_em));
+    printf("%lld\n", (long long)(math_pi));
+    printf("%lld\n", (long long)(math_e));
+    printf("%lld\n", (long long)(math_tau));
+    printf("%lld\n", (long long)(math_em));
     printf("%s\n", "--- Pi / E with precision ---");
-    double t0 = ac_math_pi(5);
-    printf("%.16g\n", (double)(t0));
-    double t1 = ac_math_e(4);
-    printf("%.16g\n", (double)(t1));
+    double t_0 = ac_math_pi(5);
+    printf("%.16g\n", (double)(t_0));
+    double t_1 = ac_math_e(4);
+    printf("%.16g\n", (double)(t_1));
     printf("%s\n", "--- Powers and Roots ---");
-    double t2 = math_sqrt(16.0);
-    printf("%.16g\n", (double)(t2));
-    double t3 = math_cbrt(27.0);
-    printf("%.16g\n", (double)(t3));
-    double t4 = math_pow(2.0, 10.0);
-    printf("%.16g\n", (double)(t4));
-    double t5 = math_hypot(3.0, 4.0);
-    printf("%.16g\n", (double)(t5));
+    ac_int t_2 = math_sqrt(16.0);
+    printf("%lld\n", (long long)(t_2));
+    ac_int t_3 = math_cbrt(27.0);
+    printf("%lld\n", (long long)(t_3));
+    ac_int t_4 = math_pow(2.0, 10.0);
+    printf("%lld\n", (long long)(t_4));
+    ac_int t_5 = math_hypot(3.0, 4.0);
+    printf("%lld\n", (long long)(t_5));
     printf("%s\n", "--- Logarithms ---");
-    double t6 = math_ln(math_e);
-    printf("%.16g\n", (double)(t6));
-    double t7 = math_log(10.0, 1000.0);
-    printf("%.16g\n", (double)(t7));
-    double t8 = math_log(2.0, 1024.0);
-    printf("%.16g\n", (double)(t8));
-    double t9 = math_log10(1000.0);
-    printf("%.16g\n", (double)(t9));
-    double t10 = math_log2(1024.0);
-    printf("%.16g\n", (double)(t10));
+    ac_int t_6 = math_ln(math_e);
+    printf("%lld\n", (long long)(t_6));
+    ac_int t_7 = math_log(10.0, 1000.0);
+    printf("%lld\n", (long long)(t_7));
+    ac_int t_8 = math_log(2.0, 1024.0);
+    printf("%lld\n", (long long)(t_8));
+    ac_int t_9 = math_log10(1000.0);
+    printf("%lld\n", (long long)(t_9));
+    ac_int t_10 = math_log2(1024.0);
+    printf("%lld\n", (long long)(t_10));
     printf("%s\n", "--- Rounding ---");
-    double t11 = math_floor(4.9);
-    printf("%.16g\n", (double)(t11));
-    double t12 = math_ceil(4.1);
-    printf("%.16g\n", (double)(t12));
-    double t13 = math_round(4.5);
-    printf("%.16g\n", (double)(t13));
-    double t15 = 0 - 7.3;
-    double t14 = math_abs(t15);
-    printf("%.16g\n", (double)(t14));
+    ac_int t_11 = math_floor(4.9);
+    printf("%lld\n", (long long)(t_11));
+    ac_int t_12 = math_ceil(4.1);
+    printf("%lld\n", (long long)(t_12));
+    ac_int t_13 = math_round(4.5);
+    printf("%lld\n", (long long)(t_13));
+    double t_15 = 0 - 7.3;
+    ac_int t_14 = math_abs(t_15);
+    printf("%lld\n", (long long)(t_14));
     printf("%s\n", "--- Clamp ---");
-    double t16 = math_clamp(5.0, 0.0, 10.0);
-    printf("%.16g\n", (double)(t16));
-    double t18 = 0 - 3.0;
-    double t17 = math_clamp(t18, 0.0, 10.0);
-    printf("%.16g\n", (double)(t17));
-    double t19 = math_clamp(15.0, 0.0, 10.0);
-    printf("%.16g\n", (double)(t19));
+    ac_int t_16 = math_clamp(5.0, 0.0, 10.0);
+    printf("%lld\n", (long long)(t_16));
+    double t_18 = 0 - 3.0;
+    ac_int t_17 = math_clamp(t_18, 0.0, 10.0);
+    printf("%lld\n", (long long)(t_17));
+    ac_int t_19 = math_clamp(15.0, 0.0, 10.0);
+    printf("%lld\n", (long long)(t_19));
     printf("%s\n", "--- Conversions ---");
-    ac_int t20 = math_to_int(3.99);
-    printf("%lld\n", (long long)(t20));
-    double t21 = math_to_dec(42);
-    printf("%.16g\n", (double)(t21));
-    exit(0);
+    ac_int t_20 = math_to_int(3.99);
+    printf("%lld\n", (long long)(t_20));
+    ac_int t_21 = math_to_dec(42);
+    printf("%lld\n", (long long)(t_21));
+    // <mainloop>
 }

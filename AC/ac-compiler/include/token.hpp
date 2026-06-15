@@ -4,7 +4,8 @@
 
 enum class TokenType {
     // Literals
-    STRING,         // $...$  or "..."
+    STRING,         // $...$
+    DQUOTE_STRING,  // "..." — only valid inside fn expressions
     NUMBER,
     IDENTIFIER,
 
@@ -19,6 +20,7 @@ enum class TokenType {
     DOUBLE_AMPERSAND, // && (method chaining with different args)
     DOT,            // .
     SLASH,          // /
+    DOUBLE_SLASH,   // // integer division
     ARROW,          // ->
     LPAREN,         // (
     RPAREN,         // )
@@ -41,6 +43,7 @@ enum class TokenType {
     HASH_GT,        // #> (NOT greater → <=)
     HASH_LT,        // #< (NOT less → >=)
     HASH_PIPE,      // #| (XNOR)
+    CARET,          // ^ (exponentiation)
     KW_XSUB,        // xsub (inclusive range count: |a-b|+1)
 
     // Keywords
@@ -72,13 +75,15 @@ enum class TokenType {
     KW_TEMP,
     KW_FUNC,
     KW_AT,
-    KW_ILIB,        // ilib (import library)
-    KW_ELIB,        // elib (external library)
-    KW_CLIB,        // clib (custom library)
+    KW_ILIB,        // ilib — AC built-in/standard libraries  (resolved from ilib/ folder)
+    KW_ELIB,        // elib — packages installed via atar (AC's package manager) (resolved from elib/ folder)
+    KW_CLIB,        // clib — custom libraries you made      (subfolders inside clib/ folder)
+    KW_FLIB,        // flib (foreign/compiled AC library: use flib /path/to/lib)
+    KW_DATAC,       // datac — import a .datac data file (baked in at compile time)
     KW_FROM,        // from (submodule import: from ilib math use statistics)
     KW_RANGE,       // range N  → [0..N], Numeral Pos only
     KW_SEQUENCE,    // sequence(x,y) → [x..y], breaks if x > y
-    KW_IS,          // is  → equality comparison (==)
+    KW_IS,          // is  → equality comparison
     KW_PASS,        // pass → no-op placeholder
     KW_SKIP,        // skip → stop rest of if/elseif/other chain
     KW_BREAK,       // break → exit loop
@@ -96,7 +101,11 @@ enum class TokenType {
     KW_TO,          // to (for keybinds: bind KEY_W to function)
     KW_EVAL,        // eval(expr) → evaluate string as AC expression
     KW_BUNDLE,      // bundle X — class/struct definition
+    KW_PRIVATE,     // private  — bundle member access modifier
+    KW_PUBLIC,      // public   — bundle member access modifier (required when mixed)
     KW_FREE,        // free x, y — declare vars as globally scoped (like Python's global)
+    KW_ALIAS,       // alias x = y — bidirectional live binding
+    KW_LAZY_EVAL,   // lazy_eval(expr) — deferred safe evaluation
     KW_DEC,         // dec x [= expr]  — coerce x to decimal/float
     KW_INT,         // int x [= expr]  — coerce x to integer
     KW_STRING,      // string x [= expr] — coerce x to string
@@ -108,6 +117,10 @@ enum class TokenType {
     KW_CATCH,       // catch block
     KW_REPORT,      // report <var> — bind caught exception
     KW_AFTER,       // after block (finally)
+    KW_USING,       // using <lib> — bring library namespace into scope
+    KW_CONST,       // const x = expr — immutable binding (JS/C++ semantics)
+    KW_CP,          // cp x = y — explicit value copy
+    KW_LENGTH,      // length(x) — array/string length
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>

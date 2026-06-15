@@ -42,5 +42,4 @@ use ilib math
     Term.display $--- Conversions ---$
     Term.display math.to_int(3.99)
     Term.display math.to_dec(42)
-    /kill
 <mainloop>

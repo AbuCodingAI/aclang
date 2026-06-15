@@ -4,6 +4,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <cctype>
+#include <cstring>
+#include <cstdint>
 #include <unordered_map>
 
 static const std::unordered_map<std::string, TokenType> KEYWORDS = {
@@ -15,7 +17,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"WHILST",   TokenType::KW_WHILST},
     {"return",   TokenType::KW_RETURN},
     {"fn",       TokenType::KW_FN},
-    {"display",  TokenType::KW_DISPLAY},
+    // display is NOT a keyword — it's the widget label constructor; Term.display is the I/O keyword
     {"use",      TokenType::KW_USE},
     {"save",     TokenType::KW_SAVE},
     {"as",       TokenType::KW_AS},
@@ -42,6 +44,8 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"ilib",     TokenType::KW_ILIB},
     {"elib",     TokenType::KW_ELIB},
     {"clib",     TokenType::KW_CLIB},
+    {"flib",     TokenType::KW_FLIB},
+    {"datac",    TokenType::KW_DATAC},
     {"from",     TokenType::KW_FROM},
     {"range",    TokenType::KW_RANGE},
     {"sequence", TokenType::KW_SEQUENCE},
@@ -49,7 +53,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"xsub",     TokenType::KW_XSUB},
     {"pass",     TokenType::KW_PASS},
     {"skip",     TokenType::KW_SKIP},
-    {"break",    TokenType::KW_BREAK},
+    // "break" removed — use /end to exit a loop in AC
     {"continue", TokenType::KW_CONTINUE},
     {"destroy",  TokenType::KW_DESTROY},
     {"programLoop", TokenType::KW_PROGRAM_LOOP},
@@ -64,11 +68,15 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"bind",        TokenType::KW_BIND},
     {"to",          TokenType::KW_TO},
     {"bundle",      TokenType::KW_BUNDLE},
+    {"private",     TokenType::KW_PRIVATE},
+    {"public",      TokenType::KW_PUBLIC},
     {"free",        TokenType::KW_FREE},
-    {"dec",         TokenType::KW_DEC},
-    {"int",         TokenType::KW_INT},
-    {"string",      TokenType::KW_STRING},
-    {"bool",        TokenType::KW_BOOL},
+    {"alias",       TokenType::KW_ALIAS},
+    {"lazy_eval",   TokenType::KW_LAZY_EVAL},
+    {"to_dec",      TokenType::KW_DEC},
+    {"to_int",      TokenType::KW_INT},
+    {"to_string",   TokenType::KW_STRING},
+    {"to_bool",     TokenType::KW_BOOL},
     {"print_page",  TokenType::KW_PRINT_PAGE},
     {"alert",       TokenType::KW_ALERT},
     {"sure",        TokenType::KW_SURE},
@@ -76,7 +84,20 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"catch",  TokenType::KW_CATCH},
     {"report", TokenType::KW_REPORT},
     {"after",  TokenType::KW_AFTER},
+    {"using",  TokenType::KW_USING},
+    {"const",  TokenType::KW_CONST},
+    {"cp",     TokenType::KW_CP},
+    {"length", TokenType::KW_LENGTH},
 };
+
+// First-byte fast-path: if a word's first byte is NOT in kwFirstByte, it can't be a keyword.
+// Initialized after KEYWORDS so the order-of-initialization is well-defined.
+static bool kwFirstByte[256];
+static const bool _kwFbInit = [] {
+    for (auto& [kw, _] : KEYWORDS)
+        if (!kw.empty()) kwFirstByte[(uint8_t)kw[0]] = true;
+    return true;
+}();
 
 class Lexer {
 public:
@@ -89,7 +110,9 @@ public:
 
     std::vector<Token> tokenize() {
         std::vector<Token> tokens;
+        tokens.reserve(src.size() / 4);
         std::vector<int> indentStack = {0};
+        indentStack.reserve(64);
 
         while (pos < src.size()) {
             // Handle newlines and indentation
@@ -133,13 +156,43 @@ public:
                 continue;
             }
 
-            // String: $...$
+            // String: $...$ (with escape sequences) and r$...$ (raw, no escapes)
             if (src[pos] == '$') {
+                // Check if previous token was IDENTIFIER "r" → raw string
+                bool rawStr = !tokens.empty() &&
+                              tokens.back().type == TokenType::IDENTIFIER &&
+                              tokens.back().value == "r";
+                if (rawStr) tokens.pop_back(); // consume the 'r' prefix token
+
                 int sc = col; pos++; col++;
                 std::string s;
-                while (pos < src.size() && src[pos] != '$') { s += src[pos++]; col++; }
-                if (pos < src.size()) { pos++; col++; }
-                tokens.emplace_back(TokenType::STRING, s, line, sc);
+                if (rawStr) {
+                    // Raw string: copy bytes until closing $, no escape processing
+                    while (pos < src.size() && src[pos] != '$') {
+                        if (src[pos] == '\n') { line++; col = 1; } else col++;
+                        s += src[pos++];
+                    }
+                } else {
+                    // Normal string: process escape sequences
+                    while (pos < src.size() && src[pos] != '$') {
+                        if (src[pos] == '\\' && pos + 1 < src.size()) {
+                            pos++; col++;
+                            char esc = src[pos];
+                            if      (esc == 'n')  s += '\n';
+                            else if (esc == 't')  s += '\t';
+                            else if (esc == 'r')  s += '\r';
+                            else if (esc == '\\') s += '\\';
+                            else if (esc == '$')  s += '$';
+                            else { s += '\\'; s += esc; }
+                        } else {
+                            if (src[pos] == '\n') { line++; col = 1; } else col++;
+                            s += src[pos];
+                        }
+                        pos++; col++;
+                    }
+                }
+                if (pos < src.size()) { pos++; col++; } // skip closing $
+                tokens.emplace_back(TokenType::STRING, std::move(s), line, sc);
                 continue;
             }
 
@@ -163,7 +216,7 @@ public:
                     }
                 }
                 if (pos < src.size()) { pos++; col++; }
-                tokens.emplace_back(TokenType::STRING, s, line, sc);
+                tokens.emplace_back(TokenType::DQUOTE_STRING, s, line, sc);
                 continue;
             }
 
@@ -222,7 +275,7 @@ public:
                 continue;
             }
 
-            // Backend: AC->XX
+            // Backend: AC->XX or AC LIB (library header, no mainloop)
             if (src.substr(pos, 3) == "AC-") {
                 int sc = col;
                 pos += 3; col += 3;
@@ -233,6 +286,16 @@ public:
                 }
                 tokens.emplace_back(TokenType::BACKEND, backend, line, sc);
                 continue;
+            }
+            if (src.size() > pos + 5 && src.substr(pos, 6) == "AC LIB") {
+                // Check it's followed by end-of-line or EOF (not "AC LIBRARY" etc.)
+                size_t eol = pos + 6;
+                if (eol >= src.size() || src[eol] == '\n' || src[eol] == '\r' || src[eol] == ' ' || src[eol] == '\t') {
+                    int sc = col;
+                    pos += 6; col += 6;
+                    tokens.emplace_back(TokenType::BACKEND, std::string("LIB"), line, sc);
+                    continue;
+                }
             }
 
             // / — block comment /*...*/, compound /=, or slash command
@@ -248,15 +311,18 @@ public:
                     }
                     continue;
                 }
-                // Check for compound assignment /=
-                if (pos < src.size() && src[pos] == '=') {
+                // Check for // (integer division) before /=
+                if (pos < src.size() && src[pos] == '/') {
+                    pos++; col++;
+                    tokens.emplace_back(TokenType::DOUBLE_SLASH, "//", line, sc);
+                } else if (pos < src.size() && src[pos] == '=') {
                     pos++; col++;
                     tokens.emplace_back(TokenType::DIVIDE_EQUAL, "/=", line, sc);
                 } else {
-                    // Regular slash command like /kill
+                    // Regular slash command like /kill, or bare division operator /
                     std::string word;
                     while (pos < src.size() && std::isalpha(src[pos])) { word += src[pos++]; col++; }
-                    tokens.emplace_back(TokenType::SLASH, word, line, sc);
+                    tokens.emplace_back(TokenType::SLASH, word.empty() ? "/" : word, line, sc);
                 }
                 continue;
             }
@@ -300,6 +366,11 @@ public:
                 std::string word;
                 while (pos < src.size() && (std::isalnum(src[pos]) || src[pos] == '_' || src[pos] == '-')) {
                     word += src[pos++]; col++;
+                }
+                // First-byte fast-path: skip hash lookup if word can't be a keyword
+                if (!word.empty() && !kwFirstByte[(uint8_t)word[0]]) {
+                    tokens.emplace_back(TokenType::IDENTIFIER, word, line, sc);
+                    continue;
                 }
                 auto it = KEYWORDS.find(word);
                 if (it != KEYWORDS.end()) {
@@ -360,8 +431,7 @@ public:
                     if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::PIPE_EQUAL, "|=", line, sc); }
                     else tokens.emplace_back(TokenType::PIPE, "|", line, sc);
                     break;
-                case '^': tokens.emplace_back(TokenType::IDENTIFIER,"^",  line, sc); break;
-                case '%': tokens.emplace_back(TokenType::IDENTIFIER,"%",  line, sc); break;
+                case '^': pos++; col++; tokens.emplace_back(TokenType::CARET, "^", line, sc); break;
                 case '<':
                     tokens.emplace_back(TokenType::LT, "<", line, sc);
                     break;
@@ -372,6 +442,16 @@ public:
                 case ']': tokens.emplace_back(TokenType::RBRACKET,  "]",  line, sc); break;
                 case '{': tokens.emplace_back(TokenType::LBRACE,    "{",  line, sc); break;
                 case '}': tokens.emplace_back(TokenType::RBRACE,    "}",  line, sc); break;
+                case '\\':
+                    // \ws → whitespace sentinel literal
+                    if (pos < src.size() && src[pos] == 'w' &&
+                        pos + 1 < src.size() && src[pos+1] == 's' &&
+                        (pos + 2 >= src.size() || !std::isalnum((unsigned char)src[pos+2]))) {
+                        pos += 2;
+                        tokens.emplace_back(TokenType::STRING, "__WS__", line, sc);
+                    }
+                    // otherwise skip bare backslash
+                    break;
                 default: break; // skip unknown
             }
         }

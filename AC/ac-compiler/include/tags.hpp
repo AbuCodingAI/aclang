@@ -15,7 +15,10 @@ inline const std::unordered_set<std::string>& core() {
         "Local",
         "StartHere",
         "EndHere",
-        "Foreign"  // internal literal for raw passthrough blocks
+        "Foreign",  // internal literal for raw passthrough blocks
+        "bound",    // scope block: variables inside cannot leak out
+        "free",     // free block: variables inside are globally accessible
+        "shutoff"   // cleanup block: compiled as __ac_shutoff__(), called before /stop
     };
     return s;
 }
@@ -43,6 +46,9 @@ inline bool isStartHere(const std::string& tag) {
 inline bool isEndHere(const std::string& tag) {
     return tag == "EndHere";
 }
+
+inline bool isBound(const std::string& tag) { return tag == "bound"; }
+inline bool isFree(const std::string& tag)  { return tag == "free"; }
 
 inline bool isSpawnable(const std::string& tag) {
     return !isMainLoop(tag) && !isGUIBox(tag) && !isLogicScope(tag) && !isStartHere(tag) && !isEndHere(tag);

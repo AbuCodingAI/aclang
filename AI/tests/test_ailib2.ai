@@ -1,0 +1,5 @@
+AI->AIBC
+use flib ailib2.ai
+
+s = square(9)
+Term.display s

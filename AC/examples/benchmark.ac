@@ -1,55 +1,114 @@
 AC->BNY
 
-Make fibonacci func(n)
-    IF n #> 1
+Make fibonacciIter func(n)
+    IF n < 2
         return n
-    OTHER
-        return fibonacci(n - 1) + fibonacci(n - 2)
 
-Make factorial func(n)
-    IF n #> 1
-        return 1
-    OTHER
-        return n @ factorial(n - 1)
+    a = 0
+    b = 1
+    i = 2
 
-Make sumNumbers func(limit)
-    sum = 0
-    i = 1
-    WHILST i #> limit
-        sum += i
+    WHILST i #> n
+        next = a + b
+        a = b
+        b = next
         i += 1
-    return sum
 
-Make power func(base, exp)
-    IF exp is 0
-        return 1
+    return b
+
+Make factorialIter func(n)
     result = 1
-    i = 1
-    WHILST i #> exp
-        result @= base
+    i = 2
+
+    WHILST i #> n
+        result @= i
         i += 1
+
     return result
 
+Make powerIter func(base, exp)
+    result = 1
+    i = 0
+
+    WHILST i < exp
+        result @= base
+        i += 1
+
+    return result
+
+Make sumNumbers func(limit)
+    total = 0
+    i = 1
+
+    WHILST i #> limit
+        total += i
+        i += 1
+
+    return total
+
+Make arithmeticStress func(limit)
+    acc = 0
+    i = 1
+
+    WHILST i #> limit
+        a = i @ 3
+        b = i / 2
+        c = i - (i // 7) * 7
+        d = i @ i
+        acc += a - b + c + d
+        i += 1
+
+    return acc
+
+Make branchStress func(limit)
+    total = 0
+    i = 1
+
+    WHILST i #> limit
+        IF (i - (i // 2) * 2) is 0
+            total += i @ 3
+        OTHER
+            total -= i @ 2
+        i += 1
+
+    return total
+
+Make statsStress func(rounds)
+    total = 0
+    i = 1
+
+    WHILST i #> rounds
+        a = 85 + i
+        b = 92 - i
+        c = 78 + (i - (i // 5) * 5)
+        d = 90 - (i - (i // 3) * 3)
+        e = 88 + (i - (i // 7) * 7)
+
+        mean = (a + b + c + d + e) / 5
+
+        da = a - mean
+        db = b - mean
+        dc = c - mean
+        dd = d - mean
+        de = e - mean
+
+        variance = ((da @ da) + (db @ db) + (dc @ dc) + (dd @ dd) + (de @ de)) / 5
+        total += variance
+
+        i += 1
+
+    return total
+
 <mainloop>
-    Term.display $=== AC Language Benchmark ===$
-    Term.display $Starting computation...$
-    
-    Term.display $Computing Fibonacci(15)...$
-    fib15 = fibonacci(15)
-    Term.display fib15
-    
-    Term.display $Computing Factorial(10)...$
-    fact10 = factorial(10)
-    Term.display fact10
-    
-    Term.display $Computing Sum(1 to 1000)...$
-    sum1000 = sumNumbers(1000)
-    Term.display sum1000
-    
-    Term.display $Computing 2^20...$
-    pow_result = power(2, 20)
-    Term.display pow_result
-    
-    Term.display $=== Benchmark Complete ===$
-    /kill
+    fib = fibonacciIter(45)
+    fact = factorialIter(12)
+    pow = powerIter(2, 30)
+    sum = sumNumbers(1000000)
+    arith = arithmeticStress(1000000)
+    branch = branchStress(1000000)
+    stats = statsStress(200000)
+
+    checksum = fib + fact + pow + sum + arith + branch + stats
+
+    Term.display checksum
 <mainloop>

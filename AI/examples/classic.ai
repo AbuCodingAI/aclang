@@ -1,0 +1,15 @@
+AI->VM
+
+/* The classic floating-point problem — solved exactly with dec */
+
+<mainloop>
+    a = to_dec 0.1
+    b = to_dec 0.2
+    c = a + b
+
+    Term.display $0.1 + 0.2 =$
+    Term.display c
+
+    Term.display $Expected: 0.3$
+    /kill
+<mainloop>

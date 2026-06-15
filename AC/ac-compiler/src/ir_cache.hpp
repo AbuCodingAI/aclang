@@ -10,7 +10,7 @@
 #include <memory>
 
 static const char IRC_MAGIC[4] = {'A','C','I','R'};
-static const uint8_t IRC_VERSION = 4; // bumped: classOwner on IRFunction, CLASS_BEGIN/END opcodes
+static const uint8_t IRC_VERSION = 12; // bumped: LongInt constant arithmetic and IR-level alias expansion
 
 // ── FNV-1a 64-bit hash ────────────────────────────────────────────────────────
 inline uint64_t fnv64(const std::string& data) {
@@ -20,9 +20,10 @@ inline uint64_t fnv64(const std::string& data) {
 }
 
 inline uint64_t hashForCache(const std::string& source, const std::string& backend) {
-    // Include build timestamp so any recompile of the compiler invalidates all caches
-    static const char BUILD_ID[] = __DATE__ " " __TIME__;
-    return fnv64(source + '\0' + backend + '\0' + BUILD_ID);
+    // IRC_VERSION bumped on any IR format change — invalidates caches without relying
+    // on build timestamp (which would invalidate every cache on every recompile).
+    static const char CACHE_VER[] = "ac-irc-v12-longint-alias";
+    return fnv64(source + '\0' + backend + '\0' + CACHE_VER);
 }
 
 // ── Serialization primitives ──────────────────────────────────────────────────
@@ -31,6 +32,7 @@ namespace irc {
 static void wU8 (std::ofstream& f, uint8_t  v) { f.write((char*)&v,1); }
 static void wI32(std::ofstream& f, int32_t  v) { f.write((char*)&v,4); }
 static void wU32(std::ofstream& f, uint32_t v) { f.write((char*)&v,4); }
+static void wI64(std::ofstream& f, int64_t  v) { f.write((char*)&v,8); }
 static void wU64(std::ofstream& f, uint64_t v) { f.write((char*)&v,8); }
 static void wF64(std::ofstream& f, double   v) { f.write((char*)&v,8); }
 static void wStr(std::ofstream& f, const std::string& s) {
@@ -41,7 +43,7 @@ static void wValue(std::ofstream& f, const AC_IR::IRValue& v) {
     wU8(f,(uint8_t)v.type);
     using namespace AC_IR;
     switch (v.type) {
-    case IRType::INT:    wI32(f, std::get<int>(v.data)); break;
+    case IRType::INT:    wI64(f, std::get<int64_t>(v.data)); break;
     case IRType::FLOAT:  wF64(f, std::get<double>(v.data)); break;
     case IRType::STRING: wStr(f, std::get<std::string>(v.data)); break;
     case IRType::BOOL:   wU8(f,  std::get<bool>(v.data) ? 1 : 0); break;
@@ -66,6 +68,7 @@ static void wInstr(std::ofstream& f, const AC_IR::IRInstruction& ins) {
 static uint8_t  rU8 (std::ifstream& f) { uint8_t  v; f.read((char*)&v,1); return v; }
 static int32_t  rI32(std::ifstream& f) { int32_t  v; f.read((char*)&v,4); return v; }
 static uint32_t rU32(std::ifstream& f) { uint32_t v; f.read((char*)&v,4); return v; }
+static int64_t  rI64(std::ifstream& f) { int64_t  v; f.read((char*)&v,8); return v; }
 static uint64_t rU64(std::ifstream& f) { uint64_t v; f.read((char*)&v,8); return v; }
 static double   rF64(std::ifstream& f) { double   v; f.read((char*)&v,8); return v; }
 static std::string rStr(std::ifstream& f) {
@@ -77,7 +80,7 @@ static AC_IR::IRValue rValue(std::ifstream& f) {
     auto type = (AC_IR::IRType)rU8(f);
     using namespace AC_IR;
     switch (type) {
-    case IRType::INT:    return IRValue(rI32(f));
+    case IRType::INT:    return IRValue(rI64(f));
     case IRType::FLOAT:  return IRValue(rF64(f));
     case IRType::STRING: return IRValue(rStr(f));
     case IRType::BOOL:   return IRValue(rU8(f) != 0);
@@ -117,6 +120,7 @@ inline void saveIRCache(const std::string& ircFile, uint64_t hash,
     wU64(f, hash);
     wStr(f, prog.backend);
     wU8(f, prog.useHighLevelIR ? 1 : 0);
+    wU8(f, prog.hadExplicitMainloop ? 1 : 0);
 
     // Symbol table
     uint32_t sc = (uint32_t)prog.symbols.size();
@@ -171,9 +175,10 @@ inline std::unique_ptr<AC_IR::IRProgram> loadIRCache(const std::string& ircFile,
     if (rU64(f) != expectedHash) return nullptr;
 
     auto prog = std::make_unique<AC_IR::IRProgram>();
-    prog->backend        = rStr(f);
-    prog->useHighLevelIR = rU8(f) != 0;
-    prog->target         = prog->backend;
+    prog->backend             = rStr(f);
+    prog->useHighLevelIR      = rU8(f) != 0;
+    prog->hadExplicitMainloop = rU8(f) != 0;
+    prog->target              = prog->backend;
 
     // Symbol table
     uint32_t sc = rU32(f);

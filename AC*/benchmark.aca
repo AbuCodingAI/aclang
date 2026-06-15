@@ -1,0 +1,70 @@
+AC*->BNY /*ACA compiles to all the targets that AC does except ASM*/
+
+Make fibonacci func(n)
+    IF n #> 1 
+        return n
+    OTHER 
+        return fibonacci(n - 1) + fibonacci(n - 2)
+
+
+Make factorial func(n)
+    return [1=>n] >> *
+
+
+Make sumNumbers func(limit)
+    return [1=>limit] >> +
+
+
+Make power func(base, exp)
+    IF exp is 0 
+        return 1
+    return [1=>exp] >> *(base)
+
+
+Make mean func(data)
+    n = count(data)
+    return (data >> +) / n
+
+
+Make std_deviation func(data)
+    n = count(data)
+    avg = mean(data)
+    
+    /* Streams the array elements, maps each to its squared deviation, and sums them up */
+    sq_deviations_sum = data >> +((x) => (x - avg) * (x - avg))
+    
+    variance = sq_deviations_sum / n
+    return sqrt(variance)
+
+
+<mainloop>
+    Term.display $=== AC* Benchmark Execution ===$
+    
+    Term.display $Calculating Fibonacci(15):$
+    fib_res = fibonacci(15)
+    Term.display fib_res
+    
+    Term.display $Calculating Factorial(10):$
+    fact_res = factorial(10)
+    Term.display fact_res
+    
+    Term.display $Calculating Sum (1 to 1000):$
+    sum_res = sumNumbers(1000)
+    Term.display sum_res
+    
+    Term.display $Calculating Power (2^20):$
+    pow_res = power(2, 20)
+    Term.display pow_res
+    
+    Term.display $--- Running Statistics Unit ---$
+    dataset = [85.5, 92.0, 78.5, 90.0, 88.5]
+    
+    Term.display $Dataset Mean:$
+    Term.display mean(dataset)
+    
+    Term.display $Population Standard Deviation (Exact NumDec Maps):$
+    sigma = std_deviation(dataset)
+    Term.display sigma
+    
+    Term.display $=== Benchmark Complete ===$
+<mainloop>

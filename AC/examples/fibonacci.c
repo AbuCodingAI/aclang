@@ -3,35 +3,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
 typedef long long ac_int;
 typedef const char* ac_str;
 
 ac_int fib(ac_int n) {
-    ac_int t0 = (ac_int)(n <= 1);
-    if (!(t0)) goto L0;
-    return n;
-    goto L1;
-L0:;
-    ac_int t2 = n - 1;
-    ac_int t1 = fib(t2);
-    ac_int t4 = n - 2;
-    ac_int t3 = fib(t4);
-    ac_int t5 = t1 + t3;
-    return t5;
-L1:;
+    ac_int t_0 = (ac_int)(n <= 1);
+    if (t_0) {
+        return n;
+    } else {
+        ac_int t_2 = n - 1;
+        ac_int t_1 = fib(t_2);
+        ac_int t_4 = n - 2;
+        ac_int t_3 = fib(t_4);
+        ac_int t_5 = t_1 + t_3;
+        return t_5;
+    }
 }
 
 int main()
 {
-    ac_int i = 0;
-L2:;
-    ac_int t6 = (ac_int)(i <= 10);
-    if (!(t6)) goto L3;
-    ac_int t7 = fib(i);
-    printf("%lld\n", (long long)(t7));
-    i = i + 1;
-    goto L2;
-L3:;
-    exit(0);
+    // <mainloop>
+    ac_int i = (ac_int)(0);
+    __typeof__(i) _ac_s0_i = i;
+    while (1) {
+        ac_int t_6 = (ac_int)(i <= 10);
+        if (!(t_6)) break;
+        ac_int t_7 = fib(i);
+        printf("%lld\n", (long long)(t_7));
+        i = i + 1;
+    }
+    i = _ac_s0_i;
+    abort();
+    // <mainloop>
 }

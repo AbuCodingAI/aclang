@@ -1,0 +1,67 @@
+# AC Widgets Library — lowering rules (ilib:widgets)
+# Maps widgets:* IR calls to the ac_widgets_* C API.
+#
+# Default fallback: widgets:X.Y -> ac_widgets_X_Y
+# All functions follow the convention; explicit rules are listed for clarity.
+
+# Init
+# widgets:init                  -> ac_widgets_init              (fallback)
+
+# Screen widget
+# widgets:screen.new            -> ac_widgets_screen_new        (fallback)
+# widgets:screen.mainloop       -> ac_widgets_screen_mainloop   (fallback)
+# widgets:screen.update         -> ac_widgets_screen_update     (fallback)
+# widgets:screen.destroy        -> ac_widgets_screen_destroy    (fallback)
+
+# Display (label)
+# widgets:display.new           -> ac_widgets_display_new       (fallback)
+# widgets:display.pack          -> ac_widgets_display_pack      (fallback)
+# widgets:display.set           -> ac_widgets_display_set       (fallback)
+# widgets:display.get           -> ac_widgets_display_get       (fallback)
+
+# Text input (ask/entry)
+# widgets:ask.new               -> ac_widgets_ask_new           (fallback)
+# widgets:ask.pack              -> ac_widgets_ask_pack          (fallback)
+# widgets:ask.get               -> ac_widgets_ask_get           (fallback)
+# widgets:ask.set               -> ac_widgets_ask_set           (fallback)
+
+# Button
+# widgets:btn.new               -> ac_widgets_btn_new           (fallback)
+# widgets:btn.pack              -> ac_widgets_btn_pack          (fallback)
+# widgets:btn.on_click          -> ac_widgets_btn_on_click      (fallback)
+
+# Checkbox button
+# widgets:ckbtn.new             -> ac_widgets_ckbtn_new         (fallback)
+# widgets:ckbtn.pack            -> ac_widgets_ckbtn_pack        (fallback)
+# widgets:ckbtn.get             -> ac_widgets_ckbtn_get         (fallback)
+# widgets:ckbtn.set             -> ac_widgets_ckbtn_set         (fallback)
+
+# Dropdown
+# widgets:dropdown.new          -> ac_widgets_dropdown_new      (fallback)
+# widgets:dropdown.pack         -> ac_widgets_dropdown_pack     (fallback)
+# widgets:dropdown.add          -> ac_widgets_dropdown_add      (fallback)
+# widgets:dropdown.get          -> ac_widgets_dropdown_get      (fallback)
+# widgets:dropdown.set          -> ac_widgets_dropdown_set      (fallback)
+
+# Progress bar
+# widgets:advance.new           -> ac_widgets_advance_new       (fallback)
+# widgets:advance.pack          -> ac_widgets_advance_pack      (fallback)
+# widgets:advance.set           -> ac_widgets_advance_set       (fallback)
+# widgets:advance.get           -> ac_widgets_advance_get       (fallback)
+
+# Slider
+# widgets:slider.new            -> ac_widgets_slider_new        (fallback)
+# widgets:slider.pack           -> ac_widgets_slider_pack       (fallback)
+# widgets:slider.get            -> ac_widgets_slider_get        (fallback)
+# widgets:slider.set            -> ac_widgets_slider_set        (fallback)
+
+# Group box
+# widgets:group.new             -> ac_widgets_group_new         (fallback)
+# widgets:group.pack            -> ac_widgets_group_pack        (fallback)
+
+# Listbox
+# widgets:listbox.new           -> ac_widgets_listbox_new       (fallback)
+# widgets:listbox.pack          -> ac_widgets_listbox_pack      (fallback)
+# widgets:listbox.add           -> ac_widgets_listbox_add       (fallback)
+# widgets:listbox.item          -> ac_widgets_listbox_item      (fallback)
+# widgets:listbox.count         -> ac_widgets_listbox_count     (fallback)

@@ -1,0 +1,10 @@
+class string property: player
+int sub.player: score
+int sub.player: level
+
+scores {
+    player: "Alex", score: 120, level: 5
+    player: "Sam", score: 90, level: 4
+    player: "Jordan", score: 150, level: 7
+    player: "Taylor", score: 110, level: 5
+}

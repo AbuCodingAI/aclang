@@ -1,0 +1,26 @@
+# AC Camera Library — lowering rules (ilib:camera)
+# Maps camera:* IR calls to the ac_camera_* / ac_sidebar_* / ac_screen_* C API.
+#
+# Default fallback: camera:X.Y -> ac_camera_X_Y
+# Explicit rules only for exceptions (sidebar and screen use different prefixes).
+
+# Camera lifecycle
+# camera:init          -> ac_camera_init        (fallback handles this)
+# camera:release       -> ac_camera_release      (fallback handles this)
+
+# Capture
+# camera:capture       -> ac_camera_capture      (fallback)
+# camera:capture.latest -> ac_camera_capture_latest  (fallback)
+# camera:capture.first  -> ac_camera_capture_first   (fallback)
+
+# Sidebar — prefix differs from camera:
+camera:sidebar.config       -> ac_sidebar_config
+camera:sidebar.region       -> ac_sidebar_setregion
+camera:sidebar.interactive  -> ac_sidebar_setinteractive
+camera:sidebar.display      -> ac_sidebar_display
+camera:sidebar.ask          -> ac_sidebar_ask
+camera:sidebar.input        -> ac_sidebar_getinput
+
+# Screen mode — prefix differs from camera:
+camera:screen.mode          -> ac_screen_setmode
+camera:screen.update        -> ac_screen_update
