@@ -88,6 +88,8 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"const",  TokenType::KW_CONST},
     {"cp",     TokenType::KW_CP},
     {"length", TokenType::KW_LENGTH},
+    {"LineUp", TokenType::KW_LINEUP},
+    {"export", TokenType::KW_EXPORT},
 };
 
 // First-byte fast-path: if a word's first byte is NOT in kwFirstByte, it can't be a keyword.

@@ -121,6 +121,8 @@ enum class TokenType {
     KW_CONST,       // const x = expr — immutable binding (JS/C++ semantics)
     KW_CP,          // cp x = y — explicit value copy
     KW_LENGTH,      // length(x) — array/string length
+    KW_LINEUP,      // LineUp — match statement with value: case syntax
+    KW_EXPORT,      // export — export function/variable for use in other files
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>

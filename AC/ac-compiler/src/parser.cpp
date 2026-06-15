@@ -859,6 +859,50 @@ private:
             return node;
         }
 
+        // LineUp value { case1: stmt, case2: stmt, default: stmt }
+        if (at(TokenType::KW_LINEUP)) {
+            advance(); // consume 'LineUp'
+            auto baseExpr = parseExpression(0);
+            skipNewlines();
+            auto node = std::make_unique<ASTNode>(NodeType::CondStmt); // Reuse CondStmt for similar semantics
+            node->attrs.push_back("lineup"); // Mark as LineUp variant
+            if (baseExpr) node->children.push_back(std::move(baseExpr));
+
+            expect(TokenType::LBRACE, "Expected '{' after LineUp expression");
+            skipNewlines();
+
+            while (!at(TokenType::RBRACE) && !at(TokenType::END_OF_FILE)) {
+                if (at(TokenType::IDENTIFIER) && peek().value == "default") {
+                    advance(); // consume 'default'
+                    expect(TokenType::COLON, "Expected ':' after 'default'");
+                    skipNewlines();
+                    auto stmt = parseStatementInner();
+                    auto o = std::make_unique<ASTNode>(NodeType::CondOther);
+                    if (stmt) o->children.push_back(std::move(stmt));
+                    node->children.push_back(std::move(o));
+                } else {
+                    auto caseExpr = parseExpression(0);
+                    if (!caseExpr) {
+                        throw SYNTAX_ERROR("Expected case value in LineUp", peek().line, peek().col);
+                    }
+                    expect(TokenType::COLON, "Expected ':' after case value");
+                    skipNewlines();
+                    auto stmt = parseStatementInner();
+                    auto c = std::make_unique<ASTNode>(NodeType::CondCase);
+                    c->children.push_back(std::move(caseExpr));
+                    if (stmt) c->children.push_back(std::move(stmt));
+                    node->children.push_back(std::move(c));
+                }
+                skipNewlines();
+                if (at(TokenType::COMMA)) {
+                    advance();
+                    skipNewlines();
+                }
+            }
+            expect(TokenType::RBRACE, "Expected '}' to close LineUp");
+            return node;
+        }
+
         // FOR item in list
         if (at(TokenType::KW_FOR)) {
             return parseFor();

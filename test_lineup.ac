@@ -1,0 +1,10 @@
+AC->PY
+<mainloop>
+    value = 2
+    LineUp value {
+        1: Term.display $One$,
+        2: Term.display $Two$,
+        3: Term.display $Three$,
+        default: Term.display $Other$
+    }
+<mainloop>
