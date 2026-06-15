@@ -1129,6 +1129,39 @@ private:
             emitHalt();
             break;
 
+        // ─── Phase 3: Memory & Pointers (Stubs - pointers not in AC yet) ─────
+        case IROpcode::ALLOC: {
+            // Stub: allocate array/list (placeholder)
+            // For now, just set result to 0 (no actual allocation)
+            if (ins.result.isValid()) {
+                em.mov_ri32(R::RAX, 0);
+                store(ins.result, R::RAX);
+            }
+            break;
+        }
+
+        case IROpcode::FREE: {
+            // Stub: deallocate memory (placeholder)
+            // For now, no-op
+            break;
+        }
+
+        case IROpcode::LOAD_INDEX: {
+            // Stub: load array[index] (placeholder)
+            // For now, just load first operand (the array)
+            if (ins.result.isValid() && !ops.empty()) {
+                load(ops[0], R::RAX);
+                store(ins.result, R::RAX);
+            }
+            break;
+        }
+
+        case IROpcode::STORE_INDEX: {
+            // Stub: store to array[index] (placeholder)
+            // For now, no-op
+            break;
+        }
+
         case IROpcode::NOP:
         default:
             break;

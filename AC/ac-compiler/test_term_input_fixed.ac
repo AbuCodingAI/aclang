@@ -1,0 +1,7 @@
+AC->BNY
+
+<mainloop>
+    y = Term.ask $Enter: $
+    Term.display y
+    /end
+<mainloop>
