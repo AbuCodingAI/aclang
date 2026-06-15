@@ -22,14 +22,14 @@ In Progress:
 
 ## In-Progress Phases
 
-### Phase 3: Memory & Pointers ⏸️ NOT STARTED
-Needs Implementation:
-- ALLOC (array/list creation)
-- FREE (memory deallocation)
-- LOAD_INDEX (array indexing)
-- STORE_INDEX (array assignment)
+### Phase 3: Memory & Pointers ⏳ STUBS ONLY
+Implemented as Placeholders (pending pointers in AC):
+- ✅ ALLOC - allocate array/list (returns 0)
+- ✅ FREE - deallocate memory (no-op)
+- ✅ LOAD_INDEX - load array[index] (returns array)
+- ✅ STORE_INDEX - store to array[index] (no-op)
 
-Note: Requires understanding AC's memory layout for composite types
+Stubs allow code to compile. Real implementations when pointers are added to AC.
 
 ## Architecture Notes
 
