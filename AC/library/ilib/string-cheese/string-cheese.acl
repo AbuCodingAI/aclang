@@ -19,3 +19,5 @@ stringm:startswith  -> stringm.startswith
 stringm:endswith    -> stringm.endswith
 stringm:count       -> stringm.count
 stringm:format      -> stringm.format
+stringm:getline     -> stringm.getline
+stringm:scan        -> stringm.scan

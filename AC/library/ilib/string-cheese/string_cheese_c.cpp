@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <string>
+#include <iostream>
 #include <algorithm>
 #include <regex>
 
@@ -140,6 +141,28 @@ int ac_stringm_count(const char* s, const char* sub) {
 
 const char* ac_stringm_format(const char* template_str) {
     return template_str ? template_str : "";
+}
+
+const char* ac_stringm_getline() {
+    // Read a line from stdin and return it
+    static thread_local std::string line;
+    line.clear();
+    if (std::getline(std::cin, line)) {
+        return _sc(line);
+    }
+    return _sc("");
+}
+
+int ac_stringm_scan(const char* needle) {
+    // Read a line from stdin and check if it contains the needle
+    // Returns 1 if found, 0 if not found or EOF
+    if (!needle) return 0;
+    static thread_local std::string line;
+    line.clear();
+    if (std::getline(std::cin, line)) {
+        return (line.find(needle) != std::string::npos) ? 1 : 0;
+    }
+    return 0;
 }
 
 } // extern "C"

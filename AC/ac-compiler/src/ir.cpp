@@ -3294,6 +3294,7 @@ static void runDCE(std::vector<IRInstruction>& instrs) {
     auto hasSideEffect = [](IROpcode op) {
         switch (op) {
             case IROpcode::PRINT:
+            case IROpcode::INPUT:        // Term.ask reads user input (side effect!)
             case IROpcode::HALT:
             case IROpcode::CALL:
             case IROpcode::LIB_CALL:
