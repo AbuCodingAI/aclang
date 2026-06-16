@@ -16,7 +16,7 @@ enum class TokenType {
     GT,             // >
     MULTIPLY,       // * inside fn...fn context
     AT,             // @ (default multiplication operator)
-    AMPERSAND,      // &
+    AMPERSAND,      // & (bitwise AND)
     DOUBLE_AMPERSAND, // && (method chaining with different args)
     DOT,            // .
     SLASH,          // /
@@ -37,14 +37,19 @@ enum class TokenType {
     MULTIPLY_EQUAL, // *=
     DIVIDE_EQUAL,   // /=
     AT_EQUAL,       // @= (compound multiplication)
-    PIPE,           // |  (XOR)
-    PIPE_EQUAL,     // |= (XOR-assign)
-    HASH,           // #  (unary NOT)
+    PIPE,           // | (bitwise XOR)
+    PIPE_EQUAL,     // |= (bitwise XOR-assign)
+    TILDE,          // ~ (bitwise NOT)
+    HASH,           // #  (unary NOT — legacy, use 'not' instead)
     HASH_GT,        // #> (NOT greater → <=)
     HASH_LT,        // #< (NOT less → >=)
-    HASH_PIPE,      // #| (XNOR)
+    HASH_PIPE,      // #| (logical XNOR)
     CARET,          // ^ (exponentiation)
     KW_XSUB,        // xsub (inclusive range count: |a-b|+1)
+    KW_AND,         // and (logical AND)
+    KW_OR,          // or (logical OR)
+    KW_XOR,         // xor (logical XOR)
+    KW_BOR,         // bor (bitwise OR)
 
     // Keywords
     KW_IF,

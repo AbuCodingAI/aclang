@@ -119,6 +119,10 @@ static std::string opcodeStr(IROpcode op) {
         case IROpcode::XOR:           return "xor";
         case IROpcode::XNOR:          return "xnor";
         case IROpcode::XSUB:          return "xsub";
+        case IROpcode::BAND:          return "band";
+        case IROpcode::BOR:           return "bor";
+        case IROpcode::BXOR:          return "bxor";
+        case IROpcode::BNOT:          return "bnot";
         case IROpcode::ALLOC:         return "alloc";
         case IROpcode::FREE:          return "free";
         case IROpcode::FREE_DECL:     return "free_decl";
@@ -369,10 +373,17 @@ class IRGenerator {
                     else if (op == ">") opcode = IROpcode::GT;
                     else if (op == "#>") opcode = IROpcode::LTE;   // NOT greater = ≤
                     else if (op == "#<") opcode = IROpcode::GTE;   // NOT less = ≥
-                    else if (op == "AND" || op == "and" || op == "&") opcode = IROpcode::AND;
-                    else if (op == "OR" || op == "or") opcode = IROpcode::OR;
-                    else if (op == "|")    opcode = IROpcode::XOR;
-                    else if (op == "#|")   opcode = IROpcode::XNOR;
+                    // Logical operators
+                    else if (op == "and") opcode = IROpcode::AND;
+                    else if (op == "or")  opcode = IROpcode::OR;
+                    else if (op == "xor") opcode = IROpcode::XOR;
+                    else if (op == "#|")  opcode = IROpcode::XNOR;
+
+                    // Bitwise operators
+                    else if (op == "&")   opcode = IROpcode::BAND;
+                    else if (op == "|")   opcode = IROpcode::BXOR;
+                    else if (op == "bor") opcode = IROpcode::BOR;
+
                     else if (op == "xsub") opcode = IROpcode::XSUB;
 
                     if (op == "overlap") {
@@ -514,7 +525,13 @@ class IRGenerator {
                         emit(std::move(i));
                         return dst;
                     } else if (expr.value == "NOT" || expr.value == "#") {
+                        // Logical NOT
                         IRInstruction i(IROpcode::NOT, dst, {operand});
+                        emit(std::move(i));
+                        return dst;
+                    } else if (expr.value == "BNOT") {
+                        // Bitwise NOT (~)
+                        IRInstruction i(IROpcode::BNOT, dst, {operand});
                         emit(std::move(i));
                         return dst;
                     }

@@ -28,6 +28,10 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"raise",    TokenType::KW_RAISE},
     {"ERR",      TokenType::KW_ERR},
     {"not",      TokenType::KW_NOT},
+    {"and",      TokenType::KW_AND},
+    {"or",       TokenType::KW_OR},
+    {"xor",      TokenType::KW_XOR},
+    {"bor",      TokenType::KW_BOR},
     {"of",       TokenType::KW_OF},
     {"type",     TokenType::KW_TYPE},
     {"Overlap",  TokenType::KW_OVERLAP},
@@ -433,7 +437,8 @@ public:
                     if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::PIPE_EQUAL, "|=", line, sc); }
                     else tokens.emplace_back(TokenType::PIPE, "|", line, sc);
                     break;
-                case '^': pos++; col++; tokens.emplace_back(TokenType::CARET, "^", line, sc); break;
+                case '^': tokens.emplace_back(TokenType::CARET, "^", line, sc); break;
+                case '~': tokens.emplace_back(TokenType::TILDE, "~", line, sc); break;
                 case '<':
                     tokens.emplace_back(TokenType::LT, "<", line, sc);
                     break;

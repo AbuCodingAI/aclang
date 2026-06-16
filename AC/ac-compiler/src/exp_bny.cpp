@@ -189,6 +189,7 @@ public:
     void sub_rr(R d, R s) { rex(true,(int)s,(int)d); emit(0x29); modrm(3,(int)s,(int)d); }
     void imul_rr(R d, R s) { rex(true,(int)d,(int)s); emit(0x0F); emit(0xAF); modrm(3,(int)d,(int)s); }
     void neg_r(R r) { rex(true,0,(int)r); emit(0xF7); modrm(3,3,(int)r); }
+    void not_r(R r) { rex(true,0,(int)r); emit(0xF7); modrm(3,2,(int)r); }
     void xor_rr(R d, R s) { rex(true,(int)s,(int)d); emit(0x31); modrm(3,(int)s,(int)d); }
     void and_rr(R d, R s) { rex(true,(int)s,(int)d); emit(0x21); modrm(3,(int)s,(int)d); }
     void or_rr(R d, R s)  { rex(true,(int)s,(int)d); emit(0x09); modrm(3,(int)s,(int)d); }
@@ -995,6 +996,31 @@ private:
             em.xor_rr(R::RAX, R::RDX);    // flip bits if negative
             em.sub_rr(R::RAX, R::RDX);    // add 1 if was negative (abs)
             em.inc_r(R::RAX);             // +1 for inclusive count
+            store(ins.result, R::RAX);
+            break;
+
+        // Bitwise operations (on integer values, not boolean)
+        case IROpcode::BAND:
+            load(op0(), R::RAX);
+            load(op1(), R::RCX);
+            em.and_rr(R::RAX, R::RCX);
+            store(ins.result, R::RAX);
+            break;
+        case IROpcode::BOR:
+            load(op0(), R::RAX);
+            load(op1(), R::RCX);
+            em.or_rr(R::RAX, R::RCX);
+            store(ins.result, R::RAX);
+            break;
+        case IROpcode::BXOR:
+            load(op0(), R::RAX);
+            load(op1(), R::RCX);
+            em.xor_rr(R::RAX, R::RCX);
+            store(ins.result, R::RAX);
+            break;
+        case IROpcode::BNOT:
+            load(op0(), R::RAX);
+            em.not_r(R::RAX);
             store(ins.result, R::RAX);
             break;
 

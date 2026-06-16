@@ -1,13 +1,78 @@
-AC->PY
+AC->BNY
+
+Make test_logical func()
+    Term.display $=== Logical Operators ===$
+    x = 1
+    y = 0
+
+    and_result = x and y
+    Term.display and_result
+
+    or_result = x or y
+    Term.display or_result
+
+    xor_result = x xor y
+    Term.display xor_result
+
+    not_result = not x
+    Term.display not_result
+
+    /* Hash is alias for not */
+    hash_not = # x
+    Term.display hash_not
+
+    return 0
+
+Make test_bitwise func()
+    Term.display $=== Bitwise Operators ===$
+    a = 12      /* 1100 in binary */
+    b = 10      /* 1010 in binary */
+
+    /* Bitwise AND: a & b = 1000 = 8 */
+    band_result = a & b
+    Term.display band_result
+
+    /* Bitwise XOR: a | b = 0110 = 6 */
+    bxor_result = a | b
+    Term.display bxor_result
+
+    /* Bitwise OR: a bor b = 1110 = 14 */
+    bor_result = a bor b
+    Term.display bor_result
+
+    /* Bitwise NOT: ~a */
+    bnot_result = ~ a
+    Term.display bnot_result
+
+    return 0
+
+Make test_numeric_multiply func()
+    Term.display $=== Numeric Multiply (*) ===$
+    a = 5
+    b = 3
+    result = a * b
+    Term.display result
+    return 0
+
+Make test_polymorphic_multiply func()
+    Term.display $=== Polymorphic Multiply (@) ===$
+    /* String repetition */
+    str = $ab$
+    str_result = str @ 3
+    Term.display str_result
+
+    /* Numeric (when both are numbers) */
+    x = 5
+    y = 3
+    num_result = x @ y
+    Term.display num_result
+
+    return 0
 
 <mainloop>
-    a = 1
-    b = 0
-    Term.display a & b
-    Term.display a and b
-    Term.display a or b
-    Term.display a | b
-    Term.display a #| b
-    Term.display # a
-    /kill
+    test_logical()
+    test_bitwise()
+    test_numeric_multiply()
+    test_polymorphic_multiply()
+    /end
 <mainloop>

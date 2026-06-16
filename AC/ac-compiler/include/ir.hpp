@@ -70,6 +70,12 @@ enum class IROpcode {
     XOR,   // Boolean XOR: (a!=0) != (b!=0)
     XNOR,  // Boolean XNOR: (a!=0) == (b!=0)
     XSUB,  // Inclusive range count: |a - b| + 1
+
+    // Bitwise
+    BAND,  // Bitwise AND: a & b
+    BOR,   // Bitwise OR: a bor b
+    BXOR,  // Bitwise XOR: a | b
+    BNOT,  // Bitwise NOT: ~a
     
     // Memory
     ALLOC,

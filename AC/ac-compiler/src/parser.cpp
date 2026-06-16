@@ -113,31 +113,32 @@ private:
 
     int getPrecedence(TokenType op) {
         switch (op) {
-            // Precedence 1: OR
-            case TokenType::IDENTIFIER:
-                if (peek().value == "OR" || peek().value == "or") return 1;
-                if (peek().value == "and") return 3;
-                // Check for other operators
-                {
-                    const std::string& val = peek().value;
-                    if (val == "+" || val == "-") return 5;
-                    if (val == "*" || val == "/") return 6;
-                }
-                return 0;  // Not an operator
+            // Precedence 1: Logical OR
+            case TokenType::KW_OR:
+                return 1;
 
-            // Precedence 2: XOR / XNOR
-            case TokenType::PIPE:
-            case TokenType::HASH_PIPE:
+            // Precedence 2: Logical XOR
+            case TokenType::KW_XOR:
                 return 2;
 
-            // Precedence 3: AND
-            case TokenType::AMPERSAND:
+            // Precedence 3: Logical AND
+            case TokenType::KW_AND:
                 return 3;
-            case TokenType::KW_NOT:
-                if (peek().value == "AND" || peek().value == "and") return 3;
-                return 0;
 
-            // Precedence 4: Comparisons (#> = ≤, #< = ≥) and overlap/is infix
+            // Precedence 4: Bitwise OR
+            case TokenType::KW_BOR:
+                return 4;
+
+            // Precedence 5: Bitwise XOR / Logical XNOR
+            case TokenType::PIPE:        // Bitwise XOR
+            case TokenType::HASH_PIPE:   // Logical XNOR
+                return 5;
+
+            // Precedence 6: Bitwise AND
+            case TokenType::AMPERSAND:
+                return 6;
+
+            // Precedence 7: Comparisons (#> = ≤, #< = ≥) and overlap/is infix
             case TokenType::KW_IS:
             case TokenType::NOT_EQUAL:
             case TokenType::LT:
@@ -145,24 +146,24 @@ private:
             case TokenType::HASH_GT:
             case TokenType::HASH_LT:
             case TokenType::KW_OVERLAP:
-                return 4;
+                return 7;
 
-            // Precedence 5: Addition/Subtraction/xsub
+            // Precedence 8: Addition/Subtraction/xsub
             case TokenType::PLUS_EQUAL:  // When used as + in expression context
             case TokenType::MINUS_EQUAL: // When used as - in expression context
             case TokenType::KW_XSUB:
-                return 5;
+                return 8;
 
-            // Precedence 6: Multiplication/Division
+            // Precedence 9: Multiplication/Division
             case TokenType::MULTIPLY:
             case TokenType::SLASH:
             case TokenType::DOUBLE_SLASH:
             case TokenType::AT:
-                return 6;
+                return 9;
 
-            // Precedence 7: Exponentiation (right-associative)
+            // Precedence 10: Exponentiation (right-associative)
             case TokenType::CARET:
-                return 7;
+                return 10;
 
             default:
                 return 0;
@@ -194,7 +195,7 @@ private:
             return node;
         }
 
-        // Unary # (boolean NOT)
+        // Unary # (logical NOT — alias for 'not')
         if (at(TokenType::HASH)) {
             advance();
             auto operand = parseExpression(7); // Precedence 7 for unary
@@ -202,7 +203,16 @@ private:
             node->children.push_back(std::move(operand));
             return node;
         }
-        
+
+        // Unary ~ (bitwise NOT)
+        if (at(TokenType::TILDE)) {
+            advance();
+            auto operand = parseExpression(7); // Precedence 7 for unary
+            auto node = std::make_unique<ASTNode>(NodeType::UnaryExpr, "BNOT");
+            node->children.push_back(std::move(operand));
+            return node;
+        }
+
         // Parenthesized expression
         if (at(TokenType::LPAREN)) {
             advance();
@@ -496,6 +506,18 @@ private:
             advance();
         } else if (op == TokenType::KW_XSUB) {
             opStr = "xsub";
+            advance();
+        } else if (op == TokenType::KW_AND) {
+            opStr = "and";
+            advance();
+        } else if (op == TokenType::KW_OR) {
+            opStr = "or";
+            advance();
+        } else if (op == TokenType::KW_XOR) {
+            opStr = "xor";
+            advance();
+        } else if (op == TokenType::KW_BOR) {
+            opStr = "bor";
             advance();
         } else {
             // Unknown operator

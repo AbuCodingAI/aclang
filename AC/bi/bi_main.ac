@@ -1,0 +1,18 @@
+AC->BNY
+use flib parser.ac
+
+<mainloop>
+    Term.display $=============================$
+    Term.display $Bi Language Interpreter v0.1$
+    Term.display $=============================$
+
+    code=$say(Hello)$
+    tokens=parser.tokenize(code)
+    count=length(tokens)
+    Term.display $Code: $
+    Term.display code
+    Term.display $Token count: $
+    Term.display count
+
+    /end
+<mainloop>
