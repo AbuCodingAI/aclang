@@ -2836,6 +2836,32 @@ class IRGenerator {
             break;
         }
 
+        case NodeType::CompfoldStmt: {
+            // compfold x = expr — user-requested compile-time constant folding
+            IRRef varRef = mkVar(n.value);
+            IRRef src = n.children.empty() ? mkConstInt(0) : lowerExprNode(*n.children[0]);
+
+            // Check if the result is a constant
+            if (src.kind == IRRef::Kind::CONST) {
+                // Successfully folded!
+                IRInstruction i(IROpcode::STORE_VAR, varRef, {src});
+                i.attrs.push_back("compfold_success");
+                emit(std::move(i));
+            } else {
+                // Can't fold — emit Toxic warning and fall back to runtime
+                std::cerr << "Toxic: User making compiler do impossible operations\n";
+                std::cerr << "    compfold " << n.value << " = <expression>\n";
+                std::cerr << "    ^^^^^^^^\n";
+                std::cerr << "Falling back to runtime evaluation\n";
+
+                // Still emit the code, just at runtime
+                IRInstruction i(IROpcode::STORE_VAR, varRef, {src});
+                i.attrs.push_back("compfold_fallback");
+                emit(std::move(i));
+            }
+            break;
+        }
+
         case NodeType::CopyStmt: {
             // cp x = y — deep copy of rhs into lhs
             IRRef dst = mkVar(n.value);

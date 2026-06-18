@@ -1245,6 +1245,17 @@ private:
             return node;
         }
 
+        // compfold x = expr — request compile-time constant folding
+        if (at(TokenType::KW_COMPFOLD)) {
+            advance();
+            std::string name = expect(TokenType::IDENTIFIER, "Expected variable name after compfold").value;
+            expect(TokenType::ASSIGN, "Expected = after compfold variable name");
+            auto val = parseExpression(0);
+            auto node = std::make_unique<ASTNode>(NodeType::CompfoldStmt, name);
+            if (val) node->children.push_back(std::move(val));
+            return node;
+        }
+
         // cp x = y — explicit value copy
         if (at(TokenType::KW_CP)) {
             advance();

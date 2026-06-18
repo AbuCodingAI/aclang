@@ -124,6 +124,7 @@ enum class TokenType {
     KW_AFTER,       // after block (finally)
     KW_USING,       // using <lib> — bring library namespace into scope
     KW_CONST,       // const x = expr — immutable binding (JS/C++ semantics)
+    KW_COMPFOLD,    // compfold x = expr — request compile-time constant folding
     KW_CP,          // cp x = y — explicit value copy
     KW_LENGTH,      // length(x) — array/string length
     KW_LINEUP,      // LineUp — match statement with value: case syntax

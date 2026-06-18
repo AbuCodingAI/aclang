@@ -80,6 +80,7 @@ enum class NodeType {
     AliasDecl,      // alias x = y — bidirectional live binding between two variables
     TypeCoerceStmt, // dec/int/string/bool x [= expr]  — coerce x to type
     ConstDecl,      // const x = expr — immutable binding
+    CompfoldStmt,   // compfold x = expr — request compile-time constant folding
     CopyStmt,       // cp x = y — explicit value copy
     CondStmt,       // cond expr { is value: block } ... OTHER block
     CondCase,       // is <expr> ... (child[0]=expr, child[1]=block)
