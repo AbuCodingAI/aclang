@@ -1,0 +1,4 @@
+AC->BNY
+<mainloop>
+    Term.display Term.ask $How are you doing: $
+<mainloop>

@@ -745,6 +745,68 @@ private:
         // import — handled via PLT/GOT; nothing to emit at runtime
         if (method == "import") return;
 
+        // Pointer library operations
+        if (method.rfind("pointers.", 0) == 0) {
+            std::string op = method.substr(9);  // Strip "pointers."
+
+            if (op == "ptr") {  // Create pointer
+                if (ins.typedOperands.size() >= 2) {
+                    load(ins.typedOperands[1], abi.argRegs[0]);  // value to point to
+                    em.call("__ac_ptr_new__");
+                    if (ins.result.isValid()) store(ins.result, R::RAX);
+                }
+                return;
+            }
+            else if (op == "deref") {  // Dereference pointer
+                if (ins.typedOperands.size() >= 2) {
+                    load(ins.typedOperands[1], abi.argRegs[0]);  // pointer
+                    em.call("__ac_ptr_deref__");
+                    if (ins.result.isValid()) store(ins.result, R::RAX);
+                }
+                return;
+            }
+            else if (op == "null") {  // Get null pointer
+                em.mov_ri32(R::RAX, -1);  // -1 = null pointer
+                if (ins.result.isValid()) store(ins.result, R::RAX);
+                return;
+            }
+            else if (op == "is_null") {  // Check if null
+                if (ins.typedOperands.size() >= 2) {
+                    load(ins.typedOperands[1], R::RAX);  // pointer
+                    em.cmp_r_i32(R::RAX, -1);
+                    em.setcc_r(0x04, R::RAX);  // SETE - set if equal
+                    if (ins.result.isValid()) store(ins.result, R::RAX);
+                }
+                return;
+            }
+            else if (op == "eq") {  // Compare pointers
+                if (ins.typedOperands.size() >= 3) {
+                    load(ins.typedOperands[1], R::RAX);  // ptr1
+                    load(ins.typedOperands[2], R::RCX);  // ptr2
+                    em.cmp_rr(R::RAX, R::RCX);
+                    em.setcc_r(0x04, R::RAX);  // SETE
+                    if (ins.result.isValid()) store(ins.result, R::RAX);
+                }
+                return;
+            }
+            else if (op == "copy") {  // Copy pointer
+                if (ins.typedOperands.size() >= 2) {
+                    load(ins.typedOperands[1], R::RAX);  // pointer
+                    if (ins.result.isValid()) store(ins.result, R::RAX);
+                }
+                return;
+            }
+            else if (op == "update") {  // Update value at pointer
+                if (ins.typedOperands.size() >= 3) {
+                    load(ins.typedOperands[1], abi.argRegs[0]);  // pointer
+                    load(ins.typedOperands[2], abi.argRegs[1]);  // new value
+                    em.call("__ac_ptr_update__");
+                    if (ins.result.isValid()) store(ins.result, R::RAX);
+                }
+                return;
+            }
+        }
+
         // General Term.X(args) — call math.X PLT stub, print integer result
         // Term.display and Term.ask fall through to the default print below
         if (method.rfind("Term.", 0) == 0 && method.size() > 5 &&

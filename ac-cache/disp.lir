@@ -1,0 +1,10 @@
+; AC LIR  backend=BNY
+; Symbol Table: 1 symbols
+; Arena: 0 / 65536 bytes used (1 blocks)
+
+section .global:
+  tag_begin "mainloop"
+  t_0 = input "How are you doing: "
+  lib_call Term.display, t_0
+  tag_end "mainloop"
+
