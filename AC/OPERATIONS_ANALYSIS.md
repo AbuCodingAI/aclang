@@ -105,25 +105,29 @@ AC->PY
 use ilib web
 use ilib os
 
+/* Define request handlers using AC's Make func syntax */
+Make handleRoot func(request)
+    RETURN $<html><body>Hello World!</body></html>$
+Make
+
+Make handleAPI func(request)
+    data = request.body
+    result = process(data)
+    RETURN web.json(result)
+Make
+
 <mainloop>
     /* 1. Create HTTP server on port 8080 */
     server = web.httpServer("0.0.0.0", 8080)
     
-    /* 2. Define routes */
-    server.get("/", fn(request)
-        RETURN $<html><body>Hello!</body></html>$
-    )
-    
-    server.post("/api/data", fn(request)
-        data = request.body
-        result = process(data)
-        RETURN web.json(result)
-    )
+    /* 2. Define routes (pass function names, not fn() syntax) */
+    server.get("/", handleRoot)
+    server.post("/api/data", handleAPI)
     
     /* 3. Serve static files */
     server.static("/public", "./static")
     
-    /* 4. Start listening */
+    /* 4. Start listening (blocks, handles requests) */
     server.listen()
     
     /end
