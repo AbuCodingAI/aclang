@@ -1,75 +1,125 @@
 # AC Language: Dual-Mode Architecture
 
-## The Vision: Pure Native + Pure Transpiler
+## The Vision: Universal Native Performance
 
-AC is engineered with a **dual-mode strategy** that maximizes both performance and portability:
+AC uses an **intelligent dual-mode strategy** that provides native performance everywhere:
 
-### 🚀 **Pure Native Powerhouse (Linux x86-64)**
+### 🚀 **Pure Native (x86 Architecture)**
 
-**AC → BNY Backend → x86-64 Assembly → ELF64 Binary**
+**All x86 platforms use direct x86-64 assembly generation:**
 
-- Generates **native machine code directly**
-- No intermediate transpilation layer
+```
+AC Code → x86-64 Assembly → Binary
+  ↓
+  ├─ Windows x86    → PE executable
+  ├─ macOS Intel    → Mach-O executable  
+  └─ Linux x86      → ELF64 executable
+```
+
+**Benefits:**
+- No intermediate transpilation
 - Maximum performance
-- Direct syscall integration
-- Optimized for server workloads on Linux
-
-**Targets:**
-- Ubuntu, Fedora, Arch Linux, Mint, Bazzite
-- Any Linux x86-64 system with libc
+- Direct syscall/API integration
+- Optimized for each platform
 
 ### ⚡ **Pure Transpiler (ARM Architecture)**
 
-**AC → C Code → GCC/Clang → Native Binary**
+**All ARM platforms intelligently fall back to C:**
 
-- Intelligently transpiles to C when targeting ARM
+```
+AC Code → C Code → Native ARM Binary
+  ↓
+  ├─ Windows ARM    → GCC → Binary
+  ├─ macOS ARM      → Clang → Binary
+  └─ Linux ARM      → GCC → Binary
+```
+
+**Benefits:**
 - Leverages existing C compiler ecosystem
-- Works on any platform with GCC or Clang
-- Portable: compile once AC code, run anywhere
+- Works on any platform with GCC/Clang
+- Near-native performance
+- Portable source code
 
-**Usage:**
+---
+
+## **Platform Matrix**
+
+| Platform | Architecture | Compilation | Output |
+|----------|--------------|-------------|--------|
+| Windows | x86-64 | Direct ASM | PE Binary |
+| Windows | ARM | AC→C→GCC | ARM Binary |
+| macOS | x86-64 (Intel) | Direct ASM | Mach-O Binary |
+| macOS | ARM (Apple Silicon) | AC→C→Clang | ARM Binary |
+| Linux | x86-64 | Direct ASM (BNY) | ELF64 Binary |
+| Linux | ARM | AC→C→GCC | ARM Binary |
+
+---
+
+## **How It Works**
+
 ```ac
-AC->BNY   // On x86 Linux: generates native ELF
-AC->BNY   // On ARM: auto-transpiles to C, uses GCC/Clang
+AC->BNY   // User writes same code everywhere
 
-AC->C     // Explicit: always use C transpiler
+// Compiler automatically detects target:
+
+Windows x86-64?
+  ✅ Direct x86 ASM → PE format
+
+Windows ARM?
+  ⏳ Transpile to C → GCC → ARM binary
+
+macOS Intel?
+  ✅ Direct x86 ASM → Mach-O format
+
+macOS ARM (M1/M2/M3)?
+  ⏳ Transpile to C → Clang → ARM binary
+
+Linux x86-64?
+  ✅ Direct x86 ASM → ELF64 format (BNY backend)
+
+Linux ARM?
+  ⏳ Transpile to C → GCC → ARM binary
 ```
 
-**Targets:**
-- macOS ARM (Apple Silicon) - uses Clang
-- Windows ARM - uses GCC
-- Linux ARM - uses GCC
-- Any architecture with C compiler support
+---
 
-### 📊 Architecture Decision Tree
+## **The AC Promise**
 
-```
-User writes: AC->BNY or AC->ASM
-         ↓
-Is target x86-64 Linux?
-   ├─ YES → Native compilation (ELF64 direct)
-   └─ NO → Auto-transpile to C + system C compiler
-             (macOS/Win/Linux on ARM)
-```
+> AC is a **pure native powerhouse on x86** across all platforms 
+> and a **pure transpiler on ARM** for maximum portability.
 
-## Why This Design?
+- **x86**: Maximum native performance everywhere
+- **ARM**: Universal portability via C
+- **Single Source**: One AC program, infinite targets
+- **Automatic**: Compiler handles platform detection
 
-1. **Performance where it matters**: Native code on Linux servers
-2. **Portability where needed**: C transpilation on ARM
-3. **Single source**: User writes same AC code everywhere
-4. **Compiler intelligence**: Platform detection automatic
-5. **No user complexity**: "Genius protocol" is transparent
+---
 
-## Current Status
+## **Current Implementation Status**
 
-- ✅ **Pure Native** (Linux x86): BNY backend complete
-- ⚠️ **Pure Transpiler** (ARM): C backend + AC→C transpiler (in progress)
-- ✅ **Multi-backend**: Python, JavaScript, C
-- ✅ **Operator coverage**: Logical, bitwise, comparison
-- ✅ **I/O system**: Term.display, Term.ask with proper types
-- ✅ **Memory safety**: Pointers + References framework
+| Component | Status | Details |
+|-----------|--------|---------|
+| **x86 Native** | ✅ Complete | PE (Windows), Mach-O (macOS), ELF64 (Linux) |
+| **BNY Backend** | ✅ Complete | Linux x86-64 ELF64 native generation |
+| **ARM Transpiler** | ⏳ In Progress | AC→C→GCC/Clang pipeline |
+| **Platform Detection** | ⏳ In Progress | Automatic architecture selection |
+| **Multi-backend** | ✅ Complete | Python, JavaScript, C backends |
+| **Operators** | ✅ Complete | Logical, bitwise, comparison |
+| **I/O System** | ✅ Complete | Term.display, Term.ask with proper types |
+| **Memory Safety** | ✅ In Progress | Pointers + References framework (Phase 3) |
 
-## The AC Promise
+---
 
-> AC is a **pure native powerhouse on Linux** and a **pure transpiler on ARM** — 
-> one language, infinite platforms, maximum efficiency where it counts.
+## **Architecture Philosophy**
+
+AC rejects the false choice between performance and portability:
+
+- **Not** "pick one platform and optimize"
+- **Not** "transpile everything to be portable"
+- **Instead**: Native where it matters (x86), portable where it's needed (ARM)
+
+This makes AC ideal for:
+- 🖥️ **Servers** (x86 Linux powerhouse)
+- 📱 **Cross-platform tools** (ARM portable via C)
+- 🚀 **Performance-critical applications** (native on x86)
+- 🌍 **Distributed systems** (one source, many targets)
