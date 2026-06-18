@@ -56,12 +56,7 @@ namespace AC_BinaryGen {
     #endif
     }
     
-    static bool needsCrossCompilation() {
-        HostCPU cpu = detectCPU();
-        return (cpu == HostCPU::ARM64 || cpu == HostCPU::ARM32);
-    }
-    
-    static bool compileViaCrossCompiler(const std::string& binPath, const std::string& cPath) {
+        static bool compileViaCrossCompiler(const std::string& binPath, const std::string& cPath) {
         HostOS os = detectOS();
         std::string compiler = "gcc";
         if (os == HostOS::MACOS) compiler = "clang";
@@ -75,11 +70,53 @@ namespace AC_BinaryGen {
             return false;
         }
         
-        // Delete intermediary C file
-        std::remove(cPath.c_str());
+        // Delete intermediary C file after compilation
+        if (std::remove(cPath.c_str()) == 0) {
+            std::cerr << "[AC->BNY] Deleted intermediary: " << cPath << std::endl;
+        }
+        
         std::cerr << "[AC->BNY] Binary ready: " << binPath << std::endl;
         return true;
     }
+    
+    // Compile x86 ASM to platform-specific binary
+    static bool compileASMToBinary(const std::string& asmPath, const std::string& binPath) {
+        HostOS os = detectOS();
+        std::string compiler = "gcc";
+        std::string cmd;
+        
+        if (os == HostOS::WINDOWS) {
+            cmd = "ml64 /c /Fo temp.obj " + asmPath + " && link temp.obj /OUT:" + binPath;
+        } else if (os == HostOS::MACOS) {
+            cmd = "as " + asmPath + " -o temp.o && ld -o " + binPath + " temp.o -lSystem";
+        } else {  // Linux
+            cmd = "as " + asmPath + " -o temp.o && ld -o " + binPath + " temp.o";
+        }
+        
+        std::cerr << "[AC->BNY Assemble] " << cmd << std::endl;
+        
+        int result = std::system(cmd.c_str());
+        if (result != 0) {
+            std::cerr << "Toxic: Assembly compilation failed\n";
+            return false;
+        }
+        
+        // Clean up intermediary files
+        std::remove(asmPath.c_str());
+        std::remove("temp.o");
+        std::remove("temp.obj");
+        
+        std::cerr << "[AC->BNY] Binary ready: " << binPath << std::endl;
+        return true;
+    }
+
+
+    static bool needsCrossCompilation() {
+        HostCPU cpu = detectCPU();
+        return (cpu == HostCPU::ARM64 || cpu == HostCPU::ARM32);
+    }
+    
+    
 
 
 // ─── Register IDs ────────────────────────────────────────────────────────────
@@ -2694,6 +2731,11 @@ public:
         em.applyFixups();
 
 
+                // Platform-specific binary generation:
+        // - Linux x86: Direct ELF64 binary (no intermediary)
+        // - Non-Linux x86: ASM→Binary (compile then delete .s)
+        // - ARM: C→Binary (compile then delete .c)
+        
         if (!dynamic) {
             // Static ELF (original path)
             size_t hdrBytes = sizeof(ElfEhdr) + 2*sizeof(ElfPhdr);
