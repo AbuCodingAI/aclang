@@ -56,8 +56,6 @@ use ilib math
     green = math.LongInt 128
     blue = math.LongInt 64
     color = (red << 16) | (green << 8) | blue
-
-    /end
 <mainloop>
 ```
 
