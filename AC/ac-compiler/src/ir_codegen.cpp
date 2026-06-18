@@ -75,12 +75,13 @@ static std::string readFFIFile(const std::string &libName, const std::string &ex
 static std::string resolveIlibDir(const std::string& libName) {
     auto tryBase = [&](const std::string& base) -> std::string {
         std::string raw = base + "/library/ilib/" + libName;
-        struct stat st{};
-        if (stat(raw.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return "";
 #ifndef _WIN32
+        struct stat st{};
+        if (::stat(raw.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return "";
         char buf[4096] = {};
         return realpath(raw.c_str(), buf) ? std::string(buf) : raw;
 #else
+        // Windows: just return the path if it exists (simplified check)
         char buf[4096] = {};
         return _fullpath(buf, raw.c_str(), sizeof(buf)) ? std::string(buf) : raw;
 #endif
@@ -4933,6 +4934,9 @@ class VStrategy : public BackendStrategy
                         if (libDir.find(' ') != std::string::npos) {
                             std::string slug = ln;
                             for (char& c : slug) if (!std::isalnum((unsigned char)c)) c = '_';
+#ifdef _WIN32
+                            safeDir = libDir;  // Windows: no symlinks, use path directly
+#else
                             safeDir = "/tmp/ac_vlib_" + slug;
                             struct stat st{};
                             bool needLink = true;
@@ -4942,6 +4946,7 @@ class VStrategy : public BackendStrategy
                                     needLink = (std::string(rbuf) != libDir);
                             }
                             if (needLink) { unlink(safeDir.c_str()); symlink(libDir.c_str(), safeDir.c_str()); }
+#endif
                         }
                         std::string tok = "@AC_LIBDIR@";
                         std::string::size_type p = 0;
@@ -6656,6 +6661,7 @@ public:
                             };
                             aclContent = tryAcl(".");
                             if (aclContent.empty()) {
+#ifndef _WIN32
                                 char exeBuf[4096] = {};
                                 ssize_t len = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf)-1);
                                 if (len > 0) {
@@ -6664,6 +6670,7 @@ public:
                                     if (sl != std::string::npos) bd = bd.substr(0, sl);
                                     aclContent = tryAcl(bd + "/..");
                                 }
+#endif
                             }
                         }
                         std::istringstream aclss(aclContent);
