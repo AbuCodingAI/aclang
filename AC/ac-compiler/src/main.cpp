@@ -635,6 +635,7 @@ int main(int argc, char* argv[]) {
                 lowering.load(libRoot + "/ilib/regex/regex.acl");
                 lowering.load(libRoot + "/ilib/os/os.acl");
                 lowering.load(libRoot + "/ilib/string-cheese/string-cheese.acl");
+                lowering.load(libRoot + "/ilib/pointers/pointers.acl");
                 lowering.apply(irProg);
             }
 

@@ -1,0 +1,11 @@
+# ilib/pointers - Pointer semantics library lowering rules
+# Maps pointer library calls to backend-specific implementations
+
+# Pointer creation and access
+pointers:ptr_new      -> pointers.ptr_new
+pointers:ptr_deref    -> pointers.ptr_deref
+pointers:ptr_null     -> pointers.ptr_null
+pointers:ptr_is_null  -> pointers.ptr_is_null
+pointers:ptr_eq       -> pointers.ptr_eq
+pointers:ptr_copy     -> pointers.ptr_copy
+pointers:ptr_update   -> pointers.ptr_update
