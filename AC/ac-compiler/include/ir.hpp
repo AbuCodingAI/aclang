@@ -76,7 +76,9 @@ enum class IROpcode {
     BOR,   // Bitwise OR: a bor b
     BXOR,  // Bitwise XOR: a | b
     BNOT,  // Bitwise NOT: ~a
-    
+    PTM,   // Power Two Multiply: a ptm b (a * 2^b, shift left)
+    PTD,   // Power Two Divide: a ptd b (a / 2^b, shift right)
+
     // Memory
     ALLOC,
     FREE,       // destroy x — memory/variable destruction

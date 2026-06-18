@@ -32,6 +32,8 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"or",       TokenType::KW_OR},
     {"xor",      TokenType::KW_XOR},
     {"bor",      TokenType::KW_BOR},
+    {"ptm",      TokenType::KW_PTM},
+    {"ptd",      TokenType::KW_PTD},
     {"of",       TokenType::KW_OF},
     {"type",     TokenType::KW_TYPE},
     {"Overlap",  TokenType::KW_OVERLAP},

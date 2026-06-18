@@ -154,11 +154,13 @@ private:
             case TokenType::KW_XSUB:
                 return 8;
 
-            // Precedence 9: Multiplication/Division
+            // Precedence 9: Multiplication/Division (including power-of-2 variants)
             case TokenType::MULTIPLY:
             case TokenType::SLASH:
             case TokenType::DOUBLE_SLASH:
             case TokenType::AT:
+            case TokenType::KW_PTM:      // Power Two Multiply (x * 2^n)
+            case TokenType::KW_PTD:      // Power Two Divide (x / 2^n)
                 return 9;
 
             // Precedence 10: Exponentiation (right-associative)
@@ -534,6 +536,12 @@ private:
             advance();
         } else if (op == TokenType::KW_BOR) {
             opStr = "bor";
+            advance();
+        } else if (op == TokenType::KW_PTM) {
+            opStr = "ptm";
+            advance();
+        } else if (op == TokenType::KW_PTD) {
+            opStr = "ptd";
             advance();
         } else {
             // Unknown operator

@@ -50,6 +50,8 @@ enum class TokenType {
     KW_OR,          // or (logical OR)
     KW_XOR,         // xor (logical XOR)
     KW_BOR,         // bor (bitwise OR)
+    KW_PTM,         // ptm (power two multiply: x * 2^n)
+    KW_PTD,         // ptd (power two divide: x / 2^n)
 
     // Keywords
     KW_IF,

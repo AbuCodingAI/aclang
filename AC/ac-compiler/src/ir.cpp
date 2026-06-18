@@ -123,6 +123,8 @@ static std::string opcodeStr(IROpcode op) {
         case IROpcode::BOR:           return "bor";
         case IROpcode::BXOR:          return "bxor";
         case IROpcode::BNOT:          return "bnot";
+        case IROpcode::PTM:           return "ptm";
+        case IROpcode::PTD:           return "ptd";
         case IROpcode::ALLOC:         return "alloc";
         case IROpcode::FREE:          return "free";
         case IROpcode::FREE_DECL:     return "free_decl";

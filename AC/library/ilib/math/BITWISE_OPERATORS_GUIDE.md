@@ -6,14 +6,16 @@ Complete guide to AC's bitwise operations.
 
 ## AC's Bitwise Operators
 
-| Operator | Name | What It Does | Example |
-|----------|------|------|---------|
-| `&` or `band` | Bitwise AND | Both bits must be 1 | `12 & 10 = 8` |
-| `\|` | Bitwise XOR | Bits must be different | `12 \| 10 = 6` |
-| `bor` | Bitwise OR | At least one bit is 1 | `12 bor 10 = 14` |
-| `~` | Bitwise NOT | Flip all bits | `~5 = -6` |
-| `<<` | LEFT SHIFT | Shift bits left | ⏳ Not yet |
-| `>>` | RIGHT SHIFT | Shift bits right | ⏳ Not yet |
+| Operator | Name | What It Does | Example | Status |
+|----------|------|------|---------|--------|
+| `&` or `band` | Bitwise AND | Both bits must be 1 | `12 & 10 = 8` | ✅ |
+| `\|` | Bitwise XOR | Bits must be different | `12 \| 10 = 6` | ✅ |
+| `bor` | Bitwise OR | At least one bit is 1 | `12 bor 10 = 14` | ✅ |
+| `~` | Bitwise NOT | Flip all bits | `~5 = -6` | ✅ |
+| `ptm` | Power Two Multiply | Shift left (×2^n) | `5 ptm 3 = 40` | ⏳ Planned |
+| `ptd` | Power Two Divide | Shift right (÷2^n) | `20 ptd 2 = 5` | ⏳ Planned |
+
+**Note:** AC+ reserves `<<` and `>>` for memory writes, so AC uses `ptm`/`ptd` instead!
 
 ---
 
