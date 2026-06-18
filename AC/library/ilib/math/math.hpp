@@ -14,20 +14,58 @@
 
 namespace ac_math {
 
-// ── LongInt: explicit signed 96-bit integer storage ───────────────────────
+// ── LongInt: 96-bit signed integer (3 × 32-bit components) ────────────────
 //
-// Normal AC integers are 64-bit. LongInt is intentionally explicit:
-// AC code must declare `math.LongInt x = ...`.
+// Perfect for game dev: RGB colors, 3D coordinates, game object IDs
+// Three 32-bit signed integer components: high, mid, low
+// Range: -(2^95-1) to +(2^95-1)
+//
+// Syntax in AC: math.LongInt x = 123456789
 class LongInt {
-    std::string digits_;
+    int32_t high = 0;   // bits 64-95
+    int32_t mid = 0;    // bits 32-63
+    int32_t low = 0;    // bits 0-31
 
 public:
-    LongInt() : digits_("0") {}
-    explicit LongInt(const std::string& decimal) : digits_(decimal.empty() ? "0" : decimal) {}
-    explicit LongInt(const char* decimal) : digits_(decimal && *decimal ? decimal : "0") {}
-    explicit LongInt(long long value) : digits_(std::to_string(value)) {}
+    LongInt() = default;
+    explicit LongInt(long long value) {
+        // Convert 64-bit to 96-bit (sign extend)
+        if (value >= 0) {
+            low = (int32_t)(value & 0xFFFFFFFF);
+            mid = (int32_t)((value >> 32) & 0xFFFFFFFF);
+            high = (value >> 63) ? -1 : 0;
+        } else {
+            low = (int32_t)(value & 0xFFFFFFFF);
+            mid = (int32_t)((value >> 32) & 0xFFFFFFFF);
+            high = -1;  // sign extended
+        }
+    }
 
-    const std::string& str() const { return digits_; }
+    explicit LongInt(int32_t h, int32_t m, int32_t l) : high(h), mid(m), low(l) {}
+
+    // Components
+    int32_t get_high() const { return high; }
+    int32_t get_mid() const { return mid; }
+    int32_t get_low() const { return low; }
+
+    // Arithmetic operations
+    LongInt operator+(const LongInt& other) const;
+    LongInt operator-(const LongInt& other) const;
+    LongInt operator*(const LongInt& other) const;
+    LongInt operator/(const LongInt& other) const;
+
+    // Comparisons
+    bool operator==(const LongInt& other) const {
+        return high == other.high && mid == other.mid && low == other.low;
+    }
+    bool operator<(const LongInt& other) const;
+
+    // Conversion
+    long long to_int64() const {
+        return ((long long)high << 64) | ((long long)mid << 32) | (long long)low;
+    }
+
+    std::string str() const;
 };
 
 // ── GoodDec: decimal (unscaled, scale) storage ─────────────────────────────
@@ -79,7 +117,47 @@ public:
     const std::string& unscaled_str() const { return unscaled_; }
     long long scale() const { return scale_; }
     std::string str() const { return format(unscaled_, scale_); }
+
+    // Arithmetic operations (exact decimal arithmetic)
+    GoodDec operator+(const GoodDec& other) const;
+    GoodDec operator-(const GoodDec& other) const;
+    GoodDec operator*(const GoodDec& other) const;
+    GoodDec operator/(const GoodDec& other) const;
+
+    // Comparisons
+    bool operator==(const GoodDec& other) const {
+        return unscaled_ == other.unscaled_ && scale_ == other.scale_;
+    }
+    bool operator<(const GoodDec& other) const;
+    bool operator<=(const GoodDec& other) const;
+    bool operator>(const GoodDec& other) const;
+    bool operator>=(const GoodDec& other) const;
+
+    // Conversions
+    double to_double() const;
+    static GoodDec from_double(double value);
 };
+
+// ── Safe Floating Point Comparison ─────────────────────────────────────────
+//
+// isclose(a, b) returns true if a and b are approximately equal within tolerance.
+// This is the SAFE way to compare floating point numbers.
+//
+// Why: IEEE 754 floats can't represent all decimals exactly (0.1, 0.2, 0.3, etc.)
+// Example: 0.1 + 0.2 = 0.30000000000000004 (not 0.3!)
+//
+// Usage: WHILST NOT math.isclose(x, 0.0)  [instead of WHILST x #= 0.0]
+// Returns: true if |a - b| <= max(rel_tol * max(|a|, |b|), abs_tol)
+inline bool isclose(double a, double b,
+                    double rel_tol = 1e-9,
+                    double abs_tol = 1e-99) {
+    double diff = std::fabs(a - b);
+    double threshold = std::max(
+        rel_tol * std::max(std::fabs(a), std::fabs(b)),
+        abs_tol
+    );
+    return diff <= threshold;
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -337,6 +415,9 @@ struct _AcMathNS {
     long long lcm(long long a, long long b) const { return math_lcm(a, b); }
     bool is_prime(long long n) const { return math_is_prime(n); }
     double clamp(double v, double lo, double hi) const { return math_clamp(v, lo, hi); }
+    bool isclose(double a, double b, double rel_tol = 1e-9, double abs_tol = 1e-99) const {
+        return ac_math::isclose(a, b, rel_tol, abs_tol);
+    }
     double sigma(const std::vector<double>& v) const   { return math_sigma(v); }
     double PI(const std::vector<double>& v) const      { return math_PI(v); }
     std::vector<double> gradient(const std::vector<double>& v) const { return math_gradient(v); }
