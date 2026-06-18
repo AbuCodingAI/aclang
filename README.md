@@ -1,8 +1,8 @@
-# AC Language — v0.9.0
+# AC Language — v0.4.0
 
 A multi-target compiled language with a Pratt parser, unified IR codegen, and a full math library. Write once, compile to 11 backends.
 
-**Status: Pre-release, approaching v1.0 production-ready**
+**Status: Pre-release, working toward v1.0 production-ready (2-4 weeks)**
 
 ```bash
 npm install -g aclang
@@ -251,7 +251,7 @@ For detailed status, see [MATURITY.md](MATURITY.md)
 
 ---
 
-## What changed in v0.9.0
+## What changed in v0.4.0
 
 - **Logical & bitwise operators** — and, or, xor, not, &, |, bor, ~
 - **Smart constant folding** — `compfold` keyword with Toxic warnings
