@@ -1,5 +1,0 @@
-n = 5
-i = 0
-whilst i < n
-    Term.display i
-    i += 1

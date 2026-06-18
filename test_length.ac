@@ -1,7 +1,0 @@
-AC->PY
-<mainloop>
-    mylist = [10, 20, 30, 40, 50]
-    Term.display length(mylist)
-    mystr = $Hello World$
-    Term.display length(mystr)
-<mainloop>

@@ -1,5 +1,0 @@
-use datac "students.datac" as students
-
-Term.display students_size
-Term.display students_name[0]
-Term.display students_grade[2]
