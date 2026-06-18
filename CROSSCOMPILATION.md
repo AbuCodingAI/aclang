@@ -1,110 +1,164 @@
-# AC Cross-Compilation Strategy
+# AC->BNY: Universal Binary Compilation
 
-## Architecture: Universal IR with Platform-Specific Backends
+## The Vision: One Command, All Platforms
+
+```
+$ ac program.ac
+```
+
+**Result: Native binary for your platform**
+- Linux x86 → ELF64 binary
+- Windows x86 → PE binary
+- macOS x86 → Mach-O binary
+- ARM (any OS) → Native ARM binary
+
+All from the **same** `ac program.ac` command!
+
+---
+
+## Compilation Strategy
+
+### **x86 Platforms: ASM→Binary (Transparent)**
 
 ```
 AC Source Code
-     ↓
-   AC IR (Unified Intermediate Representation)
-     ↓
-     ├─ x86 Path: IR → x86 ASM → Binary (ELF/PE/Mach-O)
-     │  Delete: .s assembly file
-     │
-     └─ ARM Path: IR → C Code → Binary (via GCC/Clang)
-        Delete: .c source file
+    ↓
+   IR (Intermediate Representation)
+    ↓
+ x86-64 Assembly
+    ↓
+[Platform Assembler]
+    ├─ Linux: as → ELF64 binary
+    ├─ Windows: ml64 → PE binary
+    └─ macOS: as → Mach-O binary
+    ↓
+Delete .s file
+    ↓
+Binary ✓
 ```
 
-## Compilation Flows
+**Process:**
+1. AC → IR (always)
+2. IR → x86-64 ASM (intermediate)
+3. Platform assembler compiles .s to binary
+4. Delete .s file automatically
+5. Return native binary
 
-### **x86 Platforms (Native Assembly)**
-
-**All x86 compiles to native ASM then to binary:**
-
-```
-Windows x86:  AC → IR → x86 ASM → [ELF write] → PE binary ✓ (delete .s)
-macOS x86:    AC → IR → x86 ASM → [Mach-O write] → Binary ✓ (delete .s)
-Linux x86:    AC → IR → x86 ASM → [ELF64 write] → Binary ✓ (delete .s)
-```
-
-**Advantages:**
-- Direct native code generation
-- Maximum performance
-- No intermediate compilation step
-- Assembly file deleted after binary creation
-
-### **ARM Platforms (C Intermediary)**
-
-**All ARM compiles to C, then to binary:**
-
-```
-Windows ARM:  AC → IR → C Code → [GCC] → Binary ✓ (delete .c)
-macOS ARM:    AC → IR → C Code → [Clang] → Binary ✓ (delete .c)
-Linux ARM:    AC → IR → C Code → [GCC] → Binary ✓ (delete .c)
+**Example:**
+```bash
+$ ac myapp.ac
+[AC->BNY] Detected non-Linux x86 - compiling ASM to binary
+[AC->BNY Assemble] as myapp.s -o temp.o && ld -o myapp temp.o
+[AC->BNY] Deleted intermediary: myapp.s
+[AC->BNY] Binary ready: myapp
 ```
 
-**Advantages:**
-- Portable to any platform with C compiler
-- Leverages optimized GCC/Clang toolchains
-- Works on all ARM architectures (ARMv7, ARMv8, etc.)
-- C intermediary automatically deleted
+---
 
-## Implementation Details
+### **ARM Platforms: C→Binary (Transparent)**
 
-### Platform Detection
+```
+AC Source Code
+    ↓
+   IR (Intermediate Representation)
+    ↓
+  C Code
+    ↓
+[GCC/Clang]
+    ├─ macOS ARM: clang → ARM binary
+    ├─ Linux ARM: gcc → ARM binary
+    └─ Windows ARM: gcc → ARM binary
+    ↓
+Delete .c file
+    ↓
+Binary ✓
+```
+
+**Process:**
+1. AC → IR (always)
+2. IR → C code (intermediate)
+3. System C compiler (GCC/Clang) compiles .c to binary
+4. Delete .c file automatically
+5. Return native binary
+
+**Example:**
+```bash
+$ ac myapp.ac  # On Apple Silicon Mac
+[AC->BNY] Detected ARM - generating C intermediary
+[AC->BNY Cross-compile] clang -O2 -o myapp myapp.c
+[AC->BNY] Deleted intermediary: myapp.c
+[AC->BNY] Binary ready: myapp
+```
+
+---
+
+## Platform Detection & Compilation
+
+### **Automatic Platform Detection**
+
 ```cpp
-detectCPU()  // Returns: X86_64, ARM64, ARM32, UNKNOWN
-detectOS()   // Returns: WINDOWS, MACOS, LINUX, UNKNOWN
-needsCrossCompilation()  // Returns true if ARM
+detectCPU()   // x86_64, ARM64, ARM32, UNKNOWN
+detectOS()    // WINDOWS, MACOS, LINUX, UNKNOWN
 ```
 
-### Compiler Selection
-```
-macOS → Clang
-Linux/Windows → GCC
-```
+### **Compiler Selection**
 
-### Intermediary File Handling
-```
-x86:  Generate .s (assembly)
-      ↓
-      Compile to binary
-      ↓
-      Delete .s
-      
-ARM:  Generate .c (C source)
-      ↓
-      Compile with GCC/Clang to binary
-      ↓
-      Delete .c
-```
+| Platform | CPU | ASM Compiler | C Compiler |
+|----------|-----|--------------|-----------|
+| Linux x86 | x86_64 | as | gcc |
+| Windows x86 | x86_64 | ml64 | gcc |
+| macOS Intel | x86_64 | as | clang |
+| macOS ARM | ARM64 | (C path) | clang |
+| Linux ARM | ARM32/64 | (C path) | gcc |
+| Windows ARM | ARM64 | (C path) | gcc |
 
-## Future: User Options
+---
+
+## Key Properties
+
+✅ **Transparent**: User never sees intermediaries (deleted automatically)
+✅ **Native**: Each platform gets optimized native code
+✅ **Portable**: Same AC code works everywhere
+✅ **Simple**: Single `ac program.ac` command
+✅ **Fast**: Direct native compilation on x86, C compilation on ARM
+
+---
+
+## Future: User Control
 
 ```bash
-# Default: delete intermediary
-ac program.ac  → program
+# Default: Delete intermediaries
+ac program.ac → program (binary only)
 
-# Keep assembly source (for inspection)
-ac --save-asm program.ac  → program, program.s
+# Keep assembly (for inspection)
+ac --save-asm program.ac → program + program.s
 
-# Keep C source (for inspection)
-ac --save-c program.ac  → program, program.c
+# Keep C code (for inspection)  
+ac --save-c program.ac → program + program.c
 
 # Explicit target
-ac --target arm64 program.ac  → program (ARM binary)
-ac --target x86-64 program.ac  → program (x86 binary)
+ac --target arm64 program.ac → ARM64 binary
+ac --target x86-64 program.ac → x86 binary
 ```
 
-## Current Status
+---
 
-✅ **Platform detection implemented**
-⏳ **x86 ASM generation to binary (delete .s)**
-⏳ **ARM IR→C translation**
-⏳ **GCC/Clang invocation for ARM**
-⏳ **User flags for intermediary control**
+## Current Implementation Status
 
-## Key Principle
+| Component | Status |
+|-----------|--------|
+| Platform detection | ✅ Complete |
+| Linux x86→ELF | ✅ Complete |
+| x86 ASM generation | ✅ Complete |
+| ASM→Binary compilation | ⏳ In progress |
+| ARM IR→C translation | ⏳ In progress |
+| C→Binary compilation | ✅ Infrastructure ready |
+| Intermediary deletion | ✅ Implemented |
 
-> **One IR, infinite platforms:**
-> AC's unified IR representation compiles to native code on x86,
-> and intelligently falls back to C for ARM—all transparently.
+---
+
+## The AC->BNY Promise
+
+> **AC->BNY: One language, one compilation command, every platform.**
+> 
+> Native performance on x86. Native ARM support via C. All transparently.
