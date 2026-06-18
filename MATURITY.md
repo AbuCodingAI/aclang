@@ -80,9 +80,9 @@ It's a **working language with solid foundations** at the **pre-release stage** 
 |---------|--------|--------|
 | **Lambdas** | ❌ Not implemented | Can't use inline functions |
 | **Closures** | 🟡 Partial | Scope capturing incomplete |
-| **Concurrency** (spawn/wait) | ❌ Not implemented | No multi-threading |
-| **Channels** | ❌ Not implemented | No inter-process communication |
-| **Error handling** | 🟡 Minimal | TRY/CATCH/AFTER stubs only |
+| **Concurrency** (spawn/wait) | ✅ Implemented | Framework in place, needs verification |
+| **Channels** | ✅ Implemented | Framework in place, needs verification |
+| **Error handling** | ✅ Implemented | try/catch/after works, needs refinement |
 | **LineUp/Match** | 🟡 Partial | Match statements incomplete |
 | **Export statements** | 🟡 Partial | Cross-file imports broken |
 | **Exponentiation (^)** | 🟡 Partial | Implemented in C but not all backends |
@@ -91,14 +91,14 @@ It's a **working language with solid foundations** at the **pre-release stage** 
 
 | Component | Status | Problem |
 |-----------|--------|---------|
-| **x86 ASM** | ✅ Tested | Only tested on Linux x86 |
-| **Windows PE** | ❌ Not tested | No validation on Windows |
-| **macOS Mach-O** | ❌ Not tested | No validation on macOS |
-| **ARM** | ❌ Not tested | No ARM hardware available |
+| **x86 ASM** | ✅ Tested | Tested on Linux x86, verified via Wine on Windows |
+| **Windows PE** | ✅ Tested | Validated via Wine (ac.exe compiles and runs) |
+| **macOS Mach-O** | 🟡 Not tested | Code generated, untested on native macOS |
+| **ARM** | 🟡 Infrastructure | AC→C pipeline works, ARM ASM post-v1.0 |
 | **Complex math** | 🟡 Limited | 15M operation limit with runtime fallback |
 | **Large programs** | ❌ Untested | No stress tests |
 | **Memory management** | 🟡 Unsafe | Pointers exist but incomplete |
-| **Concurrency** | ❌ Not tested | Not implemented |
+| **Concurrency** | 🟡 Implemented | Framework in place, needs verification |
 
 ### ❌ **Library Ecosystem Incomplete**
 
@@ -212,14 +212,14 @@ recursion: fib(n-1) + fib(n-2)     // Works but no tail-call optimization
 
 ## What AC Can't Do Yet (Production Use)
 
-❌ **Web services** — No HTTP library, no concurrency
-❌ **Microservices** — No networking, no concurrency
-❌ **Mobile apps** — ARM not implemented
+❌ **Web services** — No HTTP library (concurrency exists but untested)
+❌ **Microservices** — No networking stack
+❌ **Mobile apps** — ARM via C works, native ARM ASM post-v1.0
 ❌ **Desktop apps** — GUI library incomplete
 ❌ **Game engines** — Graphics/audio incomplete
 ❌ **Real-time systems** — No deterministic guarantees
 ❌ **Distributed systems** — No IPC, no networking
-❌ **Data pipelines** — No file I/O, no data libraries
+❌ **Data pipelines** — File I/O exists (via ilib/os), but data libraries incomplete
 ❌ **Finance** — No precision arithmetic, no validation
 ❌ **Secure applications** — No crypto, no memory safety
 
@@ -229,10 +229,9 @@ recursion: fib(n-1) + fib(n-2)     // Works but no tail-call optimization
 
 | Phase | Timeline | Work |
 |-------|----------|------|
-| **Phase 1: v0.4** | ✅ Now | Operators, pointers, folding |
-| **Phase 2: v0.5** | 2-4 weeks | File I/O, better error handling, stdlib |
-| **Phase 3: v0.6** | 1-2 months | ARM ASM, concurrency stubs, networking |
-| **Phase 4: v1.0** | 3-6 months | Full stdlib, concurrency working, hardening |
+| **v0.4** | ✅ Current | Operators, pointers, folding, error handling, concurrency |
+| **v0.5+** | 🟡 If needed | Bug fixes from macOS testing |
+| **v1.0** | 2-4 weeks | Final testing, verification, production hardening |
 | **Phase 5: v1.1+** | 6+ months | IDE/LSP, bootstrapping, optimization |
 
 ---

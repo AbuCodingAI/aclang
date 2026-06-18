@@ -1,8 +1,8 @@
 # AC v1.0 Roadmap
 
 **Target Release:** 2-4 weeks  
-**Current Version:** v0.9.0  
-**Status:** Pre-release, final touches before production
+**Current Version:** v0.4.0  
+**Status:** Pre-release, working toward v1.0 production-ready
 
 ---
 
