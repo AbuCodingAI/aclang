@@ -710,6 +710,51 @@ int main(int argc, char* argv[]) {
                 }
                 printTiming();
                 return true;
+
+            // ── AC->ASM: Generate ARM Assembly (C->GAS workflow) ──────────────────
+            if (tgt == "ASM") {
+                // Detect ARM at runtime
+                bool isARM = false;
+                #if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__) || defined(_M_ARM)
+                isARM = true;
+                #endif
+                
+                if (isARM) {
+                    std::cerr << "[AC->ASM] Detected ARM - generating assembly\n";
+                    
+                    std::string cFile = base + ".c";
+                    std::string asmFile = base + ".s";
+                    
+                    // Generate C code
+                    std::string cContent = generateFromIR(irProg, base, base);
+                    writeFile(cFile, cContent);
+                    std::cout << "Generated: " << cFile << " [C intermediary]\n";
+                    
+                    // Compile C to assembly
+                    std::string compiler = "gcc";
+                    #ifdef __APPLE__
+                    compiler = "clang";
+                    #endif
+                    
+                    std::string cmd = compiler + " -S -o " + asmFile + " " + cFile;
+                    std::cerr << "[AC->ASM] " << cmd << "\n";
+                    
+                    if (std::system(cmd.c_str()) != 0) {
+                        std::cerr << "Toxic: Assembly generation failed\n";
+                        return false;
+                    }
+                    
+                    std::remove(cFile.c_str());
+                    std::cout << "Generated: " << asmFile << " [ARM assembly]\n";
+                    std::cout << "Tip: gcc " << asmFile << " -o " << base << "\n";
+                    printTiming();
+                    return true;
+                } else {
+                    std::cerr << "Toxic: AC->ASM on x86 not implemented\n";
+                    std::cerr << "Suggestion: Use AC->BNY for native binary\n";
+                    return false;
+                }
+            }
             }
 
             std::string outFile = base + info.extension;
