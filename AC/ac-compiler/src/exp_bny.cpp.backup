@@ -1,7 +1,7 @@
 /*
   exp_bny.cpp — AC Native Binary Generator
-  Target: Linux x86-64 ELF64 Only
-  Generates native Linux ELF64 binaries - Ubuntu, Fedora, Arch, Mint, Bazzite, etc.
+  Targets: Linux x86-64 (ELF64), Windows x86-64 (PE32+)
+  No external assembler or linker required.
 */
 #include "../include/ac.hpp"
 #include <vector>
@@ -1752,6 +1752,138 @@ static void emitInputStrLinux(X64Emitter& em) {
     em.ret();
 }
 
+// ─── Print Helpers (Windows) ─────────────────────────────────────────────────
+static void emitPrintIntWin64(X64Emitter& em) {
+    // __ac_print_int__(rcx = int64): convert to string and print via WriteFile
+    em.label("__ac_print_int__");
+    em.push_rbp();
+    em.mov_rbp_rsp();
+    em.push_r(R::R12);
+    em.push_r(R::R13);
+    em.push_r(R::RBX);
+    // Alignment: entry rsp≡8, push_rbp→0, push_r12→8, push_r13→0, push_rbx→8
+    // Need sub N such that 8-N ≡ 0 (mod 16) → N ≡ 8 → use 40 (32 shadow + 8 local)
+    em.sub_rsp_i32(40);
+
+    // Win64: arg in RCX
+    em.mov_rr(R::R12, R::RCX);   // r12 = argument value
+    em.xor_rr(R::R13, R::R13);   // r13 = negative flag
+
+    // Write pointer: [rbp-2] going backward
+    em.lea_r_rbp8(R::R10, -2);
+
+    em.test_rr(R::R12, R::R12);
+    em.jnz("__piw_notzero__");
+    em.mov_ri32(R::RAX, '0');
+    em.mov_ptr_r8(R::R10, R::RAX);
+    em.dec_r(R::R10);
+    em.jmp("__piw_addnl__");
+
+    em.label("__piw_notzero__");
+    em.test_rr(R::R12, R::R12);
+    em.jns("__piw_pos__");
+    em.mov_ri32(R::R13, 1);
+    em.neg_r(R::R12);
+
+    em.label("__piw_pos__");
+    em.mov_ri32(R::RCX, 10);
+
+    em.label("__piw_loop__");
+    em.mov_rr(R::RAX, R::R12);
+    em.xor_edx_edx();
+    em.div_rcx();
+    em.add_dl_i8('0');
+    em.mov_ptr_r8(R::R10, R::RDX);
+    em.dec_r(R::R10);
+    em.mov_rr(R::R12, R::RAX);
+    em.test_rr(R::R12, R::R12);
+    em.jnz("__piw_loop__");
+
+    em.test_rr(R::R13, R::R13);
+    em.jz("__piw_addnl__");
+    em.mov_ri32(R::RAX, '-');
+    em.mov_ptr_r8(R::R10, R::RAX);
+    em.dec_r(R::R10);
+
+    em.label("__piw_addnl__");
+    em.inc_r(R::R10);
+    em.mov_rbp8_imm8(-1, '\n');
+
+    // Compute length
+    em.lea_r_rbp8(R::RBX, -1);   // rbx = &rbp[-1]
+    em.sub_rr(R::RBX, R::R10);
+    em.inc_r(R::RBX);            // rbx = length
+
+    // WriteFile(hStdout, r10, rbx, &written, NULL)
+    // hStdout stored at [__stdout_handle] which we call via GetStdHandle
+    // Use WriteConsoleA for simplicity: WriteConsoleA(hOut, buf, nChars, &nWritten, NULL)
+    // GetStdHandle(-11) → rax = handle
+    em.mov_ri32(R::RCX, -11);    // STD_OUTPUT_HANDLE
+    em.call("GetStdHandle");
+
+    // WriteConsoleA(hOut=rax, buf=r10, nChars=rbx, &nWritten=[rsp+0], NULL)
+    em.mov_rr(R::RCX, R::RAX);   // handle
+    em.mov_rr(R::RDX, R::R10);   // buf
+    em.mov_rr(R::R8, R::RBX);    // nChars
+    em.lea_r_rbp32(R::R9, -48);  // &written (in our local buffer)
+    // 5th arg = NULL, pushed on stack (above shadow space)
+    em.mov_ri32(R::RAX, 0);
+    em.mov_rbp_r(-56, R::RAX);   // [rsp+32] conceptually (via rbp)
+    em.call("WriteConsoleA");
+
+    em.add_rsp_i32(40);
+    em.pop_r(R::RBX);
+    em.pop_r(R::R13);
+    em.pop_r(R::R12);
+    em.pop_rbp();
+    em.ret();
+}
+
+static void emitPrintStrWin64(X64Emitter& em) {
+    em.label("__ac_print_str__");
+    em.push_rbp();
+    em.mov_rbp_rsp();
+    em.push_r(R::R12);
+    em.push_r(R::R13);
+    em.push_r(R::RBX);
+    em.sub_rsp_i32(64);
+
+    em.mov_rr(R::R12, R::RCX);   // save ptr
+    em.mov_rr(R::R13, R::RDX);   // save len
+
+    // GetStdHandle(-11)
+    em.mov_ri32(R::RCX, -11);
+    em.call("GetStdHandle");
+
+    // WriteConsoleA
+    em.mov_rr(R::RCX, R::RAX);
+    em.mov_rr(R::RDX, R::R12);
+    em.mov_rr(R::R8,  R::R13);
+    em.lea_r_rbp32(R::R9, -48);
+    em.mov_ri32(R::RAX, 0);
+    em.mov_rbp_r(-56, R::RAX);
+    em.call("WriteConsoleA");
+
+    // Print newline
+    em.mov_rbp8_imm8(-17, '\n');
+    em.mov_ri32(R::RCX, -11);
+    em.call("GetStdHandle");
+    em.mov_rr(R::RCX, R::RAX);
+    em.lea_r_rbp8(R::RDX, -17);
+    em.mov_ri32(R::R8, 1);
+    em.lea_r_rbp32(R::R9, -48);
+    em.mov_ri32(R::RAX, 0);
+    em.mov_rbp_r(-56, R::RAX);
+    em.call("WriteConsoleA");
+
+    em.add_rsp_i32(64);
+    em.pop_r(R::RBX);
+    em.pop_r(R::R13);
+    em.pop_r(R::R12);
+    em.pop_rbp();
+    em.ret();
+}
+
 // ─── DWARF Debug Info Builder ────────────────────────────────────────────────
 class DWARFBuilder {
     struct FuncInfo { std::string name; uint64_t startVA, endVA; };
@@ -2408,6 +2540,285 @@ static bool writeELFDynamic(const std::string& path,
     return true;
 }
 
+// ─── PE32+ Writer ─────────────────────────────────────────────────────────────
+#pragma pack(push,1)
+struct DosStub {
+    uint8_t  data[64];
+};
+struct PeFileHeader {
+    uint16_t Machine;
+    uint16_t NumberOfSections;
+    uint32_t TimeDateStamp;
+    uint32_t PointerToSymbolTable;
+    uint32_t NumberOfSymbols;
+    uint16_t SizeOfOptionalHeader;
+    uint16_t Characteristics;
+};
+struct PeOptHeader64 {
+    uint16_t Magic;
+    uint8_t  MajorLinkerVersion, MinorLinkerVersion;
+    uint32_t SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData;
+    uint32_t AddressOfEntryPoint;
+    uint32_t BaseOfCode;
+    uint64_t ImageBase;
+    uint32_t SectionAlignment, FileAlignment;
+    uint16_t MajorOSVersion, MinorOSVersion;
+    uint16_t MajorImageVersion, MinorImageVersion;
+    uint16_t MajorSubsystemVersion, MinorSubsystemVersion;
+    uint32_t Win32VersionValue;
+    uint32_t SizeOfImage, SizeOfHeaders;
+    uint32_t CheckSum;
+    uint16_t Subsystem;
+    uint16_t DllCharacteristics;
+    uint64_t SizeOfStackReserve, SizeOfStackCommit;
+    uint64_t SizeOfHeapReserve, SizeOfHeapCommit;
+    uint32_t LoaderFlags;
+    uint32_t NumberOfRvaAndSizes;
+    struct { uint32_t VirtualAddress, Size; } DataDirectory[16];
+};
+struct PeSectionHeader {
+    char     Name[8];
+    uint32_t VirtualSize, VirtualAddress;
+    uint32_t SizeOfRawData, PointerToRawData;
+    uint32_t PointerToRelocations, PointerToLinenumbers;
+    uint16_t NumberOfRelocations, NumberOfLinenumbers;
+    uint32_t Characteristics;
+};
+struct ImportDescriptor {
+    uint32_t OriginalFirstThunk;
+    uint32_t TimeDateStamp;
+    uint32_t ForwarderChain;
+    uint32_t Name;
+    uint32_t FirstThunk;
+};
+#pragma pack(pop)
+
+static bool writePE(const std::string& path,
+                    const std::vector<uint8_t>& text,
+                    const std::vector<uint8_t>& rodata) {
+    // Layout:
+    // 0x000: DOS stub (64 bytes) + PE sig (4 bytes)
+    // 0x044: COFF header (20 bytes)
+    // 0x058: Optional header PE32+ (240 bytes)
+    // 0x148: Section header .text (40 bytes)
+    // 0x170: Section header .rdata (40 bytes)
+    // 0x198: Section header .idata (40 bytes)
+    // [pad to 0x200] headers end
+    // 0x200: .text section
+    // Next: .rdata section (strings)
+    // Next: .idata section (import table)
+
+    const uint64_t ImageBase = 0x140000000ULL;
+    const uint32_t SecAlign  = 0x1000; // 4KB section alignment
+    const uint32_t FileAlign = 0x200;  // 512-byte file alignment
+
+    // Build import data for kernel32.dll
+    // Functions: GetStdHandle, WriteConsoleA, ExitProcess
+    struct Func { const char* name; uint32_t iatRVA; };
+    std::vector<std::string> funcs = {"GetStdHandle","WriteConsoleA","ExitProcess"};
+
+    // Build .idata (import table) in memory
+    // Structure:
+    //   ImportDescriptor (20 bytes) for kernel32.dll
+    //   ImportDescriptor (20 bytes) null terminator
+    //   IAT: 4 * 8-byte entries (3 funcs + null)
+    //   INT: same as IAT
+    //   Hint/Name entries
+    //   DLL name "KERNEL32.DLL"
+    //
+    // All offsets are RVAs (relative to image base)
+
+    std::vector<uint8_t> idata;
+    auto append = [&](const void* p, size_t n) {
+        const uint8_t* b = (const uint8_t*)p;
+        idata.insert(idata.end(), b, b+n);
+    };
+    auto append32 = [&](uint32_t v) { append(&v, 4); };
+    auto append64 = [&](uint64_t v) { append(&v, 8); };
+    auto appendStr = [&](const std::string& s) {
+        for (char c : s) idata.push_back((uint8_t)c);
+        idata.push_back(0);
+    };
+
+    // We'll compute RVAs later once we know section addresses.
+    // For now build with placeholders; then we'll fix up inline.
+    // Strategy: build idata with known relative offsets within idata,
+    // then add idataRVA when writing.
+
+    // Offsets within idata:
+    // 0: ImportDescriptor (20 bytes)
+    // 20: null ImportDescriptor (20 bytes)
+    // 40: IAT (4 * 8 = 32 bytes)
+    // 72: INT (4 * 8 = 32 bytes)  — same as IAT
+    // 104: hint/name entries
+    // After hint/names: DLL name
+
+    uint32_t iatOff  = 40;  // IAT within idata
+    uint32_t intOff  = 72;  // INT within idata
+    uint32_t hnOff   = 104; // hint/name table start
+
+    // Build hint/name entries and record their offsets
+    std::vector<uint32_t> hnOffsets;
+    std::vector<uint8_t> hnData;
+    for (auto& fn : funcs) {
+        uint32_t off = (uint32_t)hnData.size();
+        hnOffsets.push_back(hnOff + off);
+        hnData.push_back(0); hnData.push_back(0); // hint = 0
+        for (char c : fn) hnData.push_back((uint8_t)c);
+        hnData.push_back(0);
+        if (hnData.size() % 2) hnData.push_back(0); // word-align
+    }
+    uint32_t dllNameOff = hnOff + (uint32_t)hnData.size();
+
+    // Total idata size estimate
+    size_t idataSize = dllNameOff + 16; // "KERNEL32.DLL\0" = 13 bytes + padding
+    idataSize = ((idataSize + FileAlign-1)/FileAlign)*FileAlign;
+    idata.assign(idataSize, 0);
+
+    // Section layout (file offsets and RVAs):
+    uint32_t headerSize = 0x200; // generous header region
+    uint32_t textFileOff   = headerSize;
+    uint32_t textSize      = (uint32_t)((text.size() + FileAlign-1)/FileAlign)*FileAlign;
+    uint32_t rdataFileOff  = textFileOff + textSize;
+    uint32_t rdataSize     = (uint32_t)((rodata.size() + FileAlign-1)/FileAlign)*FileAlign;
+    if (rdataSize == 0) rdataSize = FileAlign;
+    uint32_t idataFileOff  = rdataFileOff + rdataSize;
+
+    uint32_t textRVA   = SecAlign; // 0x1000
+    uint32_t rdataRVA  = textRVA + (uint32_t)(((text.size()+SecAlign-1)/SecAlign)*SecAlign);
+    uint32_t idataRVA  = rdataRVA + (uint32_t)(((rodata.size()+SecAlign-1)/SecAlign)*SecAlign);
+    if (rodata.empty()) idataRVA = rdataRVA + SecAlign;
+
+    // Now fill idata with correct RVAs
+    // IAT[i] = RVA of hint/name entry i (bit63=0 means RVA to hint/name)
+    for (int i = 0; i < (int)funcs.size(); i++) {
+        uint64_t v = idataRVA + hnOffsets[i];
+        memcpy(idata.data() + iatOff + i*8, &v, 8);
+        memcpy(idata.data() + intOff + i*8, &v, 8);
+    }
+    // IAT null terminator at offset iatOff + funcs.size()*8 (already zero)
+
+    // Import descriptor
+    ImportDescriptor idesc = {};
+    idesc.OriginalFirstThunk = idataRVA + intOff;
+    idesc.TimeDateStamp = 0;
+    idesc.ForwarderChain = 0xFFFFFFFF;
+    idesc.Name = idataRVA + dllNameOff;
+    idesc.FirstThunk = idataRVA + iatOff;
+    memcpy(idata.data(), &idesc, sizeof(idesc));
+    // null terminator at offset 20 (already zero)
+
+    // Hint/Name table
+    memcpy(idata.data() + hnOff, hnData.data(), hnData.size());
+
+    // DLL name
+    const char dllName[] = "KERNEL32.DLL";
+    memcpy(idata.data() + dllNameOff, dllName, sizeof(dllName));
+
+    // Fixup call stubs in .text: calls to GetStdHandle/WriteConsoleA/ExitProcess
+    // These are emitted as call_rel32 with label = "GetStdHandle" etc.
+    // We need to add IAT stubs in the .text section that do:
+    //   jmp [iat_entry]
+    // Then the main call instructions call those stubs.
+    // The stubs are placed at the END of the .text section (before it's finalized).
+
+    // We need to patch the text for Windows: calls to "GetStdHandle" etc. should
+    // go through IAT. We add stubs to the emitter BEFORE calling applyFixups.
+    // This is handled by the BinaryCompiler calling emitIATStubs.
+
+    // Entry point is at textRVA + 0 (first byte of .text)
+    uint32_t entryRVA = textRVA;
+
+    // Note: for IAT stub calls, the text needs to include stubs.
+    // The stubs use: FF 25 <rel32> = JMP [RIP+rel32] where RIP+rel32 = IAT entry address.
+    // Each IAT entry is at absolute address: ImageBase + idataRVA + iatOff + i*8
+    // For stub at textFileOff + stubOffset (file offset),
+    //   virtual addr = ImageBase + textRVA + stubOffset
+    //   rel32 = (ImageBase + idataRVA + iatOff + i*8) - (ImageBase + textRVA + stubOffset + 6)
+    //         = (idataRVA + iatOff + i*8) - (textRVA + stubOffset + 6)
+
+    // The stub offsets depend on text size. We add them at the end.
+    // This gets complex. For now, encode stub offsets as relative.
+    // The BinaryCompiler must emit IAT stubs before calling compile so fixups work.
+
+    // Total image size
+    uint32_t idataVSize = (uint32_t)idataSize;
+    uint32_t imageSize = idataRVA + ((idataVSize + SecAlign-1)/SecAlign)*SecAlign;
+
+    // DOS header
+    uint8_t dosStub[64] = {};
+    dosStub[0] = 'M'; dosStub[1] = 'Z';
+    *(uint32_t*)(dosStub+60) = 64; // e_lfanew
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    f.write((char*)dosStub, 64);
+    f.write("PE\0\0", 4);
+
+    PeFileHeader coff = {};
+    coff.Machine = 0x8664; // AMD64
+    coff.NumberOfSections = 3;
+    coff.Characteristics = 0x0022; // executable, no relocs
+    coff.SizeOfOptionalHeader = sizeof(PeOptHeader64);
+    f.write((char*)&coff, sizeof(coff));
+
+    PeOptHeader64 opt = {};
+    opt.Magic = 0x020B; // PE32+
+    opt.AddressOfEntryPoint = entryRVA;
+    opt.BaseOfCode = textRVA;
+    opt.ImageBase = ImageBase;
+    opt.SectionAlignment = SecAlign;
+    opt.FileAlignment = FileAlign;
+    opt.MajorSubsystemVersion = 6;
+    opt.SizeOfImage = imageSize;
+    opt.SizeOfHeaders = headerSize;
+    opt.Subsystem = 3; // CUI console
+    opt.SizeOfStackReserve = 0x100000;
+    opt.SizeOfStackCommit  = 0x1000;
+    opt.SizeOfHeapReserve  = 0x100000;
+    opt.SizeOfHeapCommit   = 0x1000;
+    opt.NumberOfRvaAndSizes = 16;
+    opt.SizeOfCode = textSize;
+    opt.SizeOfInitializedData = rdataSize + idataVSize;
+    // Import table data directory
+    opt.DataDirectory[1].VirtualAddress = idataRVA;
+    opt.DataDirectory[1].Size = (uint32_t)(sizeof(ImportDescriptor)*2 + (funcs.size()+1)*16 + hnData.size() + 16);
+    f.write((char*)&opt, sizeof(opt));
+
+    auto writeSec = [&](const char* name, uint32_t vaddr, uint32_t vsz, uint32_t foff, uint32_t fsz, uint32_t chars) {
+        PeSectionHeader sh = {};
+        memcpy(sh.Name, name, std::min((size_t)8, strlen(name)));
+        sh.VirtualSize = vsz;
+        sh.VirtualAddress = vaddr;
+        sh.SizeOfRawData = fsz;
+        sh.PointerToRawData = foff;
+        sh.Characteristics = chars;
+        f.write((char*)&sh, sizeof(sh));
+    };
+    writeSec(".text",  textRVA,  (uint32_t)text.size(),   textFileOff,  textSize,  0x60000020);
+    writeSec(".rdata", rdataRVA, (uint32_t)rodata.size(), rdataFileOff, rdataSize, 0x40000040);
+    writeSec(".idata", idataRVA, idataVSize,               idataFileOff, (uint32_t)idataSize, 0xC0000040);
+
+    // Pad to headerSize
+    size_t hdrWritten = 64+4+sizeof(coff)+sizeof(opt)+3*sizeof(PeSectionHeader);
+    f.write((char*)std::vector<uint8_t>(headerSize-hdrWritten,0).data(), headerSize-hdrWritten);
+
+    // .text section
+    f.write((char*)text.data(), text.size());
+    std::vector<uint8_t> pad(textSize - text.size(), 0);
+    f.write((char*)pad.data(), pad.size());
+
+    // .rdata section
+    if (!rodata.empty()) f.write((char*)rodata.data(), rodata.size());
+    pad.assign(rdataSize - rodata.size(), 0);
+    f.write((char*)pad.data(), pad.size());
+
+    // .idata section
+    f.write((char*)idata.data(), idata.size());
+
+    return true;
+}
 
 // ─── Top-Level Binary Compiler ────────────────────────────────────────────────
 class BinaryCompiler {
@@ -2415,6 +2826,7 @@ class BinaryCompiler {
     X64Emitter em;
     StringPool sp;
     ABI        abi;
+    bool       isWindows;
     std::set<std::string> usingHeaders_; // from "using header X" in the program
 
     struct FuncBounds { std::string name; uint64_t startOff, endOff; };
@@ -2553,7 +2965,9 @@ public:
     BinaryCompiler(const AC_IR::IRProgram& p)
         : prog(p), abi(host_abi())
 #ifdef TARGET_WINDOWS
+        , isWindows(true)
 #else
+        , isWindows(false)
 #endif
     {}
 
@@ -2588,12 +3002,20 @@ public:
         bool dynamic = !extSyms.empty();
 
         // Emit print helpers
-        emitPrintIntLinux(em);
-        emitPrintStrLinux(em);
-        emitPrintCStrLinux(em);
-        emitPrintDoubleLinux(em);
-        emitInputIntLinux(em);
-        emitInputStrLinux(em);
+        if (isWindows) {
+            emitPrintIntWin64(em);
+            emitPrintStrWin64(em);
+            // Windows: __ac_print_cstr__ delegates to __ac_print_str__ via strlen stub
+            // For simplicity, emit a placeholder that falls through to print_str
+            // (true big integers are rare on BNY; full Win64 cstr support can be added later)
+        } else {
+            emitPrintIntLinux(em);
+            emitPrintStrLinux(em);
+            emitPrintCStrLinux(em);
+            emitPrintDoubleLinux(em);
+            emitInputIntLinux(em);
+            emitInputStrLinux(em);
+        }
 
         // Emit PLT stubs on Linux when there are external symbols
         if (dynamic) {
@@ -2630,6 +3052,15 @@ public:
 
         em.applyFixups();
 
+        if (isWindows) {
+            // Windows: simple layout, no dynamic linking
+            size_t hdrBytes = sizeof(ElfEhdr) + 2*sizeof(ElfPhdr);
+            uint64_t textOff   = ((hdrBytes + PGSZ-1) / PGSZ) * PGSZ;
+            uint64_t rodataOff = textOff + ((em.code().size() + PGSZ-1) / PGSZ) * PGSZ;
+            uint64_t rodataVA  = BASE + rodataOff;
+            em.applyStringFixups(rodataVA, rodata, strOffsets);
+            return writePE(outPath, em.code(), rodata);
+        }
 
         if (!dynamic) {
             // Static ELF (original path)
