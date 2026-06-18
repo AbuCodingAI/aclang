@@ -1,8 +1,0 @@
-AC->BNY
-use flib parser.ac
-
-<mainloop>
-    Term.display $Testing flib$
-    code=$Hello$    
-    parser.tokenize(code) 
-<mainloop>

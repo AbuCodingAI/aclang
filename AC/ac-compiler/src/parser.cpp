@@ -165,6 +165,16 @@ private:
             case TokenType::CARET:
                 return 10;
 
+            // IDENTIFIER case: operators like + - * / are tokenized as IDENTIFIER
+            case TokenType::IDENTIFIER: {
+                const std::string& val = peek().value;
+                if (val == "+") return 8;
+                if (val == "-") return 8;
+                if (val == "*") return 9;
+                if (val == "/") return 9;
+                return 0;  // Not an operator
+            }
+
             default:
                 return 0;
         }
@@ -449,11 +459,17 @@ private:
     NodePtr parseInfix(NodePtr left, TokenType op) {
         int prec = getPrecedence(op);
         std::string opStr;
-        
+
         // Get operator string
         if (op == TokenType::IDENTIFIER) {
             opStr = peek().value;
-            advance();
+            // Only advance if this is actually an operator identifier (+ - * /)
+            if (opStr == "+" || opStr == "-" || opStr == "*" || opStr == "/") {
+                advance();
+            } else {
+                // Not an operator, return left as-is
+                return left;
+            }
         } else if (op == TokenType::KW_IS) {
             opStr = "is";
             advance();
@@ -547,25 +563,34 @@ private:
         // Parse prefix
         auto left = parsePrefix();
         if (!left) return nullptr;
-        
+
         // Parse infix operators
         while (true) {
             TokenType op = peek().type;
             int prec = getPrecedence(op);
-            
+
+            // Special case: handle IDENTIFIER operators (+ - * /)
+            if (op == TokenType::IDENTIFIER) {
+                const std::string& opVal = peek().value;
+                if (opVal == "+") prec = 8;
+                else if (opVal == "-") prec = 8;
+                else if (opVal == "*") prec = 9;
+                else if (opVal == "/") prec = 9;
+            }
+
             // Stop if precedence is too low or we hit a terminator
-            if (prec <= precedence || 
-                at(TokenType::NEWLINE) || 
+            if (prec <= precedence ||
+                at(TokenType::NEWLINE) ||
                 at(TokenType::END_OF_FILE) ||
                 at(TokenType::RPAREN) ||
                 at(TokenType::RBRACKET) ||
                 at(TokenType::COMMA)) {
                 break;
             }
-            
+
             left = parseInfix(std::move(left), op);
         }
-        
+
         return left;
     }
 

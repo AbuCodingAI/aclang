@@ -1,0 +1,9 @@
+#!/bin/bash
+# Bi language runner
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AC_DIR="$SCRIPT_DIR/../AC"
+BI_DIR="$AC_DIR/bi"
+
+# Run Bi using AC compiler
+exec ac "$BI_DIR/src/main.ac" "$@"
