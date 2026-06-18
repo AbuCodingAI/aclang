@@ -1,6 +1,8 @@
-# AC Language — v0.2.0
+# AC Language — v0.9.0
 
 A multi-target compiled language with a Pratt parser, unified IR codegen, and a full math library. Write once, compile to 11 backends.
+
+**Status: Pre-release, approaching v1.0 production-ready**
 
 ```bash
 npm install -g aclang
@@ -42,6 +44,23 @@ ac mycode.ac BNY
 # Compile only (no run)
 ac mycode.ac -c
 ```
+
+---
+
+## Platform Support
+
+| Platform | Native | Status | Notes |
+|----------|--------|--------|-------|
+| **Linux x86-64** | ✅ Yes | ✅ Tested | ELF64 binaries, GCC/Clang |
+| **Windows x86-64** | ✅ Yes | ✅ Tested (Wine) | PE32+ binaries via MinGW, validated on Linux via Wine |
+| **macOS x86-64** | ✅ Yes | 🟡 Untested | Mach-O format generated; "pray it works" |
+| **macOS ARM64** | ✅ Yes | 🟡 Untested | M1/M2/M3 support via AC→C; likely works |
+| **Linux ARM64** | ✅ Yes | 🟡 Infrastructure | Via AC→C + GCC (ASM backend post-v1.0) |
+| **Android ARM** | 🟡 Partial | 🟡 Via C | Use AC→C + Android NDK |
+| **Raspberry Pi** | ✅ Yes | 🟡 Likely works | 64-bit OS, ARM64 via AC→C |
+
+**File I/O:** Delegated to `ilib/os` (bash-based library) and `AC->C`
+**Error Handling:** try/catch/after implemented, refinement in progress
 
 ---
 
@@ -215,6 +234,33 @@ sudo make install
 ```
 
 Requires `g++` and `make`. The Windows `ac.exe` is pre-built in `ac-compiler/ac.exe` (static, no dependencies).
+
+---
+
+## Known Limitations (Pre-v1.0)
+
+- **macOS:** Generated code likely works but untested on native macOS (compile and run at your own risk)
+- **ARM ASM:** Not yet implemented; use AC→C instead (post-v1.0 feature)
+- **Bootstrapping:** AC cannot compile itself yet
+- **Function call + operator bug:** `func() + 3` requires parentheses: `(func()) + 3`
+- **Concurrency:** spawn/wait/channels framework in place, needs verification
+- **Error handling:** try/catch/after implemented, refinement in progress
+- **Cross-file imports:** export statements partially broken
+
+For detailed status, see [MATURITY.md](MATURITY.md)
+
+---
+
+## What changed in v0.9.0
+
+- **Logical & bitwise operators** — and, or, xor, not, &, |, bor, ~
+- **Smart constant folding** — `compfold` keyword with Toxic warnings
+- **Multi-type input** — Term.ask returns strings properly
+- **Pointers framework** — ilib/pointers Phase 3 foundation
+- **AC→ASM for ARM** — C→Assembly workflow (generates .s files)
+- **Windows ac.exe** — Native MinGW build, tested via Wine
+- **64-bit only** — Architectural decision (no 32-bit support)
+- **Cross-compilation** — Smart platform detection, ARM via C
 
 ---
 
