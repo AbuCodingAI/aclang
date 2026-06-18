@@ -1205,11 +1205,17 @@ private:
                     em.call("__ac_print_cstr__");
                 }
             }
-            // Call __ac_input_int__ to read from stdin; result is in RAX
-            em.call("__ac_input_int__");
+            // Call __ac_input_str__ to read string from stdin; result is in RAX (pointer to buffer)
+            em.call("__ac_input_str__");
             // Store the result (in RAX) to the destination variable
+            // Mark as a string variable so it gets treated as string pointer
             if (ins.result.isValid()) {
+                // Store the pointer to the input buffer
                 store(ins.result, R::RAX);
+                // Also mark this variable as holding a string pointer
+                if (ins.result.kind == IRRef::Kind::VAR) {
+                    stringVarNames_.insert(varName(ins.result));
+                }
             }
             break;
         }
@@ -1717,6 +1723,31 @@ static void emitInputIntLinux(X64Emitter& em) {
 
     em.add_rsp_i32(64);
     em.pop_r(R::R13); em.pop_r(R::R12);
+    em.pop_rbp();
+    em.ret();
+}
+
+// __ac_input_str__(): read string line from stdin, return buffer pointer in RAX
+static void emitInputStrLinux(X64Emitter& em) {
+    em.label("__ac_input_str__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.sub_rsp_i32(1024 + 16);  // 1024-byte buffer for input
+
+    // read(0, buffer, 1024)
+    em.lea_r_rbp32(R::RSI, -1024);  // buffer address in RSI
+    em.mov_ri32(R::RDI, 0);         // fd = 0 (stdin) in RDI
+    em.mov_ri32(R::RDX, 1024);      // count = 1024 in RDX
+    em.mov_ri32(R::RAX, 0);         // syscall 0 = read
+    em.syscall();
+
+    // RAX = bytes read; the buffer will be null-terminated by __ac_print_cstr__
+    // Just return the buffer pointer as-is
+    em.lea_r_rbp32(R::RCX, -1024);  // RCX = buffer pointer (for reference)
+
+    // Return buffer pointer
+    em.lea_r_rbp32(R::RAX, -1024);
+
+    em.add_rsp_i32(1024 + 16);
     em.pop_rbp();
     em.ret();
 }
@@ -2983,6 +3014,7 @@ public:
             emitPrintCStrLinux(em);
             emitPrintDoubleLinux(em);
             emitInputIntLinux(em);
+            emitInputStrLinux(em);
         }
 
         // Emit PLT stubs on Linux when there are external symbols
