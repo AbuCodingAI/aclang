@@ -21,7 +21,10 @@ Make hello func(name)
     return $Hello, $ + name
 
 Make reverse func(s)
-    return s
+    reversed = $$
+    FOR c in s
+        reversed = c + reversed
+    return reversed
 `);
 
 fs.writeFileSync(path.join(testDir, 'LICENSE'), `MIT License

@@ -157,26 +157,28 @@ class Atar {
       throw new Error(`${tarFile} not found. Run: atar package`);
     }
 
-    console.log(`\n📤 Publishing ${tarFile} to GitHub...\n`);
+    console.log(`\n📤 Publishing ${tarFile} to aclang-registry...\n`);
     console.log('⚠️  Manual steps:');
-    console.log(`  1. git tag v1.0.0`);
-    console.log(`  2. git push origin v1.0.0`);
-    console.log(`  3. gh release create v1.0.0 ${tarFile}`);
+    console.log(`  1. Fork https://github.com/AbuCodingAI/aclang-registry`);
+    console.log(`  2. Add ${tarFile} to your fork`);
+    console.log(`  3. git push your-fork`);
+    console.log(`  4. Create PR to AbuCodingAI/aclang-registry`);
     console.log('');
   }
 
-  // atar install - Download from GitHub
+  // atar install - Download from GitHub registry
   async install(pkg) {
     if (!pkg) {
       throw new Error('Usage: atar install user/package');
     }
 
-    console.log(`\n📥 Installing ${pkg} from GitHub...\n`);
+    console.log(`\n📥 Installing ${pkg} from aclang-registry...\n`);
     console.log('⚠️  Manual steps:');
     console.log(`  1. cd /path/to/AC/library/elib`);
-    console.log(`  2. gh release download -R ${pkg} --pattern '*.tar'`);
-    console.log(`  3. tar -xf *.tar`);
-    console.log(`  4. rm *.tar`);
+    console.log(`  2. wget https://github.com/AbuCodingAI/aclang-registry/releases/download/latest/${pkg}.tar`);
+    console.log(`  3. mkdir ${pkg}`);
+    console.log(`  4. tar -xf ${pkg}.tar -C ${pkg}`);
+    console.log(`  5. rm ${pkg}.tar`);
     console.log('');
   }
 
