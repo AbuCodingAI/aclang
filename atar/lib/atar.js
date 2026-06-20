@@ -7,6 +7,42 @@ class Atar {
     this.cwd = cwd;
     this.atarYamlPath = path.join(cwd, 'atar.yaml');
     this.licensePath = path.join(cwd, 'LICENSE');
+    this.elibPath = this.findElibPath();
+  }
+
+  findElibPath() {
+    // 1. Check AC_PATH environment variable
+    if (process.env.AC_PATH) {
+      const acPath = path.join(process.env.AC_PATH, 'library', 'elib');
+      if (fs.existsSync(acPath)) {
+        return acPath;
+      }
+    }
+
+    // 2. Search up directory tree for AC/library/elib
+    let current = this.cwd;
+    while (current !== path.dirname(current)) {
+      const elib = path.join(current, 'AC', 'library', 'elib');
+      if (fs.existsSync(elib)) {
+        return elib;
+      }
+      current = path.dirname(current);
+    }
+
+    // 3. Try common locations
+    const commonPaths = [
+      path.join(process.env.HOME || '', 'Documents/kiro projects/AC/AC/library/elib'),
+      '/path/to/AC/library/elib'
+    ];
+
+    for (const p of commonPaths) {
+      if (fs.existsSync(p)) {
+        return p;
+      }
+    }
+
+    // 4. Return default (user will need to set AC_PATH)
+    return path.join(process.env.HOME || '', 'AC/library/elib');
   }
 
   // atar assess - Analyze directory
@@ -80,19 +116,14 @@ class Atar {
       return;
     }
 
-    // Load from package directory (if exists)
-    const pkgYamlPath = path.join(
-      process.env.AC_PATH || '/path/to/AC',
-      'library/elib',
-      pkgName,
-      'atar.yaml'
-    );
+    // Load from elib directory
+    const pkgYamlPath = path.join(this.elibPath, pkgName, 'atar.yaml');
 
     if (fs.existsSync(pkgYamlPath)) {
       const yaml = this.parseYaml(fs.readFileSync(pkgYamlPath, 'utf8'));
       this.displayYaml(yaml);
     } else {
-      throw new Error(`Package not found: ${pkgName}`);
+      throw new Error(`Package not found at: ${path.dirname(pkgYamlPath)}`);
     }
   }
 
@@ -173,8 +204,9 @@ class Atar {
     }
 
     console.log(`\n📥 Installing ${pkg} from aclang-registry...\n`);
+    console.log(`📍 elib path: ${this.elibPath}\n`);
     console.log('⚠️  Manual steps:');
-    console.log(`  1. cd /path/to/AC/library/elib`);
+    console.log(`  1. cd ${this.elibPath}`);
     console.log(`  2. wget https://github.com/AbuCodingAI/aclang-registry/releases/download/latest/${pkg}.tar`);
     console.log(`  3. mkdir ${pkg}`);
     console.log(`  4. tar -xf ${pkg}.tar -C ${pkg}`);
