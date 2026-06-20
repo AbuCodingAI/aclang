@@ -126,27 +126,40 @@ Make
 
 ---
 
-## Part 2: C/Python/Go Calling AC (Reverse FFI)
+## Part 2: Creating AC Libraries (AC->LIB)
 
-### **Expose AC Functions as Library**
-
-```ac
-AC->LIB
-/* Default: all functions are exported */
-
-Make multiply func(a: int, b: int) -> int
-    RETURN a * b
-Make
-
-Make greet func(name: str) -> str
-    RETURN $Hello, $ + name
-Make
-```
-
-**Outputs:**
+**AC->LIB already works** and outputs shared libraries:
 - `libmycode.so` (Linux)
 - `mycode.dll` (Windows)
 - `libmycode.dylib` (macOS)
+
+### **For Library Development: Use clib/**
+
+Store library code in `clib/` folder for testing:
+
+```
+my_project/
+  clib/              /* Computer Libraries - internal testing */
+    mylib/
+      lib.ac
+      atar.json
+    another/
+      lib.ac
+      atar.json
+  elib/              /* External libraries - installed via atar */
+    downloaded_lib/
+  src/
+    main.ac
+```
+
+### **For External Libraries: Use elib/**
+
+Downloaded packages go to `elib/`:
+
+```bash
+atar install math_lib              /* Downloads to elib/ */
+atar install math_lib --local      /* Alternative: downloads to elib/ */
+```
 
 ### **C Caller**
 

@@ -1,17 +1,17 @@
 # atar: AC Package Manager
 
-**Very simple. Just works.**
+**Very simple. Independent. Cross-platform.**
 
 ---
 
 ## Philosophy
 
 ```
-npm → bloated, 1000 dependencies for hello world
-pip → virtual env hell
-cargo → 5 minute compile times
-Atar → paste URL, download, use. Done.
+apt/npm/pip → platform-specific, dependency hell
+atar → self-contained .tar files, works everywhere
 ```
+
+atar is **NOT** a wrapper around system package managers. It's its own standalone PM.
 
 ---
 
@@ -21,57 +21,76 @@ Atar → paste URL, download, use. Done.
 npm install -g atar
 ```
 
+Or: download prebuilt binary for your platform.
+
 ---
 
 ## Quick Start
 
-### **1. Create Package**
+### **1. Create Package in clib/**
 
 ```bash
-cd my_ac_lib
-atar init
+cd my_project/clib
+mkdir my_string_lib
+cd my_string_lib
 ```
 
-Creates `atar.yaml`:
-```yaml
-name: my_ac_lib
-version: 1.0.0
-author: Your Name
-description: My awesome AC library
-main: lib.ac
-license: MIT
+Create `lib.ac`:
+```ac
+Make reverse func(s: str) -> str
+    RETURN reversed
+Make
+
+Make uppercase func(s: str) -> str
+    RETURN s.to_upper()
+Make
 ```
 
-### **2. Publish Package**
+### **2. Make Package Ready**
 
 ```bash
-atar publish
+cd my_string_lib
+atar ready
 ```
 
-Uploads to central registry. Done.
+**What `atar ready` does:**
+1. Checks for `LICENSE` file
+2. Creates `atar.yaml` with license info (or "NO LICENSE")
+3. Packages everything into `my_string_lib.tar`
+4. Ready to publish!
 
-### **3. Use Package**
+Output:
+```
+✅ Created my_string_lib.tar
+License: MIT (auto-detected)
+Ready to publish: atar publish my_string_lib.tar
+```
+
+### **3. Publish Package**
 
 ```bash
-atar add github.com/user/my_ac_lib
+atar publish my_string_lib.tar
 ```
 
-Adds to local `atar.lock`:
-```yaml
-my_ac_lib: github.com/user/my_ac_lib@1.0.0
+Uploads to central registry.
+
+### **4. Use in Another Project**
+
+```bash
+cd other_project
+atar install my_string_lib
 ```
 
-Code automatically fetches and caches.
+Downloads to `elib/my_string_lib/`
 
-### **4. Use in Code**
+### **5. Use in Code**
 
 ```ac
-use my_ac_lib
+use my_string_lib
 
-result = my_ac_lib.my_function(42)
+text = $hello world$
+reversed = my_string_lib.reverse(text)
 ```
-
-Done.
 
 ---
 
@@ -79,236 +98,266 @@ Done.
 
 ```
 my_project/
-  atar.yaml          /* Package metadata */
-  atar.lock          /* Locked versions */
-  atar_modules/      /* Downloaded packages (cached) */
-    my_ac_lib/
+  clib/                      /* Computer Libraries (internal) */
+    my_string_lib/
+      lib.ac
+      LICENSE
+      atar.yaml              /* Auto-created by atar ready */
+      my_string_lib.tar      /* Auto-created by atar ready */
+    another_lib/
       lib.ac
       atar.yaml
+  
+  elib/                       /* External Libraries (downloaded) */
+    installed_lib/
+      lib.ac
+      atar.yaml
+    another_installed/
+      lib.ac
+      atar.yaml
+  
   src/
-    main.ac          /* Your code */
+    main.ac                   /* Your code uses: use installed_lib */
 ```
 
 ---
 
 ## atar.yaml Format
 
+**User-created version:**
+
 ```yaml
 # Required
-name: my_ac_lib
+name: my_string_lib
 version: 1.0.0
 main: lib.ac
 
-# Optional
+# Optional (auto-filled by atar ready)
 author: Your Name
-description: Description
-license: MIT
-repository: github.com/user/my_ac_lib
+description: String utilities library
+license: MIT                    # or "NO LICENSE"
+repository: github.com/you/my_string_lib
 homepage: https://example.com
-tags: [utils, math, string]
+tags: [strings, utils]
 
-# Dependencies
-dependencies:
-  other_lib: github.com/user/other_lib@2.0.0
-  another_lib: github.com/user/another_lib@*  /* Any version */
-
-# Optional: what to include in package
+# Optional: what to include in .tar
 include:
   - lib.ac
-  - lib/
-  - README.md
   - LICENSE
+  - README.md
+```
+
+**Auto-created by `atar ready`:**
+
+```bash
+atar ready
+# Reads LICENSE file
+# Creates/updates atar.yaml with license field
+# Packages into .tar
 ```
 
 ---
 
 ## Commands
 
-### **Init**
+### **atar ready**
 ```bash
-atar init
-```
-Creates `atar.yaml` interactively.
-
-### **Add**
-```bash
-atar add github.com/user/my_lib
-atar add github.com/user/my_lib@1.2.3   /* Specific version */
-atar add github.com/user/my_lib@^1.0.0  /* Caret (compatible) */
+atar ready
 ```
 
-Adds to `atar.yaml` + downloads to `atar_modules/`
+Auto-generates `atar.yaml` + creates `.tar` file.
 
-### **Remove**
-```bash
-atar remove my_lib
+**What it does:**
+1. Reads `LICENSE` file if present
+2. Creates/updates `atar.yaml` with detected license
+3. Packages everything into `{name}.tar`
+4. Prints: "Ready to publish: `atar publish {name}.tar`"
+
+**Output:**
+```
+✅ atar.yaml created
+📦 Package: my_string_lib.tar
+🔐 License: MIT
+📝 Ready: atar publish my_string_lib.tar
 ```
 
-### **Update**
+### **atar publish**
 ```bash
-atar update                    /* Update all */
-atar update my_lib             /* Update specific */
-atar update my_lib@2.0.0       /* Update to version */
+atar publish my_string_lib.tar
 ```
 
-### **List**
+Uploads `.tar` to central registry.
+
+**Requirements:**
+- `.tar` file exists
+- `atar.yaml` inside it
+- Name + version not already published
+
+### **atar publish (Local)**
 ```bash
-atar list                      /* Local packages */
-atar list -g                   /* Global packages */
-atar list --outdated          /* Show updates available */
+atar publish --local my_string_lib.tar
 ```
 
-### **Publish**
+Publishes locally (no upload to registry).
+
+### **atar get**
 ```bash
-atar publish
+atar get my_string_lib
 ```
 
-Uploads to registry. Requires:
-- `atar.yaml` with name + version
-- Git repo with valid origin
-- Not already published at that version
-
-### **Publish (Private)**
-```bash
-atar publish --registry https://my-registry.com
+Shows package info:
+```
+Name: my_string_lib
+Version: 1.0.0
+Author: You
+License: MIT
+Description: String utilities library
+Repository: github.com/you/my_string_lib
+Size: 2.3KB
 ```
 
-Uses custom registry instead of central.
-
-### **Search**
+### **atar install**
 ```bash
-atar search math              /* Search for "math" packages */
-atar search "matrix lib"
+atar install my_string_lib          /* Global installation */
+atar install my_string_lib --local  /* Local to elib/ */
 ```
 
-Shows top results from registry.
+**Global:**
+- Downloads to system atar directory
+- Accessible from any AC project
 
-### **Info**
+**Local:**
+- Downloads to `./elib/` 
+- Only accessible from current project
+
+### **atar list**
 ```bash
-atar info github.com/user/my_lib
+atar list              /* List installed packages */
+atar list -g           /* List globally installed */
+atar list --local      /* List in local elib/ */
 ```
 
-Shows version history, downloads, etc.
-
-### **Cache**
+### **atar search**
 ```bash
-atar cache clean             /* Clear cache */
-atar cache list              /* Show cached packages */
+atar search string     /* Search registry for "string" */
+atar search "utils"
 ```
 
-### **Install Dependencies**
+Returns matching packages with versions.
+
+### **atar remove**
 ```bash
-atar install                 /* Read atar.lock, fetch all */
+atar remove my_lib             /* Remove globally */
+atar remove my_lib --local     /* Remove from elib/ */
+```
+
+### **atar cache**
+```bash
+atar cache clean       /* Clear downloaded .tar files */
+atar cache list        /* Show cached packages */
 ```
 
 ---
 
-## Version Scheme
+---
 
-**Semantic Versioning:** `MAJOR.MINOR.PATCH`
+## How It Works
 
-```
-1.0.0  → stable
-1.0.1  → bug fix
-1.1.0  → new feature, backwards compatible
-2.0.0  → breaking change
-```
-
-### **Version Ranges**
+### **Creating a Package**
 
 ```
-^1.0.0  → >=1.0.0, <2.0.0 (caret: minor+patch allowed)
-~1.0.0  → >=1.0.0, <1.1.0 (tilde: patch only)
-1.0.0   → exactly 1.0.0
-*       → any version
-1.x.x   → any 1.y.z
+1. Write code in clib/my_lib/
+2. Add LICENSE file (MIT, Apache, etc.)
+3. atar ready → creates atar.yaml + my_lib.tar
+4. atar publish my_lib.tar → uploads to registry
+```
+
+### **Using a Package**
+
+```
+1. atar install my_lib → downloads my_lib.tar
+2. Extracts to elib/my_lib/
+3. use my_lib in code
+4. Compiler finds it in elib/ and links it
+```
+
+### **Package Distribution**
+
+**Why .tar files?**
+
+```
+✅ Works everywhere (Linux, Windows, macOS)
+✅ No platform-specific dependencies
+✅ Self-contained (no apt/brew/choco needed)
+✅ Can be version-controlled (git)
+✅ Portable (download once, use anywhere)
+❌ Not dependent on system package managers
 ```
 
 ---
 
 ## Registry
 
-### **Central Registry** (Default)
+### **Central Registry**
 
 ```
 registry.aclang.dev
 ```
 
-Stores all public packages.
+Default location for all published packages.
 
-### **Private Registries**
-
-```bash
-/* In atar.yaml */
-registry:
-  - name: central
-    url: https://registry.aclang.dev
-    
-  - name: private
-    url: https://my-company-registry.com
-    auth: token
-```
+### **Local Registry** (`--local`)
 
 ```bash
-/* Or CLI */
-atar add my_company/my_lib --registry private
+atar publish --local my_lib.tar
 ```
 
-### **GitHub as Registry** (Simplest)
-
-```bash
-atar add github.com/user/my_lib
-/* Automatically uses GitHub as registry */
-/* Clones from GitHub, caches locally */
-```
+Publishes locally without uploading to central registry.
 
 ---
 
-## Lock File (atar.lock)
+## Folder Structure
 
-```yaml
-# Auto-generated, should be committed
-
-my_lib: github.com/user/my_lib@1.0.0 (hash: abc123def456)
-other_lib: github.com/other/lib@2.1.0 (hash: xyz789uvw012)
-nested_dep: github.com/dep/dep@0.5.0 (hash: 456def789abc)
-```
-
-**Why:** Ensures exact same versions on all machines.
-
-```bash
-git add atar.lock
-git commit -m "Lock dependencies"
-```
-
----
-
-## Conflict Resolution
-
-### **Diamond Dependency**
+**clib/ - Computer Libraries (Development)**
 
 ```
-my_project
-├── lib_a@1.0.0
-│   └── common@2.0.0
-└── lib_b@1.0.0
-    └── common@1.0.0    /* Conflict! */
+clib/
+  math_lib/
+    lib.ac
+    LICENSE
+    atar.yaml
+    math_lib.tar
+  string_lib/
+    lib.ac
+    LICENSE
+    atar.yaml
+    string_lib.tar
 ```
 
-**Solution:** Atar's smart resolver
+Use for:
+- ✅ Internal testing
+- ✅ Package development
+- ✅ Before publishing
 
-1. Check if `2.0.0` is compatible with `1.0.0` (semver)
-2. If yes: use `2.0.0` (newer version compatible)
-3. If no: error + suggestion
+**elib/ - External Libraries (Installation)**
 
 ```
-Error: Dependency conflict
-  lib_a requires common@2.0.0
-  lib_b requires common@1.0.0
-  
-Solution: Update lib_b to a version that accepts common@2.0.0
-  atar update lib_b
+elib/
+  math_lib/
+    lib.ac
+    atar.yaml
+  string_lib/
+    lib.ac
+    atar.yaml
+  networking_lib/
+    lib.ac
+    atar.yaml
 ```
+
+Use for:
+- ✅ Downloaded packages from atar
+- ✅ External dependencies
+- ✅ Installed globally or locally
 
 ---
 
@@ -336,30 +385,17 @@ Solution: Update lib_b to a version that accepts common@2.0.0
 
 ## Example: Complete Workflow
 
-### **Step 1: Create Package**
+### **Step 1: Create Package in clib/**
 
 ```bash
+cd my_project/clib
 mkdir my_string_lib
 cd my_string_lib
-atar init
 ```
 
-Prompts:
-```
-Name: my_string_lib
-Version: 1.0.0
-Description: String utilities
-Author: You
-Main file: lib.ac
-License: MIT
-```
-
-### **Step 2: Write Code**
-
+Create `lib.ac`:
 ```ac
-/* lib.ac */
 Make reverse func(s: str) -> str
-    /* String reversal logic */
     RETURN reversed_string
 Make
 
@@ -368,31 +404,68 @@ Make uppercase func(s: str) -> str
 Make
 ```
 
+Create `LICENSE` (MIT):
+```
+MIT License
+Copyright (c) 2026 You
+...
+```
+
+### **Step 2: Make Package Ready**
+
+```bash
+atar ready
+```
+
+Output:
+```
+✅ atar.yaml created
+📦 Package: my_string_lib.tar
+🔐 License: MIT
+📝 Ready: atar publish my_string_lib.tar
+```
+
+What happened:
+- Read LICENSE file → auto-detected MIT
+- Created atar.yaml with license
+- Packaged everything into my_string_lib.tar
+- Ready to publish!
+
 ### **Step 3: Publish**
 
 ```bash
-git init
-git add .
-git commit -m "Initial release"
-git push origin main
-
-atar publish
+atar publish my_string_lib.tar
 ```
 
+Output:
 ```
 ✅ Published my_string_lib@1.0.0
-Uploaded to registry
-Available at: github.com/you/my_string_lib
+📍 Registry: registry.aclang.dev
+🔗 Available globally
 ```
 
-### **Step 4: Use in Project**
+### **Step 4: Use in Another Project**
 
 ```bash
-mkdir my_project
-cd my_project
-atar init
+cd other_project
+atar install my_string_lib
+```
 
-atar add github.com/you/my_string_lib
+Output:
+```
+📥 Downloading: my_string_lib.tar
+✅ Installed to elib/my_string_lib/
+```
+
+Folder structure:
+```
+other_project/
+  elib/
+    my_string_lib/
+      lib.ac
+      atar.yaml
+  src/
+    main.ac
 ```
 
 ### **Step 5: Use in Code**
@@ -410,126 +483,145 @@ Term.display reversed  /* dlrow olleh */
 ### **Step 6: Run**
 
 ```bash
-ac main.ac
+ac src/main.ac
 ```
 
-Atar automatically:
-1. Fetches my_string_lib from cache or GitHub
-2. Compiles dependencies
-3. Links your code
-4. Runs result
+Compiler:
+1. Sees `use my_string_lib`
+2. Finds it in `elib/my_string_lib/`
+3. Links it
+4. Runs
 
 ---
 
 ## Special Features
 
-### **Monorepo Support**
-
-```
-my_monorepo/
-  atar.yaml
-  packages/
-    utils/
-      lib.ac
-      atar.yaml
-    math/
-      lib.ac
-      atar.yaml
-```
-
-### **Local Path Dependencies**
-
-```yaml
-# In atar.yaml
-dependencies:
-  local_lib: ./packages/utils
-  remote_lib: github.com/user/lib@1.0.0
-```
-
-### **Git Branch/Tag Dependencies**
-
-```yaml
-dependencies:
-  unstable: github.com/user/lib@main        /* Latest from main branch */
-  latest: github.com/user/lib@v2.0.0        /* Git tag */
-```
-
-### **Custom Registries**
+### **License Auto-Detection**
 
 ```bash
-atar config set registry https://my-registry.com
-atar add my_lib  /* Uses custom registry */
+atar ready
+```
+
+Automatically reads LICENSE file and includes in atar.yaml:
+
+```yaml
+license: MIT   # auto-detected
+```
+
+Or marks as "NO LICENSE" if missing.
+
+### **Multiple Installations**
+
+**Global:**
+```bash
+atar install my_lib
+```
+Available to all AC projects.
+
+**Local:**
+```bash
+atar install my_lib --local
+```
+Only in current project's elib/
+
+### **Package Management**
+
+```bash
+atar list              /* Show installed */
+atar get my_lib        /* Show package info */
+atar remove my_lib     /* Uninstall */
+atar search string     /* Search registry */
 ```
 
 ---
 
 ## Security
 
-### **Checksum Verification**
+### **License Tracking**
 
-```yaml
-# atar.lock includes checksums
-my_lib: github.com/user/my_lib@1.0.0 
-  hash: sha256:abc123...
-```
-
-Verified on every install.
-
-### **Audit**
+Every package includes license in atar.yaml.
 
 ```bash
-atar audit          /* Check for known vulnerabilities */
-atar audit --fix    /* Auto-upgrade vulnerable deps */
+atar get my_lib
+# Output includes: License: MIT
 ```
 
-### **Sandboxing** (Future)
+### **Checksums** (Future)
 
-Packages run in sandbox by default (no file access, no os.bash).
+Verify downloaded .tar integrity:
+```bash
+atar install my_lib --verify
+```
+
+### **Audit** (Future)
+
+Check for known vulnerabilities:
+```bash
+atar audit
+```
 
 ---
 
 ## CLI Summary
 
 ```bash
-atar init                               # Create new package
-atar add PACKAGE[@VERSION]              # Add dependency
-atar remove PACKAGE                     # Remove dependency
-atar update [PACKAGE]                   # Update to latest
-atar install                            # Install from lock file
-atar publish [--registry URL]           # Publish package
-atar search QUERY                       # Search packages
-atar info PACKAGE                       # Package info
-atar list [-g|--outdated]              # List packages
+atar ready [path]                       # Auto-create atar.yaml + .tar
+atar publish PACKAGE.tar                # Publish to registry
+atar publish PACKAGE.tar --local        # Publish locally
+atar install PACKAGE                    # Install globally to system
+atar install PACKAGE --local            # Install to local elib/
+atar get PACKAGE                        # Show package info
+atar list                               # List installed packages
+atar list --local                       # List in local elib/
+atar search QUERY                       # Search registry
+atar remove PACKAGE                     # Uninstall
+atar remove PACKAGE --local             # Uninstall from elib/
 atar cache clean                        # Clear cache
-atar audit [--fix]                     # Security check
-atar config set KEY VALUE              # Configure
 ```
 
 ---
 
-## Philosophy Summary
+## Architecture Summary
 
-| Feature | npm | pip | Atar |
-|---------|-----|-----|------|
-| **Simplicity** | ❌ 100MB node_modules | ❌ venv hell | ✅ atar_modules/ |
+| Aspect | Design |
+|--------|--------|
+| **Package format** | .tar (self-contained, cross-platform) |
+| **Development** | clib/ (Computer Libraries) |
+| **Installation** | elib/ (External Libraries) |
+| **Metadata** | atar.yaml (user or auto-created) |
+| **License** | Auto-detected from LICENSE file |
+| **Registry** | Central (registry.aclang.dev) + local |
+| **Independence** | NOT dependent on apt/brew/choco |
+| **Platform support** | Windows, Linux, macOS (all equal) |
+
+---
+
+## vs npm/pip
+
+| | npm | pip | **atar** |
+|---|-----|-----|----------|
+| **Bloat** | 🤦 100MB | 🤦 venv hell | ✅ Clean |
 | **Speed** | ❌ Slow | ❌ Slow | ✅ Fast |
-| **Clarity** | ❌ Confusing | ❌ Complex | ✅ Simple |
-| **Git native** | ❌ No | ❌ No | ✅ Yes |
-| **Caching** | ❌ Bad | ❌ Meh | ✅ Good |
-| **Conflicts** | ❌ Nested deps | ❌ Frozen deps | ✅ Smart resolver |
+| **Cross-platform** | ⚠️ Meh | ❌ No | ✅ Perfect |
+| **WSL/Windows** | ⚠️ Meh | ❌ Bad | ✅ Works |
+| **Simplicity** | ❌ Complex | ❌ Complex | ✅ Simple |
+| **Independence** | ❌ Requires npm | ❌ Requires pip | ✅ Self-contained |
+| **License tracking** | ❌ Optional | ❌ Optional | ✅ Automatic |
 
 ---
 
 ## Status
 
-- ✅ Design complete
+- ✅ Architecture complete
 - ⏳ CLI implementation (Phase 1)
 - ⏳ Registry backend (Phase 2)
-- ⏳ Security audit (Phase 3)
+- ⏳ License verification (Phase 3)
 
 ---
 
 ## One-Liner
 
-> **Atar: Paste GitHub URL, get code, move on with your life.**
+> **atar: .tar files + clib/elib folders + one command. Done.**
+
+**Key insight:** Independent package manager that works everywhere because it doesn't depend on system package managers. 🎯
 
