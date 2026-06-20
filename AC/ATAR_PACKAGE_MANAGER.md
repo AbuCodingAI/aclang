@@ -610,18 +610,221 @@ atar cache clean                        # Clear cache
 
 ---
 
+---
+
+## Recommended Practices
+
+### **1. Create Your Own atar.yaml**
+
+**Best practice:** Write atar.yaml manually, don't rely only on `atar ready`.
+
+```yaml
+name: my_string_lib
+version: 1.0.0
+author: Your Name
+description: String utilities and helpers
+license: MIT
+repository: github.com/you/my_string_lib
+homepage: https://example.com
+main: lib.ac
+tags: [strings, utils, text-processing]
+```
+
+**Why:**
+- ✅ Clear intent and metadata
+- ✅ Repository + homepage for users
+- ✅ Tags help with discovery
+- ✅ Version control (check in git)
+
+**atar ready supplements this:**
+- Auto-detects license from LICENSE file
+- Updates atar.yaml if missing license
+- Ensures all required fields present
+
+---
+
+### **2. Use a License**
+
+**Always include a LICENSE file.**
+
+```bash
+cd clib/my_lib
+echo "MIT License" > LICENSE
+# Or copy full license text
+```
+
+**Why:**
+- ✅ Users know what they can do with your code
+- ✅ atar auto-detects and includes in atar.yaml
+- ✅ Legal clarity (you're protected)
+- ✅ Increases adoption (people trust licensed code)
+
+**Common licenses for AC libraries:**
+
+```
+MIT              → Permissive, most popular
+Apache 2.0       → Permissive with patent protection
+GPL 3.0          → Share-alike (code sharing required)
+Unlicense        → Public domain
+```
+
+**No license?**
+```bash
+atar ready
+# Output: 🚨 Warning: NO LICENSE detected
+# atar.yaml shows: license: NO LICENSE
+```
+
+Users will hesitate to use unlicensed code.
+
+---
+
+### **3. Naming Conventions**
+
+**Package names should be:**
+
+#### **Clear & Descriptive**
+```
+✅ string_utils
+✅ math_lib
+✅ networking_tools
+❌ stuff
+❌ lib
+❌ util
+```
+
+#### **Lowercase with underscores**
+```
+✅ my_string_lib
+✅ http_client
+✅ json_parser
+❌ MyStringLib
+❌ httpClient
+❌ JSON-Parser
+```
+
+#### **Avoid conflicts**
+```
+✅ my_project_math        (prefix to avoid collision)
+✅ awesome_http_client    (descriptive + prefix)
+❌ math                   (too generic, likely taken)
+❌ http_client            (common name, collisions)
+```
+
+#### **Length guideline**
+```
+Good: 2-4 words
+  ✅ string_utils
+  ✅ http_client_lib
+  ✅ json_parser
+  
+Avoid: Too short or too long
+  ❌ str              (too short, unclear)
+  ❌ my_awesome_super_string_utilities_library  (too long)
+```
+
+#### **Examples of Good Names**
+
+```
+crypto_lib           → cryptography library
+regex_engine         → regex utilities
+file_io_utils        → file operations
+concurrent_tools     → concurrency primitives
+data_struct          → data structures
+ui_components        → UI building blocks
+ml_inference         → machine learning
+web_framework        → web server framework
+```
+
+#### **Avoid These Patterns**
+
+```
+❌ ac_*              (redundant, already in AC)
+❌ lib_*             (redundant, it's a library)
+❌ *_lib             (can use just the name)
+❌ test_*            (not for public packages)
+❌ tmp_*             (temporary, unprofessional)
+```
+
+**Better:**
+```
+❌ ac_crypto        →  ✅ crypto_utils
+❌ lib_http         →  ✅ http_client
+❌ string_lib       →  ✅ string_utils
+```
+
+---
+
+## Example: Complete Best Practices
+
+### **clib/awesome_parser/atar.yaml**
+
+```yaml
+# User-written, not auto-generated
+name: awesome_parser
+version: 1.2.0
+author: Jane Doe
+description: Fast JSON and XML parser for AC
+
+# License is auto-detected from LICENSE file
+license: MIT
+
+# User provides details
+repository: github.com/janedoe/awesome_parser
+homepage: https://awesome-parser.example.com
+main: lib.ac
+
+# Tags help with discovery
+tags: [json, xml, parsing, utilities]
+```
+
+### **clib/awesome_parser/LICENSE**
+
+```
+MIT License
+
+Copyright (c) 2026 Jane Doe
+
+Permission is hereby granted, free of charge, to any person obtaining a copy...
+```
+
+### **Publish**
+
+```bash
+cd clib/awesome_parser
+atar ready
+# ✅ Reads LICENSE → MIT detected
+# ✅ atar.yaml verified
+# ✅ awesome_parser.tar created
+
+atar publish awesome_parser.tar
+# ✅ Published to registry
+# Users can now: atar install awesome_parser
+```
+
+---
+
 ## Status
 
 - ✅ Architecture complete
+- ✅ Best practices documented
 - ⏳ CLI implementation (Phase 1)
 - ⏳ Registry backend (Phase 2)
 - ⏳ License verification (Phase 3)
 
 ---
 
-## One-Liner
+## Summary
 
-> **atar: .tar files + clib/elib folders + one command. Done.**
+**Three principles:**
 
-**Key insight:** Independent package manager that works everywhere because it doesn't depend on system package managers. 🎯
+1. **Write atar.yaml manually** → Clear metadata + intent
+2. **Always use a License** → Legal clarity + user trust
+3. **Follow naming conventions** → Discoverability + professionalism
+
+**One-Liner:**
+
+> **atar: .tar files + clear names + proper licenses = trusted ecosystem.**
+
+🎯
 
