@@ -679,78 +679,101 @@ Users will hesitate to use unlicensed code.
 
 ---
 
-### **3. Naming Conventions**
+### **3. Version & Naming Conventions**
 
-**Package names should be:**
+#### **Package Names**
 
-#### **Clear & Descriptive**
+**Lowercase with underscores:**
 ```
 ✅ string_utils
-✅ math_lib
-✅ networking_tools
-❌ stuff
-❌ lib
-❌ util
-```
-
-#### **Lowercase with underscores**
-```
-✅ my_string_lib
 ✅ http_client
 ✅ json_parser
 ❌ MyStringLib
 ❌ httpClient
-❌ JSON-Parser
 ```
 
-#### **Avoid conflicts**
+**Clear & descriptive (2-4 words):**
 ```
-✅ my_project_math        (prefix to avoid collision)
-✅ awesome_http_client    (descriptive + prefix)
-❌ math                   (too generic, likely taken)
-❌ http_client            (common name, collisions)
-```
-
-#### **Length guideline**
-```
-Good: 2-4 words
-  ✅ string_utils
-  ✅ http_client_lib
-  ✅ json_parser
-  
-Avoid: Too short or too long
-  ❌ str              (too short, unclear)
-  ❌ my_awesome_super_string_utilities_library  (too long)
+✅ my_project_math        (good: specific)
+✅ awesome_http_client    (good: descriptive)
+❌ math                   (bad: too generic)
+❌ lib                    (bad: too vague)
 ```
 
-#### **Examples of Good Names**
-
+**Avoid these patterns:**
 ```
-crypto_lib           → cryptography library
-regex_engine         → regex utilities
-file_io_utils        → file operations
-concurrent_tools     → concurrency primitives
-data_struct          → data structures
-ui_components        → UI building blocks
-ml_inference         → machine learning
-web_framework        → web server framework
+❌ ac_*              → ✅ crypto_utils
+❌ lib_*             → ✅ http_client
+❌ test_*            → ✅ parser
 ```
 
-#### **Avoid These Patterns**
+#### **Versioning Scheme**
+
+**Semantic Versioning: `MAJOR.MINOR.PATCH`**
 
 ```
-❌ ac_*              (redundant, already in AC)
-❌ lib_*             (redundant, it's a library)
-❌ *_lib             (can use just the name)
-❌ test_*            (not for public packages)
-❌ tmp_*             (temporary, unprofessional)
+0.x.x     → Preview/Prototype (not for production)
+1.0.0     → Stable (first release, ready to use)
+1.0.1     → Bugfix (patch release, fixes only)
+1.1.0     → Update (backwards compatible, syntax changes)
+2.0.0     → Big change (breaking change, major version bump)
 ```
 
-**Better:**
+**Examples:**
+
 ```
-❌ ac_crypto        →  ✅ crypto_utils
-❌ lib_http         →  ✅ http_client
-❌ string_lib       →  ✅ string_utils
+0.1.0     → Still experimental, API may change drastically
+0.5.0     → Preview, not ready yet
+
+1.0.0     → First stable release ✅ Safe to use
+1.0.1     → Bug fixes only, all code still works
+1.0.2     → Another bug fix
+1.1.0     → New features, backwards compatible, some syntax updates
+1.2.0     → More features, still compatible
+
+2.0.0     → Breaking change, requires code updates
+2.1.0     → New features on top of 2.0.0
+```
+
+**When to bump version:**
+
+```
+0.0.1 → 0.0.2   Bugfix (experimental)
+0.1.0 → 0.2.0   Features (experimental)
+0.9.0 → 1.0.0   Stable release 🎉
+
+1.0.0 → 1.0.1   Bugfix only (backward compatible)
+1.0.0 → 1.1.0   New features + syntax tweaks (backward compatible)
+1.0.0 → 2.0.0   Breaking changes (API redesign)
+```
+
+**In atar.yaml:**
+
+```yaml
+name: my_parser
+version: 1.2.3              # MAJOR.MINOR.PATCH
+                            # (currently at 1.2.3)
+```
+
+**When publishing:**
+
+```bash
+cd clib/my_parser
+# Fixed a bug → bump patch
+# atar.yaml: version: 1.0.1
+
+atar ready
+atar publish my_parser.tar
+```
+
+#### **Examples of Good Names with Versions**
+
+```
+crypto_utils 1.0.0         Stable encryption library
+http_client 0.5.0          Preview, API may change
+json_parser 1.2.3          Stable, bugfixes released
+web_framework 2.0.0        Major redesign
+file_io 1.1.0              New features, compatible
 ```
 
 ---
