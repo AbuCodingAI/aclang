@@ -1,0 +1,54 @@
+AC->BNY
+
+* Benchmark suite: tests compilation speed, runtime speed, and output size
+* Same code compiled to all 11 AC backends
+
+Make fib func(n)
+    IF n <= 1
+        RETURN n
+    RETURN fib(n - 1) + fib(n - 2)
+
+Make fibonacci_benchmark func()
+    * Compute fib(30) - enough work to measure runtime
+    result = fib(30)
+    RETURN result
+
+Make string_work func()
+    * String manipulation benchmark
+    s = $Hello World AC$
+    s2 = s + $!$
+    s3 = s2 + s2 + s2
+    RETURN s3
+
+Make list_work func()
+    * List operations benchmark
+    lst = [1, 2, 3, 4, 5]
+    sum = 0
+    FOR i in lst
+        sum = sum + i
+    RETURN sum
+
+Make loop_work func()
+    * Loop benchmark
+    total = 0
+    FOR i in range(1000)
+        total = total + i
+    RETURN total
+
+<mainloop>
+    * Run all benchmarks
+
+    fib_result = fibonacci_benchmark()
+    str_result = string_work()
+    list_result = list_work()
+    loop_result = loop_work()
+
+    Term.display $Fibonacci(30): $
+    Term.display fib_result
+    Term.display $String result: $
+    Term.display str_result
+    Term.display $List sum: $
+    Term.display list_result
+    Term.display $Loop sum: $
+    Term.display loop_result
+<mainloop>
