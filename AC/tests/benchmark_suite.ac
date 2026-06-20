@@ -26,7 +26,7 @@ Make distance func(arr)
     FOR i in arr
         IF i < minv
             minv = i
-        IF i #< maxv
+        IF i > maxv
             maxv = i
     return maxv - minv
 
@@ -98,3 +98,5 @@ Make array_ops func()
     checksum = checksum + array_result
 
     Term.display checksum
+    /kill
+<mainloop>
