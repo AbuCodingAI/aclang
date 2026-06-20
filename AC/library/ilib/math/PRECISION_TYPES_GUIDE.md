@@ -51,11 +51,13 @@ use ilib math
     mid = x.mid              /* Get middle 32-bits */
     low = x.low              /* Get low 32-bits */
 
-    /* RGB Color Example */
+    /* RGB Color Example (use ptm for shifts) */
     red = math.LongInt 255
     green = math.LongInt 128
     blue = math.LongInt 64
-    color = (red << 16) | (green << 8) | blue
+    color = (red ptm 16) bor (green ptm 8) bor blue
+
+    /end
 <mainloop>
 ```
 
@@ -280,7 +282,7 @@ IF math.isclose(target, actual, 0.01, 0.0)  /* 1% relative tolerance */
 red = math.LongInt 255
 green = math.LongInt 128
 blue = math.LongInt 64
-rgb_color = (red << 16) | (green << 8) | blue
+rgb_color = (red ptm 16) bor (green ptm 8) bor blue
 Term.display rgb_color  /* Single 96-bit color value */
 ```
 
