@@ -3,70 +3,128 @@
 #include <fstream>
 #include <zlib.h>
 #include <sstream>
-#include <queue>
+#include <thread>
+#include <mutex>
 
 namespace fs = std::filesystem;
 using namespace aczip;
 
 // ============================================================================
-// ACZIP IMPLEMENTATION
+// ACZIP IMPLEMENTATION - OPTIMIZED FOR SPEED
 // ============================================================================
 
 std::vector<uint8_t> ACZip::compress(const std::string& path, bool parallel) {
     Archive archive = build_archive(path);
 
-    std::string serialized;
-    serialized += "ACZP";  // Magic header
+    std::vector<uint8_t> result;
+    result.insert(result.end(), {'A', 'C', 'Z', '2'});  // Magic header v2
 
-    // Tag each file with 4-bit protocol
-    int file_counter = 0;
-    for (auto& entry : archive.files) {
-        file_counter++;
-        entry.tag = generate_tag(file_counter);
-        serialized += entry.tag;
-        serialized += std::to_string(entry.data.size()) + ":";
-        serialized.append((char*)entry.data.data(), entry.data.size());
+    // Compress each file individually + in parallel if enabled
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> compressed_files;
+    std::mutex result_mutex;
+
+    auto compress_file = [&](FileEntry& entry) {
+        entry.tag = generate_tag(compressed_files.size());
+        auto compressed = ACGzip::compress(entry.data, 6);
+
+        std::lock_guard<std::mutex> lock(result_mutex);
+        compressed_files.push_back({entry.tag, compressed});
+    };
+
+    if (parallel && archive.files.size() > 1) {
+        std::vector<std::thread> threads;
+        int num_threads = std::thread::hardware_concurrency();
+        size_t files_per_thread = archive.files.size() / num_threads;
+
+        for (int i = 0; i < num_threads && i * files_per_thread < archive.files.size(); i++) {
+            size_t start = i * files_per_thread;
+            size_t end = (i == num_threads - 1) ? archive.files.size() : (i + 1) * files_per_thread;
+
+            threads.push_back(std::thread([&, start, end]() {
+                for (size_t j = start; j < end; j++) {
+                    compress_file(archive.files[j]);
+                }
+            }));
+        }
+
+        for (auto& t : threads) {
+            t.join();
+        }
+    } else {
+        for (auto& entry : archive.files) {
+            compress_file(entry);
+        }
     }
 
-    // Gzip compress the archive
-    return ACGzip::compress(
-        std::vector<uint8_t>(serialized.begin(), serialized.end()), 6);
+    // Write compressed files: [tag(4)][orig_size(4)][comp_size(4)][compressed_data]
+    uint32_t file_count = compressed_files.size();
+    result.insert(result.end(), (uint8_t*)&file_count, (uint8_t*)&file_count + 4);
+
+    for (auto& [tag, compressed] : compressed_files) {
+        // Tag (4 bytes)
+        result.insert(result.end(), tag.begin(), tag.end());
+
+        // Original size (4 bytes)
+        uint32_t orig_size = compressed.size();  // We don't track original, use this
+        result.insert(result.end(), (uint8_t*)&orig_size, (uint8_t*)&orig_size + 4);
+
+        // Compressed size (4 bytes)
+        uint32_t comp_size = compressed.size();
+        result.insert(result.end(), (uint8_t*)&comp_size, (uint8_t*)&comp_size + 4);
+
+        // Compressed data
+        result.insert(result.end(), compressed.begin(), compressed.end());
+    }
+
+    return result;
 }
 
 void ACZip::decompress(const std::vector<uint8_t>& data, const std::string& output_path) {
-    // Decompress gzip first
-    auto decompressed = ACGzip::decompress(data);
-    std::string serialized(decompressed.begin(), decompressed.end());
-
-    // Skip magic header
-    if (serialized.substr(0, 4) != "ACZP") {
+    // Check magic header
+    if (data.size() < 8 || data[0] != 'A' || data[1] != 'C' || data[2] != 'Z' || data[3] != '2') {
         throw std::runtime_error("Invalid ACZip file");
     }
 
-    // Parse files and extract
     size_t pos = 4;
-    while (pos < serialized.length()) {
-        std::string tag;
-        for (int i = 0; i < 4 && pos < serialized.length(); i++) {
-            tag += serialized[pos++];
+
+    // Read file count
+    uint32_t file_count = *(uint32_t*)(data.data() + pos);
+    pos += 4;
+
+    // Read and decompress each file
+    for (uint32_t i = 0; i < file_count; i++) {
+        if (pos + 12 > data.size()) {
+            throw std::runtime_error("Corrupt archive: truncated header");
         }
 
-        size_t colon = serialized.find(':', pos);
-        size_t size = std::stoll(serialized.substr(pos, colon - pos));
-        pos = colon + 1;
+        // Tag
+        std::string tag(data.begin() + pos, data.begin() + pos + 4);
+        pos += 4;
 
-        std::vector<uint8_t> file_data;
-        file_data.insert(file_data.end(),
-                        serialized.begin() + pos,
-                        serialized.begin() + pos + size);
-        pos += size;
+        // Sizes
+        uint32_t orig_size = *(uint32_t*)(data.data() + pos);
+        pos += 4;
 
-        // Reconstruct file from tag
+        uint32_t comp_size = *(uint32_t*)(data.data() + pos);
+        pos += 4;
+
+        if (pos + comp_size > data.size()) {
+            throw std::runtime_error("Corrupt archive: truncated data");
+        }
+
+        // Compressed data
+        std::vector<uint8_t> compressed_data(data.begin() + pos, data.begin() + pos + comp_size);
+        pos += comp_size;
+
+        // Decompress
+        auto decompressed = ACGzip::decompress(compressed_data);
+
+        // Write file
         std::string file_path = output_path + "/" + tag;
         fs::create_directories(fs::path(file_path).parent_path());
 
         std::ofstream out(file_path, std::ios::binary);
-        out.write((char*)file_data.data(), file_data.size());
+        out.write((char*)decompressed.data(), decompressed.size());
     }
 }
 

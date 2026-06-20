@@ -6,10 +6,16 @@
 
 namespace aczip {
 
-// 4-bit protocol tagging
-// File tag: 0x01-0x0F
-// Folder tag: 0x1x (1x01, 1x02, etc)
-// Example: assets/enemy.png = 1x01.0x01
+// ACZip v2 Format
+// Magic: "ACZ2" (4 bytes)
+// File count: uint32 (4 bytes)
+// For each file:
+//   Tag: 4-byte ASCII tag (e.g., "0x01", "1x02")
+//   Original size: uint32
+//   Compressed size: uint32
+//   Compressed data: [comp_size] bytes
+//
+// Each file is individually gzip-compressed for parallel compression + streaming decompression
 
 struct FileEntry {
     std::string path;
@@ -19,13 +25,13 @@ struct FileEntry {
 
 struct Archive {
     std::vector<FileEntry> files;
-    std::map<std::string, std::string> folder_tags;
 };
 
-// Core compression
+// Core compression - OPTIMIZED
+// Strategy: Compress each file individually in parallel, then package
 class ACZip {
 public:
-    // Compress file/directory to .aczip
+    // Compress file/directory to .aczip (parallel by default)
     static std::vector<uint8_t> compress(const std::string& path, bool parallel = true);
 
     // Decompress .aczip to directory
@@ -34,7 +40,7 @@ public:
     // Compress optimized for HDD (sequential, less random access)
     static std::vector<uint8_t> compress_hdd(const std::string& path);
 
-    // Compress optimized for SATA (balanced)
+    // Compress optimized for SATA (balanced, threaded)
     static std::vector<uint8_t> compress_sata(const std::string& path);
 
     // Get compression ratio
@@ -43,7 +49,6 @@ public:
 private:
     static Archive build_archive(const std::string& path);
     static std::string generate_tag(int index);
-    static std::string get_folder_tag(const std::string& folder_path);
 };
 
 // TAR and GZIP wrappers

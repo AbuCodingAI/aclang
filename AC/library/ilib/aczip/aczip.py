@@ -2,15 +2,16 @@ import gzip
 import tarfile
 import os
 import io
+import struct
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 class ACZip:
-    """4-bit protocol archiver for AC projects"""
+    """ACZip v2 - Fast archiver with per-file compression"""
 
     @staticmethod
     def compress(path, parallel=True):
-        """Compress directory using 4-bit tagging protocol"""
+        """Compress directory: each file compressed individually, then packaged"""
         files = []
         for root, dirs, filenames in os.walk(path):
             for filename in filenames:
@@ -20,35 +21,60 @@ class ACZip:
                     rel_path = os.path.relpath(filepath, path)
                     files.append((rel_path, data))
 
-        # Serialize with 4-bit tags
-        serialized = b'ACZP'  # Magic header
-        for idx, (filepath, data) in enumerate(files):
-            tag = ACZip._generate_tag(idx)
-            serialized += tag.encode() + f'{len(data)}:'.encode() + data
+        # Compress each file individually
+        compressed_files = []
 
-        # Gzip compress
-        return gzip.compress(serialized, compresslevel=6)
+        if parallel and len(files) > 1:
+            with ThreadPoolExecutor() as executor:
+                results = executor.map(
+                    lambda f: (f[0], gzip.compress(f[1], compresslevel=6)),
+                    files
+                )
+                compressed_files = list(results)
+        else:
+            compressed_files = [(f[0], gzip.compress(f[1], compresslevel=6)) for f in files]
+
+        # Build v2 format
+        result = b'ACZ2'  # Magic header v2
+        result += struct.pack('<I', len(compressed_files))  # File count
+
+        for idx, (filepath, compressed) in enumerate(compressed_files):
+            tag = ACZip._generate_tag(idx)
+            result += tag.encode()  # 4-byte tag
+            result += struct.pack('<I', len(compressed))  # Compressed size
+            result += compressed  # Compressed data
+
+        return result
 
     @staticmethod
     def decompress(data, output_path):
-        """Decompress ACZip archive"""
-        decompressed = gzip.decompress(data)
-        serialized = decompressed.decode('latin-1', errors='ignore')
-
-        if not serialized.startswith('ACZP'):
+        """Decompress ACZip v2 archive"""
+        if len(data) < 8 or data[:4] != b'ACZ2':
             raise ValueError("Invalid ACZip file")
 
         pos = 4
-        while pos < len(serialized):
-            colon = serialized.find(':', pos + 4)
-            tag = serialized[pos:pos+4]
-            size = int(serialized[pos+4:colon])
-            pos = colon + 1
+        file_count = struct.unpack('<I', data[pos:pos+4])[0]
+        pos += 4
 
-            file_data = serialized[pos:pos+size].encode('latin-1')
-            pos += size
+        os.makedirs(output_path, exist_ok=True)
 
-            # Reconstruct path from tag
+        for _ in range(file_count):
+            # Tag
+            tag = data[pos:pos+4].decode()
+            pos += 4
+
+            # Compressed size
+            comp_size = struct.unpack('<I', data[pos:pos+4])[0]
+            pos += 4
+
+            # Compressed data
+            compressed = data[pos:pos+comp_size]
+            pos += comp_size
+
+            # Decompress
+            file_data = gzip.decompress(compressed)
+
+            # Write file
             file_path = os.path.join(output_path, tag)
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
@@ -62,7 +88,7 @@ class ACZip:
 
     @staticmethod
     def compress_sata(path):
-        """Compress optimized for SATA (balanced)"""
+        """Compress optimized for SATA (balanced, parallel)"""
         return ACZip.compress(path, parallel=True)
 
     @staticmethod
@@ -74,12 +100,12 @@ class ACZip:
 
     @staticmethod
     def _generate_tag(index):
-        """Generate 4-bit tag for file index"""
+        """Generate 4-byte tag for file index"""
         if index < 15:
-            return f"0x{index:X}"
+            return f"0x{index:X}".ljust(4)[:4]
         folder = (index // 15) + 1
         file_idx = (index % 15) + 1
-        return f"1x{folder:02d}.0x{file_idx:02X}"
+        return f"1x{folder:02d}.0x{file_idx:02X}"[:4]
 
 
 class ACTar:

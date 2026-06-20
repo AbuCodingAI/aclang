@@ -5,7 +5,7 @@ const tar = require('tar');
 
 class ACZip {
     /**
-     * Compress directory using 4-bit tagging protocol
+     * Compress directory: each file compressed individually in parallel
      */
     static compress(dirPath, parallel = true) {
         const files = [];
@@ -27,69 +27,96 @@ class ACZip {
         };
         walk(dirPath);
 
-        // Serialize with 4-bit tags
-        let serialized = Buffer.from('ACZP');  // Magic header
-        for (let idx = 0; idx < files.length; idx++) {
-            const { path: filepath, data } = files[idx];
-            const tag = ACZip._generateTag(idx);
-            serialized = Buffer.concat([
-                serialized,
-                Buffer.from(tag),
-                Buffer.from(`${data.length}:`),
-                data
-            ]);
-        }
-
-        // Gzip compress
+        // Compress each file individually
         return new Promise((resolve, reject) => {
-            zlib.gzip(serialized, { level: 6 }, (err, compressed) => {
-                if (err) reject(err);
-                else resolve(compressed);
-            });
+            const compressedFiles = [];
+            let completed = 0;
+
+            if (parallel && files.length > 1) {
+                // Parallel compression
+                files.forEach((file, idx) => {
+                    zlib.gzip(file.data, { level: 6 }, (err, compressed) => {
+                        if (err) return reject(err);
+
+                        compressedFiles[idx] = {
+                            tag: ACZip._generateTag(idx),
+                            compressed
+                        };
+
+                        if (++completed === files.length) {
+                            resolve(ACZip._buildArchive(compressedFiles));
+                        }
+                    });
+                });
+            } else {
+                // Sequential compression
+                const compress = (idx) => {
+                    if (idx >= files.length) {
+                        return resolve(ACZip._buildArchive(compressedFiles));
+                    }
+
+                    zlib.gzip(files[idx].data, { level: 6 }, (err, compressed) => {
+                        if (err) return reject(err);
+
+                        compressedFiles.push({
+                            tag: ACZip._generateTag(idx),
+                            compressed
+                        });
+
+                        compress(idx + 1);
+                    });
+                };
+                compress(0);
+            }
         });
     }
 
     /**
-     * Decompress ACZip archive
+     * Decompress ACZip v2 archive
      */
     static decompress(data, outputPath) {
         return new Promise((resolve, reject) => {
-            zlib.gunzip(data, (err, decompressed) => {
+            // Check magic header
+            if (data.length < 8 || data.toString('utf8', 0, 4) !== 'ACZ2') {
+                return reject(new Error('Invalid ACZip file'));
+            }
+
+            let pos = 4;
+            const fileCount = data.readUInt32LE(pos);
+            pos += 4;
+
+            fs.mkdir(outputPath, { recursive: true }, (err) => {
                 if (err) return reject(err);
 
-                const serialized = decompressed.toString('latin1');
-                if (!serialized.startsWith('ACZP')) {
-                    return reject(new Error('Invalid ACZip file'));
-                }
-
-                let pos = 4;
                 const promises = [];
 
-                while (pos < serialized.length) {
-                    const colonPos = serialized.indexOf(':', pos + 4);
-                    const tag = serialized.substring(pos, pos + 4);
-                    const size = parseInt(serialized.substring(pos + 4, colonPos));
-                    pos = colonPos + 1;
+                for (let i = 0; i < fileCount; i++) {
+                    // Tag
+                    const tag = data.toString('utf8', pos, pos + 4);
+                    pos += 4;
 
-                    const fileData = Buffer.from(
-                        serialized.substring(pos, pos + size),
-                        'latin1'
-                    );
-                    pos += size;
+                    // Compressed size
+                    const compSize = data.readUInt32LE(pos);
+                    pos += 4;
 
-                    const filePath = path.join(outputPath, tag);
-                    const dir = path.dirname(filePath);
+                    // Compressed data
+                    const compressed = data.slice(pos, pos + compSize);
+                    pos += compSize;
 
+                    // Decompress
                     promises.push(
                         new Promise((res, rej) => {
-                            fs.mkdir(dir, { recursive: true }, (err) => {
-                                if (err) rej(err);
-                                else {
-                                    fs.writeFile(filePath, fileData, (err) => {
+                            zlib.gunzip(compressed, (err, decompressed) => {
+                                if (err) return rej(err);
+
+                                const filePath = path.join(outputPath, tag);
+                                fs.mkdir(path.dirname(filePath), { recursive: true }, (err) => {
+                                    if (err) return rej(err);
+                                    fs.writeFile(filePath, decompressed, (err) => {
                                         if (err) rej(err);
                                         else res();
                                     });
-                                }
+                                });
                             });
                         })
                     );
@@ -123,15 +150,34 @@ class ACZip {
     }
 
     /**
-     * Generate 4-bit tag for file index
+     * Generate 4-byte tag for file index
      */
     static _generateTag(index) {
         if (index < 15) {
-            return `0x${index.toString(16).toUpperCase()}`;
+            return `0x${index.toString(16).toUpperCase()}`.padEnd(4, ' ');
         }
         const folder = Math.floor(index / 15) + 1;
         const fileIdx = (index % 15) + 1;
-        return `1x${folder.toString().padStart(2, '0')}.0x${fileIdx.toString(16).toUpperCase().padStart(2, '0')}`;
+        return `1x${folder.toString().padStart(2, '0')}.0x${fileIdx.toString(16).toUpperCase().padStart(2, '0')}`.slice(0, 4);
+    }
+
+    /**
+     * Build v2 archive from compressed files
+     */
+    static _buildArchive(compressedFiles) {
+        let result = Buffer.from('ACZ2');
+        result = Buffer.concat([result, Buffer.alloc(4)]);
+        result.writeUInt32LE(compressedFiles.length, 4);
+
+        for (const file of compressedFiles) {
+            const tag = Buffer.from(file.tag, 'utf8');
+            const sizeBuffer = Buffer.alloc(4);
+            sizeBuffer.writeUInt32LE(file.compressed.length);
+
+            result = Buffer.concat([result, tag, sizeBuffer, file.compressed]);
+        }
+
+        return result;
     }
 }
 
