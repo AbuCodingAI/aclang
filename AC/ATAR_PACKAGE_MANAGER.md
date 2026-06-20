@@ -96,56 +96,86 @@ reversed = my_string_lib.reverse(text)
 
 ## Directory Structure
 
+**Modules stored in AC library folder (absolute path):**
+
 ```
-my_project/
-  clib/                      /* Computer Libraries (internal) */
-    my_string_lib/
-      lib.ac
-      LICENSE
-      atar.yaml              /* Auto-created by atar ready */
-      my_string_lib.tar      /* Auto-created by atar ready */
-    another_lib/
-      lib.ac
-      atar.yaml
-  
-  elib/                       /* External Libraries (downloaded) */
-    installed_lib/
-      lib.ac
-      atar.yaml
-    another_installed/
-      lib.ac
-      atar.yaml
-  
+/path/to/AC/
+  library/
+    clib/                      /* Computer Libraries (development) */
+      my_string_lib/
+        lib.ac
+        LICENSE
+        atar.yaml
+        my_string_lib.tar
+      another_lib/
+        lib.ac
+        atar.yaml
+    
+    elib/                       /* External Libraries (installed via atar) */
+      installed_lib/
+        lib.ac
+        atar.yaml
+      another_installed/
+        lib.ac
+        atar.yaml
+```
+
+**Your AC projects use them from anywhere:**
+
+```
+/home/user/my_project/
   src/
-    main.ac                   /* Your code uses: use installed_lib */
+    main.ac                    /* use installed_lib; */
+  /* Compiler looks in: /path/to/AC/library/elib/ */
+```
+
+**Global installation:**
+```bash
+atar install my_lib
+# → /path/to/AC/library/elib/my_lib/
+# Available to all AC projects
 ```
 
 ---
 
 ## atar.yaml Format
 
-**User-created version:**
+**User-created version (you add whatever you want):**
 
 ```yaml
-# Required
+# Required fields
 name: my_string_lib
 version: 1.0.0
 main: lib.ac
 
-# Optional (auto-filled by atar ready)
+# Standard optional fields
 author: Your Name
 description: String utilities library
-license: MIT                    # or "NO LICENSE"
+license: MIT
 repository: github.com/you/my_string_lib
 homepage: https://example.com
-tags: [strings, utils]
+tags: [strings, utils, text]
 
-# Optional: what to include in .tar
-include:
-  - lib.ac
-  - LICENSE
-  - README.md
+# Custom fields (YOU can add anything!)
+maintainer: Jane Doe
+email: jane@example.com
+funding: https://buy-me-a-coffee.com/janedoe
+documentation: https://docs.example.com
+changelog: https://github.com/you/my_string_lib/releases
+social:
+  twitter: '@janedoe'
+  discord: 'https://discord.gg/...'
+custom_field: anything_you_want
 ```
+
+**Why atar.yaml is flexible:**
+
+You build it yourself! Add any metadata you want:
+- ✅ Social links
+- ✅ Funding info
+- ✅ Documentation URLs
+- ✅ Custom fields
+- ✅ Whatever makes sense for your library
 
 **Auto-created by `atar ready`:**
 
@@ -154,6 +184,7 @@ atar ready
 # Reads LICENSE file
 # Creates/updates atar.yaml with license field
 # Packages into .tar
+# But YOU can edit it and add more!
 ```
 
 ---
@@ -296,23 +327,83 @@ atar cache list        /* Show cached packages */
 
 ---
 
-## Registry
+## Registry Options
 
-### **Central Registry**
+### **Option 1: GitHub as Registry** (Recommended for free!)
 
+```bash
+atar publish my_lib.tar --github AbuCodingAI/aclang_registry
+# Uploads to GitHub releases
+# URL: github.com/AbuCodingAI/aclang_registry
+
+atar install my_lib --from github
+# Downloads from GitHub registry
 ```
-registry.aclang.dev
+
+**How it works:**
+- GitHub repos can store files (releases)
+- Free hosting (no costs!)
+- Simple (just push .tar files)
+- Everyone has a GitHub account
+
+### **Option 2: Free Hosting Services**
+
+**surge.sh** (free static hosting)
+```bash
+atar publish my_lib.tar --registry surge.sh/aclang-registry
+# URL: http://aclang-registry.surge.sh/
 ```
 
-Default location for all published packages.
+**vercel.app** (free hosting)
+```bash
+atar publish my_lib.tar --registry my-registry.vercel.app
+# URL: https://my-registry.vercel.app/
+```
 
-### **Local Registry** (`--local`)
+**.eu.org** (free TLD)
+```bash
+atar publish my_lib.tar --registry aclang.eu.org
+# URL: https://aclang.eu.org/
+# Just point DNS to your server
+```
+
+### **Option 3: Local Registry**
 
 ```bash
 atar publish --local my_lib.tar
+# Publishes locally only
+# No upload anywhere
 ```
 
-Publishes locally without uploading to central registry.
+### **Option 4: Central Registry** (Future)
+
+If we set up a central registry (simple server):
+```bash
+atar publish my_lib.tar
+# Default: uploads to central.aclang
+```
+
+But doesn't have to be expensive domain!
+Could use: `registry.eu.org`, `registry.vercel.app`, etc.
+
+### **Recommended Setup**
+
+```bash
+# Use GitHub as registry (free, reliable)
+atar publish my_lib.tar --github AbuCodingAI/aclang_registry
+
+# Users install from there
+atar install my_lib --from github
+# or
+atar install my_lib --registry github.com/AbuCodingAI/aclang_registry
+```
+
+**Benefits:**
+- ✅ Free (GitHub is free)
+- ✅ Reliable (GitHub hosting)
+- ✅ Decentralized (no single point of failure)
+- ✅ Everyone has GitHub
+- ✅ Built-in version control
 
 ---
 
