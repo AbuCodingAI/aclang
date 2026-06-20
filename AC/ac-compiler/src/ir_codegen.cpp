@@ -6722,8 +6722,9 @@ public:
             for (auto& ins : ir.globalInit) {
                 if (ins.opcode == IROpcode::INPUT)      hasInput  = true;
                 if (ins.opcode == IROpcode::EVENT_BIND) hasEvents = true;
-                if (ins.opcode == IROpcode::STORE_VAR && ins.result.kind == IRRef::Kind::VAR)
-                    globalVarNames_.insert(ref(ins.result));
+                // NOTE: Do NOT mark mainloop variables as globals — they're local to mainloop!
+                // if (ins.opcode == IROpcode::STORE_VAR && ins.result.kind == IRRef::Kind::VAR)
+                //     globalVarNames_.insert(ref(ins.result));
                 // Track scope depth and collect free vars (assigned at depth 0, not in loops)
                 if (ins.opcode == IROpcode::WHILE_BEGIN || ins.opcode == IROpcode::FOR_BEGIN)
                     scanDepth++;
