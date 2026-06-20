@@ -247,3 +247,131 @@ std::vector<uint8_t> ACGzip::decompress(const std::vector<uint8_t>& data) {
     decompressed.resize(decompressed_size);
     return decompressed;
 }
+
+// ============================================================================
+// XZ COMPRESSION (LZMA2)
+// ============================================================================
+
+std::vector<uint8_t> ACXz::compress(const std::vector<uint8_t>& data, int preset) {
+    std::string cmd = "xz -" + std::to_string(preset) + " -c";
+    FILE* proc = popen(cmd.c_str(), "w");
+    if (!proc) throw std::runtime_error("Failed to start xz");
+
+    fwrite(data.data(), 1, data.size(), proc);
+    fclose(proc);
+
+    // Read compressed output
+    std::string read_cmd = "xz -" + std::to_string(preset) + " -c";
+    FILE* read_proc = popen(read_cmd.c_str(), "r");
+    if (!read_proc) throw std::runtime_error("Failed to read xz output");
+
+    std::vector<uint8_t> compressed;
+    char buffer[4096];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), read_proc)) > 0) {
+        compressed.insert(compressed.end(), buffer, buffer + bytes);
+    }
+    pclose(read_proc);
+
+    return compressed;
+}
+
+std::vector<uint8_t> ACXz::decompress(const std::vector<uint8_t>& data) {
+    // Use xz command-line tool
+    FILE* proc = popen("xz -d -c", "w");
+    if (!proc) throw std::runtime_error("Failed to start xz decompression");
+
+    fwrite(data.data(), 1, data.size(), proc);
+    fclose(proc);
+
+    // Read decompressed output
+    FILE* read_proc = popen("xz -d -c", "r");
+    if (!read_proc) throw std::runtime_error("Failed to read xz output");
+
+    std::vector<uint8_t> decompressed;
+    char buffer[4096];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), read_proc)) > 0) {
+        decompressed.insert(decompressed.end(), buffer, buffer + bytes);
+    }
+    pclose(read_proc);
+
+    return decompressed;
+}
+
+void ACXz::compress_file(const std::string& input, const std::string& output, int preset) {
+    std::string cmd = "xz -" + std::to_string(preset) + " -c \"" + input + "\" > \"" + output + "\"";
+    if (system(cmd.c_str()) != 0) {
+        throw std::runtime_error("XZ file compression failed");
+    }
+}
+
+void ACXz::decompress_file(const std::string& input, const std::string& output) {
+    std::string cmd = "xz -d -c \"" + input + "\" > \"" + output + "\"";
+    if (system(cmd.c_str()) != 0) {
+        throw std::runtime_error("XZ file decompression failed");
+    }
+}
+
+// ============================================================================
+// ZSTD COMPRESSION
+// ============================================================================
+
+std::vector<uint8_t> ACZstd::compress(const std::vector<uint8_t>& data, int level) {
+    std::string cmd = "zstd -" + std::to_string(level) + " -c";
+    FILE* proc = popen(cmd.c_str(), "w");
+    if (!proc) throw std::runtime_error("Failed to start zstd");
+
+    fwrite(data.data(), 1, data.size(), proc);
+    fclose(proc);
+
+    // Read compressed output
+    FILE* read_proc = popen(cmd.c_str(), "r");
+    if (!read_proc) throw std::runtime_error("Failed to read zstd output");
+
+    std::vector<uint8_t> compressed;
+    char buffer[4096];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), read_proc)) > 0) {
+        compressed.insert(compressed.end(), buffer, buffer + bytes);
+    }
+    pclose(read_proc);
+
+    return compressed;
+}
+
+std::vector<uint8_t> ACZstd::decompress(const std::vector<uint8_t>& data) {
+    FILE* proc = popen("zstd -d -c", "w");
+    if (!proc) throw std::runtime_error("Failed to start zstd decompression");
+
+    fwrite(data.data(), 1, data.size(), proc);
+    fclose(proc);
+
+    // Read decompressed output
+    FILE* read_proc = popen("zstd -d -c", "r");
+    if (!read_proc) throw std::runtime_error("Failed to read zstd output");
+
+    std::vector<uint8_t> decompressed;
+    char buffer[4096];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), read_proc)) > 0) {
+        decompressed.insert(decompressed.end(), buffer, buffer + bytes);
+    }
+    pclose(read_proc);
+
+    return decompressed;
+}
+
+void ACZstd::compress_file(const std::string& input, const std::string& output, int level) {
+    std::string cmd = "zstd -" + std::to_string(level) + " -c \"" + input + "\" > \"" + output + "\"";
+    if (system(cmd.c_str()) != 0) {
+        throw std::runtime_error("Zstd file compression failed");
+    }
+}
+
+void ACZstd::decompress_file(const std::string& input, const std::string& output) {
+    std::string cmd = "zstd -d -c \"" + input + "\" > \"" + output + "\"";
+    if (system(cmd.c_str()) != 0) {
+        throw std::runtime_error("Zstd file decompression failed");
+    }
+}

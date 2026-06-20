@@ -64,4 +64,20 @@ public:
     static std::vector<uint8_t> decompress(const std::vector<uint8_t>& data);
 };
 
+class ACXz {
+public:
+    static std::vector<uint8_t> compress(const std::vector<uint8_t>& data, int preset = 6);
+    static std::vector<uint8_t> decompress(const std::vector<uint8_t>& data);
+    static void compress_file(const std::string& input, const std::string& output, int preset = 6);
+    static void decompress_file(const std::string& input, const std::string& output);
+};
+
+class ACZstd {
+public:
+    static std::vector<uint8_t> compress(const std::vector<uint8_t>& data, int level = 3);
+    static std::vector<uint8_t> decompress(const std::vector<uint8_t>& data);
+    static void compress_file(const std::string& input, const std::string& output, int level = 3);
+    static void decompress_file(const std::string& input, const std::string& output);
+};
+
 }  // namespace aczip

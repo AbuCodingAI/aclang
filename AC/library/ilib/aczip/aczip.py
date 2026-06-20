@@ -3,8 +3,15 @@ import tarfile
 import os
 import io
 import struct
+import lzma
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except ImportError:
+    HAS_ZSTD = False
 
 class ACZip:
     """ACZip v2 - Fast archiver with per-file compression"""
@@ -139,3 +146,79 @@ class ACGzip:
     def decompress(data):
         """Decompress gzip data"""
         return gzip.decompress(data)
+
+
+class ACXz:
+    """XZ compression and decompression (LZMA2)"""
+
+    @staticmethod
+    def compress(data, preset=6):
+        """Compress with XZ (LZMA2)
+        preset: 0-9, higher = better compression but slower
+        """
+        return lzma.compress(data, preset=preset, filters=[{'id': lzma.FILTER_LZMA2}])
+
+    @staticmethod
+    def decompress(data):
+        """Decompress XZ data"""
+        return lzma.decompress(data)
+
+    @staticmethod
+    def compress_file(input_path, output_path, preset=6):
+        """Compress file with XZ"""
+        with open(input_path, 'rb') as f:
+            data = f.read()
+        compressed = ACXz.compress(data, preset)
+        with open(output_path, 'wb') as f:
+            f.write(compressed)
+
+    @staticmethod
+    def decompress_file(input_path, output_path):
+        """Decompress XZ file"""
+        with open(input_path, 'rb') as f:
+            data = f.read()
+        decompressed = ACXz.decompress(data)
+        with open(output_path, 'wb') as f:
+            f.write(decompressed)
+
+
+class ACZstd:
+    """Zstandard (zstd) compression and decompression"""
+
+    @staticmethod
+    def compress(data, level=3):
+        """Compress with zstd
+        level: 1-22, higher = better compression but slower
+        """
+        if not HAS_ZSTD:
+            raise ImportError("zstandard not installed. Install with: pip install zstandard")
+
+        cctx = zstd.ZstdCompressor(level=level)
+        return cctx.compress(data)
+
+    @staticmethod
+    def decompress(data):
+        """Decompress zstd data"""
+        if not HAS_ZSTD:
+            raise ImportError("zstandard not installed. Install with: pip install zstandard")
+
+        dctx = zstd.ZstdDecompressor()
+        return dctx.decompress(data)
+
+    @staticmethod
+    def compress_file(input_path, output_path, level=3):
+        """Compress file with zstd"""
+        with open(input_path, 'rb') as f:
+            data = f.read()
+        compressed = ACZstd.compress(data, level)
+        with open(output_path, 'wb') as f:
+            f.write(compressed)
+
+    @staticmethod
+    def decompress_file(input_path, output_path):
+        """Decompress zstd file"""
+        with open(input_path, 'rb') as f:
+            data = f.read()
+        decompressed = ACZstd.decompress(data)
+        with open(output_path, 'wb') as f:
+            f.write(decompressed)

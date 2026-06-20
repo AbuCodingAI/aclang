@@ -3,6 +3,13 @@ const path = require('path');
 const zlib = require('zlib');
 const tar = require('tar');
 
+let zstd = null;
+try {
+    zstd = require('zstd');
+} catch (e) {
+    // zstd optional
+}
+
 class ACZip {
     /**
      * Compress directory: each file compressed individually in parallel
@@ -238,4 +245,148 @@ class ACGzip {
     }
 }
 
-module.exports = { ACZip, ACTar, ACGzip };
+class ACXz {
+    /**
+     * Compress with XZ (using Node.js xz module)
+     */
+    static compress(data, preset = 6) {
+        return new Promise((resolve, reject) => {
+            const { execSync } = require('child_process');
+            const tmpIn = `/tmp/ac_xz_${Date.now()}_in`;
+            const tmpOut = `/tmp/ac_xz_${Date.now()}_out`;
+
+            try {
+                fs.writeFileSync(tmpIn, data);
+                execSync(`xz -${preset} -c "${tmpIn}" > "${tmpOut}"`);
+                const compressed = fs.readFileSync(tmpOut);
+                fs.unlinkSync(tmpIn);
+                fs.unlinkSync(tmpOut);
+                resolve(compressed);
+            } catch (err) {
+                reject(new Error(`XZ compression failed: ${err.message}`));
+            }
+        });
+    }
+
+    /**
+     * Decompress XZ data
+     */
+    static decompress(data) {
+        return new Promise((resolve, reject) => {
+            const { execSync } = require('child_process');
+            const tmpIn = `/tmp/ac_xz_${Date.now()}_in`;
+            const tmpOut = `/tmp/ac_xz_${Date.now()}_out`;
+
+            try {
+                fs.writeFileSync(tmpIn, data);
+                execSync(`xz -d -c "${tmpIn}" > "${tmpOut}"`);
+                const decompressed = fs.readFileSync(tmpOut);
+                fs.unlinkSync(tmpIn);
+                fs.unlinkSync(tmpOut);
+                resolve(decompressed);
+            } catch (err) {
+                reject(new Error(`XZ decompression failed: ${err.message}`));
+            }
+        });
+    }
+
+    /**
+     * Compress file with XZ
+     */
+    static compressFile(inputPath, outputPath, preset = 6) {
+        return new Promise((resolve, reject) => {
+            const { execSync } = require('child_process');
+            try {
+                execSync(`xz -${preset} -c "${inputPath}" > "${outputPath}"`);
+                resolve();
+            } catch (err) {
+                reject(new Error(`XZ file compression failed: ${err.message}`));
+            }
+        });
+    }
+
+    /**
+     * Decompress XZ file
+     */
+    static decompressFile(inputPath, outputPath) {
+        return new Promise((resolve, reject) => {
+            const { execSync } = require('child_process');
+            try {
+                execSync(`xz -d -c "${inputPath}" > "${outputPath}"`);
+                resolve();
+            } catch (err) {
+                reject(new Error(`XZ file decompression failed: ${err.message}`));
+            }
+        });
+    }
+}
+
+class ACZstd {
+    /**
+     * Compress with zstd
+     */
+    static compress(data, level = 3) {
+        return new Promise((resolve, reject) => {
+            if (!zstd) {
+                return reject(new Error('zstd not available. Install with: npm install zstd'));
+            }
+
+            try {
+                const compressed = zstd.compress(data, level);
+                resolve(compressed);
+            } catch (err) {
+                reject(new Error(`Zstd compression failed: ${err.message}`));
+            }
+        });
+    }
+
+    /**
+     * Decompress zstd data
+     */
+    static decompress(data) {
+        return new Promise((resolve, reject) => {
+            if (!zstd) {
+                return reject(new Error('zstd not available. Install with: npm install zstd'));
+            }
+
+            try {
+                const decompressed = zstd.decompress(data);
+                resolve(decompressed);
+            } catch (err) {
+                reject(new Error(`Zstd decompression failed: ${err.message}`));
+            }
+        });
+    }
+
+    /**
+     * Compress file with zstd
+     */
+    static compressFile(inputPath, outputPath, level = 3) {
+        return new Promise((resolve, reject) => {
+            const { execSync } = require('child_process');
+            try {
+                execSync(`zstd -${level} -c "${inputPath}" > "${outputPath}"`);
+                resolve();
+            } catch (err) {
+                reject(new Error(`Zstd file compression failed: ${err.message}`));
+            }
+        });
+    }
+
+    /**
+     * Decompress zstd file
+     */
+    static decompressFile(inputPath, outputPath) {
+        return new Promise((resolve, reject) => {
+            const { execSync } = require('child_process');
+            try {
+                execSync(`zstd -d -c "${inputPath}" > "${outputPath}"`);
+                resolve();
+            } catch (err) {
+                reject(new Error(`Zstd file decompression failed: ${err.message}`));
+            }
+        });
+    }
+}
+
+module.exports = { ACZip, ACTar, ACGzip, ACXz, ACZstd };
