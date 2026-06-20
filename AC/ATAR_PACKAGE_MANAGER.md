@@ -327,83 +327,73 @@ atar cache list        /* Show cached packages */
 
 ---
 
-## Registry Options
+## Registry: GitHub Only
 
-### **Option 1: GitHub as Registry** (Recommended for free!)
+**Simple. One place. Everyone uses it.**
+
+### **Publishers: Publish to GitHub**
 
 ```bash
-atar publish my_lib.tar --github AbuCodingAI/aclang_registry
-# Uploads to GitHub releases
-# URL: github.com/AbuCodingAI/aclang_registry
-
-atar install my_lib --from github
-# Downloads from GitHub registry
+cd clib/my_lib
+atar ready
+atar publish my_lib.tar
+# Publishes to: github.com/you/my_lib/releases
 ```
 
 **How it works:**
-- GitHub repos can store files (releases)
-- Free hosting (no costs!)
-- Simple (just push .tar files)
-- Everyone has a GitHub account
+1. atar reads your GitHub info from git config
+2. Creates release on GitHub
+3. Uploads .tar file to release
+4. Done!
 
-### **Option 2: Free Hosting Services**
-
-**surge.sh** (free static hosting)
-```bash
-atar publish my_lib.tar --registry surge.sh/aclang-registry
-# URL: http://aclang-registry.surge.sh/
-```
-
-**vercel.app** (free hosting)
-```bash
-atar publish my_lib.tar --registry my-registry.vercel.app
-# URL: https://my-registry.vercel.app/
-```
-
-**.eu.org** (free TLD)
-```bash
-atar publish my_lib.tar --registry aclang.eu.org
-# URL: https://aclang.eu.org/
-# Just point DNS to your server
-```
-
-### **Option 3: Local Registry**
+### **Users: Install from GitHub**
 
 ```bash
-atar publish --local my_lib.tar
-# Publishes locally only
-# No upload anywhere
+atar install you/my_lib
+# Downloads from: github.com/you/my_lib/releases
 ```
 
-### **Option 4: Central Registry** (Future)
+**That's it.**
 
-If we set up a central registry (simple server):
+### **Why GitHub-Only?**
+
+```
+✅ One place to publish (no multiple registries)
+✅ One place to install from (no choosing)
+✅ Publishers don't duplicate effort
+✅ Users have predictable location
+✅ Free (GitHub is free)
+✅ Reliable (GitHub is reliable)
+✅ Everyone has GitHub
+✅ Built-in versioning (GitHub releases)
+✅ No registry maintenance needed
+```
+
+### **Example Workflow**
+
+**Publisher:**
 ```bash
-atar publish my_lib.tar
-# Default: uploads to central.aclang
+cd clib/awesome_parser
+atar ready
+atar publish awesome_parser.tar
+# → github.com/janedoe/awesome_parser/releases/v1.0.0
 ```
 
-But doesn't have to be expensive domain!
-Could use: `registry.eu.org`, `registry.vercel.app`, etc.
-
-### **Recommended Setup**
-
+**User:**
 ```bash
-# Use GitHub as registry (free, reliable)
-atar publish my_lib.tar --github AbuCodingAI/aclang_registry
-
-# Users install from there
-atar install my_lib --from github
-# or
-atar install my_lib --registry github.com/AbuCodingAI/aclang_registry
+atar install janedoe/awesome_parser
+# → Downloads from GitHub
+# → Installs to /path/to/AC/library/elib/awesome_parser/
+# Done!
 ```
 
-**Benefits:**
-- ✅ Free (GitHub is free)
-- ✅ Reliable (GitHub hosting)
-- ✅ Decentralized (no single point of failure)
-- ✅ Everyone has GitHub
-- ✅ Built-in version control
+### **No Multiple Registry Hell**
+
+```
+❌ npm: npm, yarn, pnpm (pick one, install from different places)
+❌ Python: PyPI, Conda, Poetry (dependency nightmare)
+✅ atar: GitHub only (always same place)
+```
 
 ---
 
@@ -657,9 +647,8 @@ atar audit
 
 ```bash
 atar ready [path]                       # Auto-create atar.yaml + .tar
-atar publish PACKAGE.tar                # Publish to registry
-atar publish PACKAGE.tar --local        # Publish locally
-atar install PACKAGE                    # Install globally to system
+atar publish PACKAGE.tar                # Publish to GitHub releases
+atar install PACKAGE                    # Install globally from GitHub
 atar install PACKAGE --local            # Install to local elib/
 atar get PACKAGE                        # Show package info
 atar list                               # List installed packages
@@ -679,9 +668,9 @@ atar cache clean                        # Clear cache
 | **Package format** | .tar (self-contained, cross-platform) |
 | **Development** | clib/ (Computer Libraries) |
 | **Installation** | elib/ (External Libraries) |
-| **Metadata** | atar.yaml (user or auto-created) |
+| **Metadata** | atar.yaml (user-built) |
 | **License** | Auto-detected from LICENSE file |
-| **Registry** | Central (registry.aclang.dev) + local |
+| **Registry** | GitHub only (github.com/username/repo/releases) |
 | **Independence** | NOT dependent on apt/brew/choco |
 | **Platform support** | Windows, Linux, macOS (all equal) |
 
