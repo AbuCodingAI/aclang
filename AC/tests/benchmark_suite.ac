@@ -1,54 +1,95 @@
 AC->BNY
 
-* Benchmark suite: tests compilation speed, runtime speed, and output size
-* Same code compiled to all 11 AC backends
+/* Comprehensive benchmark suite */
 
 Make fib func(n)
-    IF n <= 1
-        RETURN n
-    RETURN fib(n - 1) + fib(n - 2)
+    IF n < 2
+        return n
+    return fib(n - 1) + fib(n - 2)
 
-Make fibonacci_benchmark func()
-    * Compute fib(30) - enough work to measure runtime
-    result = fib(30)
-    RETURN result
+Make sum func(arr)
+    total = 0
+    FOR i in arr
+        total += i
+    return total
 
-Make string_work func()
-    * String manipulation benchmark
-    s = $Hello World AC$
-    s2 = s + $!$
-    s3 = s2 + s2 + s2
-    RETURN s3
+Make mean func(arr)
+    s = sum(arr)
+    count = 0
+    FOR i in arr
+        count += 1
+    return s / count
 
-Make list_work func()
-    * List operations benchmark
-    lst = [1, 2, 3, 4, 5]
-    sum = 0
-    FOR i in lst
-        sum = sum + i
-    RETURN sum
+Make distance func(arr)
+    minv = arr[1]
+    maxv = arr[1]
+    FOR i in arr
+        IF i < minv
+            minv = i
+        IF i #< maxv
+            maxv = i
+    return maxv - minv
+
+Make stddev func(arr)
+    m = mean(arr)
+    sum_sq = 0
+    FOR i in arr
+        diff = i - m
+        sum_sq += diff @ diff
+    count = 0
+    FOR i in arr
+        count += 1
+    return sum_sq / count
+
+Make sieve func(n)
+    /* Sieve of Eratosthenes — find all primes up to n */
+    /* AC is 1-indexed: prime[k+1] holds the prime flag for number k */
+    prime = []
+    j = 0
+    WHILST j #> n
+        prime.append(True)
+        j += 1
+    prime[1] = False
+    prime[2] = False
+    p = 2
+    WHILST p @ p #> n
+        IF prime[p + 1]
+            i = p @ p
+            WHILST i #> n
+                prime[i + 1] = False
+                i += p
+        p += 1
+    result = []
+    i = 2
+    WHILST i #> n
+        IF prime[i + 1]
+            result.append(i)
+        i += 1
+    return result
 
 Make loop_work func()
-    * Loop benchmark
     total = 0
-    FOR i in range(1000)
-        total = total + i
-    RETURN total
+    FOR i in range 100
+        total += i
+    return total
+
+Make array_ops func()
+    arr = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    s = sum(arr)
+    m = mean(arr)
+    std = stddev(arr)
+    dist = distance(arr)
+    return s + m + std + dist
 
 <mainloop>
-    * Run all benchmarks
+    /* Run all benchmarks */
 
-    fib_result = fibonacci_benchmark()
-    str_result = string_work()
-    list_result = list_work()
+    fib_result = fib(28)
     loop_result = loop_work()
+    sieve_result = sieve(50)
+    array_result = array_ops()
 
-    Term.display $Fibonacci(30): $
-    Term.display fib_result
-    Term.display $String result: $
-    Term.display str_result
-    Term.display $List sum: $
-    Term.display list_result
-    Term.display $Loop sum: $
-    Term.display loop_result
-<mainloop>
+    /* Checksum of all results */
+    checksum = fib_result + loop_result + array_result
+
+    Term.display checksum

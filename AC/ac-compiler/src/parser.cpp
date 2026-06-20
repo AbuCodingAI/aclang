@@ -428,12 +428,10 @@ private:
             return node;
         }
 
-        // length(x) — get array/string length
+        // length expr — get array/string length (no parentheses required)
         if (at(TokenType::KW_LENGTH)) {
             advance();
-            expect(TokenType::LPAREN, "Expected ( after length");
             auto arg = parseExpression(0);
-            expect(TokenType::RPAREN, "Expected ) after length argument");
             auto node = std::make_unique<ASTNode>(NodeType::CallExpr, "length");
             if (arg) node->children.push_back(std::move(arg));
             return node;
