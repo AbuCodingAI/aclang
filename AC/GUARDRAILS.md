@@ -161,23 +161,24 @@ result = web.jasql("TAKE * FROM users IF id = ?", [user_id])
 
 ---
 
-## 10. **No Unsafe eval()** 🟢
+## 10. **Safe eval() - Math Expressions Only** 🟢
 
-**What it does:** AC doesn't have eval() for untrusted code
+**What it does:** AC has `math.eval()` for evaluating mathematical expressions only
 
 ```ac
-/* ❌ DOESN'T EXIST in AC */
-eval(user_code)  /* Not in language */
+/* SAFE: math.eval() only evaluates math expressions */
+result = math.eval($2 * x + 3$)       /* Safe - math only */
+result = math.eval($sin(pi/2)$)       /* Safe - no code execution */
 
-/* You'd need Foreign block (requires --allow-foreign) */
-<Foreign>
-    eval(user_code)  /* Unsafe, but explicit */
-<Foreign>
+/* CANNOT: Eval arbitrary code */
+result = math.eval($os.bash("rm -rf /")$)  /* ❌ Syntax error - not math */
 ```
 
-- No `eval()` function in AC
-- No `exec()` function
-- No string-to-code compilation at runtime
+- **math.eval()** parses mathematical expressions only
+- Cannot eval arbitrary AC code (no Foreign-like escape)
+- Cannot exec shell commands
+- Scope: +, -, *, /, ^, sin, cos, tan, sqrt, pi, e, tau, etc.
+- **Threat**: If untrusted user input in expression, could be solved with parameterized expressions (future enhancement)
 
 ---
 
@@ -487,7 +488,7 @@ IF hash(password) is stored_hash
 | Path traversal blocking | Library | High | ✅ Yes (in web lib) |
 | SQL injection protection | Language | High | ✅ Yes (JaSQL) |
 | Foreign blocks gating | Language | Critical | ✅ Yes (--allow-foreign) |
-| No eval() | Language | High | ✅ Yes |
+| Safe math.eval() | Language | High | ✅ Yes (math expressions only) |
 | Type safety | Compile | High | ✅ Yes |
 | Safe strings | Language | Medium | ✅ Yes |
 | Operator safety | Language | Medium | ✅ Yes |
