@@ -35,7 +35,7 @@ Make stddev func(arr)
     sum_sq = 0
     FOR i in arr
         diff = i - m
-        sum_sq += diff @ diff
+        sum_sq += (diff @ diff)
     count = 0
     FOR i in arr
         count += 1
@@ -52,9 +52,9 @@ Make sieve func(n)
     prime[1] = False
     prime[2] = False
     p = 2
-    WHILST p @ p #> n
+    WHILST (p @ p) #> n
         IF prime[p + 1]
-            i = p @ p
+            i = (p @ p)
             WHILST i #> n
                 prime[i + 1] = False
                 i += p
