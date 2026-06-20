@@ -40,11 +40,9 @@ class ACZip {
             let completed = 0;
 
             if (parallel && files.length > 1) {
-                // Parallel compression
+                // Parallel compression (using zstd by default - faster + better)
                 files.forEach((file, idx) => {
-                    zlib.gzip(file.data, { level: 6 }, (err, compressed) => {
-                        if (err) return reject(err);
-
+                    ACZstd.compress(file.data, 3).then(compressed => {
                         compressedFiles[idx] = {
                             tag: ACZip._generateTag(idx),
                             compressed
@@ -53,25 +51,23 @@ class ACZip {
                         if (++completed === files.length) {
                             resolve(ACZip._buildArchive(compressedFiles));
                         }
-                    });
+                    }).catch(reject);
                 });
             } else {
-                // Sequential compression
+                // Sequential compression (using zstd)
                 const compress = (idx) => {
                     if (idx >= files.length) {
                         return resolve(ACZip._buildArchive(compressedFiles));
                     }
 
-                    zlib.gzip(files[idx].data, { level: 6 }, (err, compressed) => {
-                        if (err) return reject(err);
-
+                    ACZstd.compress(files[idx].data, 3).then(compressed => {
                         compressedFiles.push({
                             tag: ACZip._generateTag(idx),
                             compressed
                         });
 
                         compress(idx + 1);
-                    });
+                    }).catch(reject);
                 };
                 compress(0);
             }

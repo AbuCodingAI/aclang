@@ -31,6 +31,12 @@ std::vector<uint8_t> ACZip::compress(const std::string& path, bool parallel) {
         compressed_files.push_back({entry.tag, compressed});
     };
 
+    // Use Zstd for compression (faster + better ratio than gzip)
+    auto compress_with_zstd = [](FileEntry& entry) {
+        entry.tag = generate_tag(compressed_files.size());
+        compressed_files.push_back({entry.tag, ACZstd::compress(entry.data, 3)});
+    };
+
     if (parallel && archive.files.size() > 1) {
         std::vector<std::thread> threads;
         int num_threads = std::thread::hardware_concurrency();
@@ -42,7 +48,7 @@ std::vector<uint8_t> ACZip::compress(const std::string& path, bool parallel) {
 
             threads.push_back(std::thread([&, start, end]() {
                 for (size_t j = start; j < end; j++) {
-                    compress_file(archive.files[j]);
+                    compress_with_zstd(archive.files[j]);
                 }
             }));
         }
@@ -52,21 +58,17 @@ std::vector<uint8_t> ACZip::compress(const std::string& path, bool parallel) {
         }
     } else {
         for (auto& entry : archive.files) {
-            compress_file(entry);
+            compress_with_zstd(entry);
         }
     }
 
-    // Write compressed files: [tag(4)][orig_size(4)][comp_size(4)][compressed_data]
+    // Write compressed files: [tag(4)][comp_size(4)][compressed_data]
     uint32_t file_count = compressed_files.size();
     result.insert(result.end(), (uint8_t*)&file_count, (uint8_t*)&file_count + 4);
 
     for (auto& [tag, compressed] : compressed_files) {
         // Tag (4 bytes)
         result.insert(result.end(), tag.begin(), tag.end());
-
-        // Original size (4 bytes)
-        uint32_t orig_size = compressed.size();  // We don't track original, use this
-        result.insert(result.end(), (uint8_t*)&orig_size, (uint8_t*)&orig_size + 4);
 
         // Compressed size (4 bytes)
         uint32_t comp_size = compressed.size();

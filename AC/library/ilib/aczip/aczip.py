@@ -34,12 +34,12 @@ class ACZip:
         if parallel and len(files) > 1:
             with ThreadPoolExecutor() as executor:
                 results = executor.map(
-                    lambda f: (f[0], gzip.compress(f[1], compresslevel=6)),
+                    lambda f: (f[0], ACZstd.compress(f[1], level=3)),
                     files
                 )
                 compressed_files = list(results)
         else:
-            compressed_files = [(f[0], gzip.compress(f[1], compresslevel=6)) for f in files]
+            compressed_files = [(f[0], ACZstd.compress(f[1], level=3)) for f in files]
 
         # Build v2 format
         result = b'ACZ2'  # Magic header v2
