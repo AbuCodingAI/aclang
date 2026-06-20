@@ -86,10 +86,15 @@ Make array_ops func()
 
     fib_result = fib(28)
     loop_result = loop_work()
-    sieve_result = sieve(50)
+    sieve_primes = sieve(50)
+    /* Count primes manually */
+    sieve_count = 0
+    FOR p in sieve_primes
+        sieve_count += 1
     array_result = array_ops()
 
-    /* Checksum of all results */
-    checksum = fib_result + loop_result + array_result
+    /* Checksum: fib + loop + sieve_count + array_result */
+    checksum = fib_result + loop_result + sieve_count
+    checksum = checksum + array_result
 
     Term.display checksum

@@ -66,8 +66,10 @@ fn sieve(n int) []int {
 
 	for p := 2; p * p <= n; p++ {
 		if prime[p] {
-			for mut i := p * p; i <= n; i += p {
+			mut i := p * p
+			for i <= n {
 				prime[i] = false
+				i += p
 			}
 		}
 	}
@@ -105,7 +107,7 @@ fn main() {
 	sieve_result := sieve(50).len
 	array_result := array_ops()
 
-	checksum := fib_result + loop_result + i64(sieve_result)
+	mut checksum := fib_result + loop_result + i64(sieve_result)
 	checksum = i64(f64(checksum) + array_result)
 
 	println(checksum)
