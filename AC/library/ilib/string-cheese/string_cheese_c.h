@@ -25,6 +25,8 @@ int         ac_stringm_count(const char* s, const char* sub);
 const char* ac_stringm_format(const char* template_str);  /* literal passthrough; AC compiler handles {} at IR level */
 const char* ac_stringm_getline();  /* read line from stdin */
 int         ac_stringm_scan(const char* needle);  /* read line from stdin and check if it contains needle; returns 1 if found, 0 otherwise */
+int         ac_stringm_ischar(const char* s);  /* check if string contains only alphabetic characters; returns 1 if true, 0 if false or empty */
+int         ac_stringm_isws(const char* s);  /* check if string contains only whitespace; returns 1 if true, 0 if false */
 
 #ifdef __cplusplus
 }

@@ -165,4 +165,23 @@ int ac_stringm_scan(const char* needle) {
     return 0;
 }
 
+int ac_stringm_ischar(const char* s) {
+    // Check if string contains only alphabetic characters
+    if (!s || !*s) return 0;
+    for (const char* p = s; *p; p++) {
+        if (!isalpha((unsigned char)*p)) return 0;
+    }
+    return 1;
+}
+
+int ac_stringm_isws(const char* s) {
+    // Check if string contains only whitespace characters
+    if (!s) return 0;
+    if (!*s) return 1;  // empty string is all whitespace
+    for (const char* p = s; *p; p++) {
+        if (!isspace((unsigned char)*p)) return 0;
+    }
+    return 1;
+}
+
 } // extern "C"
