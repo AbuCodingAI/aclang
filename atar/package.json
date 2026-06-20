@@ -1,0 +1,15 @@
+{
+  "name": "atar",
+  "version": "1.0.0",
+  "description": "AC package manager using GitHub releases",
+  "bin": {
+    "atar": "bin/atar.js"
+  },
+  "main": "lib/index.js",
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "keywords": ["ac", "package", "manager", "github"],
+  "author": "Abu",
+  "license": "MIT"
+}
