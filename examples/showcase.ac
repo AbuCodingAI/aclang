@@ -1,0 +1,41 @@
+AC->PY
+
+/* AC showcase — a little of everything in one file */
+
+use ilib math
+
+Make is_prime func(n)
+    IF n < 2
+        return 0
+    d = 2
+    WHILST d @ d #> n
+        IF math.mod(n, d) is 0
+            return 0
+        d += 1
+    return 1
+
+Make describe func(n)
+    cond is_prime(n)
+        is 1
+            return $prime$
+        OTHER
+            return $composite$
+
+<mainloop>
+    Term.display $== AC showcase ==$
+    primes = []
+    FOR n in sequence(2, 30)
+        IF is_prime(n) is 1
+            primes.append(n)
+    Term.display length primes
+    Term.display primes[1]
+    Term.display describe(13)
+    Term.display describe(15)
+    Term.display 2 ^ 8
+    Term.display 12 band 10
+    Term.display iota 5
+    try
+        Term.display 5 // is_prime(4)
+    catch
+        Term.display $divide by zero caught$
+<mainloop>

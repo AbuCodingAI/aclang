@@ -1,0 +1,22 @@
+AC->BNY
+
+/* Absolute value and sign, hand-rolled */
+
+Make absv func(n)
+    IF n < 0
+        return 0 - n
+    return n
+
+Make sign func(n)
+    IF n > 0
+        return 1
+    IF n < 0
+        return 0 - 1
+    return 0
+
+<mainloop>
+    Term.display absv(-7)
+    Term.display sign(-7)
+    Term.display sign(42)
+    Term.display sign(0)
+<mainloop>

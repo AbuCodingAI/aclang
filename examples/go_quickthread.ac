@@ -1,0 +1,17 @@
+AC->GO
+
+/* Go's superpower: quickthread = a real goroutine.
+   Other backends run the call synchronously — same result, no parallelism. */
+
+Make crunch func(id)
+    total = 0
+    FOR i in range 100000
+        bound total += (i @ id) band 127
+    Term.display total
+
+<mainloop>
+    quickthread crunch(1)
+    quickthread crunch(2)
+    quickthread crunch(3)
+    Term.display $main continues while workers crunch$
+<mainloop>

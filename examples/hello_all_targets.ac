@@ -1,0 +1,8 @@
+AC->PY
+
+/* One source, any target: recompile with `ac hello_all_targets.ac BNY`
+   (or JS, C, RS, GO, ...) — the header is just the default. */
+
+<mainloop>
+    Term.display $same code, any backend$
+<mainloop>

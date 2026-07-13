@@ -1,0 +1,11 @@
+AC->BNY
+
+/* ptm = power-two multiply (x @ 2^n), ptd = power-two divide — bit shifts.
+   Sane code writes x@2 or x//2; ptm/ptd are the explicit bit-level forms. */
+
+<mainloop>
+    Term.display 5 ptm 1
+    Term.display 5 ptm 3
+    Term.display 40 ptd 2
+    Term.display 7 ptd 1
+<mainloop>

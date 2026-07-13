@@ -1,0 +1,19 @@
+AC->BNY
+
+/* Second-largest element in one pass */
+
+Make second func(arr)
+    best = arr[1]
+    runner = arr[1]
+    FOR v in arr
+        IF v > best
+            runner = best
+            best = v
+        ELSEIF v > runner and v < best
+            runner = v
+    return runner
+
+<mainloop>
+    Term.display second([3, 9, 5, 7])
+    Term.display second([1, 2])
+<mainloop>

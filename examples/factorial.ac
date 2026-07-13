@@ -1,0 +1,13 @@
+AC->BNY
+
+/* Recursive factorial */
+
+Make fact func(n)
+    IF n #> 1
+        return 1
+    return n @ fact(n - 1)
+
+<mainloop>
+    Term.display fact(5)
+    Term.display fact(10)
+<mainloop>

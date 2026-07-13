@@ -1,0 +1,17 @@
+AC->CPP
+
+/* ml ilib — native autodiff: d(wx)^2/dw, then one SGD step */
+
+use ilib ml
+
+<mainloop>
+    w = ml.tensor(2)
+    ml.gradient_track(w, 1)
+    x = ml.tensor(3)
+    y = ml.multiply(w, x)
+    loss = ml.multiply(y, y)
+    ml.backward(loss)
+    Term.display ml.take(w)
+    ml.weights(0.01, w)
+    Term.display ml.take(w)
+<mainloop>

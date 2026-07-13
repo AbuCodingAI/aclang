@@ -1,6 +1,0 @@
-AI->VM
-
-<mainloop>
-    Term.display $Hello\nWorld$
-    Term.display r$no\nescape$
-/kill

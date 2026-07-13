@@ -1,0 +1,18 @@
+AC->BNY
+
+/* How many digits an integer has */
+
+Make ndigits func(n)
+    IF n is 0
+        return 1
+    d = 0
+    WHILST n > 0
+        d += 1
+        n = n // 10
+    return d
+
+<mainloop>
+    Term.display ndigits(0)
+    Term.display ndigits(7)
+    Term.display ndigits(123456)
+<mainloop>

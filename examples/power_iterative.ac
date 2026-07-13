@@ -1,0 +1,16 @@
+AC->BNY
+
+/* Iterative power — same answer as the ^ operator */
+
+Make ipow func(base, exp)
+    result = 1
+    i = 0
+    WHILST i < exp
+        result @= base
+        i += 1
+    return result
+
+<mainloop>
+    Term.display ipow(2, 10)
+    Term.display 2 ^ 10
+<mainloop>

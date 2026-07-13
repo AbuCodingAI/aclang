@@ -1,0 +1,12 @@
+AC->PY
+
+/* string-cheese ilib (stringm) — string manipulation */
+
+use ilib string-cheese
+
+<mainloop>
+    Term.display stringm.upper($shout$)
+    Term.display stringm.lower($WHISPER$)
+    Term.display stringm.strip($  padded  $)
+    Term.display stringm.replace($x.y.z$, $.$, $_$)
+<mainloop>

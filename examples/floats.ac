@@ -1,0 +1,10 @@
+AC->BNY
+
+/* Floats: / is true division (Python-style), // is floor division */
+
+<mainloop>
+    Term.display 7 / 2
+    Term.display 7 // 2
+    Term.display 1.5 + 2.25
+    Term.display 10.0 / 4.0
+<mainloop>

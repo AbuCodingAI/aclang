@@ -1,0 +1,18 @@
+AC->BNY
+
+/* Minimum and maximum of an array */
+
+Make minmax_diff func(arr)
+    lo = arr[1]
+    hi = arr[1]
+    FOR v in arr
+        IF v < lo
+            lo = v
+        IF v > hi
+            hi = v
+    return hi - lo
+
+<mainloop>
+    Term.display minmax_diff([7, 2, 9, 4])
+    Term.display minmax_diff([5, 5, 5])
+<mainloop>

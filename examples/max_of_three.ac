@@ -1,0 +1,16 @@
+AC->BNY
+
+/* Largest of three, no arrays needed */
+
+Make max3 func(a, b, c)
+    m = a
+    IF b > m
+        m = b
+    IF c > m
+        m = c
+    return m
+
+<mainloop>
+    Term.display max3(3, 9, 5)
+    Term.display max3(10, 2, 7)
+<mainloop>

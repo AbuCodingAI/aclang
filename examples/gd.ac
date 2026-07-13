@@ -1,0 +1,49 @@
+AC->CPP
+
+use ilib gl
+
+/*  gd — Geometry Dash: the cube hops on Space, the spike scrolls left
+    forever, and the game ends when they overlap. <StartHere>...<EndHere>
+    is the per-frame game loop (frame.begin → update → body → render → end). */
+
+Make hop func(arg)
+    IF is_obj(arg)
+        arg.CircleFall(1/3 RightDir)
+
+<mainloop>
+    <gui>
+
+        <OBJECT>
+            obj.Cube
+            Cube.config item=square(32) - location=(x=140, y=screen-80) - white
+
+            obj.Spike
+            Spike.config item=square(24) - location=(x=screen-40, y=screen-72) - white
+        <OBJECT>
+
+        <SCREEN>
+            Make Screen object
+            Screen.OBJECT resize 800x400
+            background.config color=black
+            animate(60 fps)
+        <SCREEN>
+
+        <LOGIC>
+
+            configure event-listener
+                use listener to establish rule
+                    on value is space
+                        hop(Cube)
+
+            Spike.velocity(-160, 0)
+
+            <StartHere>
+                IF Cube.hitbox.coords overlap Spike.hitbox.coords
+                    Term.display $game over$
+                    Spike.regen()
+            <EndHere>
+
+        <LOGIC>
+
+    <gui>
+<mainloop>

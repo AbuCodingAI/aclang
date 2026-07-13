@@ -1,0 +1,22 @@
+# AC String-Cheese Library — lowering rules (ilib:string-cheese)
+# Maps stringm:* calls to the stringm.* Python/JS object.
+
+# stringm:f (f-string) and stringm:t (template/trim) removed — string building is `$a$ + $b$` now.
+stringm:b           -> stringm.b
+stringm:upper       -> stringm.upper
+stringm:lower       -> stringm.lower
+stringm:UPPER       -> stringm.upper
+stringm:LOWER       -> stringm.lower
+stringm:find        -> stringm.find
+stringm:strip       -> stringm.strip
+stringm:replace     -> stringm.replace
+stringm:split       -> stringm.split
+stringm:join        -> stringm.join
+stringm:length      -> stringm.length
+stringm:len         -> stringm.length
+stringm:startswith  -> stringm.startswith
+stringm:endswith    -> stringm.endswith
+stringm:count       -> stringm.count
+stringm:format      -> stringm.format
+stringm:getline     -> stringm.getline
+stringm:scan        -> stringm.scan

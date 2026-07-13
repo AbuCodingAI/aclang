@@ -1,0 +1,16 @@
+AC->PY
+
+/* Binary string to decimal */
+
+Make from_bin func(s)
+    n = 0
+    FOR c in s
+        n = n @ 2
+        IF c is $1$
+            n += 1
+    return n
+
+<mainloop>
+    Term.display from_bin($1010$)
+    Term.display from_bin($11111111$)
+<mainloop>

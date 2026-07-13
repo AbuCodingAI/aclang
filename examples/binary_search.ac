@@ -1,0 +1,23 @@
+AC->BNY
+
+/* Binary search on a sorted array — returns 1-based index or 0 */
+
+Make bin_search func(arr, target)
+    lo = 1
+    hi = length arr
+    WHILST lo #> hi
+        mid = (lo + hi) // 2
+        IF arr[mid] is target
+            return mid
+        IF arr[mid] < target
+            lo = mid + 1
+        OTHER
+            hi = mid - 1
+    return 0
+
+<mainloop>
+    sorted = [2, 5, 8, 12, 16, 23, 38, 56]
+    Term.display bin_search(sorted, 23)
+    Term.display bin_search(sorted, 2)
+    Term.display bin_search(sorted, 99)
+<mainloop>

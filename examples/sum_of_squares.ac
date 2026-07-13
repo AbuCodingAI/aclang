@@ -1,0 +1,17 @@
+AC->BNY
+
+/* Sum of squares 1..n, loop vs closed form */
+
+Make loop_sum func(n)
+    s = 0
+    FOR i in sequence(1, n + 1)
+        s += i @ i
+    return s
+
+Make formula func(n)
+    return n @ (n + 1) @ (2 @ n + 1) // 6
+
+<mainloop>
+    Term.display loop_sum(10)
+    Term.display formula(10)
+<mainloop>

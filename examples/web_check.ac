@@ -1,0 +1,7 @@
+AC->PY
+use ilib web
+
+<mainloop>
+    safe = web.pdf($notes.txt$)
+    Term.display safe
+<mainloop>

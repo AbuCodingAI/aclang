@@ -1,0 +1,11 @@
+AC->BNY
+
+/* Bitwise operators are words: band, bor, bxor, bnot (~ is the only symbol) */
+
+<mainloop>
+    Term.display 12 band 10
+    Term.display 12 bor 10
+    Term.display 12 bxor 10
+    Term.display bnot 0
+    Term.display ~ 5
+<mainloop>

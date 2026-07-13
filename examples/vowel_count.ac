@@ -1,0 +1,15 @@
+AC->PY
+
+/* Count vowels using logical or */
+
+Make vowels func(s)
+    n = 0
+    FOR c in s
+        IF c is $a$ or c is $e$ or c is $i$ or c is $o$ or c is $u$
+            free n += 1
+    return n
+
+<mainloop>
+    Term.display vowels($programming language$)
+    Term.display vowels($xyz$)
+<mainloop>

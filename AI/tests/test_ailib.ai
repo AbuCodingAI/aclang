@@ -1,7 +1,0 @@
-AI->AIBC
-use flib ailib.ai
-
-d = double(7)
-g = greet($World$)
-Term.display d
-Term.display g

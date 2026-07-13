@@ -1,0 +1,14 @@
+# AC ML Library - native C++ tensor/autograd lowering rules (ilib:ml)
+
+ml:tensor          -> ml.tensor
+ml:grid            -> ml.grid
+ml:gradient_track  -> ml.gradient_track
+ml:backward        -> ml.backward
+ml:grad_wipe       -> ml.grad_wipe
+ml:weights         -> ml.weights
+ml:take            -> ml.take
+ml:grad            -> ml.grad
+ml:add             -> ml.add
+ml:multiply        -> ml.multiply
+ml:relu            -> ml.relu
+ml:optimize        -> ml.optimize

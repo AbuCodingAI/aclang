@@ -1,0 +1,23 @@
+AC->BNY
+
+/* Kadane's algorithm: maximum subarray sum */
+
+Make max_subarray func(arr)
+    best = arr[1]
+    cur = arr[1]
+    i = 2
+    WHILST i #> length arr
+        v = arr[i]
+        IF cur + v > v
+            cur = cur + v
+        OTHER
+            cur = v
+        IF cur > best
+            best = cur
+        i += 1
+    return best
+
+<mainloop>
+    Term.display max_subarray([-2, 1, -3, 4, -1, 2, 1, -5, 4])
+    Term.display max_subarray([-3, -1, -2])
+<mainloop>

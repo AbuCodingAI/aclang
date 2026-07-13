@@ -1,0 +1,18 @@
+AC->BNY
+
+/* cond — switch-style dispatch on one value */
+
+Make day_type func(d)
+    cond d
+        is 1
+            return 100
+        is 7
+            return 100
+        OTHER
+            return 200
+
+<mainloop>
+    Term.display day_type(1)
+    Term.display day_type(3)
+    Term.display day_type(7)
+<mainloop>

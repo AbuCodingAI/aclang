@@ -1,0 +1,22 @@
+AC->PY
+
+/* Perfect numbers: equal to the sum of their proper divisors */
+
+use ilib math
+
+Make is_perfect func(n)
+    s = 0
+    d = 1
+    WHILST d < n
+        IF math.mod(n, d) is 0
+            s += d
+        d += 1
+    IF s is n
+        return 1
+    return 0
+
+<mainloop>
+    Term.display is_perfect(6)
+    Term.display is_perfect(28)
+    Term.display is_perfect(12)
+<mainloop>

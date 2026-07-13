@@ -1,0 +1,22 @@
+AC->PY
+
+/* Armstrong number: sum of cubes of digits equals the number (3-digit case) */
+
+use ilib math
+
+Make is_armstrong func(n)
+    total = 0
+    m = n
+    WHILST m > 0
+        d = math.mod(m, 10)
+        total += d @ d @ d
+        m = m // 10
+    IF total is n
+        return 1
+    return 0
+
+<mainloop>
+    Term.display is_armstrong(153)
+    Term.display is_armstrong(370)
+    Term.display is_armstrong(100)
+<mainloop>

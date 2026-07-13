@@ -1,0 +1,11 @@
+AC->PY
+
+/* Building strings in a loop */
+
+<mainloop>
+    line = $$
+    FOR i in range 5
+        line += $ab$
+    Term.display line
+    Term.display length line
+<mainloop>

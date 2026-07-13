@@ -1,0 +1,15 @@
+AC->BNY
+
+/* Sum and count of an array */
+
+Make total func(arr)
+    s = 0
+    FOR v in arr
+        s += v
+    return s
+
+<mainloop>
+    data = [3, 1, 4, 1, 5, 9, 2, 6]
+    Term.display total(data)
+    Term.display length data
+<mainloop>

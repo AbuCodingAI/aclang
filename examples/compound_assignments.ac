@@ -1,0 +1,15 @@
+AC->BNY
+
+/* Compound assignment: += -= @= /= */
+
+<mainloop>
+    x = 10
+    x += 5
+    Term.display x
+    x -= 3
+    Term.display x
+    x @= 2
+    Term.display x
+    x /= 4
+    Term.display x
+<mainloop>

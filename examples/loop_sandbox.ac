@@ -1,0 +1,13 @@
+AC->BNY
+
+/* SCOPING: a loop is a bound sandbox. Vars mutate freely INSIDE the loop,
+   then revert at loop exit. Inside: 7 8 9. After: back to 6. */
+
+<mainloop>
+    x = 6
+    FOR i in range 3
+        x += 1
+        Term.display x
+    Term.display $after loop:$
+    Term.display x
+<mainloop>

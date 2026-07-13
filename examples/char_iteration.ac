@@ -1,0 +1,9 @@
+AC->PY
+
+/* FOR iterates characters of a string */
+
+<mainloop>
+    word = $hello$
+    FOR c in word
+        Term.display c
+<mainloop>

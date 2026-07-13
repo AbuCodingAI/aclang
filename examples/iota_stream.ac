@@ -1,0 +1,14 @@
+AC->PY
+
+/* iota n — lazy range, displays concatenated: 0123456789
+   stream(a, b, step) — lazy sequence, same idea */
+
+<mainloop>
+    Term.display iota 10
+    FOR i in iota 5
+        Term.display i
+    total = 0
+    FOR v in stream(2, 9, 3)
+        free total += v
+        Term.display v
+<mainloop>

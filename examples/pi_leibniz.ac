@@ -1,0 +1,14 @@
+AC->PY
+
+/* Approximate pi with the Leibniz series */
+
+use ilib math
+
+<mainloop>
+    pi4 = 0.0
+    sign = 1.0
+    FOR k in range 10000
+        free pi4 += sign / (2.0 @ k + 1.0)
+        free sign = 0.0 - sign
+    Term.display pi4 @ 4.0
+<mainloop>

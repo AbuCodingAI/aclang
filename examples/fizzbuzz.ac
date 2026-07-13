@@ -1,0 +1,17 @@
+AC->PY
+
+/* FizzBuzz, the classic */
+
+use ilib math
+
+<mainloop>
+    FOR i in sequence(1, 16)
+        IF math.mod(i, 15) is 0
+            Term.display $FizzBuzz$
+        ELSEIF math.mod(i, 3) is 0
+            Term.display $Fizz$
+        ELSEIF math.mod(i, 5) is 0
+            Term.display $Buzz$
+        OTHER
+            Term.display i
+<mainloop>

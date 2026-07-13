@@ -1,0 +1,16 @@
+AC->BNY
+
+/* Functions with several parameters */
+
+Make clamp func(v, lo, hi)
+    IF v < lo
+        return lo
+    IF v > hi
+        return hi
+    return v
+
+<mainloop>
+    Term.display clamp(5, 0, 10)
+    Term.display clamp(-3, 0, 10)
+    Term.display clamp(99, 0, 10)
+<mainloop>

@@ -1,0 +1,11 @@
+AC->BNY
+
+/* AC's # comparisons: #> is NOT-greater (<=), #< is NOT-less (>=), #= is not-equal */
+
+<mainloop>
+    Term.display 3 #> 5
+    Term.display 5 #> 3
+    Term.display 5 #< 3
+    Term.display 4 #= 4
+    Term.display 4 #= 9
+<mainloop>

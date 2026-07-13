@@ -1,0 +1,20 @@
+AC->PY
+
+/* Collatz: count steps to reach 1 */
+
+use ilib math
+
+Make collatz func(n)
+    steps = 0
+    WHILST n #= 1
+        IF math.mod(n, 2) is 0
+            n = n // 2
+        OTHER
+            n = 3 @ n + 1
+        steps += 1
+    return steps
+
+<mainloop>
+    Term.display collatz(27)
+    Term.display collatz(6)
+<mainloop>

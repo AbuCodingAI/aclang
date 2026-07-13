@@ -1,0 +1,13 @@
+AC->BNY
+
+/* Swapping two variables with a temp */
+
+<mainloop>
+    a = 1
+    b = 2
+    t = a
+    a = b
+    b = t
+    Term.display a
+    Term.display b
+<mainloop>

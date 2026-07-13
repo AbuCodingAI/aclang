@@ -1,0 +1,12 @@
+AC->PY
+
+/* to_int / to_string / to_dec — statement-form coercion */
+
+<mainloop>
+    to_int n = $42$
+    Term.display n + 1
+    to_string label = 99
+    Term.display label + $!$
+    to_dec d = 7
+    Term.display d / 2
+<mainloop>

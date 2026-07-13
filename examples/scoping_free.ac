@@ -1,0 +1,11 @@
+AC->PY
+
+/* free — escape the loop sandbox: mutations persist after the loop.
+   Compare with loop_sandbox.ac where x reverts. */
+
+<mainloop>
+    total = 0
+    FOR i in range 5
+        free total += i
+    Term.display total
+<mainloop>

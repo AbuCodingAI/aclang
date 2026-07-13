@@ -1,0 +1,13 @@
+AC->BNY
+
+/* Logical operators: and, or, xor, not (# is the not symbol) */
+
+<mainloop>
+    Term.display 1 and 1
+    Term.display 1 and 0
+    Term.display 0 or 1
+    Term.display 1 xor 1
+    Term.display 1 xor 0
+    Term.display not 0
+    Term.display # 1
+<mainloop>

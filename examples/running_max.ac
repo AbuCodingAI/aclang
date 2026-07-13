@@ -1,0 +1,12 @@
+AC->BNY
+
+/* Running maximum over a stream of values */
+
+<mainloop>
+    data = [3, 7, 2, 9, 4, 9, 1]
+    best = data[1]
+    FOR v in data
+        IF v > best
+            free best = v
+        Term.display best
+<mainloop>

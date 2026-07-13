@@ -1,0 +1,13 @@
+AC->PY
+
+/* free a, b, c — declare names as free (global) up front */
+
+<mainloop>
+    free hits, misses
+    hits = 0
+    misses = 0
+    FOR i in range 4
+        free hits += 1
+    Term.display hits
+    Term.display misses
+<mainloop>

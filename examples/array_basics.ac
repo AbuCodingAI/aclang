@@ -1,0 +1,12 @@
+AC->BNY
+
+/* Arrays: literal, 1-indexed access, length */
+
+<mainloop>
+    nums = [5, 10, 15, 20]
+    Term.display nums[1]
+    Term.display nums[4]
+    Term.display length nums
+    nums[2] = 99
+    Term.display nums[2]
+<mainloop>

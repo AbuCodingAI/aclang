@@ -1,0 +1,13 @@
+AC->BNY
+
+/* ^ is exponentiation — like math class, not C's XOR */
+
+Make powdemo func(b, e)
+    return b ^ e
+
+<mainloop>
+    Term.display 2 ^ 10
+    Term.display 3 ^ 4
+    Term.display powdemo(5, 3)
+    Term.display 2 ^ 0
+<mainloop>

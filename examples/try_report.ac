@@ -1,0 +1,14 @@
+AC->PY
+
+/* report err — bind the exception message inside catch */
+
+Make risky func(d)
+    return 100 // d
+
+<mainloop>
+    try
+        Term.display risky(0)
+    catch
+        report err
+        Term.display err
+<mainloop>

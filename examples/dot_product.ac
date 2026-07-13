@@ -1,0 +1,15 @@
+AC->BNY
+
+/* Dot product of two vectors (1-indexed) */
+
+Make dot func(a, b)
+    s = 0
+    i = 1
+    WHILST i #> length a
+        s += a[i] @ b[i]
+        i += 1
+    return s
+
+<mainloop>
+    Term.display dot([1, 2, 3], [4, 5, 6])
+<mainloop>

@@ -1,0 +1,11 @@
+AC->PY
+
+/* Strings use $...$ — concatenation with + */
+
+<mainloop>
+    greeting = $Hello$
+    name = $AC$
+    message = greeting + $, $ + name + $!$
+    Term.display message
+    Term.display length message
+<mainloop>

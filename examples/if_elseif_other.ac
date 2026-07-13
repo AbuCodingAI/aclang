@@ -1,0 +1,17 @@
+AC->BNY
+
+/* Branching: IF / ELSEIF / OTHER */
+
+Make classify func(n)
+    IF n #> 9
+        return 1
+    ELSEIF n #> 99
+        return 2
+    OTHER
+        return 3
+
+<mainloop>
+    Term.display classify(5)
+    Term.display classify(50)
+    Term.display classify(500)
+<mainloop>

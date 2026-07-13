@@ -1,0 +1,10 @@
+AC->BNY
+
+/* Nested loops: multiplication table corner */
+
+<mainloop>
+    FOR i in sequence(1, 4)
+        FOR j in sequence(1, 4)
+            Term.display i @ j
+        Term.display $---$
+<mainloop>

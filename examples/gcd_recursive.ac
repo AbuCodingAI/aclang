@@ -1,0 +1,15 @@
+AC->PY
+
+/* Euclid's GCD, recursive form (see gcd.ac for the subtraction loop) */
+
+use ilib math
+
+Make gcd func(a, b)
+    IF b is 0
+        return a
+    return gcd(b, math.mod(a, b))
+
+<mainloop>
+    Term.display gcd(48, 18)
+    Term.display gcd(1071, 462)
+<mainloop>

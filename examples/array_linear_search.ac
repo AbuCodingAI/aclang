@@ -1,0 +1,16 @@
+AC->BNY
+
+/* Linear search — first 1-based index of target, or 0 */
+
+Make find func(arr, target)
+    i = 1
+    WHILST i #> length arr
+        IF arr[i] is target
+            return i
+        i += 1
+    return 0
+
+<mainloop>
+    Term.display find([4, 8, 15, 16, 23, 42], 15)
+    Term.display find([4, 8, 15], 99)
+<mainloop>

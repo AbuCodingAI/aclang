@@ -1,0 +1,11 @@
+AC->PY
+
+/* regex ilib — match, search, replace */
+
+use ilib regex
+
+<mainloop>
+    Term.display regex.match($hello123$, $[a-z]+[0-9]+$)
+    Term.display regex.search($order 66 confirmed$, $[0-9]+$)
+    Term.display regex.replace($a-b-c$, $-$, $ $)
+<mainloop>

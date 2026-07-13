@@ -1,0 +1,11 @@
+AC->PY
+
+/* const — immutable binding */
+
+<mainloop>
+    const limit = 10
+    total = 0
+    FOR i in range limit
+        free total += i
+    Term.display total
+<mainloop>

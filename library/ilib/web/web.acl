@@ -1,0 +1,17 @@
+# AC Web Library - lowering/import rules (ilib:web)
+# The compiler's normal dot-call formatting emits web_open/web_page_get for
+# C-like backends; web_c.h/web.hpp provide those wrappers over libacweb's
+# exported ac_web_* symbols. These entries also teach "using header web" which
+# bare symbols belong to the web namespace.
+
+web:open        -> web.open
+web:file_open   -> web.file_open
+web:popen       -> web.popen
+web:ropen       -> web.ropen
+web:browser     -> web.browser
+web:pdf         -> web.pdf
+web:text        -> web.text
+web:inspect     -> web.inspect
+web:ac_page     -> web.ac_page
+web:page_get    -> web.page_get
+web:help        -> web.help

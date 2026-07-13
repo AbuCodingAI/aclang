@@ -1,0 +1,10 @@
+AC->HTML
+
+/* HTML backend — the program IS a web page: output renders in the browser DOM */
+
+<mainloop>
+    Term.display $This paragraph was compiled from AC$
+    FOR i in sequence(1, 6)
+        Term.display i @ i
+    Term.display iota 10
+<mainloop>

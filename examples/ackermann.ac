@@ -1,0 +1,15 @@
+AC->BNY
+
+/* Ackermann — deeply recursive; keep inputs tiny */
+
+Make ack func(m, n)
+    IF m is 0
+        return n + 1
+    IF n is 0
+        return ack(m - 1, 1)
+    return ack(m - 1, ack(m, n - 1))
+
+<mainloop>
+    Term.display ack(2, 3)
+    Term.display ack(3, 3)
+<mainloop>

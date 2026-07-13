@@ -1,0 +1,16 @@
+AC->PY
+
+/* Palindrome check by reversing the string */
+
+Make is_pal func(s)
+    r = $$
+    FOR c in s
+        r = c + r
+    IF r is s
+        return 1
+    return 0
+
+<mainloop>
+    Term.display is_pal($racecar$)
+    Term.display is_pal($hello$)
+<mainloop>

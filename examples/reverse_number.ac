@@ -1,0 +1,17 @@
+AC->PY
+
+/* Reverse the digits of an integer */
+
+use ilib math
+
+Make rev func(n)
+    out = 0
+    WHILST n > 0
+        out = out @ 10 + math.mod(n, 10)
+        n = n // 10
+    return out
+
+<mainloop>
+    Term.display rev(1234)
+    Term.display rev(1200)
+<mainloop>

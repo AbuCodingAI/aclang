@@ -1,0 +1,10 @@
+AC->PY
+
+/* web ilib — fetch a page as a string (needs network) */
+
+use ilib web
+
+<mainloop>
+    html = web.page_get($http://example.com$)
+    Term.display length html
+<mainloop>

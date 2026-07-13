@@ -1,0 +1,20 @@
+AC->PY
+
+/* Least common multiple via GCD */
+
+use ilib math
+
+Make gcd func(a, b)
+    WHILST b #= 0
+        t = math.mod(a, b)
+        a = b
+        b = t
+    return a
+
+Make lcm func(a, b)
+    return a // gcd(a, b) @ b
+
+<mainloop>
+    Term.display lcm(4, 6)
+    Term.display lcm(21, 6)
+<mainloop>

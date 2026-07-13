@@ -1,0 +1,11 @@
+AC->JS
+
+/* JS backend + web ilib — fetch a page and measure it (needs network) */
+
+use ilib web
+
+<mainloop>
+    html = web.page_get($http://example.com$)
+    Term.display length html
+    Term.display $fetched over HTTP from a JS runtime$
+<mainloop>

@@ -1,0 +1,16 @@
+AC->BNY
+
+/* Newton's method for square roots (floats) */
+
+Make nsqrt func(x)
+    guess = x / 2.0
+    i = 0
+    WHILST i < 20
+        guess = (guess + x / guess) / 2.0
+        i += 1
+    return guess
+
+<mainloop>
+    Term.display nsqrt(2.0)
+    Term.display nsqrt(144.0)
+<mainloop>

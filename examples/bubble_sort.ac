@@ -1,0 +1,23 @@
+AC->BNY
+
+/* Bubble sort in place (1-indexed) */
+
+Make sort func(arr)
+    n = length arr
+    i = 0
+    WHILST i < n
+        j = 1
+        WHILST j < n
+            IF arr[j] > arr[j + 1]
+                t = arr[j]
+                arr[j] = arr[j + 1]
+                arr[j + 1] = t
+            j += 1
+        i += 1
+    return arr
+
+<mainloop>
+    s = sort([5, 2, 9, 1, 7])
+    FOR v in s
+        Term.display v
+<mainloop>

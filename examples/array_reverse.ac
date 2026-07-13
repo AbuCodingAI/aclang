@@ -1,0 +1,14 @@
+AC->BNY
+
+/* Reverse an array by copying backwards (1-indexed) */
+
+Make reverse func(arr)
+    out = arr[-0]
+    
+    return out
+
+<mainloop>
+    r = reverse([1, 2, 3, 4, 5])
+    FOR v in r
+        Term.display v
+<mainloop>

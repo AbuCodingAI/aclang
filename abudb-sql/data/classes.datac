@@ -1,8 +1,0 @@
-class string property: class
-string sub.class: student
-
-classes {
-    class: "Math", student: "Alex"
-    class: "Science", student: "Jordan"
-    class: "History", student: "Sam"
-}

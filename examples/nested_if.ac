@@ -1,0 +1,15 @@
+AC->BNY
+
+/* Nested conditions */
+
+<mainloop>
+    a = 7
+    b = 3
+    IF a > b
+        IF a > 5
+            Term.display $a is big and bigger than b$
+        OTHER
+            Term.display $a is small but bigger than b$
+    OTHER
+        Term.display $b wins$
+<mainloop>

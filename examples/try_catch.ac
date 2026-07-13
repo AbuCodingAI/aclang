@@ -1,0 +1,16 @@
+AC->PY
+
+/* try / catch — runtime errors are caught; after always runs */
+
+Make risky func(d)
+    return 10 // d
+
+<mainloop>
+    try
+        x = risky(0)
+        Term.display x
+    catch
+        Term.display $caught a runtime error$
+    after
+        Term.display $always runs$
+<mainloop>

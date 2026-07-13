@@ -1,0 +1,11 @@
+AC->BNY
+
+/* FOR over a list — AC arrays are 1-indexed */
+
+<mainloop>
+    nums = [10, 20, 30, 40]
+    FOR v in nums
+        Term.display v
+    Term.display nums[1]
+    Term.display nums[4]
+<mainloop>

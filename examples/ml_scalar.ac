@@ -1,0 +1,16 @@
+AC->CPP
+use ilib ml
+
+<mainloop>
+    w = ml.tensor(2)
+    ml.gradient_track(w, 1)
+    x = ml.tensor(3)
+    y = ml.multiply(w, x)
+    loss = ml.multiply(y, y)
+    ml.backward(loss)
+    before = ml.take(w)
+    ml.weights(0.01, w)
+    updated = ml.take(w)
+    Term.display before
+    Term.display updated
+<mainloop>

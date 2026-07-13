@@ -1,0 +1,17 @@
+AC->PY
+
+/* LineUp — match statement: value cases + default, brace-delimited */
+
+const value=2
+
+<mainloop>
+    LineUp value {
+        1:Term.display $One$
+        2:Term.display $Two$
+        default: Term.display $Other$
+    }
+    LineUp 9 {
+        1:Term.display $one$
+        default: Term.display $fell through$
+    }
+<mainloop>

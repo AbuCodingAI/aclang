@@ -1,0 +1,14 @@
+AC->BNY
+
+/* Mean of an array (float division) */
+
+Make mean func(arr)
+    s = 0
+    FOR v in arr
+        s += v
+    return s / length arr
+
+<mainloop>
+    Term.display mean([2, 4, 6, 8])
+    Term.display mean([1, 2, 4])
+<mainloop>

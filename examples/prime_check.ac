@@ -1,0 +1,22 @@
+AC->PY
+
+/* Trial-division primality test */
+
+use ilib math
+
+Make is_prime func(n)
+    IF n < 2
+        return 0
+    d = 2
+    WHILST d @ d #> n
+        IF math.mod(n, d) is 0
+            return 0
+        d += 1
+    return 1
+
+<mainloop>
+    Term.display is_prime(97)
+    Term.display is_prime(91)
+    Term.display is_prime(2)
+    Term.display is_prime(1)
+<mainloop>

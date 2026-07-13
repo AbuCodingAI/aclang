@@ -1,0 +1,28 @@
+AC->PY
+
+/* Collect the first primes by trial division (see sieve.ac for the sieve) */
+
+use ilib math
+
+Make is_prime func(n)
+    IF n < 2
+        return 0
+    d = 2
+    WHILST d @ d #> n
+        IF math.mod(n, d) is 0
+            return 0
+        d += 1
+    return 1
+
+<mainloop>
+    found = []
+    n = 2
+    count = 0
+    WHILST count < 10
+        IF is_prime(n) is 1
+            found.append(n)
+            free count += 1
+        free n += 1
+    FOR p in found
+        Term.display p
+<mainloop>

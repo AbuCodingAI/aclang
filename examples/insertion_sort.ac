@@ -1,0 +1,22 @@
+AC->BNY
+
+/* Insertion sort (1-indexed) */
+
+Make isort func(arr)
+    n = length arr
+    i = 2
+    WHILST i #> n
+        key = arr[i]
+        j = i - 1
+        WHILST j > 0 and arr[j] > key
+            arr[j + 1] = arr[j]
+            j -= 1
+        arr[j + 1] = key
+        i += 1
+    return arr
+
+<mainloop>
+    s = isort([31, 41, 59, 26, 53])
+    FOR v in s
+        Term.display v
+<mainloop>

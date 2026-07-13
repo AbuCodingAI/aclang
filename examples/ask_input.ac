@@ -1,0 +1,8 @@
+AC->PY
+
+/* Term.ask — read a line from the user (run interactively) */
+
+<mainloop>
+    name = Term.ask $What is your name? $
+    Term.display $Hello, $ + name + $!$
+<mainloop>

@@ -1,0 +1,9 @@
+AC->BNY
+
+/* Times table for one number */
+
+<mainloop>
+    n = 7
+    FOR i in sequence(1, 11)
+        Term.display n @ i
+<mainloop>

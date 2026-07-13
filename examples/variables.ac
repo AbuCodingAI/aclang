@@ -1,0 +1,14 @@
+AC->BNY
+
+/* Variables: assignment, reassignment, expressions */
+
+<mainloop>
+    x = 10
+    y = 4
+    sum = x + y
+    diff = x - y
+    Term.display sum
+    Term.display diff
+    x = x + 100
+    Term.display x
+<mainloop>

@@ -1,0 +1,21 @@
+AC->BNY
+
+/* Build a list of the first n Fibonacci numbers */
+
+Make fibs func(n)
+    out = []
+    a = 0
+    b = 1
+    i = 0
+    WHILST i < n
+        out.append(a)
+        t = a + b
+        a = b
+        b = t
+        i += 1
+    return out
+
+<mainloop>
+    FOR v in fibs(10)
+        Term.display v
+<mainloop>

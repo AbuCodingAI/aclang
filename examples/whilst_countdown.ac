@@ -1,0 +1,11 @@
+AC->BNY
+
+/* WHILST loops while the condition holds; #> means NOT-greater (<=) */
+
+<mainloop>
+    n = 5
+    WHILST n > 0
+        Term.display n
+        n -= 1
+    Term.display $liftoff$
+<mainloop>

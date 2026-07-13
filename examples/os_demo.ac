@@ -1,0 +1,13 @@
+AC->PY
+
+/* os ilib — delegate to the operating system (bash, files, env) */
+
+use ilib os
+
+<mainloop>
+    Term.display os.cwd()
+    os.mkfile($/tmp/ac_os_demo.txt$)
+    Term.display os.exists($/tmp/ac_os_demo.txt$)
+    os.rmfile($/tmp/ac_os_demo.txt$)
+    Term.display os.exists($/tmp/ac_os_demo.txt$)
+<mainloop>

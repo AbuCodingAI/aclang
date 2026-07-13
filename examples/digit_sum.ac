@@ -1,0 +1,17 @@
+AC->PY
+
+/* Sum of decimal digits */
+
+use ilib math
+
+Make digit_sum func(n)
+    total = 0
+    WHILST n > 0
+        total += math.mod(n, 10)
+        n = n // 10
+    return total
+
+<mainloop>
+    Term.display digit_sum(1234)
+    Term.display digit_sum(99999)
+<mainloop>

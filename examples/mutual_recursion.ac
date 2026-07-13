@@ -1,0 +1,19 @@
+AC->BNY
+
+/* Mutual recursion: is_even / is_odd calling each other */
+
+Make is_even func(n)
+    IF n is 0
+        return 1
+    return is_odd(n - 1)
+
+Make is_odd func(n)
+    IF n is 0
+        return 0
+    return is_even(n - 1)
+
+<mainloop>
+    Term.display is_even(10)
+    Term.display is_even(7)
+    Term.display is_odd(7)
+<mainloop>

@@ -1,0 +1,13 @@
+AC->BNY
+
+/* Towers of Hanoi: minimum moves for n disks = 2^n - 1, computed recursively */
+
+Make hanoi func(n)
+    IF n is 1
+        return 1
+    return 2 @ hanoi(n - 1) + 1
+
+<mainloop>
+    Term.display hanoi(3)
+    Term.display hanoi(10)
+<mainloop>

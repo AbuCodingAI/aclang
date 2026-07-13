@@ -1,0 +1,15 @@
+AC->PY
+
+/* Count occurrences of a character */
+
+Make count_l func(s)
+    n = 0
+    FOR c in s
+        IF c is $l$
+            n += 1
+    return n
+
+<mainloop>
+    Term.display count_l($hello well$)
+    Term.display count_l($abc$)
+<mainloop>

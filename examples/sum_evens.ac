@@ -1,0 +1,16 @@
+AC->PY
+
+/* Sum even numbers up to n using xor-free logic */
+
+use ilib math
+
+Make sum_evens func(n)
+    s = 0
+    FOR i in sequence(0, n + 1, 2)
+        free s += i
+    return s
+
+<mainloop>
+    Term.display sum_evens(10)
+    Term.display sum_evens(100)
+<mainloop>

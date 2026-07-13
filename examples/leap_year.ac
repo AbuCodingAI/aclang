@@ -1,0 +1,21 @@
+AC->PY
+
+/* Leap year: divisible by 4, except centuries unless divisible by 400 */
+
+use ilib math
+
+Make is_leap func(y)
+    IF math.mod(y, 400) is 0
+        return 1
+    IF math.mod(y, 100) is 0
+        return 0
+    IF math.mod(y, 4) is 0
+        return 1
+    return 0
+
+<mainloop>
+    Term.display is_leap(2024)
+    Term.display is_leap(1900)
+    Term.display is_leap(2000)
+    Term.display is_leap(2026)
+<mainloop>

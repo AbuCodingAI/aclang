@@ -1,0 +1,13 @@
+AC->PY
+
+/* <Foreign> — raw target-language passthrough at top level.
+   Compile with:  ac foreign_block.ac --allow-foreign */
+
+<Foreign>
+def native_square(n):
+    return n * n
+<Foreign>
+
+<mainloop>
+    Term.display native_square(9)
+<mainloop>

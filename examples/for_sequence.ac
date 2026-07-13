@@ -1,0 +1,11 @@
+AC->BNY
+
+/* sequence(a, b) iterates a .. b-1; optional third step arg */
+
+<mainloop>
+    FOR n in sequence(3, 8)
+        Term.display n
+    Term.display $---$
+    FOR n in sequence(0, 20, 5)
+        Term.display n
+<mainloop>

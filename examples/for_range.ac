@@ -1,0 +1,9 @@
+AC->BNY
+
+/* FOR i in range N iterates 0 .. N-1 */
+
+<mainloop>
+    total = 0
+    FOR i in range 10
+        Term.display i
+<mainloop>

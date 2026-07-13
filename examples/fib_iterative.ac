@@ -1,0 +1,19 @@
+AC->BNY
+
+/* Iterative Fibonacci — no recursion, runs in O(n) */
+
+Make fib func(n)
+    a = 0
+    b = 1
+    i = 0
+    WHILST i < n
+        t = a + b
+        a = b
+        b = t
+        i += 1
+    return a
+
+<mainloop>
+    Term.display fib(10)
+    Term.display fib(30)
+<mainloop>

@@ -1,0 +1,13 @@
+AC->PY
+
+/* math ilib statistics */
+
+use ilib math
+
+<mainloop>
+    Term.display math.mod(17, 5)
+    Term.display math.abs(-42)
+    Term.display math.floor(3.9)
+    Term.display math.ceil(3.1)
+    Term.display math.sqrt(144.0)
+<mainloop>

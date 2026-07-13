@@ -1,0 +1,12 @@
+AC->BNY
+
+/* Growing an array with append */
+
+<mainloop>
+    squares = []
+    FOR i in sequence(1, 6)
+        squares.append(i @ i)
+    Term.display length squares
+    FOR s in squares
+        Term.display s
+<mainloop>
