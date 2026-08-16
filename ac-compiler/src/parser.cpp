@@ -22,6 +22,10 @@ private:
     // Error recovery support
     std::vector<ParseError> errors;
     int maxErrors = 10;
+    // -supercalifragilisticexpialidocious: never give up on a garbled file — raise the
+    // error cap way past anything a real file will hit, while keeping a finite backstop
+    // against a pathological non-advancing loop (see synchronize()).
+    bool lenient = false;
 
     Token& peek() {
         if (pos < tokens.size()) return tokens[pos];
@@ -223,13 +227,17 @@ private:
             return node;
         }
 
-        // Expression-form conversions: to_string(x), to_int(x), to_dec(x), to_bool(x)
+        // Expression-form conversions: to_string(x), to_int(x), to_dec(x), to_bool(x), short(x), mini(x), atomic(x)
         if ((at(TokenType::KW_STRING) || at(TokenType::KW_INT) ||
-             at(TokenType::KW_DEC) || at(TokenType::KW_BOOL)) &&
+             at(TokenType::KW_DEC) || at(TokenType::KW_BOOL) ||
+             at(TokenType::KW_SHORT) || at(TokenType::KW_MINI) || at(TokenType::KW_ATOMIC)) &&
             peekAhead(1).type == TokenType::LPAREN) {
             std::string kind = at(TokenType::KW_STRING) ? "TO_STRING"
                              : at(TokenType::KW_INT)    ? "TO_INT"
-                             : at(TokenType::KW_DEC)    ? "TO_DEC" : "TO_BOOL";
+                             : at(TokenType::KW_DEC)    ? "TO_DEC"
+                             : at(TokenType::KW_SHORT)  ? "TO_SHORT"
+                             : at(TokenType::KW_MINI)   ? "TO_MINI"
+                             : at(TokenType::KW_ATOMIC) ? "TO_ATOMIC" : "TO_BOOL";
             advance(); advance(); // keyword + (
             auto inner = parseExpression(0);
             expect(TokenType::RPAREN, "Expected ')' after conversion argument");
@@ -317,6 +325,21 @@ private:
         // Also allow event-system keywords (value, on, rule, listener) as variable names
         if (at(TokenType::IDENTIFIER) || at(TokenType::KW_VALUE) || at(TokenType::KW_RULE)) {
             auto tok = advance();
+
+            // Trailing wildcard: `p%` (starts-with pattern — `_wmatch` in the gl ilib's C++/JS/
+            // Python runtimes already implements this exact match rule against the live GL
+            // object-name registry, just never reachable from AC source before now: the lexer
+            // emitted a PERCENT token but nothing consumed it, so any `%` was a hard parse
+            // error — "Expected ')' after expression [got '%']", blocking examples/pong.ac's
+            // `ball.hitbox.coords overlap p%.hitbox.coords`). Fold the `%` into the identifier
+            // text itself so the REST of this function (dot-chain building, MethodCall/variable
+            // construction) treats "p%" exactly like any other bare receiver name — no new AST
+            // shape needed; ir.cpp's `overlap` lowering (see its own matching comment) is what
+            // actually turns a `%`-suffixed name into the real wildcard-overlap call.
+            if (at(TokenType::PERCENT)) {
+                tok.value += "%";
+                advance();
+            }
 
             // Method call in expression: obj.method or obj.ns.method(args) etc.
             if (at(TokenType::DOT)) {
@@ -581,7 +604,7 @@ private:
             opStr = "bor";
             advance();
         } else if (op == TokenType::PIPE) {
-            throw ACError::syntax("operator '|' was removed — use 'bxor' (bitwise XOR)",
+            throw ACError::syntax("operator '|' was removed — use 'bor' (bitwise OR) or 'or' (logical)",
                                   peek().line, peek().col);
         } else if (op == TokenType::HASH_PIPE) {
             throw ACError::syntax("operator '#|' was removed — use 'not (a xor b)' (XNOR)",
@@ -661,7 +684,10 @@ private:
     }
 
 public:
-    explicit Parser(std::vector<Token> toks) : tokens(std::move(toks)) {}
+    explicit Parser(std::vector<Token> toks, bool lenientMode = false)
+        : tokens(std::move(toks)), lenient(lenientMode) {
+        if (lenient) maxErrors = 1000000;
+    }
 
     NodePtr parse() {
         auto program = std::make_unique<ASTNode>(NodeType::Program);
@@ -692,11 +718,12 @@ private:
         if (at(TokenType::END_OF_FILE)) return nullptr;
         try {
         return parseStatementInner();
-        } catch (const std::runtime_error& e) {
-            // "Too many parse errors" — rethrow so the outer parse() loop can stop
-            throw;
         } catch (const ACError& e) {
-            // ACError from throws inside parsers that weren't converted yet
+            // ACError derives from std::runtime_error, so it MUST be caught before any
+            // runtime_error handler — otherwise recovery below is dead code and the first
+            // syntax error aborts the whole parse (defeating multi-error reporting).
+            // The internal "Too many parse errors" control signal propagates up to stop parse().
+            if (std::string(e.what()).find("Too many parse errors") != std::string::npos) throw;
             errors.push_back({peek().line, peek().col, e.what(), ""});
             if ((int)errors.size() >= maxErrors) {
                 throw ACError::tooManyParseErrors();
@@ -724,6 +751,18 @@ private:
             }
             auto stmt = parseStatementInner();
             if (stmt) stmt->exported = true;
+            return stmt;
+        }
+
+        // DEG/RAD — math ilib sugar tagging the value an assignment statement produces as
+        // already-degrees (DEG, a no-op — AC's angle-taking functions are degree-native) or
+        // radians (RAD, converted via math.rad2deg before the assignment happens). Same
+        // prefix-wraps-the-following-statement shape as `export` above.
+        if (at(TokenType::KW_DEG) || at(TokenType::KW_RAD)) {
+            int unit = at(TokenType::KW_DEG) ? 1 : 2;
+            advance();
+            auto stmt = parseStatementInner();
+            if (stmt) stmt->angleUnit = unit;
             return stmt;
         }
 
@@ -836,6 +875,21 @@ private:
             return std::make_unique<ASTNode>(NodeType::InputStmt, keybind);
         }
 
+        // bind <key> to <function> — standalone keybinding, real functional grammar for
+        // KW_BIND/KW_TO (previously reserved words with zero grammar: lexed but never
+        // consumed anywhere, silently swallowed by the "skip unknown tokens" fallback).
+        // Equivalent to `configure event-listener` + a single `on value is <key>` binding,
+        // without the surrounding block — same IR (EVENT_BIND), same runtime.
+        if (at(TokenType::KW_BIND)) {
+            advance();
+            std::string key = expect(TokenType::IDENTIFIER, "Expected key name after 'bind'").value;
+            expect(TokenType::KW_TO, "Expected 'to' after bind key");
+            std::string func = expect(TokenType::IDENTIFIER, "Expected function name after 'to'").value;
+            auto node = std::make_unique<ASTNode>(NodeType::BindStmt, key);
+            node->attrs.push_back(func);
+            return node;
+        }
+
         // use X
         if (at(TokenType::KW_USE)) {
             advance();
@@ -943,7 +997,16 @@ private:
             if (at(TokenType::KW_USE)) {
                 advance(); // consume 'use'
                 while (at(TokenType::IDENTIFIER)) {
-                    node->attrs.push_back(advance().value); // each requested symbol
+                    std::string sym = advance().value;
+                    // Reassemble hyphenated symbol names (e.g. `web-server`, a sub-ilib
+                    // of `web`): AC has no kebab-case identifiers, so a bare '-' lexes
+                    // as its own IDENTIFIER token with value "-", not a distinct operator.
+                    while (at(TokenType::IDENTIFIER) && peek().value == "-"
+                           && peekAhead(1).type == TokenType::IDENTIFIER) {
+                        advance(); // consume the "-" identifier-token
+                        sym += "-" + advance().value;
+                    }
+                    node->attrs.push_back(sym); // each requested symbol
                     if (at(TokenType::COMMA)) advance(); else break;
                 }
             }
@@ -1144,17 +1207,25 @@ private:
             skipNewlines();
             
             auto node = std::make_unique<ASTNode>(NodeType::EventListener);
-            
-            // Parse the nested block: use listener to establish rule
+
+            // Parse the nested block: establish listener of <name>
             if (!at(TokenType::INDENT)) {
                 throw SYNTAX_ERROR("Expected indentation after 'configure event-listener'", peek().line, peek().col);
             }
             advance(); // consume INDENT
-            
-            // Skip "use listener to establish rule" line
-            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                advance();
-            }
+
+            // `establish listener of <name>` — real grammar for KW_ESTABLISH/KW_LISTENER/
+            // KW_OF (previously reserved words with zero grammar: this exact line used to be
+            // discarded as free-form text regardless of content — "use listener to establish
+            // rule" or literally anything else parsed identically, since nothing checked it).
+            // The name becomes this listener block's identifier (node->value below), currently
+            // used for diagnostics; a future `destroy <name>` could target a specific listener
+            // by it.
+            expect(TokenType::KW_ESTABLISH, "Expected 'establish listener of <name>'");
+            expect(TokenType::KW_LISTENER, "Expected 'listener' after 'establish'");
+            expect(TokenType::KW_OF, "Expected 'of' after 'establish listener'");
+            std::string listenerName = expect(TokenType::IDENTIFIER, "Expected a name after 'establish listener of'").value;
+            node->value = listenerName;
             skipNewlines();
             
             // Expect INDENT before key bindings
@@ -1307,6 +1378,9 @@ private:
             else if (at(TokenType::KW_INT))    coerceType = "INT";
             else if (at(TokenType::KW_STRING)) coerceType = "STRING";
             else if (at(TokenType::KW_BOOL))   coerceType = "BOOL";
+            else if (at(TokenType::KW_SHORT))  coerceType = "SHORT";  // 32-bit int var
+            else if (at(TokenType::KW_MINI))   coerceType = "MINI";   // 16-bit int var
+            else if (at(TokenType::KW_ATOMIC)) coerceType = "ATOMIC"; // globally-locked int var
 
             if (!coerceType.empty()) {
                 advance();
@@ -2358,7 +2432,14 @@ private:
                     }
                     std::string tv = advance().value;
                     if (tv == "-" && depth == 0) { pushAttr(); continue; } // attr separator
-                    if (!cur.empty() && cur.back() != '(' && cur.back() != '=') cur += " ";
+                    // Dotted names (`gl.size=...`) must stay glued with no surrounding spaces —
+                    // '.' isn't special-cased like '(' /'=' /',' above, so it fell into the
+                    // generic token path below on both sides and came out "gl . size=..." (verified:
+                    // examples/pong.ac's `gl.size=` construct — the reconstructed spec string never
+                    // matched the runtime's `strncmp(item_spec, "gl.size=", 8)` check because of the
+                    // extra spaces).
+                    if (tv == ".") { cur += "."; continue; }
+                    if (!cur.empty() && cur.back() != '(' && cur.back() != '=' && cur.back() != '.') cur += " ";
                     cur += tv;
                 }
                 pushAttr();
@@ -2378,8 +2459,14 @@ private:
             }
 
             // compound assignment on chained prop: Name.prop.sub /= val, *= val, etc.
+            // AT_EQUAL ("@=", multiply-assign — @ is AC's general multiply operator) included:
+            // a GL object's `speed@=-1` needs this to reach ir.cpp's PropAssign lowering at all
+            // (verified: examples/pong.ac's `ball.speed@=-1` — without AT_EQUAL here it fell into
+            // the generic no-parens bare-tail branch below instead, which just slurps the whole
+            // "@= -1" as inert trailing text on a MethodCall node, never a real assignment).
             if (at(TokenType::DIVIDE_EQUAL) || at(TokenType::MULTIPLY_EQUAL) ||
-                at(TokenType::PLUS_EQUAL)   || at(TokenType::MINUS_EQUAL)) {
+                at(TokenType::PLUS_EQUAL)   || at(TokenType::MINUS_EQUAL)   ||
+                at(TokenType::AT_EQUAL)) {
                 std::string op = advance().value; // "/=", "*=", etc.
                 auto rhsExpr = parseExpression(0);
                 auto node = std::make_unique<ASTNode>(NodeType::PropAssign, name + "." + prop);
@@ -2653,9 +2740,9 @@ struct ParseErrorRecord {
 };
 std::vector<ParseErrorRecord> g_parseErrors;
 
-NodePtr parse(const std::vector<Token>& tokens) {
+NodePtr parse(const std::vector<Token>& tokens, bool lenient) {
     g_parseErrors.clear();
-    Parser p(tokens);
+    Parser p(tokens, lenient);
     auto ast = p.parse();
     for (const auto& e : p.getErrors()) {
         g_parseErrors.push_back({e.line, e.col, e.message, e.context});

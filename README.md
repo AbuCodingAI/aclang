@@ -1,6 +1,6 @@
 # AC Language
 
-AC (AbuCompiled) is a high-level, indentation-based, multi-target compiled language. Write once, compile to any of thirteen backends. The compiler lexes AC source into a Pratt-parsed AST, lowers it to a unified IR, runs optimization passes, and emits the selected target language.
+AC (AbuCompiled) is a high-level, indentation-based, multi-target compiled language. Write once, compile to any of twelve backends. The compiler lexes AC source into a Pratt-parsed AST, lowers it to a unified IR, runs optimization passes, and emits the selected target language.
 
 Current version: **AC 1** (npm `aclang@1.0.1`) — see `ac --version`. Java-style product versioning:
 "AC 1" is the release; the npm artifact rides a compliant semver underneath. (`1.0.0` was a burned prototype.)
@@ -80,7 +80,7 @@ Full flag reference:
 | Declaration | Output | Runner |
 |-------------|--------|--------|
 | `AC->BNY` | `.acb` | AC's own native x86-64 binary |
-| `AC->ASM` | `.s` | x86-64 assembly → linked with `gcc` |
+| `AC->ASM` | `.asm` | x86-64 NASM assembly → `nasm` + `gcc` |
 | `AC->C` | `.c` | C (C99) → compiled with `gcc` |
 | `AC->C++` or `AC->CPP` | `.cpp` | C++ (C++17) → compiled with `g++` |
 | `AC->PY` | `.py` | Python 3 |
@@ -101,14 +101,16 @@ Full flag reference:
 
 ### Comments
 
-```ac
-* single-line comment (asterisk both sides) *
+AC has exactly one comment form: C-style `/* ... */`. It covers both single-line and multi-line comments.
 
-/* multi-line
+```ac
+/* a single-line comment */
+
+/* a multi-line
    comment */
 ```
 
-The `*` character is a comment delimiter in most positions. Inside `fn` expression lines it becomes numeric multiply.
+There is no `* ... *` or `#` comment. `*` is always multiply, and `#` is always an operator prefix (`#>`, `#<`, `#=`, boolean NOT) — neither begins a comment.
 
 ### Indentation
 
@@ -137,10 +139,10 @@ Integer and float literals. Hex-like text with `x` is recognized by the lexer.
 ### Booleans and Null-Like Values
 
 ```ac
-truth = True     * also TRUE, true *
-lie   = False    * also FALSE, false *
-n     = null     * backend null: None / null / nullptr / nil / none *
-empty = nil      * AC empty-set sentinel ∅ — distinct from null *
+truth = True     /* also TRUE, true */
+lie   = False    /* also FALSE, false */
+n     = null     /* backend null: None / null / nullptr / nil / none */
+empty = nil      /* AC empty-set sentinel ∅ — distinct from null */
 ```
 
 `nil` represents the empty set. `[nil]` is the set containing the empty set `{∅}`.
@@ -165,7 +167,6 @@ data = null
 | `x *= y` | Numeric multiply |
 | `x @= y` | Polymorphic multiply |
 | `x /= y` | Divide |
-| `x |= y` | XOR |
 
 ---
 
@@ -179,15 +180,18 @@ data = null
 | `-` | Subtraction / unary negate | |
 | `*` | Numeric multiply |Not like Python *|
 | `@` | Polymorphic multiply | Numbers, strings, or lists |
-| `/` | True division | Always yields float; `5/2 = 2.5` |
+| `/` | Smart division | Int when it divides evenly, else float; `4/2 = 2`, `5/2 = 2.5`. Resolved to int or float at compile time when types are known. |
 | `//` | Integer division | Truncates toward zero; `5//2 = 2` |
+| `///` | Float division | Always yields float; `4///2 = 2.0` |
 | `math.mod(a, b)` | Modulo | math library function |
 | `a xsub b` | Inclusive distance | `|a − b| + 1` |
 
 ```ac
-a = 5 / 2      * a = 2.5 *
-b = 5 // 2     * b = 2   *
-c = 7 xsub 3   * c = 5   *
+a = 5 / 2      /* a = 2.5 (5 doesn't divide evenly) */
+d = 4 / 2      /* d = 2   (clean → int) */
+b = 5 // 2     /* b = 2   */
+e = 4 /// 2    /* e = 2.0 (always float) */
+c = 7 xsub 3   /* c = 5   */
 ```
 
 ### Comparison
@@ -215,7 +219,7 @@ c = 7 xsub 3   * c = 5   *
 ### Precedence (highest to lowest)
 
 1. Unary `-`, `#`
-2. `*`, `/`, `//`, `@`
+2. `*`, `/`, `//`, `///`, `@`
 3. `+`, `-`, `xsub`
 4. `is`, `#=`, `<`, `>`, `#>`, `#<`, `overlap`
 5. `&`, `and`
@@ -245,7 +249,7 @@ to_string label = count
 
 ```ac
 const MAX = 100
-const PI  = 3.14159
+const PI  = 3.14159265358979323846
 ```
 
 Reassigning a `const` is a compile-time `Preposterous:` error. Backends emit the appropriate immutable form:
@@ -297,8 +301,8 @@ use ilib math
 <mainloop>
     math.GoodDec price = 1.23
     math.GoodDec tax   = 0.1 + 0.2
-    Term.display price   * 1.23 *
-    Term.display tax     * 0.3 (exact) *
+    Term.display price   /* 1.23 */
+    Term.display tax     /* 0.3 (exact) */
 <mainloop>
 ```
 
@@ -315,7 +319,7 @@ nums  = [1, 2, 3, 4, 5]
 mixed = [$hello$, 42, True]
 empty = []
 
-Term.display nums[1]    * first element (1-based) *
+Term.display nums[1]    /* first element (1-based) */
 nums[2] = 99
 ```
 
@@ -341,8 +345,8 @@ other = dict-{name: $Grace$, age: 85}
 ### Range and Sequence
 
 ```ac
-FOR i in range 10          * i = 0..9 *
-FOR n in sequence(3, 7)    * n = 3..7 *
+FOR i in range 10          /* i = 0..9 */
+FOR n in sequence(3, 7)    /* n = 3..7 */
 ```
 
 `range N` generates integers 0 to N−1. `sequence(x, y)` generates x to y inclusive and stops early if x > y.
@@ -435,9 +439,9 @@ FOR n in sequence(1, 100)
 ### Loop Control
 
 ```ac
-/end        * break out of enclosing loop; at top level, exits program *
-continue    * skip to next iteration *
-pass        * no-op placeholder *
+/end        /* break out of enclosing loop; at top level, exits program */
+continue    /* skip to next iteration */
+pass        /* no-op placeholder */
 ```
 
 `break` is not in AC — use `/end`.
@@ -464,7 +468,7 @@ Both `Make` and `make` are accepted. `pass` is a valid empty body.
 Make apply func(f, n)
     return f(n)
 
-result = apply(square, 5)    * result = 25 *
+result = apply(square, 5)    /* result = 25 */
 ```
 
 Backends emit the correct first-class function type: function pointers in C, `std::function` in C++, `LongUnaryOperator` in Java, `fn()` in Rust, `func()` in Go.
@@ -561,12 +565,12 @@ def tag <setup>
 ## Slash Commands
 
 ```ac
-/kill           * hard terminate (os.abort) *
-/stop           * graceful stop — runs <shutoff> then exits cleanly *
-/end            * break current loop; at top level acts like /stop *
-/restart        * re-run program body once from top *
-/halt 1.5       * pause for 1.5 seconds *
-/halt math.inf  * treated as /stop *
+/kill           /* hard terminate (os.abort) */
+/stop           /* graceful stop — runs <shutoff> then exits cleanly */
+/end            /* break current loop; at top level acts like /stop */
+/restart        /* re-run program body once from top */
+/halt 1.5       /* pause for 1.5 seconds */
+/halt math.inf  /* treated as /stop */
 ```
 
 ---
@@ -601,7 +605,7 @@ Variables declared inside cannot leak out:
     tmp = heavy_compute()
     Term.display tmp
 <bound>
-* tmp does not exist here *
+/* tmp does not exist here */
 ```
 
 ### `alias` — bidirectional live binding
@@ -647,11 +651,11 @@ after
 ### raise
 
 ```ac
-raise ERR                      * "Preposterous: Fatality occurred" + abort *
-raise ERR($custom message$)    * "Preposterous: custom message" + abort *
-raise hint($try this instead$) * "Suggestion: try this instead" (non-fatal, stderr) *
-raise toxic($deprecated$)      * "Toxic: deprecated" (non-fatal, stderr) *
-raise MyClause($text$)         * "MyClause: text" (non-fatal, stderr) *
+raise ERR                      /* "Preposterous: Fatality occurred" + abort */
+raise ERR($custom message$)    /* "Preposterous: custom message" + abort */
+raise hint($try this instead$) /* "Suggestion: try this instead" (non-fatal, stderr) */
+raise toxic($deprecated$)      /* "Toxic: deprecated" (non-fatal, stderr) */
+raise MyClause($text$)         /* "MyClause: text" (non-fatal, stderr) */
 ```
 
 ---
@@ -666,14 +670,14 @@ Term.display $literal string$
 answer = Term.ask $Enter your name: $
 ```
 
-`Term.display` is the only terminal output keyword. `Term.print`, `Term.log`, and `Term.write` do not exist.
+`Term.display` is the only terminal output keyword.
 
 ### Browser / HTML only
 
 ```ac
 alert $Message$
-ok = sure $Continue?$    * window.confirm → bool *
-print_page               * window.print() *
+ok = sure $Continue?$    /* window.confirm → bool */
+print_page               /* window.print() */
 ```
 
 ### Styled display (HTML renders, others fall back to plain)
@@ -701,22 +705,22 @@ String methods are auto-dispatched when calling `.method` on a string variable (
 use ilib string-cheese
 
 s = $Hello, World$
-Term.display s.lower      * hello, world *
-Term.display s.upper      * HELLO, WORLD *
-Term.display s.strip      * strips whitespace *
-Term.display s.length     * 13 *
-Term.display s.format     * formatted string *
+Term.display s.lower      /* hello, world */
+Term.display s.upper      /* HELLO, WORLD */
+Term.display s.strip      /* strips whitespace */
+Term.display s.length     /* 13 */
+Term.display s.format     /* formatted string */
 ```
 
 Multi-argument methods:
 
 ```ac
-Term.display s.find($World$)          * 8 *
-Term.display s.replace($World$, $AC$) * Hello, AC *
-Term.display s.split($, $)            * [$Hello$, $World$] *
-Term.display s.count($l$)             * 3 *
-Term.display s.startswith($Hello$)    * True *
-Term.display s.endswith($World$)      * True *
+Term.display s.find($World$)          /* 8 */
+Term.display s.replace($World$, $AC$) /* Hello, AC */
+Term.display s.split($, $)            /* [$Hello$, $World$] */
+Term.display s.count($l$)             /* 3 */
+Term.display s.startswith($Hello$)    /* True */
+Term.display s.endswith($World$)      /* True */
 ```
 
 Alternate casings are accepted: `.LOWER`, `.UPPER`, `.STRIP`, `.TRIM`, `.LEN`, `.FIND`, `.REPLACE`, etc.
@@ -749,8 +753,8 @@ fn Term.display $Hello$ & Term.display $World$
 
 ```ac
 code   = $3 + 4 * 2$
-result = eval(code)           * evaluates string as AC expression *
-safe   = lazy_eval(code)      * safe evaluation; on error returns exception object *
+result = eval(code)           /* evaluates string as AC expression */
+safe   = lazy_eval(code)      /* safe evaluation; on error returns exception object */
 ```
 
 ---
@@ -779,11 +783,11 @@ from ilib math use sin, cos, sqrt
 **Namespace imports:**
 
 ```ac
-using header math          * bring math.* into flat scope *
-using math                 * synonym *
-using math.sin             * bring only sin into flat scope *
-using math.sin, math.cos   * multiple symbols *
-using namespace ilib       * unqualified calls resolve to imported ilib namespaces *
+using header math          * bring math./* into flat scope */
+using math                 /* synonym */
+using math.sin             /* bring only sin into flat scope */
+using math.sin, math.cos   /* multiple symbols */
+using namespace ilib       /* unqualified calls resolve to imported ilib namespaces */
 ```
 
 **datac — compile-time data baking:**
@@ -808,12 +812,12 @@ use ilib math
 ### Constants
 
 ```ac
-math.pi           * π *
-math.e            * e *
-math.tau          * τ = 2π *
-math.em           * Euler-Mascheroni γ ≈ 0.5772 *
-math.phi          * golden ratio φ ≈ 1.6180 *
-math.inf          * +∞ *
+math.pi           /* π */
+math.e            /* e */
+math.tau          /* τ = 2π */
+math.em           /* Euler-Mascheroni γ ≈ 0.5772 */
+math.phi          /* golden ratio φ ≈ 1.6180 */
+math.inf          /* +∞ */
 ```
 
 Precision-call form (returns string to N decimal places):
@@ -853,9 +857,9 @@ math.deg2rad(x)  math.rad2deg(x)
 ### Statistics and Aggregates
 
 ```ac
-math.sigma(list)       * Σ sum *
-math.product(list)     * Π product *
-math.gradient(list)    * numerical gradient *
+math.sigma(list)       /* Σ sum */
+math.PI(list)          /* Π product (uppercase PI; math.pi lowercase is the constant) */
+math.gradient(list)    /* numerical gradient */
 
 math.stat.avg(list)
 math.stat.median(list)
@@ -948,7 +952,7 @@ AC's GL library is SDL2-backed, not pygame.
 ### Screen
 
 ```ac
-gl.screen.init(w, h, $title$)
+gl.screen.create(w, h, $title$)
 gl.screen.set_bg(r, g, b)
 gl.screen.set_bg_by_name($color$)
 gl.screen.set_fps(fps)
@@ -979,9 +983,8 @@ gl.obj.circle_fell($name$)
 gl.obj.set_spawn($name$)
 gl.obj.regen($name$)
 gl.obj.animate($name$, $dir$, speed)
-gl.obj.is($name$)
-gl.obj.is_draw($name$)
-gl.obj.save_spawn($name$)
+gl.is_obj($name$)      /* top-level gl namespace, not gl.obj */
+gl.is_draw($name$)     /* top-level gl namespace, not gl.obj */
 ```
 
 Direction constants: `RightDir`, `LeftDir`, `UpDir`, `DownDir`
@@ -1003,7 +1006,7 @@ gl.draw.to_obj($name$)
 ```ac
 IF a.hitbox.coords overlap b.hitbox.coords
 gl.hitbox.overlap($a$, $b$)
-gl.hitbox.overlap_boundary($name$)
+gl.hitbox.boundary($name$)
 gl.hitbox.overlap_pattern($name$, $pattern$)
 gl.hitbox.many_overlap()
 ```
@@ -1079,7 +1082,7 @@ All fatal messages use the `Preposterous:` prefix:
 | Type | Example output |
 |------|---------------|
 | Parse error | `Preposterous: ParseError at line 7 col 3: unexpected token` |
-| Compile error | `Preposterous: CompileError: unknown backend RS` |
+| Compile error | `Preposterous: CompileError: unknown backend APL` |
 | Semantic error | `Preposterous: SemanticError: bundle mixes modifiers` |
 | Const reassignment | `Preposterous: Cannot reassign const variable 'MAX'` |
 | Runtime fatal | `Preposterous: my custom message` (from `raise ERR`) |
@@ -1137,7 +1140,7 @@ Use `--force` or `--no-cache` when working on compiler internals.
 
 **Exceptions:** `try`, `catch`, `report`, `after`, `raise`, `ERR`
 
-**Functions:** `Make` / `make`, `func`, `fn`, `eval`, `lazy_eval`
+**Functions:** `Make` / `make`, `func`, `eval`, `lazy_eval`
 
 **Imports:** `use`, `using`, `from`, `as`, `ilib`, `elib`, `clib`, `flib`, `datac`, `header`
 
@@ -1145,7 +1148,7 @@ Use `--force` or `--no-cache` when working on compiler internals.
 
 **Types / coercions:** `to_int`, `to_dec`, `to_string`, `to_bool`, `const`, `cp`
 
-**Scope / aliasing:** `alias`, `free`, `destroy`
+**Scope / aliasing:** `alias`, `free`, `destroy`, `bound`
 
 **Bundles:** `bundle`, `private`, `public`
 

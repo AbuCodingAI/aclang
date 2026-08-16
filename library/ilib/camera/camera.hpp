@@ -231,10 +231,10 @@ private:
     bool visible;
     std::string title;
     std::vector<std::string> messages;
-    std::function<void(const std::string&)> inputCallback;
+    std::function<std::string(const std::string&)> inputCallback;
     
 public:
-    SidebarConsole() : interactive(false), visible(true), position("left") {}
+    SidebarConsole() : position("left"), interactive(false), visible(true) {}
     
     /**
      * Configure sidebar properties
@@ -283,7 +283,7 @@ public:
      */
     std::string ask(const std::string& prompt) {
         if (interactive && inputCallback) {
-            inputCallback(prompt);
+            return inputCallback(prompt);
         }
         return "";
     }
@@ -294,7 +294,7 @@ public:
      */
     std::string getInput() {
         if (interactive && inputCallback) {
-            inputCallback("Enter command:");
+            return inputCallback("Enter command:");
         }
         return "";
     }

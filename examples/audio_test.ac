@@ -6,16 +6,16 @@ use ilib machine-audio
 
     Term.display $=== AC Machine Audio Test ====$
 
-    tts_ready = maudio_tts_ok()
+    tts_ready = maudio.tts_ok()
     IF tts_ready is True
         Term.display $TTS available — speaking...$
-        maudio_speak($Hello. I am AC. This is a text to speech test.$)
-        maudio_speak($The quick brown fox jumps over the lazy dog.$)
+        maudio.speak($Hello. I am AC. This is a text to speech test.$)
+        maudio.speak($The quick brown fox jumps over the lazy dog.$)
     OTHER
         Term.display $No TTS engine found.$
 
     Term.display $Listening for 4 seconds — say something...$
-    heard = maudio_listen(4000)
+    heard = maudio.listen(4000)
     IF heard is $$
         Term.display $Nothing heard or STT unavailable.$
     OTHER
@@ -23,7 +23,7 @@ use ilib machine-audio
         Term.display heard
 
     IF tts_ready is True
-        maudio_speak($Test complete.$)
+        maudio.speak($Test complete.$)
 
     Term.display $Done.$
 

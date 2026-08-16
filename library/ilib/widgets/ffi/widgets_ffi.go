@@ -3,8 +3,8 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../
-#cgo LDFLAGS: -L${SRCDIR}/../ -lacwidgets -Wl,-rpath,${SRCDIR}/../
+#cgo CFLAGS: -I${SRCDIR}/library/ilib/widgets
+#cgo LDFLAGS: -L${SRCDIR}/library/ilib/widgets -lacwidgets -Wl,-rpath,${SRCDIR}/library/ilib/widgets
 #include "widgets_c.h"
 #include <stdlib.h>
 */

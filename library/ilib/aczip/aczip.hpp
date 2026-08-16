@@ -48,7 +48,6 @@ public:
 
 private:
     static Archive build_archive(const std::string& path);
-    static std::string generate_tag(int index);
 };
 
 // TAR and GZIP wrappers

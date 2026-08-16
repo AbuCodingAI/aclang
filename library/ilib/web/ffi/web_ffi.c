@@ -6,6 +6,8 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #endif
 
 /* Allow only http(s) URLs of safe characters — blocks shell injection via popen. */
@@ -22,18 +24,25 @@ static int web_safe_url(const char* url) {
 }
 
 static void open_url(const char* url) {
+    if (!url) return;
 #ifdef _WIN32
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "start %s", url);
-    system(cmd);
-#elif __APPLE__
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "open %s", url);
-    system(cmd);
+    /* ShellExecute passes the URL as a single parameter — no shell command line to inject into. */
+    ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
 #else
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "xdg-open %s", url);
-    system(cmd);
+  #ifdef __APPLE__
+    const char* opener = "open";
+  #else
+    const char* opener = "xdg-open";
+  #endif
+    /* Spawn via execvp with the URL as a distinct argv element — NO shell, so a URL
+       containing '$(...)', backticks, ';', quotes etc. is just a URL, never a command. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        char* av[] = { (char*)opener, (char*)url, NULL };
+        execvp(opener, av);
+        _exit(127);
+    }
+    if (pid > 0) { int st; waitpid(pid, &st, 0); }
 #endif
 }
 

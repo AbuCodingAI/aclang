@@ -1,5 +1,5 @@
 // AC ilib: machine-audio — Speech-to-Text and Text-to-Speech (JavaScript/Node.js)
-const { execSync, spawnSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -14,24 +14,25 @@ function maudio_speak(text, rate = 175) {
     rate = Math.max(50, Math.min(300, rate || 175));
 
     try {
-        // Try espeak-ng first (Linux/cross-platform)
+        // Try espeak-ng first (Linux/cross-platform). Argv-array form (no shell string
+        // is built), so '$(...)'/backticks/quotes etc. in `text` are inert.
         if (commandExists('espeak-ng')) {
-            execSync(`espeak-ng -s ${rate} "${text.replace(/"/g, '\\"')}"`, { stdio: 'pipe' });
+            execFileSync('espeak-ng', ['-s', String(rate), text], { stdio: 'pipe' });
             return true;
         }
         // Try say (macOS)
         if (commandExists('say')) {
-            execSync(`say "${text.replace(/"/g, '\\"')}"`, { stdio: 'pipe' });
+            execFileSync('say', [text], { stdio: 'pipe' });
             return true;
         }
         // Try espeak (Linux)
         if (commandExists('espeak')) {
-            execSync(`espeak -s ${rate} "${text.replace(/"/g, '\\"')}"`, { stdio: 'pipe' });
+            execFileSync('espeak', ['-s', String(rate), text], { stdio: 'pipe' });
             return true;
         }
         // Try spd-say (Linux)
         if (commandExists('spd-say')) {
-            execSync(`spd-say -r ${rate - 175} "${text.replace(/"/g, '\\"')}"`, { stdio: 'pipe' });
+            execFileSync('spd-say', ['-r', String(rate - 175), text], { stdio: 'pipe' });
             return true;
         }
         // Fallback
@@ -83,9 +84,9 @@ function maudio_listen(timeout_ms = 5000) {
 
         // Record audio using ffmpeg or arecord
         if (commandExists('arecord')) {
-            execSync(`arecord -d ${secs} -f cd -t wav "${tmpFile}"`, { stdio: 'pipe' });
+            execFileSync('arecord', ['-d', String(secs), '-f', 'cd', '-t', 'wav', tmpFile], { stdio: 'pipe' });
         } else if (commandExists('ffmpeg')) {
-            execSync(`ffmpeg -f avfoundation -i ":0" -t ${secs} "${tmpFile}" -y`, {
+            execFileSync('ffmpeg', ['-f', 'avfoundation', '-i', ':0', '-t', String(secs), tmpFile, '-y'], {
                 stdio: 'pipe',
                 cwd: os.tmpdir()
             });
@@ -95,7 +96,7 @@ function maudio_listen(timeout_ms = 5000) {
 
         // Transcribe using whisper
         if (commandExists('whisper')) {
-            execSync(`whisper --model tiny "${tmpFile}" --output-txt --output-file "${outFile}"`, {
+            execFileSync('whisper', ['--model', 'tiny', tmpFile, '--output-txt', '--output-file', outFile], {
                 stdio: 'pipe'
             });
 
@@ -142,9 +143,9 @@ function maudio_stt_ok() {
 function commandExists(cmd) {
     try {
         if (process.platform === 'win32') {
-            execSync(`where ${cmd}`, { stdio: 'pipe' });
+            execFileSync('where', [cmd], { stdio: 'pipe' });
         } else {
-            execSync(`which ${cmd}`, { stdio: 'pipe' });
+            execFileSync('which', [cmd], { stdio: 'pipe' });
         }
         return true;
     } catch {

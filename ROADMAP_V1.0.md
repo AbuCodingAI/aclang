@@ -222,7 +222,7 @@ Total: 2-4 weeks depending on bugs found
 1. **Call-on-indexed-expression** `funcs[i](x)` — parser drops the call; blocks perfect-ish.ac.
    Needs postfix-call parsing + indirect-call codegen (emitIndirectCall exists on text backends;
    BNY needs call-through-register).
-2. **BNY Term.ask** input broken (read syscall returns 0) — most concrete user-facing BNY defect.
+2. **BNY Term.ask** input — fixed for direct display, repeated reads, and string params; keep probes in regression.
 3. **BNY list display** — `Term.display arr` prints the block pointer; needs __ac_print_list__
    (same helper family as BNY iota value-display, also missing).
 4. **Parser catch-order dead handler** (parser.cpp ~650: catch(runtime_error) before

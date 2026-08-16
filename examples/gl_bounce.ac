@@ -34,7 +34,7 @@ Make reset_ball func(arg)
         <LOGIC>
 
             configure event-listener
-                use listener to establish rule
+                establish listener of keys
                     on value is space
                         reset_ball(Ball)
 

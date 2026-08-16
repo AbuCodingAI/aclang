@@ -26,3 +26,5 @@ perfect-ish.py
 disp
 disp.[!a]*
 disp.acb
+applicants.ndjson
+ac-compiler/kw_modules_out.txt

@@ -65,3 +65,19 @@
 # widgets:listbox.add           -> ac_widgets_listbox_add       (fallback)
 # widgets:listbox.item          -> ac_widgets_listbox_item      (fallback)
 # widgets:listbox.count         -> ac_widgets_listbox_count     (fallback)
+
+# Tabs (real GtkNotebook — add_tab returns a new master, see widgets.hpp's tabpage)
+# widgets:tabs.new               -> ac_widgets_tabs_new          (fallback)
+# widgets:tabs.pack              -> ac_widgets_tabs_pack         (fallback)
+# widgets:tabs.add_tab           -> ac_widgets_tabs_add_tab      (fallback)
+
+# Scroller (real GtkScrollbar — standalone, matches the ttk.Scrollbar reference)
+# widgets:scroller.new           -> ac_widgets_scroller_new      (fallback)
+# widgets:scroller.pack          -> ac_widgets_scroller_pack     (fallback)
+
+# Table (real multi-column GtkTreeView with visible headers)
+# widgets:table.new              -> ac_widgets_table_new         (fallback)
+# widgets:table.pack             -> ac_widgets_table_pack        (fallback)
+# widgets:table.add              -> ac_widgets_table_add         (fallback)
+# widgets:table.row              -> ac_widgets_table_row         (fallback)
+# widgets:table.count            -> ac_widgets_table_count       (fallback)

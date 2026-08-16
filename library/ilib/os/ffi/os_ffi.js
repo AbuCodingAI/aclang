@@ -8,6 +8,8 @@ const _path  = require('path');
 const _SBASH_FORBIDDEN = [
     /\bsudo\b/,
     /\bsu\s/,
+    /\bscreen\b/,   // parity with PY/Rust/Java (backgrounding via screen/tmux was let through on JS)
+    /\btmux\b/,
     /function\s+\w+\s*\(/,
     /\(\s*\)\s*\{/,
     /&\s*$/,
@@ -67,7 +69,8 @@ function os_write_to(p, content) {
     catch(e) { process.stderr.write(`[os.write_to] ${e}\n`); return -1; }
 }
 function os_append_to(p, content) {
-    try { _fs.appendFileSync(String(p), String(content)); return 0; }
+    // Match PY/Rust: ensure a trailing newline (was omitted → different file contents per backend).
+    try { let s = String(content); if (!s.endsWith('\n')) s += '\n'; _fs.appendFileSync(String(p), s); return 0; }
     catch(e) { process.stderr.write(`[os.append_to] ${e}\n`); return -1; }
 }
 function os_read(p) {

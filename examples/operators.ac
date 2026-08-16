@@ -1,11 +1,11 @@
 AC->BNY
 
 Make testXor func(a, b)
-    result = a | b
+    result = a xor b
     return result
 
 Make testXnor func(a, b)
-    result = a #| b
+    result = not (a xor b)
     return result
 
 Make testNot func(a)
@@ -13,7 +13,7 @@ Make testNot func(a)
     return result
 
 Make testAnd func(a, b)
-    result = a & b
+    result = a and b
     return result
 
 Make testNotGt func(a, b)

@@ -5,128 +5,208 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
+#include <atomic>
+#include <algorithm>
+#include <cstring>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 namespace fs = std::filesystem;
 using namespace aczip;
 
 // ============================================================================
+// SUBPROCESS HELPERS (no shell) — replaces popen()/system() string-building.
+//
+// The old code built commands like `"tar -xf - -C \"" + output_path + "\""`
+// and handed them to popen()/system(), which runs them through /bin/sh -c.
+// Any path or argument containing shell metacharacters (`;`, `$(...)`,
+// backticks, quotes, etc.) could inject arbitrary commands. These helpers
+// fork()+execvp() the target binary directly with an argv array, so
+// arguments are never re-parsed by a shell — matching the pattern already
+// used by web.cpp's open_url().
+// ============================================================================
+
+namespace {
+
+std::vector<char*> to_argv(const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    return argv;
+}
+
+void check_status(int status, const std::string& prog) {
+    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0))
+        throw std::runtime_error(prog + " failed");
+}
+
+// Run argv, feed `input` (may be nullptr/0) to its stdin, capture all stdout.
+std::vector<uint8_t> run_capture(const std::vector<std::string>& args,
+                                  const uint8_t* input, size_t input_len) {
+    int in_pipe[2], out_pipe[2];
+    if (pipe(in_pipe) != 0) throw std::runtime_error("pipe() failed");
+    if (pipe(out_pipe) != 0) throw std::runtime_error("pipe() failed");
+
+    pid_t pid = fork();
+    if (pid < 0) throw std::runtime_error("fork() failed");
+
+    if (pid == 0) {
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        auto argv = to_argv(args);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+
+    // Feed stdin from a writer thread: with large input this avoids a
+    // deadlock where the child blocks writing stdout (full pipe) while we're
+    // still blocked writing its stdin.
+    std::thread writer([&]{
+        size_t written = 0;
+        while (input && written < input_len) {
+            ssize_t n = write(in_pipe[1], input + written, input_len - written);
+            if (n <= 0) break;
+            written += (size_t)n;
+        }
+        close(in_pipe[1]);
+    });
+
+    std::vector<uint8_t> output;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(out_pipe[0], buf, sizeof(buf))) > 0)
+        output.insert(output.end(), buf, buf + n);
+    close(out_pipe[0]);
+    writer.join();
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    check_status(status, args.empty() ? "subprocess" : args[0]);
+    return output;
+}
+
+// Run argv, feeding `input` to stdin, but with no shell redirection —
+// used where the old code piped a command's stdin from data already in memory.
+void run_argv_with_stdin(const std::vector<std::string>& args,
+                          const uint8_t* input, size_t input_len) {
+    run_capture(args, input, input_len);
+}
+
+// Run argv with stdout redirected to output_path (replaces `cmd > "file"`).
+void run_argv_to_file(const std::vector<std::string>& args, const std::string& output_path) {
+    int fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) throw std::runtime_error("Failed to open output file: " + output_path);
+
+    pid_t pid = fork();
+    if (pid < 0) { close(fd); throw std::runtime_error("fork() failed"); }
+    if (pid == 0) {
+        dup2(fd, STDOUT_FILENO);
+        close(fd);
+        auto argv = to_argv(args);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    close(fd);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    check_status(status, args.empty() ? "subprocess" : args[0]);
+}
+
+} // namespace
+
+// ============================================================================
 // ACZIP IMPLEMENTATION - OPTIMIZED FOR SPEED
 // ============================================================================
+
+// Archive format v2 (self-consistent, filenames preserved, single zlib codec):
+//   magic 'A','C','Z','2' | file_count:u32 |
+//   per file: path_len:u32 | path bytes | orig_size:u32 | comp_size:u32 | zlib(data)
+// (The old version compressed with zstd but decompressed with zlib, wrote an 8-byte
+//  header but read a 12-byte one, lost all filenames, raced, and could div-by-zero.)
+static void put32(std::vector<uint8_t>& v, uint32_t x) {
+    uint8_t b[4]; std::memcpy(b, &x, 4); v.insert(v.end(), b, b + 4);
+}
 
 std::vector<uint8_t> ACZip::compress(const std::string& path, bool parallel) {
     Archive archive = build_archive(path);
 
-    std::vector<uint8_t> result;
-    result.insert(result.end(), {'A', 'C', 'Z', '2'});  // Magic header v2
-
-    // Compress each file individually + in parallel if enabled
-    std::vector<std::pair<std::string, std::vector<uint8_t>>> compressed_files;
-    std::mutex result_mutex;
-
-    auto compress_file = [&](FileEntry& entry) {
-        entry.tag = generate_tag(compressed_files.size());
-        auto compressed = ACGzip::compress(entry.data, 6);
-
-        std::lock_guard<std::mutex> lock(result_mutex);
-        compressed_files.push_back({entry.tag, compressed});
-    };
-
-    // Use Zstd for compression (faster + better ratio than gzip)
-    auto compress_with_zstd = [](FileEntry& entry) {
-        entry.tag = generate_tag(compressed_files.size());
-        compressed_files.push_back({entry.tag, ACZstd::compress(entry.data, 3)});
-    };
-
+    // Compress each file's data (zlib) into a per-index slot. Parallel writes go to
+    // distinct indices (no shared push_back), so there is no data race.
+    std::vector<std::vector<uint8_t>> comp(archive.files.size());
     if (parallel && archive.files.size() > 1) {
-        std::vector<std::thread> threads;
-        int num_threads = std::thread::hardware_concurrency();
-        size_t files_per_thread = archive.files.size() / num_threads;
-
-        for (int i = 0; i < num_threads && i * files_per_thread < archive.files.size(); i++) {
-            size_t start = i * files_per_thread;
-            size_t end = (i == num_threads - 1) ? archive.files.size() : (i + 1) * files_per_thread;
-
-            threads.push_back(std::thread([&, start, end]() {
-                for (size_t j = start; j < end; j++) {
-                    compress_with_zstd(archive.files[j]);
-                }
-            }));
-        }
-
-        for (auto& t : threads) {
-            t.join();
-        }
+        unsigned hw = std::thread::hardware_concurrency();
+        unsigned nt = hw ? std::min<unsigned>(hw, (unsigned)archive.files.size()) : 1;  // guard 0
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        for (unsigned t = 0; t < nt; t++)
+            pool.emplace_back([&]{
+                size_t i;
+                while ((i = next.fetch_add(1)) < archive.files.size())
+                    comp[i] = ACGzip::compress(archive.files[i].data, 6);
+            });
+        for (auto& t : pool) t.join();
     } else {
-        for (auto& entry : archive.files) {
-            compress_with_zstd(entry);
-        }
+        for (size_t i = 0; i < archive.files.size(); i++)
+            comp[i] = ACGzip::compress(archive.files[i].data, 6);
     }
 
-    // Write compressed files: [tag(4)][comp_size(4)][compressed_data]
-    uint32_t file_count = compressed_files.size();
-    result.insert(result.end(), (uint8_t*)&file_count, (uint8_t*)&file_count + 4);
-
-    for (auto& [tag, compressed] : compressed_files) {
-        // Tag (4 bytes)
-        result.insert(result.end(), tag.begin(), tag.end());
-
-        // Compressed size (4 bytes)
-        uint32_t comp_size = compressed.size();
-        result.insert(result.end(), (uint8_t*)&comp_size, (uint8_t*)&comp_size + 4);
-
-        // Compressed data
-        result.insert(result.end(), compressed.begin(), compressed.end());
+    std::vector<uint8_t> result{'A', 'C', 'Z', '2'};
+    put32(result, (uint32_t)archive.files.size());
+    for (size_t i = 0; i < archive.files.size(); i++) {
+        const std::string& p = archive.files[i].path;
+        put32(result, (uint32_t)p.size());
+        result.insert(result.end(), p.begin(), p.end());
+        put32(result, (uint32_t)archive.files[i].data.size());   // orig size
+        put32(result, (uint32_t)comp[i].size());                 // comp size
+        result.insert(result.end(), comp[i].begin(), comp[i].end());
     }
-
     return result;
 }
 
 void ACZip::decompress(const std::vector<uint8_t>& data, const std::string& output_path) {
-    // Check magic header
-    if (data.size() < 8 || data[0] != 'A' || data[1] != 'C' || data[2] != 'Z' || data[3] != '2') {
+    if (data.size() < 8 || data[0] != 'A' || data[1] != 'C' || data[2] != 'Z' || data[3] != '2')
         throw std::runtime_error("Invalid ACZip file");
-    }
 
     size_t pos = 4;
+    auto need = [&](size_t n) { if (pos + n > data.size()) throw std::runtime_error("Corrupt archive: truncated"); };
+    auto rd32 = [&]() -> uint32_t { need(4); uint32_t v; std::memcpy(&v, data.data() + pos, 4); pos += 4; return v; };
 
-    // Read file count
-    uint32_t file_count = *(uint32_t*)(data.data() + pos);
-    pos += 4;
-
-    // Read and decompress each file
+    uint32_t file_count = rd32();
     for (uint32_t i = 0; i < file_count; i++) {
-        if (pos + 12 > data.size()) {
-            throw std::runtime_error("Corrupt archive: truncated header");
+        uint32_t path_len = rd32();
+        need(path_len);
+        std::string rel((const char*)data.data() + pos, path_len); pos += path_len;
+        uint32_t orig_size = rd32();
+        uint32_t comp_size = rd32();
+        need(comp_size);
+        std::vector<uint8_t> compressed(data.begin() + pos, data.begin() + pos + comp_size); pos += comp_size;
+
+        auto decompressed = ACGzip::decompress(compressed);
+        if (orig_size && decompressed.size() != orig_size)
+            throw std::runtime_error("Corrupt archive: size mismatch for " + rel);
+
+        // Sanitize path: strip absolute prefix and any ".." so extraction can never
+        // escape output_path (zip-slip protection).
+        std::string safe;
+        for (const auto& part : fs::path(rel).lexically_normal()) {
+            std::string s = part.string();
+            if (s == ".." || s == "/" || s == "\\" || s.empty()) continue;
+            safe += (safe.empty() ? "" : "/") + s;
         }
+        if (safe.empty()) safe = "file_" + std::to_string(i);
 
-        // Tag
-        std::string tag(data.begin() + pos, data.begin() + pos + 4);
-        pos += 4;
-
-        // Sizes
-        uint32_t orig_size = *(uint32_t*)(data.data() + pos);
-        pos += 4;
-
-        uint32_t comp_size = *(uint32_t*)(data.data() + pos);
-        pos += 4;
-
-        if (pos + comp_size > data.size()) {
-            throw std::runtime_error("Corrupt archive: truncated data");
-        }
-
-        // Compressed data
-        std::vector<uint8_t> compressed_data(data.begin() + pos, data.begin() + pos + comp_size);
-        pos += comp_size;
-
-        // Decompress
-        auto decompressed = ACGzip::decompress(compressed_data);
-
-        // Write file
-        std::string file_path = output_path + "/" + tag;
-        fs::create_directories(fs::path(file_path).parent_path());
-
+        fs::path file_path = fs::path(output_path) / safe;
+        fs::create_directories(file_path.parent_path());
         std::ofstream out(file_path, std::ios::binary);
-        out.write((char*)decompressed.data(), decompressed.size());
+        out.write((const char*)decompressed.data(), decompressed.size());
     }
 }
 
@@ -156,56 +236,28 @@ Archive ACZip::build_archive(const std::string& path) {
 
             FileEntry fe;
             fe.path = entry.path().relative_path().string();
-            fe.data = data;
+            fe.data = std::move(data);          // move the (possibly large) file buffer, don't copy
 
-            archive.files.push_back(fe);
+            archive.files.push_back(std::move(fe));
         }
     }
 
     return archive;
 }
 
-std::string ACZip::generate_tag(int index) {
-    if (index <= 15) {
-        char buf[3];
-        snprintf(buf, sizeof(buf), "0x%X", index);
-        return std::string(buf);
-    }
-    // Folder tags
-    int folder = (index / 15) + 1;
-    int file = (index % 15) + 1;
-    char buf[10];
-    snprintf(buf, sizeof(buf), "1x%02d.0x%02X", folder, file);
-    return std::string(buf);
-}
+// (generate_tag removed — the v2 format preserves real filenames, so tags are gone;
+//  the old buf[10] also truncated the folder-tag format.)
 
 // ============================================================================
 // TAR IMPLEMENTATION
 // ============================================================================
 
 std::vector<uint8_t> ACTar::create(const std::string& path) {
-    std::string cmd = "tar -cf - \"" + path + "\"";
-    FILE* proc = popen(cmd.c_str(), "r");
-    if (!proc) throw std::runtime_error("Failed to create tar");
-
-    std::vector<uint8_t> tar_data;
-    char buffer[4096];
-    size_t bytes;
-    while ((bytes = fread(buffer, 1, sizeof(buffer), proc)) > 0) {
-        tar_data.insert(tar_data.end(), buffer, buffer + bytes);
-    }
-
-    pclose(proc);
-    return tar_data;
+    return run_capture({"tar", "-cf", "-", path}, nullptr, 0);
 }
 
 void ACTar::extract(const std::vector<uint8_t>& data, const std::string& output_path) {
-    std::string cmd = "tar -xf - -C \"" + output_path + "\"";
-    FILE* proc = popen(cmd.c_str(), "w");
-    if (!proc) throw std::runtime_error("Failed to extract tar");
-
-    fwrite(data.data(), 1, data.size(), proc);
-    pclose(proc);
+    run_argv_with_stdin({"tar", "-xf", "-", "-C", output_path}, data.data(), data.size());
 }
 
 // ============================================================================
@@ -229,25 +281,19 @@ std::vector<uint8_t> ACGzip::compress(const std::vector<uint8_t>& data, int leve
 }
 
 std::vector<uint8_t> ACGzip::decompress(const std::vector<uint8_t>& data) {
-    std::vector<uint8_t> decompressed(data.size() * 4);
-
-    uLongf decompressed_size = decompressed.size();
-    int result = uncompress(decompressed.data(), &decompressed_size,
-                           data.data(), data.size());
-
-    if (result == Z_BUF_ERROR) {
-        decompressed.resize(decompressed_size * 2);
-        decompressed_size = decompressed.size();
-        result = uncompress(decompressed.data(), &decompressed_size,
-                           data.data(), data.size());
-    }
-
-    if (result != Z_OK) {
+    if (data.empty()) return {};
+    // Grow the output buffer until it fits — robust for any compression ratio
+    // (the old version only doubled once, so anything better than ~8:1 failed).
+    size_t cap = data.size() * 4 + 64;
+    for (int attempt = 0; attempt < 32; attempt++) {
+        std::vector<uint8_t> out(cap);
+        uLongf out_size = (uLongf)cap;
+        int r = uncompress(out.data(), &out_size, data.data(), data.size());
+        if (r == Z_OK) { out.resize(out_size); return out; }
+        if (r == Z_BUF_ERROR) { cap *= 2; continue; }
         throw std::runtime_error("Gzip decompression failed");
     }
-
-    decompressed.resize(decompressed_size);
-    return decompressed;
+    throw std::runtime_error("Gzip decompression: output exceeds limit");
 }
 
 // ============================================================================
@@ -255,64 +301,19 @@ std::vector<uint8_t> ACGzip::decompress(const std::vector<uint8_t>& data) {
 // ============================================================================
 
 std::vector<uint8_t> ACXz::compress(const std::vector<uint8_t>& data, int preset) {
-    std::string cmd = "xz -" + std::to_string(preset) + " -c";
-    FILE* proc = popen(cmd.c_str(), "w");
-    if (!proc) throw std::runtime_error("Failed to start xz");
-
-    fwrite(data.data(), 1, data.size(), proc);
-    fclose(proc);
-
-    // Read compressed output
-    std::string read_cmd = "xz -" + std::to_string(preset) + " -c";
-    FILE* read_proc = popen(read_cmd.c_str(), "r");
-    if (!read_proc) throw std::runtime_error("Failed to read xz output");
-
-    std::vector<uint8_t> compressed;
-    char buffer[4096];
-    size_t bytes;
-    while ((bytes = fread(buffer, 1, sizeof(buffer), read_proc)) > 0) {
-        compressed.insert(compressed.end(), buffer, buffer + bytes);
-    }
-    pclose(read_proc);
-
-    return compressed;
+    return run_capture({"xz", "-" + std::to_string(preset), "-c"}, data.data(), data.size());
 }
 
 std::vector<uint8_t> ACXz::decompress(const std::vector<uint8_t>& data) {
-    // Use xz command-line tool
-    FILE* proc = popen("xz -d -c", "w");
-    if (!proc) throw std::runtime_error("Failed to start xz decompression");
-
-    fwrite(data.data(), 1, data.size(), proc);
-    fclose(proc);
-
-    // Read decompressed output
-    FILE* read_proc = popen("xz -d -c", "r");
-    if (!read_proc) throw std::runtime_error("Failed to read xz output");
-
-    std::vector<uint8_t> decompressed;
-    char buffer[4096];
-    size_t bytes;
-    while ((bytes = fread(buffer, 1, sizeof(buffer), read_proc)) > 0) {
-        decompressed.insert(decompressed.end(), buffer, buffer + bytes);
-    }
-    pclose(read_proc);
-
-    return decompressed;
+    return run_capture({"xz", "-d", "-c"}, data.data(), data.size());
 }
 
 void ACXz::compress_file(const std::string& input, const std::string& output, int preset) {
-    std::string cmd = "xz -" + std::to_string(preset) + " -c \"" + input + "\" > \"" + output + "\"";
-    if (system(cmd.c_str()) != 0) {
-        throw std::runtime_error("XZ file compression failed");
-    }
+    run_argv_to_file({"xz", "-" + std::to_string(preset), "-c", input}, output);
 }
 
 void ACXz::decompress_file(const std::string& input, const std::string& output) {
-    std::string cmd = "xz -d -c \"" + input + "\" > \"" + output + "\"";
-    if (system(cmd.c_str()) != 0) {
-        throw std::runtime_error("XZ file decompression failed");
-    }
+    run_argv_to_file({"xz", "-d", "-c", input}, output);
 }
 
 // ============================================================================
@@ -320,60 +321,17 @@ void ACXz::decompress_file(const std::string& input, const std::string& output) 
 // ============================================================================
 
 std::vector<uint8_t> ACZstd::compress(const std::vector<uint8_t>& data, int level) {
-    std::string cmd = "zstd -" + std::to_string(level) + " -c";
-    FILE* proc = popen(cmd.c_str(), "w");
-    if (!proc) throw std::runtime_error("Failed to start zstd");
-
-    fwrite(data.data(), 1, data.size(), proc);
-    fclose(proc);
-
-    // Read compressed output
-    FILE* read_proc = popen(cmd.c_str(), "r");
-    if (!read_proc) throw std::runtime_error("Failed to read zstd output");
-
-    std::vector<uint8_t> compressed;
-    char buffer[4096];
-    size_t bytes;
-    while ((bytes = fread(buffer, 1, sizeof(buffer), read_proc)) > 0) {
-        compressed.insert(compressed.end(), buffer, buffer + bytes);
-    }
-    pclose(read_proc);
-
-    return compressed;
+    return run_capture({"zstd", "-" + std::to_string(level), "-c"}, data.data(), data.size());
 }
 
 std::vector<uint8_t> ACZstd::decompress(const std::vector<uint8_t>& data) {
-    FILE* proc = popen("zstd -d -c", "w");
-    if (!proc) throw std::runtime_error("Failed to start zstd decompression");
-
-    fwrite(data.data(), 1, data.size(), proc);
-    fclose(proc);
-
-    // Read decompressed output
-    FILE* read_proc = popen("zstd -d -c", "r");
-    if (!read_proc) throw std::runtime_error("Failed to read zstd output");
-
-    std::vector<uint8_t> decompressed;
-    char buffer[4096];
-    size_t bytes;
-    while ((bytes = fread(buffer, 1, sizeof(buffer), read_proc)) > 0) {
-        decompressed.insert(decompressed.end(), buffer, buffer + bytes);
-    }
-    pclose(read_proc);
-
-    return decompressed;
+    return run_capture({"zstd", "-d", "-c"}, data.data(), data.size());
 }
 
 void ACZstd::compress_file(const std::string& input, const std::string& output, int level) {
-    std::string cmd = "zstd -" + std::to_string(level) + " -c \"" + input + "\" > \"" + output + "\"";
-    if (system(cmd.c_str()) != 0) {
-        throw std::runtime_error("Zstd file compression failed");
-    }
+    run_argv_to_file({"zstd", "-" + std::to_string(level), "-c", input}, output);
 }
 
 void ACZstd::decompress_file(const std::string& input, const std::string& output) {
-    std::string cmd = "zstd -d -c \"" + input + "\" > \"" + output + "\"";
-    if (system(cmd.c_str()) != 0) {
-        throw std::runtime_error("Zstd file decompression failed");
-    }
+    run_argv_to_file({"zstd", "-d", "-c", input}, output);
 }

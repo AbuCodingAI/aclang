@@ -601,23 +601,48 @@ void ac_gl_obj_pos_from_spec(const char* name, const char* x_spec, const char* y
     ac_gl_obj_pos(name, x, y);
 }
 
+// `gl.size=<fraction> width|length` — a dimension expressed relative to the
+// current screen instead of a fixed pixel count, so `.config`'d objects stay
+// proportional across different `Screen.OBJECT resize WxH` values. "width" is
+// the screen's SHORTER side, "length" the longer one — orientation-independent
+// terms (a landscape screen's shorter side is conventionally its height, but
+// naming it "width" here means the same spec means the same thing whether the
+// screen ends up landscape or portrait). Evaluated once, against whatever
+// _scr_w/_scr_h are at the moment `.config` runs (same timing the plain pixel
+// form already had — this was never a live per-frame resize target, and
+// doesn't attempt to become one here). Falls back to a plain pixel int when
+// the spec isn't a `gl.size=` token at all.
+static int _parse_dim(const char* s) {
+    if (strncmp(s, "gl.size=", 8) == 0) {
+        double frac = atof(s + 8);
+        const char* p = s + 8;
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+        int shortSide = (_scr_w < _scr_h) ? _scr_w : _scr_h;
+        int longSide  = (_scr_w < _scr_h) ? _scr_h : _scr_w;
+        int side = (strncmp(p, "length", 6) == 0) ? longSide : shortSide; // default/"width" = short side
+        return (int)(frac * side);
+    }
+    return atoi(s);
+}
+
 void ac_gl_obj_config_item(const char* name, const char* item_spec) {
     if (strncmp(item_spec, "square(", 7) == 0) {
-        int sz = atoi(item_spec + 7);
+        int sz = _parse_dim(item_spec + 7);
         ac_gl_obj_square(name, sz);
     } else if (strncmp(item_spec, "geometry(", 9) == 0) {
         int w2 = 0, h2 = 0;
         const char* p = item_spec + 9;
-        w2 = atoi(p);
+        w2 = _parse_dim(p);
         while (*p && *p != '@') p++;
-        if (*p == '@') { p++; while (*p == ' ') p++; h2 = atoi(p); }
+        if (*p == '@') { p++; while (*p == ' ') p++; h2 = _parse_dim(p); }
         if (w2 > 0 && h2 > 0) ac_gl_obj_geometry(name, w2, h2);
     } else if (strncmp(item_spec, "rect(", 5) == 0) {
         int w2 = 0, h2 = 0;
         sscanf(item_spec + 5, "%d,%d", &w2, &h2);
         if (w2 > 0 && h2 > 0) ac_gl_obj_geometry(name, w2, h2);
     } else if (strncmp(item_spec, "circle(", 7) == 0) {
-        int r = atoi(item_spec + 7);
+        int r = _parse_dim(item_spec + 7);
         ac_gl_obj_geometry(name, r * 2, r * 2);
     }
 }

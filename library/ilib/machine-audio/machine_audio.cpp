@@ -25,6 +25,10 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <csignal>
 
 #ifndef AC_NO_MPG123
 #  ifdef __has_include
@@ -72,13 +76,25 @@ static bool              g_voiceMale = true;
 
 static void runEspeak(const std::string& text, bool block) {
     std::string voice = g_voiceMale ? "en+m3" : "en+f3";
-    char cmd[4096];
-    std::snprintf(cmd, sizeof(cmd),
-        "espeak-ng -s %d -p %d -a %d -v \"%s\" \"%s\" %s 2>/dev/null",
-        (int)g_rate, (int)g_pitch, (int)g_amplitude,
-        voice.c_str(), text.c_str(),
-        block ? "" : "&");
-    std::system(cmd);
+    char sbuf[16], pbuf[16], abuf[16];
+    std::snprintf(sbuf, sizeof(sbuf), "%d", (int)g_rate);
+    std::snprintf(pbuf, sizeof(pbuf), "%d", (int)g_pitch);
+    std::snprintf(abuf, sizeof(abuf), "%d", (int)g_amplitude);
+    // Spawn espeak-ng via execvp — `text` and `voice` are distinct argv elements, so a
+    // spoken string containing `$(...)`, backticks, `;` etc. can never run a shell command.
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { dup2(dn, 2); close(dn); }   // silence espeak stderr
+        char* av[] = { (char*)"espeak-ng", (char*)"-s", sbuf, (char*)"-p", pbuf,
+                       (char*)"-a", abuf, (char*)"-v", (char*)voice.c_str(),
+                       (char*)text.c_str(), nullptr };
+        execvp("espeak-ng", av);
+        _exit(127);
+    }
+    if (block) { int st; waitpid(pid, &st, 0); }
+    else       { signal(SIGCHLD, SIG_IGN); }        // reap async speaker, no zombie
 }
 
 // ── AC machine-audio API ─────────────────────────────────────────────────────
@@ -158,17 +174,29 @@ static void playOnce(Track* t) {
     if (pcm) { snd_pcm_drain(pcm); snd_pcm_close(pcm); }
 #  else
     // Fallback: shell
-    char cmd[4096];
-    std::snprintf(cmd, sizeof(cmd), "mpg123 -q \"%s\" 2>/dev/null", t->path.c_str());
-    std::system(cmd);
+    // mpg123 CLI via execvp — the track path is a distinct argv element, never a shell string.
+    pid_t mpid = fork();
+    if (mpid == 0) {
+        int dn = open("/dev/null", O_WRONLY); if (dn >= 0) { dup2(dn, 2); close(dn); }
+        char* av[] = { (char*)"mpg123", (char*)"-q", (char*)t->path.c_str(), nullptr };
+        execvp("mpg123", av);
+        _exit(127);
+    }
+    if (mpid > 0) { int st; waitpid(mpid, &st, 0); }
 #  endif
     mpg123_close(mh);
     mpg123_delete(mh);
 #else
     // Fallback: try mpg123 CLI
-    char cmd[4096];
-    std::snprintf(cmd, sizeof(cmd), "mpg123 -q \"%s\" 2>/dev/null", t->path.c_str());
-    std::system(cmd);
+    // mpg123 CLI via execvp — the track path is a distinct argv element, never a shell string.
+    pid_t mpid = fork();
+    if (mpid == 0) {
+        int dn = open("/dev/null", O_WRONLY); if (dn >= 0) { dup2(dn, 2); close(dn); }
+        char* av[] = { (char*)"mpg123", (char*)"-q", (char*)t->path.c_str(), nullptr };
+        execvp("mpg123", av);
+        _exit(127);
+    }
+    if (mpid > 0) { int st; waitpid(mpid, &st, 0); }
 #endif
 }
 
@@ -179,13 +207,13 @@ void ac_maudio_play(int handle) {
     if (it == g_tracks.end()) return;
     Track* t = it->second;
     if (t->playing) return;
+    if (t->playThread.joinable()) t->playThread.join();  // reap a finished prior play; NOT detached → no UAF
     t->playing = true;
     t->looping = false;
     t->playThread = std::thread([t]() {
         playOnce(t);
         t->playing = false;
     });
-    t->playThread.detach();
 }
 
 // play.loop(var) — loop playback until stop()
@@ -195,13 +223,13 @@ void ac_maudio_play_loop(int handle) {
     if (it == g_tracks.end()) return;
     Track* t = it->second;
     if (t->playing) return;
+    if (t->playThread.joinable()) t->playThread.join();
     t->playing = true;
     t->looping = true;
     t->playThread = std::thread([t]() {
         while (t->looping && t->playing) playOnce(t);
         t->playing = false;
     });
-    t->playThread.detach();
 }
 
 // pause(var)
@@ -293,6 +321,130 @@ fallback:
     (void)u16; (void)u32;
 }
 
+// ── speak / listen / tts_ok ──────────────────────────────────────────────────
+// AC's `maudio_speak`/`maudio_listen`/`maudio_tts_ok` (used by examples/audio_test.ac,
+// jarvis.ac) were ONLY ever implemented natively in Python (machine-audio.py) — this shared
+// C++ core (what C/C++/Rust/Go/Java/V/ASM/BNY all actually call through) never had them at
+// all, so every non-PY/JS backend hit a hard "undefined reference"/"undeclared identifier" on
+// any program using them. Real implementations, mirroring PY's own tool fallback chain
+// (espeak-ng/spd-say for TTS, arecord+whisper CLI for STT — all language-agnostic system
+// tools, not Python-specific) so every backend gets identical, genuinely working behavior
+// through the one shared library instead of needing a from-scratch reimplementation each.
+
+// Runs `cmd` via execvp with `argv`; returns true if the exec succeeded (exit code 0),
+// false if the tool is missing or failed. WEXITSTATUS==127 means execvp couldn't find `cmd`.
+static bool runTool(const char* cmd, char* const argv[], bool silence) {
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        if (silence) {
+            int dn = open("/dev/null", O_WRONLY);
+            if (dn >= 0) { dup2(dn, 1); dup2(dn, 2); close(dn); }
+        }
+        execvp(cmd, argv);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+static bool toolExists(const char* cmd) {
+    char* av[] = { (char*)cmd, (char*)"--version", nullptr };
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { dup2(dn, 1); dup2(dn, 2); close(dn); }
+        execvp(cmd, av);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) != 127;
+}
+
+// tts_ok() — is a real TTS engine available? (1/0, matches AC's int-everything convention)
+int ac_maudio_tts_ok() {
+    return (toolExists("espeak-ng") || toolExists("espeak") || toolExists("spd-say")) ? 1 : 0;
+}
+
+// speak($text$) — blocking TTS via whichever engine is actually installed; prints the text
+// as a last-resort fallback (matches PY's own `print(f"[machine-audio::speak] {text}")`) so
+// the call is never silently a no-op even with zero TTS engines present.
+void ac_maudio_speak(const char* text) {
+    if (!text) return;
+    if (toolExists("espeak-ng")) {
+        char* av[] = { (char*)"espeak-ng", (char*)text, nullptr };
+        if (runTool("espeak-ng", av, true)) return;
+    }
+    if (toolExists("espeak")) {
+        char* av[] = { (char*)"espeak", (char*)text, nullptr };
+        if (runTool("espeak", av, true)) return;
+    }
+    if (toolExists("spd-say")) {
+        char* av[] = { (char*)"spd-say", (char*)"-w", (char*)text, nullptr };
+        if (runTool("spd-say", av, true)) return;
+    }
+    std::printf("[machine-audio::speak] %s\n", text);
+}
+
+// listen(timeout_ms) — record from the default mic via `arecord`, transcribe via the
+// `whisper` CLI. Returns "" (matches AC's own "Nothing heard or STT unavailable" documented
+// fallback path — see audio_test.ac) if either tool is missing or nothing was transcribed;
+// never blocks longer than timeout_ms/1000 seconds regardless of outcome.
+const char* ac_maudio_listen(int timeout_ms) {
+    static std::string result;
+    result.clear();
+    if (!toolExists("arecord") || !toolExists("whisper")) return result.c_str();
+    int secs = timeout_ms > 0 ? std::max(1, timeout_ms / 1000) : 1;
+    char wavPath[] = "/tmp/ac_listen_XXXXXX.wav";
+    int fd = mkstemps(wavPath, 4);
+    if (fd < 0) return result.c_str();
+    close(fd);
+    char secBuf[16];
+    std::snprintf(secBuf, sizeof(secBuf), "%d", secs);
+    {
+        char* av[] = { (char*)"arecord", (char*)"-q", (char*)"-d", secBuf,
+                       (char*)"-f", (char*)"cd", (char*)"-t", (char*)"wav",
+                       wavPath, nullptr };
+        runTool("arecord", av, true);
+    }
+    std::string outDir = "/tmp";
+    {
+        char* av[] = { (char*)"whisper", wavPath, (char*)"--model", (char*)"tiny",
+                       (char*)"--output_format", (char*)"txt",
+                       (char*)"--output_dir", (char*)outDir.c_str(), nullptr };
+        runTool("whisper", av, true);
+    }
+    std::string base = wavPath;
+    auto slash = base.find_last_of('/');
+    std::string stem = (slash == std::string::npos) ? base : base.substr(slash + 1);
+    auto dot = stem.rfind(".wav");
+    if (dot != std::string::npos) stem = stem.substr(0, dot);
+    std::string txtPath = outDir + "/" + stem + ".txt";
+    FILE* f = std::fopen(txtPath.c_str(), "r");
+    if (f) {
+        char buf[4096];
+        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = 0;
+        std::fclose(f);
+        result = buf;
+        while (!result.empty() && (result.back() == '\n' || result.back() == ' ' || result.back() == '\r'))
+            result.pop_back();
+        std::remove(txtPath.c_str());
+    }
+    std::remove(wavPath);
+    return result.c_str();
+}
+
+// stop_all() — no-arg cleanup used by the compiler's auto-injected `maudio.stop()` shutdown
+// call (see ir.cpp's injectAutoShutoff) whenever `use ilib machine-audio` is imported; distinct
+// from ac_maudio_stop(handle), which stops one specific MP3 track.
+void ac_maudio_stop_all() {
+    std::lock_guard<std::mutex> lk(g_trackMu);
+    for (auto& [id, t] : g_tracks) { t->looping = false; t->playing = false; }
+}
+
 // Cleanup a track handle
 void ac_maudio_free(int handle) {
     std::lock_guard<std::mutex> lk(g_trackMu);
@@ -301,6 +453,7 @@ void ac_maudio_free(int handle) {
     Track* t = it->second;
     t->looping = false;
     t->playing  = false;
+    if (t->playThread.joinable()) t->playThread.join();  // wait for the player to exit BEFORE freeing (was UAF)
     delete t;
     g_tracks.erase(it);
 }

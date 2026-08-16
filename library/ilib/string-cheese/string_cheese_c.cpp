@@ -9,15 +9,22 @@
 #include <algorithm>
 #include <regex>
 
-// Thread-local output buffer — avoids static state issues in single-call patterns
-static thread_local char _sc_buf[65536];
+// Thread-local output buffers, round-robin. A SINGLE shared buffer made two stringm.* results in
+// one expression alias — `stringm.upper(a) + stringm.lower(b)` returned the same pointer twice, so
+// the first result was overwritten by the second. Rotating across N buffers keeps up to N results
+// live simultaneously (covers any realistic chained-call expression).
+static const int _SC_NBUF = 8;
+static thread_local char _sc_bufs[_SC_NBUF][65536];
+static thread_local int  _sc_idx = 0;
 
 static const char* _sc(const std::string& s) {
+    char* buf = _sc_bufs[_sc_idx];
+    _sc_idx = (_sc_idx + 1) % _SC_NBUF;
     size_t n = s.size();
-    if (n >= sizeof(_sc_buf)) n = sizeof(_sc_buf) - 1;
-    memcpy(_sc_buf, s.data(), n);
-    _sc_buf[n] = '\0';
-    return _sc_buf;
+    if (n >= 65536) n = 65535;
+    memcpy(buf, s.data(), n);
+    buf[n] = '\0';
+    return buf;
 }
 
 extern "C" {
@@ -79,9 +86,11 @@ const char* ac_stringm_replace(const char* s, const char* old_sub, const char* n
     if (!s || !old_sub || !new_sub) return s ? s : "";
     std::string r(s);
     std::string from(old_sub), to(new_sub);
-    // ws sentinel: replace all whitespace runs
+    // ws sentinel: replace all whitespace runs. Compile the pattern ONCE (a std::regex build is
+    // orders of magnitude costlier than the replace) — it's a constant, so make it static.
     if (from == " \t\n\r") {
-        std::string out = std::regex_replace(r, std::regex("\\s+"), to);
+        static const std::regex ws_re("\\s+");
+        std::string out = std::regex_replace(r, ws_re, to);
         return _sc(out);
     }
     size_t pos = 0;
@@ -142,6 +151,12 @@ int ac_stringm_count(const char* s, const char* sub) {
 const char* ac_stringm_format(const char* template_str) {
     return template_str ? template_str : "";
 }
+
+/* b / f / t string-prefix constructors. f-string (formatted) and t-string (template,
+   PEP 750) interpolate at the compiler/IR level; the runtime is a passthrough, exactly
+   like ac_stringm_format. (ac_stringm_b is the bytes constructor, defined below.) */
+const char* ac_stringm_f(const char* s) { return s ? s : ""; }
+const char* ac_stringm_t(const char* s) { return s ? s : ""; }
 
 const char* ac_stringm_getline() {
     // Read a line from stdin and return it

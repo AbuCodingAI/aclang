@@ -10,7 +10,7 @@ final class AcCamera {
         String _os = System.getProperty("os.name").toLowerCase();
         String _libFile = _os.contains("win") ? "libaccamera.dll" : "libaccamera.so";
         Path _libPath = Path.of(System.getProperty("user.dir"))
-            .resolve("library/camera/" + _libFile).toAbsolutePath();
+            .resolve("library/ilib/camera/" + _libFile).toAbsolutePath();
         _SYM = SymbolLookup.libraryLookup(_libPath, Arena.global());
     }
     private static MethodHandle _mh(String name, FunctionDescriptor fd) {

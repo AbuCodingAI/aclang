@@ -6,61 +6,111 @@ type U8 = u8;
 
 #[link(name = "acgl")]
 extern "C" {
+    #[link_name = "ac_gl_init"]
     fn _raw_ac_gl_init() -> c_int;
+    #[link_name = "ac_gl_quit"]
     fn _raw_ac_gl_quit();
 
+    #[link_name = "ac_gl_screen_create"]
     fn _raw_ac_gl_screen_create(w: c_int, h: c_int, title: *const c_char) -> c_int;
+    #[link_name = "ac_gl_screen_set_bg"]
     fn _raw_ac_gl_screen_set_bg(r: U8, g: U8, b: U8);
+    #[link_name = "ac_gl_screen_set_fps"]
     fn _raw_ac_gl_screen_set_fps(fps: c_int);
+    #[link_name = "ac_gl_screen_w"]
     fn _raw_ac_gl_screen_w() -> c_int;
+    #[link_name = "ac_gl_screen_h"]
     fn _raw_ac_gl_screen_h() -> c_int;
 
+    #[link_name = "ac_gl_obj_create"]
     fn _raw_ac_gl_obj_create(name: *const c_char);
+    #[link_name = "ac_gl_obj_geometry"]
     fn _raw_ac_gl_obj_geometry(name: *const c_char, w: c_int, h: c_int);
+    #[link_name = "ac_gl_obj_square"]
     fn _raw_ac_gl_obj_square(name: *const c_char, size: c_int);
+    #[link_name = "ac_gl_obj_pos"]
     fn _raw_ac_gl_obj_pos(name: *const c_char, x: c_int, y: c_int);
+    #[link_name = "ac_gl_obj_color"]
     fn _raw_ac_gl_obj_color(name: *const c_char, r: U8, g: U8, b: U8);
+    #[link_name = "ac_gl_obj_velocity"]
     fn _raw_ac_gl_obj_velocity(name: *const c_char, vx: c_float, vy: c_float);
+    #[link_name = "ac_gl_obj_set_speed"]
     fn _raw_ac_gl_obj_set_speed(name: *const c_char, speed: c_float);
+    #[link_name = "ac_gl_obj_set_direction"]
     fn _raw_ac_gl_obj_set_direction(name: *const c_char, deg: c_float);
+    #[link_name = "ac_gl_obj_speed_mult"]
     fn _raw_ac_gl_obj_speed_mult(name: *const c_char, mult: c_float);
+    #[link_name = "ac_gl_obj_move_x"]
     fn _raw_ac_gl_obj_move_x(name: *const c_char, dx: c_int);
+    #[link_name = "ac_gl_obj_move_y"]
     fn _raw_ac_gl_obj_move_y(name: *const c_char, dy: c_int);
+    #[link_name = "ac_gl_obj_x"]
     fn _raw_ac_gl_obj_x(name: *const c_char) -> c_int;
+    #[link_name = "ac_gl_obj_y"]
     fn _raw_ac_gl_obj_y(name: *const c_char) -> c_int;
+    #[link_name = "ac_gl_obj_w"]
     fn _raw_ac_gl_obj_w(name: *const c_char) -> c_int;
+    #[link_name = "ac_gl_obj_h"]
     fn _raw_ac_gl_obj_h(name: *const c_char) -> c_int;
+    #[link_name = "ac_gl_obj_curveshape"]
     fn _raw_ac_gl_obj_curveshape(name: *const c_char, expr: *const c_char);
+    #[link_name = "ac_gl_obj_vertex"]
     fn _raw_ac_gl_obj_vertex(name: *const c_char, vx: c_float, vy: c_float);
+    #[link_name = "ac_gl_obj_to_draw"]
     fn _raw_ac_gl_obj_to_draw(name: *const c_char);
+    #[link_name = "ac_gl_obj_circle_fall"]
     fn _raw_ac_gl_obj_circle_fall(name: *const c_char, fraction: c_float, dir: *const c_char);
+    #[link_name = "ac_gl_obj_circle_fell"]
     fn _raw_ac_gl_obj_circle_fell(name: *const c_char, fraction: c_float, dir: *const c_char) -> c_int;
+    #[link_name = "ac_gl_obj_set_spawn"]
     fn _raw_ac_gl_obj_set_spawn(name: *const c_char);
+    #[link_name = "ac_gl_obj_regen"]
     fn _raw_ac_gl_obj_regen(name: *const c_char);
+    #[link_name = "ac_gl_obj_animate"]
     fn _raw_ac_gl_obj_animate(name: *const c_char, dir: *const c_char, speed: c_float);
+    #[link_name = "ac_gl_hitbox_many_overlap"]
     fn _raw_ac_gl_hitbox_many_overlap() -> c_int;
 
+    #[link_name = "ac_gl_draw_create"]
     fn _raw_ac_gl_draw_create(name: *const c_char);
+    #[link_name = "ac_gl_draw_curveshape"]
     fn _raw_ac_gl_draw_curveshape(name: *const c_char, expr: *const c_char);
+    #[link_name = "ac_gl_draw_vertex"]
     fn _raw_ac_gl_draw_vertex(name: *const c_char, vx: c_float, vy: c_float);
+    #[link_name = "ac_gl_draw_line"]
     fn _raw_ac_gl_draw_line(name: *const c_char, x1: c_float, y1: c_float, x2: c_float, y2: c_float, r: U8, g: U8, b: U8);
+    #[link_name = "ac_gl_draw_circle"]
     fn _raw_ac_gl_draw_circle(name: *const c_char, cx: c_float, cy: c_float, radius: c_float, r: U8, g: U8, b: U8);
+    #[link_name = "ac_gl_draw_clear"]
     fn _raw_ac_gl_draw_clear(name: *const c_char);
+    #[link_name = "ac_gl_draw_to_obj"]
     fn _raw_ac_gl_draw_to_obj(name: *const c_char);
+    #[link_name = "ac_gl_is_draw"]
     fn _raw_ac_gl_is_draw(name: *const c_char) -> c_int;
+    #[link_name = "ac_gl_is_obj"]
     fn _raw_ac_gl_is_obj(name: *const c_char) -> c_int;
 
+    #[link_name = "ac_gl_hitbox_overlap"]
     fn _raw_ac_gl_hitbox_overlap(a: *const c_char, b: *const c_char) -> c_int;
+    #[link_name = "ac_gl_hitbox_overlap_boundary"]
     fn _raw_ac_gl_hitbox_overlap_boundary(name: *const c_char) -> c_int;
+    #[link_name = "ac_gl_hitbox_overlap_pattern"]
     fn _raw_ac_gl_hitbox_overlap_pattern(name: *const c_char, pat: *const c_char) -> c_int;
 
+    #[link_name = "ac_gl_key_pressed"]
     fn _raw_ac_gl_key_pressed(key: *const c_char) -> c_int;
+    #[link_name = "ac_gl_key_just_pressed"]
     fn _raw_ac_gl_key_just_pressed(key: *const c_char) -> c_int;
 
+    #[link_name = "ac_gl_frame_begin"]
     fn _raw_ac_gl_frame_begin() -> c_int;
+    #[link_name = "ac_gl_frame_update"]
     fn _raw_ac_gl_frame_update(dt: c_float);
+    #[link_name = "ac_gl_frame_render"]
     fn _raw_ac_gl_frame_render();
+    #[link_name = "ac_gl_frame_end"]
     fn _raw_ac_gl_frame_end();
+    #[link_name = "ac_gl_delta_time"]
     fn _raw_ac_gl_delta_time() -> c_float;
 }
 
@@ -270,6 +320,10 @@ pub fn ac_gl_obj_pos_from_spec(name: &str, x_spec: &str, y_spec: &str) {
 pub fn ac_gl_obj_move_y(name: &str, dy: i32)             { gl_obj_move_y(name, dy) }
 pub fn ac_gl_obj_move_x(name: &str, dx: i32)             { gl_obj_move_x(name, dx) }
 pub fn ac_gl_obj_vertex(name: &str, vx: f32, vy: f32)    { gl_obj_vertex(name, vx, vy) }
+pub fn ac_gl_obj_velocity(name: &str, vx: f32, vy: f32)  { gl_obj_velocity(name, vx, vy) }
+pub fn ac_gl_obj_set_direction(name: &str, deg: f32)      { gl_obj_set_direction(name, deg) }
+pub fn ac_gl_obj_speed_mult(name: &str, mult: f32)        { gl_obj_speed_mult(name, mult) }
+pub fn ac_gl_hitbox_overlap_boundary(name: &str) -> bool  { gl_hitbox_boundary(name) }
 pub fn ac_gl_obj_curveshape(name: &str, expr: &str)       { gl_obj_curveshape(name, expr) }
 pub fn ac_gl_obj_circle_fall(name: &str, frac: f32, dir: &str) { gl_obj_circle_fall(name, frac, dir) }
 pub fn ac_gl_obj_circle_fell(name: &str, frac: f32, dir: &str) -> bool { gl_obj_circle_fell(name, frac, dir) }

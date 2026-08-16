@@ -36,6 +36,10 @@ fn maudio_stop() {
     let _ = Command::new("pkill").args(["-f", "espeak"]).status();
 }
 
+fn maudio_tts_ok() -> bool {
+    _which("espeak-ng") || _which("say") || _which("espeak")
+}
+
 fn maudio_listen(timeout_ms: i64) -> String {
     // Try vosk-transcriber (matches the Python vosk path)
     if _which("vosk-transcriber") {
@@ -65,12 +69,18 @@ fn maudio_play(path: &str) {
 
 struct _MaudioNS;
 impl _MaudioNS {
-    fn say(&self, text: &str) -> bool           { maudio_say(text) }
-    fn say_rate(&self, t: &str, r: i64) -> bool { maudio_say_rate(t, r) }
-    fn say_async(&self, text: &str)             { maudio_say_async(text) }
+    // AC's actual calling convention for this ilib is `maudio.speak(...)`/`maudio.tts_ok()`
+    // (matches Go/C++/Python's own naming — see their FFI files) — this struct previously named
+    // the method `say` (no `speak` at all, and no `tts_ok`), a real pre-existing gap: any AC
+    // source using this ilib on Rust failed with "no method named `speak`/`tts_ok` found for
+    // struct `_MaudioNS`" (verified: examples/audio_test.ac).
+    fn speak(&self, text: &str) -> bool           { maudio_say(text) }
+    fn speak_rate(&self, t: &str, r: i64) -> bool { maudio_say_rate(t, r) }
+    fn speak_async(&self, text: &str)             { maudio_say_async(text) }
     fn stop(&self)                               { maudio_stop() }
     fn listen(&self, timeout_ms: i64) -> String { maudio_listen(timeout_ms) }
     fn play(&self, path: &str)                  { maudio_play(path) }
+    fn tts_ok(&self) -> bool                    { maudio_tts_ok() }
 }
 
 static maudio: _MaudioNS = _MaudioNS;

@@ -303,6 +303,7 @@ tensor_id_t pt_softmax(tensor_id_t x_id, int64_t) {
     Tensor out;
     out.shape = x->shape;
     out.data.resize(x->data.size());
+    if (x->data.empty()) return store(std::move(out));   // empty tensor → no max_element deref (was UB)
     double maxv = *std::max_element(x->data.begin(), x->data.end());
     double sum = 0.0;
     for (size_t i = 0; i < x->data.size(); ++i) {

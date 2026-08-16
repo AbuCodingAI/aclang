@@ -12,7 +12,7 @@ final class AcRegex {
         String _os = System.getProperty("os.name").toLowerCase();
         String _lib = _os.contains("win") ? "acregex.dll" : "libacregex.so";
         Path _p = Path.of(System.getProperty("user.dir"))
-            .resolve("library/regex/" + _lib).toAbsolutePath();
+            .resolve("library/ilib/regex/" + _lib).toAbsolutePath();
         _SYM = SymbolLookup.libraryLookup(_p, Arena.global());
     }
     private static MethodHandle _mh(String n, FunctionDescriptor fd) {
@@ -45,7 +45,7 @@ final class AcRegex {
 
     private static String _str(MemorySegment seg) {
         if (seg == null || seg.equals(MemorySegment.NULL)) return "";
-        return seg.reinterpret(Long.MAX_VALUE).getString(0);
+        return seg.reinterpret(Long.MAX_VALUE).getUtf8String(0);
     }
 
     private static List<String> _list(Arena ar, MemorySegment arr, int n) {
@@ -60,57 +60,57 @@ final class AcRegex {
 
     public static boolean match(String s, String p) {
         try (Arena a = Arena.ofConfined()) {
-            return _i(_match, a.allocateFrom(s), a.allocateFrom(p)) != 0;
+            return _i(_match, a.allocateUtf8String(s), a.allocateUtf8String(p)) != 0;
         }
     }
     public static boolean test(String s, String p) {
         try (Arena a = Arena.ofConfined()) {
-            return _i(_test, a.allocateFrom(s), a.allocateFrom(p)) != 0;
+            return _i(_test, a.allocateUtf8String(s), a.allocateUtf8String(p)) != 0;
         }
     }
     public static String search(String s, String p) {
         try (Arena a = Arena.ofConfined()) {
-            return _str(_a(_search, a.allocateFrom(s), a.allocateFrom(p)));
+            return _str(_a(_search, a.allocateUtf8String(s), a.allocateUtf8String(p)));
         }
     }
     public static String replace(String s, String p, String r) {
         try (Arena a = Arena.ofConfined()) {
-            return _str(_a(_replace, a.allocateFrom(s), a.allocateFrom(p), a.allocateFrom(r)));
+            return _str(_a(_replace, a.allocateUtf8String(s), a.allocateUtf8String(p), a.allocateUtf8String(r)));
         }
     }
     public static String replaceAll(String s, String p, String r) {
         try (Arena a = Arena.ofConfined()) {
-            return _str(_a(_replaceAll, a.allocateFrom(s), a.allocateFrom(p), a.allocateFrom(r)));
+            return _str(_a(_replaceAll, a.allocateUtf8String(s), a.allocateUtf8String(p), a.allocateUtf8String(r)));
         }
     }
     public static int count(String s, String p) {
         try (Arena a = Arena.ofConfined()) {
-            return _i(_count, a.allocateFrom(s), a.allocateFrom(p));
+            return _i(_count, a.allocateUtf8String(s), a.allocateUtf8String(p));
         }
     }
     public static String escape(String s) {
         try (Arena a = Arena.ofConfined()) {
-            return _str(_a(_escape, a.allocateFrom(s)));
+            return _str(_a(_escape, a.allocateUtf8String(s)));
         }
     }
     public static List<String> findAll(String s, String p) {
         try (Arena a = Arena.ofConfined()) {
             MemorySegment nSeg = a.allocate(I);
-            MemorySegment arr  = _a(_findAll, a.allocateFrom(s), a.allocateFrom(p), nSeg);
+            MemorySegment arr  = _a(_findAll, a.allocateUtf8String(s), a.allocateUtf8String(p), nSeg);
             return _list(a, arr, nSeg.get(I, 0));
         }
     }
     public static List<String> split(String s, String p) {
         try (Arena a = Arena.ofConfined()) {
             MemorySegment nSeg = a.allocate(I);
-            MemorySegment arr  = _a(_split, a.allocateFrom(s), a.allocateFrom(p), nSeg);
+            MemorySegment arr  = _a(_split, a.allocateUtf8String(s), a.allocateUtf8String(p), nSeg);
             return _list(a, arr, nSeg.get(I, 0));
         }
     }
     public static List<String> groups(String s, String p) {
         try (Arena a = Arena.ofConfined()) {
             MemorySegment nSeg = a.allocate(I);
-            MemorySegment arr  = _a(_groups, a.allocateFrom(s), a.allocateFrom(p), nSeg);
+            MemorySegment arr  = _a(_groups, a.allocateUtf8String(s), a.allocateUtf8String(p), nSeg);
             return _list(a, arr, nSeg.get(I, 0));
         }
     }

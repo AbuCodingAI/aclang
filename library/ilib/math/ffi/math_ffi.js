@@ -15,7 +15,7 @@ const _m=_ffi.Library(_lib,{
 'ac_pow':[_D,[_D,_D]],'ac_sqrt':[_D,[_D]],'ac_cbrt':[_D,[_D]],
 'ac_abs':[_D,[_D]],'ac_abs_int':[_I,[_I]],
 'ac_floor':[_D,[_D]],'ac_ceil':[_D,[_D]],'ac_round':[_D,[_D]],
-'ac_hypot':[_D,[_D,_D]],'ac_log':[_D,[_D]],'ac_log2':[_D,[_D]],'ac_log10':[_D,[_D]],
+'ac_hypot':[_D,[_D,_D]],'ac_ln':[_D,[_D]],'ac_log_base':[_D,[_D,_D]],'ac_log2':[_D,[_D]],'ac_log10':[_D,[_D]],
 'ac_mod':[_D,[_D,_D]],'ac_mod_int':[_I,[_I,_I]],
 'ac_to_int':[_I,[_D]],'ac_to_dec':[_D,[_I]],
 'ac_gcd':[_I,[_I,_I]],'ac_lcm':[_I,[_I,_I]],
@@ -29,9 +29,9 @@ const _m=_ffi.Library(_lib,{
 'ac_stat_mode':[_D,['pointer',_INT]],'ac_stat_min':[_D,['pointer',_INT]],
 'ac_stat_max':[_D,['pointer',_INT]],'ac_stat_boxnum':[_V,['pointer',_INT,'pointer']],
 });
-function _arr(lst){const b=Buffer.alloc(lst.length*8);lst.forEach((v,i)=>b.writeDoubleBE(v,i*8));return b;}
+function _arr(lst){const b=Buffer.alloc(lst.length*8);lst.forEach((v,i)=>b.writeDoubleLE(v,i*8));return b;}
 function _out(n){return Buffer.alloc(n*8);}
-function _rout(b,n){const r=[];for(let i=0;i<n;i++)r.push(b.readDoubleBE(i*8));return r;}
+function _rout(b,n){const r=[];for(let i=0;i<n;i++)r.push(b.readDoubleLE(i*8));return r;}
 const math_PI=_m.ac_math_pi_const(),math_E=_m.ac_math_e_const(),math_TAU=_m.ac_math_tau_const(),math_PHI=_m.ac_math_phi_const(),math_inf=_m.ac_math_inf();
 const math_pi=n=>_m.ac_math_pi(n),math_e=n=>_m.ac_math_e(n),math_phi=n=>_m.ac_math_phi(n);
 const math_sin=x=>_m.ac_sin(x),math_cos=x=>_m.ac_cos(x),math_tan=x=>_m.ac_tan(x);
@@ -42,7 +42,7 @@ const math_atan2=(y,x)=>_m.ac_atan2(y,x),math_deg2rad=d=>_m.ac_deg2rad(d),math_r
 const math_pow=(b,e)=>_m.ac_pow(b,e),math_sqrt=x=>_m.ac_sqrt(x),math_cbrt=x=>_m.ac_cbrt(x);
 const math_abs=x=>_m.ac_abs(x),math_abs_int=x=>_m.ac_abs_int(x);
 const math_floor=x=>_m.ac_floor(x),math_ceil=x=>_m.ac_ceil(x),math_round=x=>_m.ac_round(x);
-const math_hypot=(a,b)=>_m.ac_hypot(a,b),math_log=x=>_m.ac_log(x),math_log2=x=>_m.ac_log2(x),math_log10=x=>_m.ac_log10(x);
+const math_hypot=(a,b)=>_m.ac_hypot(a,b),math_ln=x=>_m.ac_ln(x),math_log=(b,x)=>_m.ac_log_base(b,x),math_log2=x=>_m.ac_log2(x),math_log10=x=>_m.ac_log10(x);
 const math_mod=(a,b)=>_m.ac_mod(a,b),math_mod_int=(a,b)=>_m.ac_mod_int(a,b);
 const math_to_int=x=>_m.ac_to_int(x),math_to_dec=x=>_m.ac_to_dec(x);
 const math_gcd=(a,b)=>_m.ac_gcd(a,b),math_lcm=(a,b)=>_m.ac_lcm(a,b);

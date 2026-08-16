@@ -6,8 +6,8 @@ const _WS = " \t\n\r";
 
 function _isWs(s) { return s === _WS; }
 
-function stringm_f(template, ...args)  { return String(template); }
-function stringm_t(s)                  { return String(s).trim(); }
+function stringm_f(template, ...args)  { return String(template); }   // f-string (compiler interpolates {})
+function stringm_t(template, ...args)  { return String(template); }   // t-string (template, resolved at IR level)
 function stringm_b(s)                  { return Buffer.from(String(s), 'utf8'); }
 function stringm_upper(s)              { return String(s).toUpperCase(); }
 function stringm_lower(s)              { return String(s).toLowerCase(); }

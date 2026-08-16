@@ -1,0 +1,163 @@
+AC->PY
+
+/* AC keyword catalog — CORE language: literals, types, operators, control flow,
+   functions, variables, error handling, bundles. Every keyword below is a real,
+   working, verified AC construct. See kw_modules.ac / kw_gui.ac for the rest. */
+
+Make risky func(d)
+    return 10 // d
+
+Make crunch func(id)
+    total = 0
+    FOR i in range 5
+        bound total += (i @ id) band 3
+    return total
+
+bundle Critter
+    public name = $unnamed$
+    public hp = 10
+    private secret = 99
+    public Make greet func()
+        Term.display self.name
+
+<mainloop>
+    /* --- literals --- */
+    Term.display True
+    Term.display False
+    Term.display null
+    Term.display nil
+
+    /* --- type coercion: statement form --- */
+    to_int n = $42$
+    Term.display n + 1
+    to_string label = 99
+    Term.display label + $!$
+    to_dec d = 7
+    Term.display d / 2
+    to_bool flag = 1
+    Term.display flag
+    short s = 1000
+    Term.display s
+    mini m = 100
+    Term.display m
+    atomic a = 5
+    a = a + 1
+    Term.display a
+
+    /* --- type coercion: expression form --- */
+    Term.display to_int($9$)
+    Term.display to_string(9)
+    Term.display to_dec(9)
+    Term.display to_bool(0)
+    Term.display short(5)
+    Term.display mini(5)
+    Term.display atomic(5)
+
+    /* --- logical + bitwise operators --- */
+    Term.display 1 and 1
+    Term.display 0 or 1
+    Term.display 1 xor 0
+    Term.display not 0
+    Term.display # 1
+    Term.display 12 band 10
+    Term.display 12 bor 10
+    Term.display 12 bxor 10
+    Term.display bnot 0
+    Term.display ~ 5
+
+    /* --- arithmetic-family operators --- */
+    Term.display 5 xsub 2
+    Term.display 5 ptm 1
+    Term.display 40 ptd 2
+    Term.display 3 is 3
+    Term.display 3 #= 4
+
+    /* --- control flow --- */
+    IF n is 43
+        Term.display $forty-three$
+    ELSEIF n #> 100
+        Term.display $small$
+    OTHER
+        Term.display $other-branch$
+
+    total = 0
+    FOR i in sequence(1, 5)
+        total += i
+    Term.display total
+
+    counter = 0
+    WHILST counter #< 3
+        counter += 1
+        IF counter is 2
+            skip
+        Term.display counter
+    OTHER
+        pass
+
+    cond n
+        is 42
+            Term.display $matched$
+        OTHER
+            Term.display $no match$
+
+    LineUp n {
+        42: Term.display $lineup-hit$
+        default: Term.display $lineup-miss$
+    }
+
+    FOR i in range 5
+        IF i is 2
+            continue
+        Term.display i
+
+    /* --- functions --- */
+    Term.display risky(2)
+    quickthread crunch(1)
+    fn Term.display $chained-one$ & Term.display $chained-two$
+
+    /* --- data / sequences --- */
+    Term.display length $hello$
+    Term.display iota 3
+    Term.display stream(1, 3)
+    xs = [1, 2, 3]
+    Term.display xs[1]
+
+    /* --- variables --- */
+    free g
+    free g = 7
+    Term.display g
+    bound bnd = 1
+    Term.display bnd
+    const kconst = 11
+    Term.display kconst
+    compfold cf = 2 + 3
+    Term.display cf
+    cp copied = n
+    Term.display copied
+    alias al = n
+    Term.display al
+    destroy copied
+
+    /* --- error handling --- */
+    try
+        x = risky(0)
+        Term.display x
+    catch
+        Term.display $caught a runtime error$
+    after
+        Term.display $always runs$
+
+    raise hint($just a suggestion$)
+    raise toxic($just a warning$)
+    raise MyClause($custom clause$)
+
+    /* --- misc statement-only keywords --- */
+    eval($1 + 1$)
+    lazy_eval($1 + 1$)
+    label at 60
+
+    /* --- bundle usage --- */
+    c = Critter()
+    Term.display c.hp
+    c.greet()
+<mainloop>

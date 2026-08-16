@@ -1,5 +1,5 @@
 const _ffi=require('ffi-napi'),_path=require('path');
-const _lib=_path.join(process.cwd(),'library','camera',process.platform==='win32'?'libaccamera.dll':'libaccamera.so');
+const _lib=_path.join(process.cwd(),'library','ilib','camera',process.platform==='win32'?'libaccamera.dll':'libaccamera.so');
 const _CS='string',_I='int',_V='void';
 const _c=_ffi.Library(_lib,{
 'ac_camera_init':[_I,[]],'ac_camera_capture':[_I,[_CS]],'ac_camera_capture_latest':[_I,[_CS]],

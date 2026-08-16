@@ -1,0 +1,42 @@
+AC->PY
+
+/* AC keyword catalog — EVENT/GUI-adjacent keywords: configure/event-listener/
+   establish/listener/of/on/value/input/bind/to, plus browser-facing statements
+   (print_page/alert/sure) and the program_loop identifier allowlist.
+   `input <key>` SIMULATES a key event (EVENT_TRIGGER) so this runs headless,
+   without a real window. */
+
+Make hop func()
+    Term.display $hopped$
+
+<mainloop>
+    configure event-listener
+        establish listener of keys
+            on value is space
+                Term.display $space pressed$
+            on value is enter
+                Term.display $enter pressed$
+
+    input space
+    input enter
+
+    /* bind <key> to <function> — a standalone keybinding (same EVENT_BIND
+       mechanism as configure event-listener, no surrounding block needed) */
+    bind up to hop
+    input up
+
+    /* programLoop is allow-listed as an ASSIGNMENT TARGET despite being a keyword —
+       note: unlike rule/value below, it is NOT allow-listed as a readable expression
+       (Term.display programLoop is a parse error) — a real, narrow asymmetry. */
+    programLoop = 1
+
+    /* rule/value are allow-listed as identifiers in BOTH positions (same allowlist
+       LineUp's `const value=2` relies on) */
+    rule = 2
+    Term.display rule
+
+    print_page
+    alert $hello from AC$
+    result = sure $confirm?$
+    Term.display result
+<mainloop>

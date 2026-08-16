@@ -9,7 +9,7 @@ Complete review of what AC has, what's missing, and what servers need.
 ### **Arithmetic**
 - `+` Addition
 - `-` Subtraction
-- `@` or `*` Multiplication (inside `fn...fn`)
+- `@` or `*` Multiplication
 - `/` Division
 - `//` Integer division
 - `^` Exponentiation

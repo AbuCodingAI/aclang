@@ -34,7 +34,8 @@ fn C.ac_floor(x f64) f64
 fn C.ac_ceil(x f64)  f64
 fn C.ac_round(x f64) f64
 fn C.ac_hypot(a f64, b f64) f64
-fn C.ac_log(x f64)   f64
+fn C.ac_ln(x f64) f64
+fn C.ac_log_base(b f64, x f64) f64
 fn C.ac_log2(x f64)  f64
 fn C.ac_log10(x f64) f64
 fn C.ac_mod(a f64, b f64)   f64
@@ -88,8 +89,8 @@ fn math_floor(x f64) f64      { return C.ac_floor(x) }
 fn math_ceil(x f64) f64       { return C.ac_ceil(x)  }
 fn math_round(x f64) f64      { return C.ac_round(x) }
 fn math_hypot(a f64, b f64) f64 { return C.ac_hypot(a, b) }
-fn math_ln(x f64) f64         { return C.ac_log(x)   }
-fn math_log(x f64) f64        { return C.ac_log(x)   }
+fn math_ln(x f64) f64         { return C.ac_ln(x)   }
+fn math_log(base f64, x f64) f64 { return C.ac_log_base(base, x) }
 fn math_log2(x f64) f64       { return C.ac_log2(x)  }
 fn math_log10(x f64) f64      { return C.ac_log10(x) }
 fn math_mod(a f64, b f64) f64 { return C.ac_mod(a, b) }
@@ -158,7 +159,7 @@ fn (m AcMathNS) ceil(x f64) f64   { return math_ceil(x)  }
 fn (m AcMathNS) round(x f64) f64  { return math_round(x) }
 fn (m AcMathNS) hypot(a f64, b f64) f64 { return math_hypot(a, b) }
 fn (m AcMathNS) ln(x f64) f64     { return math_ln(x)    }
-fn (m AcMathNS) log(x f64) f64    { return math_log(x)   }
+fn (m AcMathNS) log(base f64, x f64) f64 { return math_log(base, x) }
 fn (m AcMathNS) log2(x f64) f64   { return math_log2(x)  }
 fn (m AcMathNS) log10(x f64) f64  { return math_log10(x) }
 fn (m AcMathNS) mod(a f64, b f64) f64 { return math_mod(a, b) }

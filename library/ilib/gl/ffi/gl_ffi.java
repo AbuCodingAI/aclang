@@ -11,7 +11,7 @@ final class AcGl {
         String _os = System.getProperty("os.name").toLowerCase();
         String _lib = _os.contains("win") ? "acgl.dll" : "libacgl.so";
         Path _p = Path.of(System.getProperty("user.dir"))
-            .resolve("library/gl/" + _lib).toAbsolutePath();
+            .resolve("library/ilib/gl/" + _lib).toAbsolutePath();
         _SYM = SymbolLookup.libraryLookup(_p, Arena.global());
     }
     private static MethodHandle _mh(String n, FunctionDescriptor fd) {

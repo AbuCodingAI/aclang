@@ -72,6 +72,7 @@ enum class NodeType {
     FunctionCall,   // func arg1 arg2 arg3 (multiple arguments)
     KeyBinding,     // on value=key function_call
     InputStmt,      // input <keybind> → send ghost/simulated input
+    BindStmt,       // bind <key> to <function> → standalone key→callback registration (value=key, attrs[0]=function name)
     EvalExpr,       // eval(expr) → evaluate string as AC expression, returns value
     BundleDef,      // bundle X — class/struct definition (body has BundleMember nodes)
     BundleMember,   // bundle member: value=access("public"/"private"), child=actual member node
@@ -97,6 +98,7 @@ struct ASTNode {
     std::vector<std::string> attrs; // extra attributes
     TypePtr inferredType;       // type information for this node
     bool exported = false;      // marked by `export` — visible to files importing this one
+    int angleUnit = 0;          // marked by `DEG`(1)/`RAD`(2) prefix — math ilib angle-unit sugar
 
     ASTNode(NodeType t, std::string v = "")
         : type(t), value(std::move(v)), inferredType(nullptr) {}

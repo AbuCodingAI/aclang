@@ -46,6 +46,9 @@ extern "C" {
     fn ac_widgets_slider_get(h: AcW) -> c_double;
 
     fn ac_widgets_group_new(master: AcW, text: *const c_char) -> AcW;
+    fn ac_widgets_tabs_new(master: AcW) -> AcW;
+    fn ac_widgets_scroller_new(master: AcW, orient: *const c_char) -> AcW;
+    fn ac_widgets_table_new(master: AcW, columns_csv: *const c_char, height: c_int) -> AcW;
     fn ac_widgets_listbox_new(master: AcW, width: c_int, height: c_int) -> AcW;
     fn ac_widgets_listbox_item(h: AcW, index: c_int) -> *const c_char;
     fn ac_widgets_listbox_count(h: AcW) -> c_int;
@@ -55,6 +58,7 @@ extern "C" {
     fn ac_widgets_sketch_rect(h: AcW, x1: c_double, y1: c_double, x2: c_double, y2: c_double, r: u8, g: u8, b: u8);
     fn ac_widgets_sketch_circle(h: AcW, cx: c_double, cy: c_double, radius: c_double, r: u8, g: u8, b: u8);
     fn ac_widgets_sketch_text(h: AcW, x: c_double, y: c_double, text: *const c_char, r: u8, g: u8, b: u8);
+    fn ac_widgets_tabs_add_tab(h: AcW, name: *const c_char) -> AcW;
 }
 
 fn _cs(s: &str) -> CString { CString::new(s).unwrap_or_default() }
@@ -74,10 +78,16 @@ pub trait AcWidgetExt {
     fn destroy(self);
     fn add(self, item: &str);
     fn set(self, v: i64);
+    fn set_str(self, v: &str);
     fn set_val(self, v: f64);
     fn get(self) -> String;
     fn get_val(self) -> f64;
     fn clear(self);
+    fn add_tab(self, name: &str) -> i64;
+    fn line(self, x1: i64, y1: i64, x2: i64, y2: i64, r: i64, g: i64, b: i64);
+    fn rect(self, x1: i64, y1: i64, x2: i64, y2: i64, r: i64, g: i64, b: i64);
+    fn circle(self, cx: i64, cy: i64, radius: i64, r: i64, g: i64, b: i64);
+    fn text_at(self, x: i64, y: i64, text: &str, r: i64, g: i64, b: i64);
 }
 
 impl AcWidgetExt for i64 {
@@ -88,10 +98,28 @@ impl AcWidgetExt for i64 {
     fn destroy(self)            { unsafe { ac_widgets_screen_destroy(self as AcW) } }
     fn add(self, item: &str)    { let c = _cs(item); unsafe { ac_widgets_add(self as AcW, c.as_ptr()) } }
     fn set(self, v: i64)        { unsafe { ac_widgets_set_d(self as AcW, v as c_double) } }
+    fn set_str(self, v: &str)   { let c = _cs(v); unsafe { ac_widgets_display_set(self as AcW, c.as_ptr()) } }
     fn set_val(self, v: f64)    { unsafe { ac_widgets_set_d(self as AcW, v as c_double) } }
     fn get(self) -> String      { unsafe { _gs(ac_widgets_display_get(self as AcW)) } }
     fn get_val(self) -> f64     { unsafe { ac_widgets_advance_get(self as AcW) } }
     fn clear(self)              { unsafe { ac_widgets_sketch_clear(self as AcW) } }
+    fn add_tab(self, name: &str) -> i64 {
+        let c = _cs(name);
+        unsafe { ac_widgets_tabs_add_tab(self as AcW, c.as_ptr()) as i64 }
+    }
+    fn line(self, x1: i64, y1: i64, x2: i64, y2: i64, r: i64, g: i64, b: i64) {
+        unsafe { ac_widgets_sketch_line(self as AcW, x1 as c_double, y1 as c_double, x2 as c_double, y2 as c_double, r as u8, g as u8, b as u8) }
+    }
+    fn rect(self, x1: i64, y1: i64, x2: i64, y2: i64, r: i64, g: i64, b: i64) {
+        unsafe { ac_widgets_sketch_rect(self as AcW, x1 as c_double, y1 as c_double, x2 as c_double, y2 as c_double, r as u8, g as u8, b as u8) }
+    }
+    fn circle(self, cx: i64, cy: i64, radius: i64, r: i64, g: i64, b: i64) {
+        unsafe { ac_widgets_sketch_circle(self as AcW, cx as c_double, cy as c_double, radius as c_double, r as u8, g as u8, b as u8) }
+    }
+    fn text_at(self, x: i64, y: i64, text: &str, r: i64, g: i64, b: i64) {
+        let c = _cs(text);
+        unsafe { ac_widgets_sketch_text(self as AcW, x as c_double, y as c_double, c.as_ptr(), r as u8, g as u8, b as u8) }
+    }
 }
 
 // ── Callback wrapper: AC fn(i64)->i64 → extern "C" fn(*mut c_void) ────────────
@@ -177,11 +205,20 @@ pub fn group(master: i64, text: &str) -> i64 {
     unsafe { ac_widgets_pack(h as AcW) }; h
 }
 
-pub fn tabs(master: i64) -> i64   { group(master, "") }
-pub fn scroller(master: i64) -> i64 { group(master, "") }
+pub fn tabs(master: i64) -> i64 {
+    let h = unsafe { ac_widgets_tabs_new(master as AcW) as i64 };
+    unsafe { ac_widgets_pack(h as AcW) }; h
+}
 
-pub fn table(master: i64) -> i64 {
-    let h = unsafe { ac_widgets_listbox_new(master as AcW, 40, 10) as i64 };
+pub fn scroller(master: i64, orient: &str) -> i64 {
+    let co = _cs(orient);
+    let h = unsafe { ac_widgets_scroller_new(master as AcW, co.as_ptr()) as i64 };
+    unsafe { ac_widgets_pack(h as AcW) }; h
+}
+
+pub fn table(master: i64, columns_csv: &str, height: i64) -> i64 {
+    let cc = _cs(columns_csv);
+    let h = unsafe { ac_widgets_table_new(master as AcW, cc.as_ptr(), height as c_int) as i64 };
     unsafe { ac_widgets_pack(h as AcW) }; h
 }
 

@@ -26,6 +26,34 @@ void        ac_maudio_free(int handle);
 /* White noise */
 void        ac_maudio_static_noise(int duration_ms);
 
+/* Simplified speak/listen/availability — used by examples/audio_test.ac, jarvis.ac */
+int         ac_maudio_tts_ok(void);
+void        ac_maudio_speak(const char* text);
+const char* ac_maudio_listen(int timeout_ms);
+void        ac_maudio_stop_all(void);   /* no-arg cleanup — see injectAutoShutoff's `maudio.stop()` */
+
 #ifdef __cplusplus
 }
+#endif
+
+/* ── Call-form shims ─────────────────────────────────────────────────────────
+   AC's own correct calling convention for this ilib is the DOTTED form —
+   `maudio.speak(...)`, `maudio.listen(...)`, `maudio.tts_ok()`, and the compiler's own
+   auto-injected cleanup call `maudio.stop()` (see ir.cpp's injectAutoShutoff, fired whenever
+   `use ilib machine-audio` is imported) — matching every other native ilib implementation
+   (see machine-audio.py's own `class maudio` staticmethod wrapper). C++ needs an actual
+   object for that dot syntax to resolve against; C-only code (no dotCallSyntax) instead gets
+   the underscore form via #define, same as string-cheese_c.h's own such block. */
+#define maudio_speak    ac_maudio_speak
+#define maudio_listen   ac_maudio_listen
+#define maudio_tts_ok   ac_maudio_tts_ok
+#define maudio_stop     ac_maudio_stop_all
+#ifdef __cplusplus
+struct _ac_maudio_ns {
+    void        (*speak)(const char*)  = ac_maudio_speak;
+    const char* (*listen)(int)         = ac_maudio_listen;
+    int         (*tts_ok)(void)        = ac_maudio_tts_ok;
+    void        (*stop)(void)          = ac_maudio_stop_all;
+};
+static _ac_maudio_ns maudio;
 #endif

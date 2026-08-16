@@ -31,8 +31,9 @@ def has_tool(*names):
     return all(shutil.which(n) for n in names)
 
 
-def run(cmd, cwd=None, input_text=None):
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+def run(cmd, cwd=None, input_text=None, timeout=30):
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd,
+                       input=input_text, timeout=timeout)
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -40,7 +41,7 @@ def compile_ac(src_text, backend, tmpdir):
     src = os.path.join(tmpdir, "prog.ac")
     with open(src, "w") as f:
         f.write(f"AC->{backend}\n{src_text}")
-    rc, out, err = run([COMPILER, src, "--force"], cwd=tmpdir)
+    rc, out, err = run([COMPILER, src, "--force", "--no-cache", "--no-run"], cwd=tmpdir)
     return rc, out, err, tmpdir
 
 
@@ -111,34 +112,19 @@ def make_backends(tmpdir):
         return run(["node", prog_base + ".js"])
 
     def run_java():
-        rc, out, err = run(["javac", prog_base + ".java"], cwd=tmpdir)
-        if rc != 0:
-            return rc, out, err
         return run(["java", "-cp", tmpdir, "prog"])
 
     def run_go():
         return run(["go", "run", prog_base + ".go"])
 
     def run_rs():
-        bin_path = prog_base + "_rs"
-        rc, out, err = run(["rustc", prog_base + ".rs", "-o", bin_path])
-        if rc != 0:
-            return rc, out, err
-        return run([bin_path])
+        return run([prog_base])
 
     def run_c():
-        bin_path = prog_base + "_c"
-        rc, out, err = run(["gcc", prog_base + ".c", "-o", bin_path])
-        if rc != 0:
-            return rc, out, err
-        return run([bin_path])
+        return run([prog_base])
 
     def run_cpp():
-        bin_path = prog_base + "_cpp"
-        rc, out, err = run(["g++", prog_base + ".cpp", "-o", bin_path])
-        if rc != 0:
-            return rc, out, err
-        return run([bin_path])
+        return run([prog_base])
 
     backends = [
         ("PY",   ".py",   has_tool("python3"),       run_py),
@@ -176,8 +162,9 @@ def run_tests():
 
                 # Compile
                 rc, _, err, td = compile_ac(body, backend, tmpdir)
-                if rc != 0 and "error" in err.lower():
-                    print(f"  {FAIL}  {label}: compile error: {err[:120]}")
+                if rc != 0:
+                    detail = err or _
+                    print(f"  {FAIL}  {label}: compile error: {detail[:120]}")
                     failed += 1
                     continue
 

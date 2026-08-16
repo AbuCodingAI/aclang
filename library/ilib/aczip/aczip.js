@@ -244,19 +244,19 @@ class ACGzip {
 class ACXz {
     /**
      * Compress with XZ (using Node.js xz module)
+     *
+     * Uses execFileSync with an argv array (no shell), so `preset` and the
+     * data never pass through /bin/sh -c — a raw execSync template string
+     * would let a crafted path/arg inject arbitrary shell commands.
      */
     static compress(data, preset = 6) {
         return new Promise((resolve, reject) => {
-            const { execSync } = require('child_process');
-            const tmpIn = `/tmp/ac_xz_${Date.now()}_in`;
-            const tmpOut = `/tmp/ac_xz_${Date.now()}_out`;
-
+            const { execFileSync } = require('child_process');
             try {
-                fs.writeFileSync(tmpIn, data);
-                execSync(`xz -${preset} -c "${tmpIn}" > "${tmpOut}"`);
-                const compressed = fs.readFileSync(tmpOut);
-                fs.unlinkSync(tmpIn);
-                fs.unlinkSync(tmpOut);
+                const compressed = execFileSync('xz', [`-${preset}`, '-c'], {
+                    input: data,
+                    maxBuffer: 1024 * 1024 * 1024
+                });
                 resolve(compressed);
             } catch (err) {
                 reject(new Error(`XZ compression failed: ${err.message}`));
@@ -269,16 +269,12 @@ class ACXz {
      */
     static decompress(data) {
         return new Promise((resolve, reject) => {
-            const { execSync } = require('child_process');
-            const tmpIn = `/tmp/ac_xz_${Date.now()}_in`;
-            const tmpOut = `/tmp/ac_xz_${Date.now()}_out`;
-
+            const { execFileSync } = require('child_process');
             try {
-                fs.writeFileSync(tmpIn, data);
-                execSync(`xz -d -c "${tmpIn}" > "${tmpOut}"`);
-                const decompressed = fs.readFileSync(tmpOut);
-                fs.unlinkSync(tmpIn);
-                fs.unlinkSync(tmpOut);
+                const decompressed = execFileSync('xz', ['-d', '-c'], {
+                    input: data,
+                    maxBuffer: 1024 * 1024 * 1024
+                });
                 resolve(decompressed);
             } catch (err) {
                 reject(new Error(`XZ decompression failed: ${err.message}`));
@@ -291,9 +287,14 @@ class ACXz {
      */
     static compressFile(inputPath, outputPath, preset = 6) {
         return new Promise((resolve, reject) => {
-            const { execSync } = require('child_process');
+            const { execFileSync } = require('child_process');
             try {
-                execSync(`xz -${preset} -c "${inputPath}" > "${outputPath}"`);
+                const data = fs.readFileSync(inputPath);
+                const compressed = execFileSync('xz', [`-${preset}`, '-c'], {
+                    input: data,
+                    maxBuffer: 1024 * 1024 * 1024
+                });
+                fs.writeFileSync(outputPath, compressed);
                 resolve();
             } catch (err) {
                 reject(new Error(`XZ file compression failed: ${err.message}`));
@@ -306,9 +307,14 @@ class ACXz {
      */
     static decompressFile(inputPath, outputPath) {
         return new Promise((resolve, reject) => {
-            const { execSync } = require('child_process');
+            const { execFileSync } = require('child_process');
             try {
-                execSync(`xz -d -c "${inputPath}" > "${outputPath}"`);
+                const data = fs.readFileSync(inputPath);
+                const decompressed = execFileSync('xz', ['-d', '-c'], {
+                    input: data,
+                    maxBuffer: 1024 * 1024 * 1024
+                });
+                fs.writeFileSync(outputPath, decompressed);
                 resolve();
             } catch (err) {
                 reject(new Error(`XZ file decompression failed: ${err.message}`));
@@ -355,13 +361,18 @@ class ACZstd {
     }
 
     /**
-     * Compress file with zstd
+     * Compress file with zstd (execFileSync + argv array — no shell).
      */
     static compressFile(inputPath, outputPath, level = 3) {
         return new Promise((resolve, reject) => {
-            const { execSync } = require('child_process');
+            const { execFileSync } = require('child_process');
             try {
-                execSync(`zstd -${level} -c "${inputPath}" > "${outputPath}"`);
+                const data = fs.readFileSync(inputPath);
+                const compressed = execFileSync('zstd', [`-${level}`, '-c'], {
+                    input: data,
+                    maxBuffer: 1024 * 1024 * 1024
+                });
+                fs.writeFileSync(outputPath, compressed);
                 resolve();
             } catch (err) {
                 reject(new Error(`Zstd file compression failed: ${err.message}`));
@@ -374,9 +385,14 @@ class ACZstd {
      */
     static decompressFile(inputPath, outputPath) {
         return new Promise((resolve, reject) => {
-            const { execSync } = require('child_process');
+            const { execFileSync } = require('child_process');
             try {
-                execSync(`zstd -d -c "${inputPath}" > "${outputPath}"`);
+                const data = fs.readFileSync(inputPath);
+                const decompressed = execFileSync('zstd', ['-d', '-c'], {
+                    input: data,
+                    maxBuffer: 1024 * 1024 * 1024
+                });
+                fs.writeFileSync(outputPath, decompressed);
                 resolve();
             } catch (err) {
                 reject(new Error(`Zstd file decompression failed: ${err.message}`));

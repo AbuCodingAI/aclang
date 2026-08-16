@@ -83,31 +83,32 @@ void ac_gradient(const double* arr, int len, double* out) {
 
 // ── Statistics (pointer + length C API) ────────────────────────────────────
 
-double ac_stat_avg(const double* arr, int len) {
-    return ac_math::statistics::avg(std::vector<double>(arr, arr + len));
-}
-double ac_stat_median(const double* arr, int len) {
-    return ac_math::statistics::median(std::vector<double>(arr, arr + len));
-}
-double ac_stat_q1(const double* arr, int len) {
-    return ac_math::statistics::q1(std::vector<double>(arr, arr + len));
-}
-double ac_stat_q3(const double* arr, int len) {
-    return ac_math::statistics::q3(std::vector<double>(arr, arr + len));
-}
-double ac_stat_mode(const double* arr, int len) {
-    return ac_math::statistics::mode(std::vector<double>(arr, arr + len));
-}
-double ac_stat_min(const double* arr, int len) {
-    return ac_math::statistics::min_val(std::vector<double>(arr, arr + len));
-}
-double ac_stat_max(const double* arr, int len) {
-    return ac_math::statistics::max_val(std::vector<double>(arr, arr + len));
-}
+// The statistics:: helpers THROW on empty/too-small input. An exception unwinding
+// through this extern-C boundary into a non-C++ caller (Go/V/ASM/C) is UB / std::terminate,
+// so every wrapper guards empty input and swallows exceptions, returning 0.0.
+#define AC_STAT_WRAP(name, fn) \
+    double name(const double* arr, int len) { \
+        if (!arr || len <= 0) return 0.0; \
+        try { return ac_math::statistics::fn(std::vector<double>(arr, arr + len)); } \
+        catch (...) { return 0.0; } \
+    }
+AC_STAT_WRAP(ac_stat_avg,    avg)
+AC_STAT_WRAP(ac_stat_median, median)
+AC_STAT_WRAP(ac_stat_q1,     q1)
+AC_STAT_WRAP(ac_stat_q3,     q3)
+AC_STAT_WRAP(ac_stat_mode,   mode)
+AC_STAT_WRAP(ac_stat_min,    min_val)
+AC_STAT_WRAP(ac_stat_max,    max_val)
+#undef AC_STAT_WRAP
 // boxnum: writes 5 results into out [min,q1,median,q3,max]
 void ac_stat_boxnum(const double* arr, int len, double* out) {
-    auto v = ac_math::statistics::boxnum(std::vector<double>(arr, arr + len));
-    for (int i = 0; i < 5; i++) out[i] = v[i];
+    if (!out) return;
+    for (int i = 0; i < 5; i++) out[i] = 0.0;
+    if (!arr || len <= 0) return;
+    try {
+        auto v = ac_math::statistics::boxnum(std::vector<double>(arr, arr + len));
+        for (int i = 0; i < 5 && i < (int)v.size(); i++) out[i] = v[i];
+    } catch (...) { /* leave zero-filled */ }
 }
 
 // ── Expression evaluator ───────────────────────────────────────────────────

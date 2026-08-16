@@ -9,6 +9,7 @@
 #include <windows.h>
 #else
 #include <sys/types.h>
+#include <sys/wait.h>
 #endif
 
 // Only allow http(s) URLs built from safe characters: blocks shell-metacharacter
@@ -27,18 +28,25 @@ static bool web_safe_url(const char* url) {
 }
 
 static void open_url(const char* url) {
+    if (!url) return;
 #ifdef _WIN32
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "start %s", url);
-    system(cmd);
-#elif __APPLE__
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "open %s", url);
-    system(cmd);
+    // ShellExecute passes the URL as a single parameter — no shell command line to inject into.
+    ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
 #else
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "xdg-open '%s'", url);
-    system(cmd);
+  #ifdef __APPLE__
+    const char* opener = "open";
+  #else
+    const char* opener = "xdg-open";
+  #endif
+    // Spawn via execvp with the URL as a distinct argv element — NO shell, so a URL
+    // containing '$(...)', backticks, ';', quotes etc. is just a URL, never a command.
+    pid_t pid = fork();
+    if (pid == 0) {
+        char* av[] = { (char*)opener, (char*)url, nullptr };
+        execvp(opener, av);
+        _exit(127);
+    }
+    if (pid > 0) { int st; waitpid(pid, &st, 0); }
 #endif
 }
 
@@ -71,6 +79,7 @@ void ac_web_browser() {
 }
 
 int ac_web_pdf(const char* pdf) {
+    if (!pdf) return 0;
     if (strlen(pdf) > 4 && strcmp(pdf + strlen(pdf) - 4, ".pdf") == 0) {
         ac_web_file_open(pdf);
         return 1;
@@ -79,6 +88,7 @@ int ac_web_pdf(const char* pdf) {
 }
 
 int ac_web_text(const char* text) {
+    if (!text) return 0;
     const char* valid_exts[] = {".txt", ".md", ".bashrc", ".zshrc"};
     size_t text_len = strlen(text);
     for (int i = 0; i < 4; i++) {
@@ -92,6 +102,7 @@ int ac_web_text(const char* text) {
 }
 
 int ac_web_inspect(const char* program) {
+    if (!program) return 0;
     const char* valid_exts[] = {".py", ".java", ".js", ".c", ".cpp", ".v", ".ac", ".s", ".go", ".rs", ".sh", ".html", ".sql"};
     size_t prog_len = strlen(program);
     for (int i = 0; i < 13; i++) {

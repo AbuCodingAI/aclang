@@ -8,7 +8,8 @@ import (
 )
 
 func _maudio_which(cmd string) bool {
-	return exec.LookPath(cmd) == nil || func() bool { _, err := exec.LookPath(cmd); return err == nil }()
+	_, err := exec.LookPath(cmd)
+	return err == nil
 }
 
 func maudio_say(text string) bool { return maudio_say_rate(text, 175) }
@@ -51,3 +52,18 @@ func maudio_play(path string) {
 		go exec.Command("paplay", path).Run()
 	}
 }
+
+// tts_ok() — is a real TTS engine available?
+func maudio_tts_ok() bool {
+	return _maudio_which("espeak-ng") || _maudio_which("say") || _maudio_which("espeak")
+}
+
+// AC's actual calling convention for this ilib is the DOTTED form (`maudio.speak(...)`,
+// matching machine-audio.py's own `class maudio` staticmethod wrapper and every other native
+// ilib implementation) — including the compiler's auto-injected `maudio.stop()` shutdown call.
+var maudio = struct {
+	speak  func(string) bool
+	listen func(int64) string
+	tts_ok func() bool
+	stop   func()
+}{maudio_say, maudio_listen, maudio_tts_ok, maudio_stop}

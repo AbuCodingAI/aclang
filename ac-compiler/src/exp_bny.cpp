@@ -63,12 +63,16 @@ using PhysReg = R;
 // ─── x86-64 Code Emitter ─────────────────────────────────────────────────────
 class X64Emitter {
     std::vector<uint8_t> buf;
-    std::map<std::string, size_t>           labelDefs;   // label → offset
-    std::map<size_t, std::string>           rel32Fixups; // offset → label
-    std::map<size_t, int>                   strAddrFixups; // offset → string pool id
-    std::map<size_t, int>                   gvarAddrFixups; // offset → global var slot id (NA→free)
+    // These are pure key→value stores whose consumers patch DISJOINT byte ranges of `buf`, so the
+    // emitted bytes are identical regardless of iteration order → unordered_map (O(1) vs O(log n)
+    // over hundreds of emit sites). (NOTE: the live-interval map in the reg allocator is left as
+    // std::map on purpose — its ordered iteration breaks sort ties deterministically.)
+    std::unordered_map<std::string, size_t> labelDefs;   // label → offset
+    std::unordered_map<size_t, std::string> rel32Fixups; // offset → label
+    std::unordered_map<size_t, int>         strAddrFixups; // offset → string pool id
+    std::unordered_map<size_t, int>         gvarAddrFixups; // offset → global var slot id (NA→free)
     // PLT→GOT fixups: buf_offset → sym_idx (>=0) or -1 (got[1]) or -2 (got[2])
-    std::map<size_t, int>                   gotPltFixups_;
+    std::unordered_map<size_t, int>         gotPltFixups_;
 
     void rex(bool W, int R_, int B) {
         uint8_t b = 0x40;
@@ -99,6 +103,12 @@ public:
 
     // ── Labels & fixups ──────────────────────────────────────────────────────
     void label(const std::string& name) { labelDefs[name] = pos(); }
+
+    // --static-link splicing: append a freestanding ilib's raw .text, and bind an ilib call label
+    // directly to the spliced code (no PLT/GOT, no DT_NEEDED). The object is verified to have zero
+    // undefined external symbols, so its .text is position-independent-enough to run as-is inline.
+    void appendSplicedText(const std::vector<uint8_t>& t) { buf.insert(buf.end(), t.begin(), t.end()); }
+    void defineLabelAt(const std::string& name, size_t off) { labelDefs[name] = off; }
 
     // Apply all relative fixups (must call before extracting bytes)
     void applyFixups() {
@@ -179,6 +189,18 @@ public:
         else if (rm == 4) { modrm(0,(int)s,4); emit(0x24); }
         else { modrm(0,(int)s,rm); }
     }
+    // xchg [ptr], r64 — atomically swaps [ptr] and r (XCHG with a memory operand carries an
+    // IMPLICIT LOCK on x86 — no explicit `lock` prefix needed; Intel SDM Vol.2, XCHG). This is
+    // the real primitive `atomic` uses on BNY: a spinlock's try-acquire (xchg-with-1, retry
+    // while the old value read back is nonzero) needs no libc, no syscall, no external process —
+    // fits BNY's zero-dependency, "own the CPU" design exactly.
+    void xchg_ptr_r(R ptr, R s) {
+        rex(true,(int)s,(int)ptr); emit(0x87);
+        int rm = (int)ptr & 7;
+        if (rm == 5) { modrm(1,(int)s,5); emit(0); }
+        else if (rm == 4) { modrm(0,(int)s,4); emit(0x24); }
+        else { modrm(0,(int)s,rm); }
+    }
     // mov r64, [rbp+disp]
     void mov_r_rbp(R d, int32_t disp) {
         rex(true,(int)d,5);
@@ -249,12 +271,23 @@ public:
     void not_r(R r) { rex(true,0,(int)r); emit(0xF7); modrm(3,2,(int)r); }
     void xor_rr(R d, R s) { rex(true,(int)s,(int)d); emit(0x31); modrm(3,(int)s,(int)d); }
     void and_rr(R d, R s) { rex(true,(int)s,(int)d); emit(0x21); modrm(3,(int)s,(int)d); }
+    // and rsp, -16 — force 16-byte stack alignment regardless of incoming parity.
+    // Used once at a Windows process-exit call site (see emitHalt): unlike a normal
+    // call site where the compiler tracks parity through the frame's push/sub count,
+    // the exact rsp parity at an arbitrary emitHalt() call site isn't tracked, and
+    // since control never returns here, clobbering the exact rsp value is free.
+    void and_rsp_align16() { emit(0x48); emit(0x83); emit(0xE4); emit(0xF0); }
     void or_rr(R d, R s)  { rex(true,(int)s,(int)d); emit(0x09); modrm(3,(int)s,(int)d); }
     // cqo: sign-extend rax into rdx:rax
     void cqo() { emit(0x48); emit(0x99); }
     // idiv rcx: signed divide rdx:rax by rcx → rax=quotient, rdx=remainder
     void idiv_rcx() { emit(0x48); emit(0xF7); emit(0xF9); }
     void call_r(R r) { if ((int)r >= 8) emit(0x41); emit(0xFF); modrm(3, 2, (int)r); } // call reg
+    // jmp reg (FF /4) — unlike call_r, does NOT push a return address. Needed for a real
+    // longjmp-style non-local jump: by the time this fires, RSP has already been restored to
+    // the try's own frame, so a `call` here would push onto (and corrupt) that frame's own
+    // locals instead of transferring control cleanly.
+    void jmp_r(R r) { if ((int)r >= 8) emit(0x41); emit(0xFF); modrm(3, 4, (int)r); }
     void shl_rax_cl() { emit(0x48); emit(0xD3); emit(0xE0); }  // shl rax, cl
     void sar_rax_cl() { emit(0x48); emit(0xD3); emit(0xF8); }  // sar rax, cl (arithmetic)
     void rdtsc() { emit(0x0F); emit(0x31); }                   // rdtsc → edx:eax
@@ -464,12 +497,15 @@ static ABI sysv_abi() {
 static ABI win64_abi() {
     return { {R::RCX,R::RDX,R::R8,R::R9}, false, 32 };
 }
+
+// Real cross-compile target selector, set once at the top of BinaryCompiler::compile()
+// from a CLI flag. NOT the same thing as the old `TARGET_WINDOWS`/`_WIN32` macros
+// above, which detect the HOST the `ac` binary itself runs on — useless for producing
+// a Windows .exe from a Linux-hosted compiler, which is the actual use case here.
+static bool g_bnyTargetWindows = false;
+
 static ABI host_abi() {
-#ifdef TARGET_WINDOWS
-    return win64_abi();
-#else
-    return sysv_abi();
-#endif
+    return g_bnyTargetWindows ? win64_abi() : sysv_abi();
 }
 
 // ─── String Pool ─────────────────────────────────────────────────────────────
@@ -503,8 +539,10 @@ public:
 // ─── Function Frame ───────────────────────────────────────────────────────────
 // Maps temp IDs and symbol IDs to rbp-relative offsets
 class FuncFrame {
-    std::map<int,int32_t> tempOff;  // temp_id → rbp offset (negative)
-    std::map<int,int32_t> varOff;   // symbol_id → rbp offset (negative)
+    // Offsets are assigned by the linear scan in scanInstrs (nextSlot++), not by map order; these
+    // maps only store/retrieve the already-computed offset → unordered_map is byte-identical + O(1).
+    std::unordered_map<int,int32_t> tempOff;  // temp_id → rbp offset (negative)
+    std::unordered_map<int,int32_t> varOff;   // symbol_id → rbp offset (negative)
     int nextSlot = 0;   // slot counter (each = 8 bytes)
     int baseSlot = 0;   // first slot available for temps/vars (slots 0..base-1 are
                         // reserved for callee-save pushes which live at rbp-8..rbp-8*base)
@@ -725,16 +763,19 @@ static bool returnsCString(const std::string& irName) {
         "os.cwd", "os.env", "os.bash", "os.sbash", "os.read_from",
         "regex.search", "regex.replace", "regex.escape",
         "stringm.upper", "stringm.lower", "stringm.strip", "stringm.trim",
-        "stringm.replace", "stringm.b", "stringm.format", "stringm.getline",
+        "stringm.replace", "stringm.b", "stringm.f", "stringm.t", "stringm.format", "stringm.getline",
         "web.page_get", "web.help",
+        "server.db_run", "server.db_run_p", "server.db_import",
+        "server.db_reset", "server.help",
+        "server.req_method", "server.req_path", "server.req_query",
+        "server.req_body", "server.req_header",
+        "maudio.listen",
     };
     return cstr.count(irName) > 0;
 }
 
 static bool isFloatReturningCall(const std::string& irName) {
-    if (irName == "ml.take" || irName == "ml_take") return true;
-    if (irName.rfind("math.", 0) != 0) return false;
-    return !isIntReturningMathCall(irName);
+    return acCallReturnsFloat(irName);   // single authority in type.hpp (see acCallReturnsFloat)
 }
 
 static bool callArgTakesDouble(const std::string& irName, int argIndex) {
@@ -749,6 +790,37 @@ static bool callArgTakesDouble(const std::string& irName, int argIndex) {
     return false;
 }
 
+// Shared with BinaryCompiler::collectExternalSymbols() (a separate class further down this
+// file, needs the same widget-kind classification to register the REAL `ac_widgets_*` PLT
+// symbols — see widgetVarKind_'s comment in FuncCompiler for the full story). Free functions
+// so both classes can see them regardless of declaration order.
+static bool bnyIsWidgetCtorName(const std::string& func) {
+    static const std::set<std::string> ctors = {
+        "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
+        "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch", "textbox"
+    };
+    return ctors.count(func) > 0;
+}
+static std::string bnyWidgetPackFn(const std::string& kind) {
+    if (kind == "Screen") return "";
+    if (kind == "radbtn") return "ac_widgets_ckbtn_pack";
+    return "ac_widgets_" + kind + "_pack";
+}
+static std::string bnyWidgetGetFn(const std::string& kind) {
+    if (kind == "radbtn") return "ac_widgets_ckbtn_get";
+    return "ac_widgets_" + kind + "_get";
+}
+static std::string bnyWidgetSetFn(const std::string& kind) {
+    if (kind == "radbtn") return "ac_widgets_ckbtn_set";
+    return "ac_widgets_" + kind + "_set";
+}
+static std::string bnyWidgetNewFn(const std::string& func) {
+    if (!bnyIsWidgetCtorName(func)) return "";
+    if (func == "Screen") return "ac_widgets_screen_new";
+    if (func == "ckbtn" || func == "radbtn") return "ac_widgets_ckbtn_new";
+    return "ac_widgets_" + func + "_new";
+}
+
 // One logic base, driven by any emitter that speaks the X64Emitter instruction API.
 // Instantiated as FuncCompiler<X64Emitter> for BNY (machine-code bytes); a future
 // FuncCompiler<NasmEmitter> emits the same logic as NASM text. Duck-typed on `Em`:
@@ -761,9 +833,64 @@ public:
     std::set<std::string>*  stringFuncs_ = nullptr; // user fns returning char* (shared)
     std::set<std::string>*  arrayFuncs_ = nullptr;  // user fns returning list blocks (shared)
     std::set<std::string>   forcedStringParams_;
+    std::set<std::string>   forcedFloatParams_;   // params a caller passes a float to (→ load as double)
     // NA→free: free-var names that live in shared global slots, and the name→slot map (shared).
     std::set<std::string>*       promotedGlobals_ = nullptr;
     std::map<std::string,int>*   gvarSlots_       = nullptr;
+    bool                         usesSave_        = false; // program uses `save as` (set by orchestrator)
+    bool                         usesTry_         = false; // program uses try/catch (set by orchestrator)
+    // Bundle/class — shared (pointer, like gvarSlots_/promotedGlobals_) since instanceClass_ is
+    // mutated live as CONSTRUCT calls are compiled, visible across whichever FuncCompiler
+    // instance (global-section or a specific function) processes a given statement.
+    std::map<std::string, std::vector<std::string>>* classFields_ = nullptr;
+    std::map<std::string, std::string>* instanceClass_ = nullptr;
+    std::map<std::string, std::set<std::string>>* classStringFields_ = nullptr;
+    // widgets ilib var-kind map — pointer (like classFields_/instanceClass_ above) so a
+    // WHOLE-PROGRAM prescan (a widget var built in one function, e.g. `<mainloop>`, is routinely
+    // used from another — an on_click callback declared earlier in source, scanned first)
+    // populates one shared map BEFORE any FuncCompiler starts codegen, instead of each
+    // function's own fresh FuncCompiler instance only ever seeing ctors from its OWN body
+    // (verified: applicant_form.ac's `pos_drop.get()`, called from a callback declared before
+    // `<mainloop>`'s `pos_drop = dropdown(...)` runs, needs `pos_drop`'s kind known from
+    // function-scan #1 while its ctor is only ever seen in function-scan #2). See
+    // isWidgetCtorName's comment below for the "undefined label 'display'" bug this whole
+    // module (bnyWidgetCtor/bnyWidgetMethod + collectExternalSymbols' matching prescan) fixes.
+    std::map<std::string, std::string>* widgetVarKind_ = nullptr;
+    std::string currentClass_;   // set in compileFn from fn.classOwner; empty outside a method
+    int fieldOffset(const std::string &cls, const std::string &field) const {
+        if (!classFields_) return -1;
+        auto it = classFields_->find(cls);
+        if (it == classFields_->end()) return -1;
+        for (size_t i = 0; i < it->second.size(); i++)
+            if (it->second[i] == field) return (int)(8 * i);
+        return -1;
+    }
+    bool resolveFieldAccess(const std::string &name, std::string &base, int &offset) const {
+        auto dot = name.find('.');
+        if (dot == std::string::npos) return false;
+        base = name.substr(0, dot);
+        std::string field = name.substr(dot + 1);
+        std::string cls = (base == "self") ? currentClass_
+                         : (instanceClass_ && instanceClass_->count(base) ? instanceClass_->at(base) : std::string());
+        if (cls.empty()) return false;
+        offset = fieldOffset(cls, field);
+        return offset >= 0;
+    }
+    // Synthetic symbol ID for a method's `self` parameter — see compileFn's comment on why "self"
+    // can never be found via the normal name-matching scan (it's never a bare VAR in the IR,
+    // only ever fused into compound names like "self.hp"). Must be a value no real symbol ID or
+    // TEMP id will ever collide with; both are non-negative small integers in this compiler.
+    static constexpr int kSelfSymId_ = -777001;
+    // Loads a plain (non-field) variable NAME's value into `scratch` — used to get the object
+    // pointer a field access needs to add its offset to.
+    void loadNamedVar(const std::string &name, R scratch) {
+        if (name == "self") { em.mov_r_rbp(scratch, frame.varOffset(kSelfSymId_)); return; }
+        int gs = gvarSlotOf(name);
+        if (gs >= 0) { em.mov_ri64_gvar(scratch, gs); em.mov_r_ptr(scratch, scratch); return; }
+        auto it = localVarIds_.find(name);
+        if (it != localVarIds_.end()) { em.mov_r_rbp(scratch, frame.varOffset(it->second)); return; }
+        em.mov_ri32(scratch, 0);   // shouldn't happen — name wasn't a known var
+    }
 private:
     // var name → symbol id within the function currently being compiled (for `arr.append`,
     // whose receiver array is encoded in the LIB_CALL method name, not as an operand).
@@ -802,13 +929,342 @@ private:
     std::set<int>           arrayTempIds_;   // temp IDs holding list blocks
     std::set<std::string>   dictVarNames_;   // var names holding dict blocks ([n][k0][v0]…)
     std::set<int>           dictTempIds_;    // temp IDs holding dict blocks
+    std::set<std::string>   listOfDictVarNames_; // list vars whose elements are dict-block pointers
+    std::set<int>           listOfDictTempIds_;
+    // Per-dict-var (and per-dict-TEMP) set of keys whose LITERAL value is a `$..$` string —
+    // a dict is naturally heterogeneous at runtime (every value slot is just an int64), but a
+    // LOAD_INDEX with a compile-time-constant string key ("name") needs to know statically
+    // whether to print/consume the result as a string or an int64. Populated by a content-string
+    // prescan over every ALLOC "dict" site (below) before codegen runs, same fixpoint-adjacent
+    // spirit as the dict/list-of-dict var-kind propagation.
+    std::map<std::string, std::set<std::string>> dictStrKeysByVar_;
+    std::map<int, std::set<std::string>>         dictStrKeysByTemp_;
+    std::set<std::string> dictStrKeysFor(const AC_IR::IRRef& r) const {
+        if (r.kind == AC_IR::IRRef::Kind::TEMP) {
+            auto it = dictStrKeysByTemp_.find(r.id);
+            if (it != dictStrKeysByTemp_.end()) return it->second;
+        } else if (r.kind == AC_IR::IRRef::Kind::VAR) {
+            auto it = dictStrKeysByVar_.find(varName(r));
+            if (it != dictStrKeysByVar_.end()) return it->second;
+        }
+        return {};
+    }
+    void mergeDictStrKeys(const AC_IR::IRRef& dst, const std::set<std::string>& keys) {
+        if (keys.empty()) return;
+        if (dst.kind == AC_IR::IRRef::Kind::TEMP)
+            dictStrKeysByTemp_[dst.id].insert(keys.begin(), keys.end());
+        else if (dst.kind == AC_IR::IRRef::Kind::VAR) {
+            std::string vn = varName(dst);
+            if (!vn.empty()) dictStrKeysByVar_[vn].insert(keys.begin(), keys.end());
+        }
+    }
+    // Returns true if merging `keys` into dst actually grew its recorded set (fixpoint signal).
+    bool mergeDictStrKeysChanged(const AC_IR::IRRef& dst, const std::set<std::string>& keys) {
+        size_t before = dictStrKeysFor(dst).size();
+        mergeDictStrKeys(dst, keys);
+        return dictStrKeysFor(dst).size() != before;
+    }
+    std::set<std::string>   atomicVarNames_; // var names declared `atomic` — lock-guarded stores
+    // widgets ilib: `use ilib widgets` exposes bare-name constructor calls (`display(root,...)`)
+    // and dot-method calls on the returned handle (`lang_drop.add(...)`) — every other backend
+    // (CStrategy's cWidgetCtor/cWidgetMethod is the reference this ports) expands these into the
+    // real `ac_widgets_*_new`/`_pack`/`_set`/`_get`/`_add` calls. BNY had NONE of this: a bare
+    // `display(...)` fell straight through the generic CALL path to `em.call("display")` — a
+    // label that exists nowhere (not even in the .so, which only exports `ac_widgets_display_new`
+    // etc), the exact "undefined label 'display'" this session's audit found.
+    static bool isWidgetCtorName(const std::string& func) {
+        static const std::set<std::string> ctors = {
+            "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
+            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch", "textbox"
+        };
+        return ctors.count(func) > 0;
+    }
+    static std::string widgetPackFn(const std::string& kind) {
+        if (kind == "Screen") return "";
+        if (kind == "radbtn") return "ac_widgets_ckbtn_pack";
+        return "ac_widgets_" + kind + "_pack";
+    }
+    static std::string widgetGetFn(const std::string& kind) {
+        if (kind == "radbtn") return "ac_widgets_ckbtn_get";
+        return "ac_widgets_" + kind + "_get";
+    }
+    static std::string widgetSetFn(const std::string& kind) {
+        if (kind == "radbtn") return "ac_widgets_ckbtn_set";
+        return "ac_widgets_" + kind + "_set";
+    }
+    int userFuncArity(const std::string& name) const {
+        for (auto& fn : prog.functions) if (fn.name == name) return (int)fn.parameters.size();
+        return 0;
+    }
+    void loadArgOrInt(const std::vector<AC_IR::IRRef>& args, size_t i, int64_t def, R reg) {
+        if (i < args.size()) load(args[i], reg);
+        else em.mov_ri64(reg, (uint64_t)def);
+    }
+    void loadArgOrStr(const std::vector<AC_IR::IRRef>& args, size_t i, const std::string& def, R reg) {
+        if (i < args.size()) load(args[i], reg);
+        else { int sid = sp.add(def); em.mov_ri64_str(reg, sid); }
+    }
+    // Constructor: `res = display(root, "text")` etc. Returns false (nothing emitted) if `func`
+    // isn't a widget constructor name, so callers can fall through to the generic CALL path.
+    bool bnyWidgetCtor(const AC_IR::IRInstruction& ins, const std::string& func,
+                       const std::vector<AC_IR::IRRef>& args) {
+        if (!isWidgetCtorName(func) || !ins.result.isValid()) return false;
+        struct A { bool isStr; std::string def; };
+        std::string newFn; std::vector<A> specs;
+        if (func == "Screen") { newFn = "ac_widgets_screen_new"; specs = {{true,"AC App"},{true,"800x600"}}; }
+        else if (func == "display") { newFn = "ac_widgets_display_new"; specs = {{false,"0"},{true,""}}; }
+        else if (func == "ask") { newFn = "ac_widgets_ask_new"; specs = {{false,"0"},{false,"20"}}; }
+        else if (func == "btn") { newFn = "ac_widgets_btn_new"; specs = {{false,"0"},{true,"Button"}}; }
+        else if (func == "ckbtn" || func == "radbtn") { newFn = "ac_widgets_ckbtn_new"; specs = {{false,"0"},{true,""}}; }
+        else if (func == "dropdown") { newFn = "ac_widgets_dropdown_new"; specs = {{false,"0"}}; }
+        else if (func == "advance") { newFn = "ac_widgets_advance_new"; specs = {{false,"0"},{false,"200"}}; }
+        else if (func == "slider") { newFn = "ac_widgets_slider_new"; specs = {{false,"0"},{false,"0"},{false,"100"},{true,"horizontal"}}; }
+        else if (func == "group") { newFn = "ac_widgets_group_new"; specs = {{false,"0"},{true,""}}; }
+        else if (func == "tabs") { newFn = "ac_widgets_tabs_new"; specs = {{false,"0"}}; }
+        else if (func == "scroller") { newFn = "ac_widgets_scroller_new"; specs = {{false,"0"},{true,"vertical"}}; }
+        else if (func == "listbox") { newFn = "ac_widgets_listbox_new"; specs = {{false,"0"},{false,"20"},{false,"10"}}; }
+        else if (func == "table") { newFn = "ac_widgets_table_new"; specs = {{false,"0"},{true,""},{false,"10"}}; }
+        else if (func == "sketch") { newFn = "ac_widgets_sketch_new"; specs = {{false,"0"},{false,"300"},{false,"200"}}; }
+        else if (func == "textbox") { newFn = "ac_widgets_textbox_new"; specs = {{false,"0"},{true,"black"},{true,"monospace"}}; }
+        else return false;
+        // A trailing `lazy` sentinel arg (`textbox(root, ..., lazy)`) defers auto-pack to a
+        // manual caller-side `.pack(...)` later — mirrors CStrategy's hasLazyArg/withoutLazy
+        // (see its comment) exactly; BNY never had this at all before (every ctor always
+        // auto-packed unconditionally, silently ignoring any trailing `lazy` arg that happened
+        // to overflow past a shorter ctor's own arg count with no effect either way).
+        bool isLazy = !args.empty() && funcName(args.back()) == "lazy";
+        std::vector<AC_IR::IRRef> realArgs = isLazy
+            ? std::vector<AC_IR::IRRef>(args.begin(), args.end() - 1) : args;
+        for (size_t i = 0; i < specs.size() && i < abi.argRegs.size(); i++) {
+            if (specs[i].isStr) loadArgOrStr(realArgs, i, specs[i].def, abi.argRegs[i]);
+            else {
+                int64_t d = 0; try { d = std::stoll(specs[i].def); } catch (...) {}
+                loadArgOrInt(realArgs, i, d, abi.argRegs[i]);
+            }
+        }
+        em.call(newFn);
+        store(ins.result, R::RAX);
+        std::string resName = varName(ins.result);
+        if (!resName.empty() && widgetVarKind_) (*widgetVarKind_)[resName] = func;
+        if (isLazy) { load(ins.result, R::RDI); em.call("ac_widgets_set_lazy"); }
+        else {
+            std::string packFn = widgetPackFn(func);
+            if (!packFn.empty()) { load(ins.result, abi.argRegs[0]); em.call(packFn); }
+        }
+        if (func == "btn" && args.size() > 2) {
+            std::string cbName = funcName(args[2]);
+            std::string adapter = userFuncArity(cbName) > 0 ? "_ac_widget_call1" : "_ac_widget_call0";
+            load(ins.result, R::RDI);
+            em.lea_r_label(R::RSI, adapter);
+            em.lea_r_label(R::RDX, cbName);
+            em.call("ac_widgets_btn_on_click");
+        }
+        return true;
+    }
+    // Method call: `recv.method(args)` where `recv` is a known widget var (LIB_CALL path).
+    bool bnyWidgetMethod(const AC_IR::IRInstruction& ins, const std::string& recv,
+                         const std::string& method, const std::vector<AC_IR::IRRef>& args) {
+        if (!widgetVarKind_) return false;
+        auto wit = widgetVarKind_->find(recv);
+        if (wit == widgetVarKind_->end()) return false;
+        const std::string& kind = wit->second;
+        if (method == "pack") {
+            if (args.size() >= 2) {
+                loadNamedVar(recv, R::RDI);
+                load(args[0], R::RSI);
+                load(args[1], R::RDX);
+                em.call("ac_widgets_pack_spaced");
+            } else {
+                loadNamedVar(recv, R::RDI);
+                em.call(widgetPackFn(kind));
+            }
+            return true;
+        }
+        if (method == "mainloop" && kind == "Screen") { loadNamedVar(recv, R::RDI); em.call("ac_widgets_screen_mainloop"); return true; }
+        if (method == "update"   && kind == "Screen") { loadNamedVar(recv, R::RDI); em.call("ac_widgets_screen_update");   return true; }
+        if (method == "destroy"  && kind == "Screen") { loadNamedVar(recv, R::RDI); em.call("ac_widgets_screen_destroy");  return true; }
+        if (method == "dimensions" && kind == "Screen" && args.size() >= 2) {
+            loadNamedVar(recv, R::RDI);
+            load(args[0], R::RSI);
+            load(args[1], R::RDX);
+            em.call("ac_widgets_screen_dimensions");
+            return true;
+        }
+        if (method == "add") {
+            std::string fn = (kind == "dropdown" ? "ac_widgets_dropdown_add" :
+                              kind == "listbox"  ? "ac_widgets_listbox_add"  :
+                              kind == "table"    ? "ac_widgets_table_add"    : "ac_widgets_add");
+            loadNamedVar(recv, R::RDI);
+            for (size_t i = 0; i < args.size() && i + 1 < abi.argRegs.size(); i++)
+                load(args[i], abi.argRegs[i + 1]);
+            em.call(fn);
+            return true;
+        }
+        if (method == "set" || method == "config") {
+            loadNamedVar(recv, R::RDI);
+            if (!args.empty()) load(args[0], R::RSI);
+            else { int sid = sp.add(""); em.mov_ri64_str(R::RSI, sid); }
+            em.call(widgetSetFn(kind));
+            return true;
+        }
+        if (method == "get") {
+            loadNamedVar(recv, R::RDI);
+            em.call(widgetGetFn(kind));
+            if (ins.result.isValid()) {
+                store(ins.result, R::RAX);
+                if (kind == "ask" || kind == "display" || kind == "dropdown" || kind == "textbox")
+                    markDstString(ins.result);
+            }
+            return true;
+        }
+        // textbox.write(text) — sets/overwrites its content. Own method name (not "set"): a
+        // different real symbol (`ac_widgets_textbox_write`), matching the API Abu specified
+        // directly for the ac-ide rebuild rather than reusing the generic scalar set/config path.
+        if (method == "write" && kind == "textbox" && !args.empty()) {
+            loadNamedVar(recv, R::RDI);
+            load(args[0], R::RSI);
+            em.call("ac_widgets_textbox_write");
+            return true;
+        }
+        // textbox.find(needle) — returns the matched text (or "") — and textbox.fix(text) —
+        // writes text and locks the box read-only. Composable: `tb.fix(tb.find($x$))`.
+        if (method == "find" && kind == "textbox" && !args.empty()) {
+            loadNamedVar(recv, R::RDI);
+            load(args[0], R::RSI);
+            em.call("ac_widgets_textbox_find");
+            if (ins.result.isValid()) { store(ins.result, R::RAX); markDstString(ins.result); }
+            return true;
+        }
+        if (method == "fix" && kind == "textbox" && !args.empty()) {
+            loadNamedVar(recv, R::RDI);
+            load(args[0], R::RSI);
+            em.call("ac_widgets_textbox_fix");
+            return true;
+        }
+        if (method == "on_click" && kind == "btn" && !args.empty()) {
+            std::string cbName = funcName(args[0]);
+            std::string adapter = userFuncArity(cbName) > 0 ? "_ac_widget_call1" : "_ac_widget_call0";
+            loadNamedVar(recv, R::RDI);
+            em.lea_r_label(R::RSI, adapter);
+            em.lea_r_label(R::RDX, cbName);
+            em.call("ac_widgets_btn_on_click");
+            return true;
+        }
+        // tabs.add_tab / sketch's drawing methods — mirrors CStrategy's cWidgetMethod (see its
+        // matching comment for the "undefined label" bug both this and the C fix close).
+        if (method == "add_tab" && kind == "tabs" && !args.empty()) {
+            loadNamedVar(recv, R::RDI);
+            load(args[0], R::RSI);
+            em.call("ac_widgets_tabs_add_tab");
+            if (ins.result.isValid()) store(ins.result, R::RAX);
+            return true;
+        }
+        if (method == "clear" && kind == "sketch") {
+            loadNamedVar(recv, R::RDI);
+            em.call("ac_widgets_sketch_clear");
+            return true;
+        }
+        // ac_widgets_sketch_{line,rect}(h, x1,y1,x2,y2 [double], r,g,b [int]) — SysV assigns
+        // float-class (XMM0..3) and int-class (RDI/RSI/RDX/RCX after RDI=h) args independently.
+        if ((method == "line" || method == "rect") && kind == "sketch" && args.size() >= 7) {
+            loadNamedVar(recv, R::RDI);
+            for (int k = 0; k < 4; k++) {
+                load(args[k], R::RAX);
+                if (isFloatRef(args[k])) em.movq_xmmN_from_gpr(k, R::RAX);
+                else em.cvtsi2sd_xmmN_from_gpr(k, R::RAX);
+            }
+            load(args[4], R::RSI);
+            load(args[5], R::RDX);
+            load(args[6], R::RCX);
+            em.call(method == "line" ? "ac_widgets_sketch_line" : "ac_widgets_sketch_rect");
+            return true;
+        }
+        if (method == "circle" && kind == "sketch" && args.size() >= 6) {
+            loadNamedVar(recv, R::RDI);
+            for (int k = 0; k < 3; k++) {
+                load(args[k], R::RAX);
+                if (isFloatRef(args[k])) em.movq_xmmN_from_gpr(k, R::RAX);
+                else em.cvtsi2sd_xmmN_from_gpr(k, R::RAX);
+            }
+            load(args[3], R::RSI);
+            load(args[4], R::RDX);
+            load(args[5], R::RCX);
+            em.call("ac_widgets_sketch_circle");
+            return true;
+        }
+        if (method == "text_at" && kind == "sketch" && args.size() >= 6) {
+            loadNamedVar(recv, R::RDI);
+            for (int k = 0; k < 2; k++) {
+                load(args[k], R::RAX);
+                if (isFloatRef(args[k])) em.movq_xmmN_from_gpr(k, R::RAX);
+                else em.cvtsi2sd_xmmN_from_gpr(k, R::RAX);
+            }
+            load(args[2], R::RSI);   // text
+            load(args[3], R::RDX);   // r
+            load(args[4], R::RCX);   // g
+            load(args[5], R::R8);    // b
+            em.call("ac_widgets_sketch_text");
+            return true;
+        }
+        return false;
+    }
     // Structured IF support (IF_BEGIN/IF_ELSE/IF_END markers from cond/LineUp lowering)
     struct IfCtx { std::string elseL, endL; bool sawElse; };
     std::vector<IfCtx> ifStack_;
     std::vector<std::string> catchSkip_;   // #29: pending labels that skip catch bodies
+    std::vector<std::string> catchEntry_;  // pending catch-body ENTRY labels (longjmp landing pad)
     int catchCounter_ = 0;
     int ifCounter_ = 0;
+    // Per-function prefix for internally-generated labels. FuncCompiler is re-instantiated per
+    // function so catchCounter_/ifCounter_ reset to 0 each time; without a prefix, two functions
+    // both emit "__ac_idiv_ok_0__"/"__if0_else__" into the SHARED emitter map → applyFixups binds
+    // both functions' jumps to the last definition → function A jumps into function B. (FATAL)
+    std::string labelPrefix_;
+    std::string uniq(const std::string& base) const { return labelPrefix_ + base; }
     std::set<std::string>   usingHeaders_;  // namespaces from "using header X"
+
+    // Shared by IDIV and MOD's zero-divisor guard: if inside a `try` (a call site reached from a
+    // DIFFERENT function than the one containing that try — this is exactly why real cross-frame
+    // unwinding is needed, not a same-function jump), restore RSP/RBP from the try-stack and
+    // jmp_r straight to the catch body; otherwise print the error and exit(1) same as always.
+    // Clobbers RAX/RCX/RDX/RBX — call only at a statement boundary, matching every other call site.
+    void emitDivZeroTrap() {
+        std::string fatalL = uniq("__ac_divzero_fatal_" + std::to_string(catchCounter_++) + "__");
+        if (usesTry_) {
+            int stackSlot = (*gvarSlots_)["__try_stack_ptr"];
+            int depthSlot = (*gvarSlots_)["__try_depth"];
+            em.mov_ri64_gvar(R::RCX, depthSlot);
+            em.mov_r_ptr(R::RAX, R::RCX);
+            em.test_rr(R::RAX, R::RAX);
+            em.je(fatalL);                       // depth == 0 → no active try
+            em.dec_r(R::RAX);
+            em.mov_ptr_r(R::RCX, R::RAX);         // depth--
+            em.mov_rr(R::RDX, R::RAX);            // rdx = slot index to use (post-decrement)
+            em.mov_ri64_gvar(R::RCX, stackSlot);
+            em.mov_r_ptr(R::R8, R::RCX);          // r8 = try-stack base (stable pointer, NOT
+                                                   // one of the values being restored)
+            em.mov_ri32(R::RAX, 64);
+            em.imul_rr(R::RAX, R::RDX);
+            em.add_rr(R::R8, R::RAX);             // r8 = slot address
+            em.mov_r_ptr(R::RSP, R::R8); em.add_ri32(R::R8, 8);
+            em.mov_r_ptr(R::RBP, R::R8); em.add_ri32(R::R8, 8);
+            em.mov_r_ptr(R::RBX, R::R8); em.add_ri32(R::R8, 8);
+            em.mov_r_ptr(R::R12, R::R8); em.add_ri32(R::R8, 8);
+            em.mov_r_ptr(R::R13, R::R8); em.add_ri32(R::R8, 8);
+            em.mov_r_ptr(R::R14, R::R8); em.add_ri32(R::R8, 8);
+            em.mov_r_ptr(R::R15, R::R8); em.add_ri32(R::R8, 8);
+            em.mov_r_ptr(R::RAX, R::R8);          // rax = saved catch-entry target
+            em.jmp_r(R::RAX);
+        }
+        em.label(fatalL);
+        std::string msg = "Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\n";
+        int sid = sp.add(msg);
+        em.mov_ri64_str(R::RSI, sid);
+        em.mov_ri32(R::RDI, 2);
+        em.mov_ri32(R::RDX, (int32_t)msg.size());
+        em.mov_ri32(R::RAX, 1); em.syscall();      // write(2, msg)
+        em.mov_ri32(R::RAX, 60); em.mov_ri32(R::RDI, 1); em.syscall(); // exit(1)
+    }
     // floatFuncs_ moved to public section above
 
     // Is this ref a known string (const literal, marked var, or marked temp)?
@@ -833,6 +1289,18 @@ private:
         else if (r.kind == AC_IR::IRRef::Kind::VAR) {
             std::string vn = varName(r);
             if (!vn.empty()) dictVarNames_.insert(vn);
+        }
+    }
+    bool isListOfDictRef(const AC_IR::IRRef& r) const {
+        if (r.kind == AC_IR::IRRef::Kind::TEMP && listOfDictTempIds_.count(r.id)) return true;
+        if (r.kind == AC_IR::IRRef::Kind::VAR && listOfDictVarNames_.count(varName(r))) return true;
+        return false;
+    }
+    void markDstListOfDict(const AC_IR::IRRef& r) {
+        if (r.kind == AC_IR::IRRef::Kind::TEMP) listOfDictTempIds_.insert(r.id);
+        else if (r.kind == AC_IR::IRRef::Kind::VAR) {
+            std::string vn = varName(r);
+            if (!vn.empty()) listOfDictVarNames_.insert(vn);
         }
     }
     void markDstArray(const AC_IR::IRRef& r) {
@@ -937,7 +1405,19 @@ private:
             em.mov_r_rbp(scratch, frame.tempOffset(r.id));
             return scratch;
         case IRRef::Kind::VAR: {
-            int gs = gvarSlotOf(varName(r));
+            std::string nm = varName(r);
+            std::string fbase; int foff;
+            if (resolveFieldAccess(nm, fbase, foff)) {
+                // self.field / instance.field — real pointer+offset access (see the field-order
+                // pre-scan's comment). Was completely disconnected before: this var just got ITS
+                // OWN local stack slot via frame.varOffset(r.id) below, same as any unrelated
+                // plain variable — a field WRITE never reached the actual object at all.
+                loadNamedVar(fbase, scratch);
+                if (foff != 0) em.add_ri32(scratch, foff);
+                em.mov_r_ptr(scratch, scratch);
+                return scratch;
+            }
+            int gs = gvarSlotOf(nm);
             if (gs >= 0) {                          // promoted free var: load from global slot
                 em.mov_ri64_gvar(scratch, gs);      // scratch = &slot
                 em.mov_r_ptr(scratch, scratch);     // scratch = *scratch
@@ -962,7 +1442,16 @@ private:
         if (r.kind == IRRef::Kind::TEMP)
             em.mov_rbp_r(frame.tempOffset(r.id), src);
         else if (r.kind == IRRef::Kind::VAR) {
-            int gs = gvarSlotOf(varName(r));
+            std::string nm = varName(r);
+            std::string fbase; int foff;
+            if (resolveFieldAccess(nm, fbase, foff)) {
+                R addr = (src == R::R11) ? R::R10 : R::R11;
+                loadNamedVar(fbase, addr);
+                if (foff != 0) em.add_ri32(addr, foff);
+                em.mov_ptr_r(addr, src);
+                return;
+            }
+            int gs = gvarSlotOf(nm);
             if (gs >= 0) {                          // promoted free var: store to global slot
                 R addr = (src == R::R11) ? R::R10 : R::R11;
                 em.mov_ri64_gvar(addr, gs);         // addr = &slot
@@ -983,14 +1472,16 @@ private:
     }
 
     void emitHalt() {
-#ifdef TARGET_WINDOWS
-        em.mov_ri32(R::RCX, 0);
-        em.call("ExitProcess");
-#else
-        em.mov_ri32(R::RAX, 60);
-        em.xor_rr(R::RDI, R::RDI);
-        em.syscall();
-#endif
+        if (g_bnyTargetWindows) {
+            em.and_rsp_align16();      // force alignment — parity here isn't tracked, control never returns
+            em.sub_rsp_i32(32);        // Win64 shadow space
+            em.mov_ri32(R::RCX, 0);
+            em.call_rip_rel("ExitProcess"); // real IAT call, not a PLT-style direct call
+        } else {
+            em.mov_ri32(R::RAX, 60);
+            em.xor_rr(R::RDI, R::RDI);
+            em.syscall();
+        }
     }
 
     void emitLibCall(const AC_IR::IRInstruction& ins) {
@@ -1007,6 +1498,21 @@ private:
 
         // import — handled via PLT/GOT; nothing to emit at runtime
         if (method == "import") return;
+
+        // widgets method call (`lang_drop.add(...)`, `bar.set(42)`, `root.mainloop`) — must run
+        // before the generic dotted-method fallbacks below, same ordering CStrategy/AsmStrategy
+        // use (see widgetVarKind_'s header comment).
+        {
+            auto dot = method.find('.');
+            if (dot != std::string::npos) {
+                std::string recv = method.substr(0, dot);
+                std::string mname = method.substr(dot + 1);
+                if (widgetVarKind_ && widgetVarKind_->count(recv)) {
+                    std::vector<IRRef> args(ins.typedOperands.begin() + 1, ins.typedOperands.end());
+                    if (bnyWidgetMethod(ins, recv, mname, args)) return;
+                }
+            }
+        }
 
         // arr.append(value): grow the receiver array and store the new pointer back into it.
         // The receiver array name is the part of the method before ".append".
@@ -1036,6 +1542,28 @@ private:
             }
         }
 
+        // `c.greet()` — instance method call on a known bundle var. Previously fell all the way
+        // through this function (nothing matched "c.greet" against any `fn.name`, since methods
+        // are compiled as bare "greet"/"init" — see compileFn) and did NOTHING — a pure,
+        // silent no-op; `c.greet()` just vanished. Redirect to the real class-qualified label
+        // (`Critter_greet`), passing the instance pointer as `self` (1st arg).
+        {
+            auto dot = method.find('.');
+            if (dot != std::string::npos) {
+                std::string recv = method.substr(0, dot);
+                std::string methodName = method.substr(dot + 1);
+                if (instanceClass_ && instanceClass_->count(recv)) {
+                    std::string cls = instanceClass_->at(recv);
+                    loadNamedVar(recv, R::RDI);
+                    for (size_t ai = 1; ai < ins.typedOperands.size() && ai < abi.argRegs.size(); ai++)
+                        load(ins.typedOperands[ai], abi.argRegs[ai]);
+                    em.call(cls + "_" + methodName);
+                    if (ins.result.isValid()) store(ins.result, R::RAX);
+                    return;
+                }
+            }
+        }
+
         // quickthread f(args): BNY has no lightweight threads — degrade to a plain call.
         if (method == "quickthread" && ins.typedOperands.size() >= 2) {
             std::string fname = funcName(ins.typedOperands[1]);
@@ -1058,67 +1586,14 @@ private:
             }
         }
 
-        // Pointer library operations
-        if (method.rfind("pointers.", 0) == 0) {
-            std::string op = method.substr(9);  // Strip "pointers."
-
-            if (op == "ptr") {  // Create pointer
-                if (ins.typedOperands.size() >= 2) {
-                    load(ins.typedOperands[1], abi.argRegs[0]);  // value to point to
-                    em.call("__ac_ptr_new__");
-                    if (ins.result.isValid()) store(ins.result, R::RAX);
-                }
-                return;
-            }
-            else if (op == "deref") {  // Dereference pointer
-                if (ins.typedOperands.size() >= 2) {
-                    load(ins.typedOperands[1], abi.argRegs[0]);  // pointer
-                    em.call("__ac_ptr_deref__");
-                    if (ins.result.isValid()) store(ins.result, R::RAX);
-                }
-                return;
-            }
-            else if (op == "null") {  // Get null pointer
-                em.mov_ri32(R::RAX, -1);  // -1 = null pointer
-                if (ins.result.isValid()) store(ins.result, R::RAX);
-                return;
-            }
-            else if (op == "is_null") {  // Check if null
-                if (ins.typedOperands.size() >= 2) {
-                    load(ins.typedOperands[1], R::RAX);  // pointer
-                    em.cmp_r_i32(R::RAX, -1);
-                    em.setcc_r(0x04, R::RAX);  // SETE - set if equal
-                    if (ins.result.isValid()) store(ins.result, R::RAX);
-                }
-                return;
-            }
-            else if (op == "eq") {  // Compare pointers
-                if (ins.typedOperands.size() >= 3) {
-                    load(ins.typedOperands[1], R::RAX);  // ptr1
-                    load(ins.typedOperands[2], R::RCX);  // ptr2
-                    em.cmp_rr(R::RAX, R::RCX);
-                    em.setcc_r(0x04, R::RAX);  // SETE
-                    if (ins.result.isValid()) store(ins.result, R::RAX);
-                }
-                return;
-            }
-            else if (op == "copy") {  // Copy pointer
-                if (ins.typedOperands.size() >= 2) {
-                    load(ins.typedOperands[1], R::RAX);  // pointer
-                    if (ins.result.isValid()) store(ins.result, R::RAX);
-                }
-                return;
-            }
-            else if (op == "update") {  // Update value at pointer
-                if (ins.typedOperands.size() >= 3) {
-                    load(ins.typedOperands[1], abi.argRegs[0]);  // pointer
-                    load(ins.typedOperands[2], abi.argRegs[1]);  // new value
-                    em.call("__ac_ptr_update__");
-                    if (ins.result.isValid()) store(ins.result, R::RAX);
-                }
-                return;
-            }
-        }
+        // NOTE: the old "pointers.*" dispatch block that used to live here was 100% dead —
+        // bare `ptr_new(...)` etc. never reach codegen as a dotted "pointers.X" LIB_CALL method
+        // (every other backend's generated source shows they're plain CALLs), and it called
+        // `__ac_ptr_new__`/`__ac_ptr_deref__`/`__ac_ptr_update__` helper labels that were never
+        // defined anywhere — so even the (unreachable) match would have failed to assemble.
+        // native-cpu's bare functions (ptr_new, dha, arena_alloc, abort, ...) now go through the
+        // same generic external-symbol / PLT-GOT path as os./regex./ml. — see
+        // collectExternalSymbols()'s bare-name check and libForSym()'s "libacncpu.so" mapping.
 
         // General Term.X(args) — call math.X PLT stub, print integer result
         // Term.display and Term.ask fall through to the default print below
@@ -1141,10 +1616,11 @@ private:
         }
 
         // Namespaced ilib calls — ml.tensor(2), os.mkfile(p), regex.match(s,p),
-        // stringm.upper(s), web.open(u) — all route through their .so PLT stubs.
+        // stringm.upper(s), web.open(u), ncpu.dha(n) — all route through their .so PLT stubs.
         if (method.rfind("ml.", 0) == 0 || method.rfind("os.", 0) == 0 ||
             method.rfind("regex.", 0) == 0 || method.rfind("stringm.", 0) == 0 ||
-            method.rfind("web.", 0) == 0) {
+            method.rfind("web.", 0) == 0 || method.rfind("ncpu.", 0) == 0 ||
+            method.rfind("maudio.", 0) == 0) {
             if (method == "ml.weights" && ins.typedOperands.size() >= 3) {
                 load(ins.typedOperands[1], R::RAX);
                 if (isFloatRef(ins.typedOperands[1])) em.movq_xmm0_from_gpr(R::RAX);
@@ -1154,14 +1630,27 @@ private:
                 if (ins.result.isValid()) store(ins.result, R::RAX);
                 return;
             }
+            // SysV AMD64: integer and float args use INDEPENDENT register sequences —
+            // ints fill RDI,RSI,RDX,RCX,R8,R9 in order; floats fill XMM0..XMM7 in order; each
+            // arg consumes exactly one of its own sequence. The old code loaded EVERY arg into
+            // an int reg AND placed floats into XMM[arg-index] → a mixed sig like
+            // ml.grid(int,int,double) put the double in XMM2 (callee reads XMM0) → garbage. (FATAL)
             int argCount = (int)ins.typedOperands.size() - 1;
-            for (int i = 0; i < argCount && i < (int)abi.argRegs.size(); i++)
-                load(ins.typedOperands[1 + i], abi.argRegs[i]);
-            for (int ai = 0; ai < argCount && ai < 6 && ai < (int)abi.argRegs.size(); ++ai) {
-                if (!callArgTakesDouble(method, ai)) continue;   // #41: was capped at 2 args
-                R arg = abi.argRegs[ai];
-                if (isFloatRef(ins.typedOperands[1 + ai])) em.movq_xmmN_from_gpr(ai, arg);
-                else                                       em.cvtsi2sd_xmmN_from_gpr(ai, arg);
+            int intIdx = 0, fltIdx = 0;
+            for (int ai = 0; ai < argCount; ++ai) {
+                const auto& argRef = ins.typedOperands[1 + ai];
+                if (callArgTakesDouble(method, ai)) {
+                    if (fltIdx < 8) {
+                        load(argRef, R::RAX);                                   // scratch (not an arg reg)
+                        if (isFloatRef(argRef)) em.movq_xmmN_from_gpr(fltIdx, R::RAX);
+                        else                    em.cvtsi2sd_xmmN_from_gpr(fltIdx, R::RAX);
+                    }
+                    fltIdx++;
+                } else {
+                    if (intIdx < (int)abi.argRegs.size())
+                        load(argRef, abi.argRegs[intIdx]);
+                    intIdx++;
+                }
             }
             em.call(method);
             if (isFloatReturningCall(method)) {
@@ -1267,16 +1756,13 @@ private:
                 } else {
                     // Propagate float/string type from source to destination
                     bool srcIsFloat = isFloatRef(src);
+                    bool srcIsString = isStrRef(src);
                     if (src.kind == AC_IR::IRRef::Kind::CONST) {
-                        if (src.value.type == AC_IR::IRType::STRING) {
-                            if (dst.kind == AC_IR::IRRef::Kind::VAR) {
-                                std::string vn = varName(dst);
-                                if (!vn.empty()) stringVarNames_.insert(vn);
-                            }
-                        } else if (src.value.type == AC_IR::IRType::FLOAT) {
+                        if (src.value.type == AC_IR::IRType::FLOAT) {
                             srcIsFloat = true;
                         }
                     }
+                    if (srcIsString) markDstString(dst);
                     if (srcIsFloat) {
                         if (dst.kind == AC_IR::IRRef::Kind::TEMP) floatTempIds_.insert(dst.id);
                         else if (dst.kind == AC_IR::IRRef::Kind::VAR) {
@@ -1294,10 +1780,23 @@ private:
                     store(dst, R::RAX);
                 }
             };
+            // `atomic` var reassignment (`x = x + 1`, ...): wrap the WHOLE statement (the read
+            // of the current value that computed `src`, plus this write) in the real spinlock —
+            // same statement-level critical section every other backend's `atomic` codegen uses.
+            auto isAtomicDst = [&](const AC_IR::IRRef& dst) {
+                return dst.kind == AC_IR::IRRef::Kind::VAR
+                    && atomicVarNames_.count(varName(dst)) > 0;
+            };
             if (ins.result.isValid()) {
+                bool atomic = isAtomicDst(ins.result);
+                if (atomic) em.call("__ac_atomic_lock__");
                 handleSrc(op0(), ins.result);
+                if (atomic) em.call("__ac_atomic_unlock__");
             } else if (ops.size() >= 2) {
+                bool atomic = isAtomicDst(ops[0]);
+                if (atomic) em.call("__ac_atomic_lock__");
                 handleSrc(ops[1], ops[0]);
+                if (atomic) em.call("__ac_atomic_unlock__");
             }
             break;
         }
@@ -1334,6 +1833,8 @@ private:
                 (ops[0].kind == IRRef::Kind::TEMP && stringTempIds_.count(ops[0].id)) ||
                 (ops[0].kind == IRRef::Kind::CONST && ops[0].value.type == IRType::STRING);
             switch (ins.resultType) {
+            case IRType::SHORT:   // native BNY has no sub-word slots; short/mini use the 64-bit
+            case IRType::MINI:    // integer path (width advisory here — no manual truncation)
             case IRType::INT:
                 load(ops[0], R::RDI);
                 if (srcIsStr) {
@@ -1346,6 +1847,21 @@ private:
                 }
                 store(ins.result, R::RAX);
                 break;
+            case IRType::ATOMIC: {
+                // `atomic x = e` — the declaration is just the first write; wrap it in the same
+                // real spinlock (xchg-based, see X64Emitter::xchg_ptr_r) every later `x = ...`
+                // reassignment uses too, so it's a genuine critical section from the start.
+                if (ins.result.kind == IRRef::Kind::VAR) {
+                    std::string vn = varName(ins.result);
+                    if (!vn.empty()) atomicVarNames_.insert(vn);
+                }
+                load(ops[0], R::RDI);
+                em.call("__ac_atomic_lock__");
+                em.mov_rr(R::RAX, R::RDI);
+                store(ins.result, R::RAX);
+                em.call("__ac_atomic_unlock__");
+                break;
+            }
             case IRType::FLOAT:
                 load(ops[0], R::RDI);
                 if (srcIsStr) { em.call("__ac_atoi__"); em.cvtsi2sd_xmm0_from_gpr(R::RAX); }
@@ -1468,18 +1984,10 @@ private:
             // Integer (floor) division. Zero divisor → clean ZeroDivisionError (idiv on 0
             // raises SIGFPE = core dump; match C's guarded behavior instead).
             load(op0(), R::RAX); load(op1(), R::RCX);
-            std::string okL = "__ac_idiv_ok_" + std::to_string(catchCounter_++) + "__";
+            std::string okL = uniq("__ac_idiv_ok_" + std::to_string(catchCounter_++) + "__");
             em.test_rr(R::RCX, R::RCX);
             em.jne(okL);
-            {
-                std::string msg = "Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\n";
-                int sid = sp.add(msg);
-                em.mov_ri64_str(R::RSI, sid);
-                em.mov_ri32(R::RDI, 2);
-                em.mov_ri32(R::RDX, (int32_t)msg.size());
-                em.mov_ri32(R::RAX, 1); em.syscall();      // write(2, msg)
-                em.mov_ri32(R::RAX, 60); em.mov_ri32(R::RDI, 1); em.syscall(); // exit(1)
-            }
+            emitDivZeroTrap();
             em.label(okL);
             em.cqo(); em.idiv_rcx();
             store(ins.result, R::RAX);
@@ -1492,11 +2000,18 @@ private:
             else                             em.sar_rax_cl();
             store(ins.result, R::RAX);
             break;
-        case IROpcode::MOD:
+        case IROpcode::MOD: {
+            // Same zero-divisor guard as IDIV — bare idiv on a 0 divisor raises SIGFPE (core dump).
             load(op0(), R::RAX); load(op1(), R::RCX);
+            std::string okL = uniq("__ac_mod_ok_" + std::to_string(catchCounter_++) + "__");
+            em.test_rr(R::RCX, R::RCX);
+            em.jne(okL);
+            emitDivZeroTrap();
+            em.label(okL);
             em.cqo(); em.idiv_rcx();
             store(ins.result, R::RDX);
             break;
+        }
 
         case IROpcode::EQ:  case IROpcode::NEQ:
         case IROpcode::LT:  case IROpcode::GT:
@@ -1629,8 +2144,8 @@ private:
             // Structured IF markers (cond/LineUp lower through these even on BNY).
             // They were silently ignored — every branch body executed sequentially.
             IfCtx c;
-            c.elseL = "__if" + std::to_string(ifCounter_) + "_else__";
-            c.endL  = "__if" + std::to_string(ifCounter_) + "_end__";
+            c.elseL = uniq("__if" + std::to_string(ifCounter_) + "_else__");
+            c.endL  = uniq("__if" + std::to_string(ifCounter_) + "_end__");
             ifCounter_++;
             c.sawElse = false;
             if (!ops.empty()) load(ops[0], R::RAX);
@@ -1690,12 +2205,78 @@ private:
                 if (ins.result.isValid()) store(ins.result, R::RAX);
                 break;
             }
-            std::string fn = resolveFunc(funcName(ops[0]));
+            std::string rawFn = funcName(ops[0]);
+            // widgets ctor (`root = Screen(...)`, `lbl = display(root, ...)`) — must be checked
+            // against the RAW name too, same reasoning as the bundle-construction check right
+            // below: no function is ever literally named "display" (see widgetVarKind_'s header
+            // comment for the exact failure this fixes).
+            if (isWidgetCtorName(rawFn)) {
+                std::vector<IRRef> args(ops.begin() + 1, ops.end());
+                if (bnyWidgetCtor(ins, rawFn, args)) break;
+            }
+            // A zero-arg dotted widget method call WITH parens (`pos_drop.get()`) lowers through
+            // this plain CALL opcode instead of LIB_CALL — LIB_CALL is only used when the dotted
+            // call actually carries args (see the LIR: `lib_call pos_drop.add, "..."` vs
+            // `call pos_drop.get`). Same "zero-arg dot-call-with-parens takes a different IR path
+            // than a with-args one" bug class as jarvis.ac's `speech.lower()` fix earlier this
+            // session — different symptom (widget dispatch instead of string-cheese), same root
+            // shape, so it needs its own check here rather than relying on emitLibCall alone.
+            {
+                auto dot = rawFn.find('.');
+                if (dot != std::string::npos && widgetVarKind_) {
+                    std::string recv = rawFn.substr(0, dot);
+                    std::string mname = rawFn.substr(dot + 1);
+                    if (widgetVarKind_->count(recv)) {
+                        std::vector<IRRef> args(ops.begin() + 1, ops.end());
+                        if (bnyWidgetMethod(ins, recv, mname, args)) break;
+                    }
+                }
+            }
+            // `c = Critter()` — bundle construction. Must be checked against the RAW function
+            // name, BEFORE resolveFunc's using-namespace prefixing runs: no function is ever
+            // literally named "Critter" (only class-qualified METHODS like "Critter_init" are,
+            // via compileFn's label — a class name on its own never appears as an `fn.name`
+            // anywhere), so `resolveFunc`'s "is this user-defined?" scan always fails for a bare
+            // class name and falls through to prefixing it with the first `using` namespace —
+            // e.g. a program with `using math.sqrt` turned "Critter" into "math.Critter" (verified:
+            // the full kitchen-sink file, which has `using math.sqrt`, silently exited before ever
+            // reaching the bundle code — an isolated repro without that `using` line worked fine,
+            // which is what made this one non-obvious). Previously this whole thing fell straight
+            // through to the generic `em.call(fn)` at the bottom, calling a label that never
+            // existed (only "Critter_init" did) — a hard "undefined label" error, or (with the
+            // namespace-prefix bug) an even more confusing SILENT wrong-symbol failure.
+            if (classFields_ && classFields_->count(rawFn)) {
+                const std::string& fn = rawFn;
+                int n = (int)(*classFields_)[fn].size();
+                em.mov_ri32(R::RDI, 8 * (n > 0 ? n : 1));
+                em.call("__ac_alloc__");
+                em.mov_rr(R::RBX, R::RAX);        // rbx = new object ptr (callee-saved, survives init call)
+                em.mov_rr(R::RDI, R::RBX);
+                for (int ai = 1; ai < (int)ops.size() && (ai - 1) < (int)abi.argRegs.size() - 1; ai++)
+                    load(ops[ai], abi.argRegs[ai]);   // extra constructor args start at 2nd reg (self is 1st)
+                em.call(fn + "_init");
+                em.mov_rr(R::RAX, R::RBX);
+                if (ins.result.isValid()) {
+                    store(ins.result, R::RAX);
+                    std::string resName = varName(ins.result);
+                    if (!resName.empty() && instanceClass_) (*instanceClass_)[resName] = fn;
+                }
+                break;
+            }
+            std::string fn = resolveFunc(rawFn);
             if (fn.empty()) break;
             if (fn == "ac_length" && ops.size() >= 2) {
                 auto& a = ops[1];
+                // `length $hello$` — a raw string LITERAL argument, not a variable/temp — never
+                // matched either branch here (both check VAR/TEMP tracking sets, neither
+                // recognizes a bare CONST STRING), so a direct-literal `length` call fell to the
+                // ARRAY-length helper, reading the string's pointer bytes as if they were an
+                // array's length header — garbage (verified: printed a random ~19-digit number
+                // instead of 5). Same shape of bug as CStrategy's own `length $literal$` fix
+                // earlier this session (see [[ac_v_trycatch_and_asm_full_rebuild]]).
                 bool isStr = (a.kind == IRRef::Kind::VAR && stringVarNames_.count(varName(a)))
-                          || (a.kind == IRRef::Kind::TEMP && stringTempIds_.count(a.id));
+                          || (a.kind == IRRef::Kind::TEMP && stringTempIds_.count(a.id))
+                          || (a.kind == IRRef::Kind::CONST && a.value.type == IRType::STRING);
                 load(a, R::RDI);
                 em.call(isStr ? "__ac_strlen__" : "ac_length");
                 if (ins.result.isValid()) store(ins.result, R::RAX);
@@ -1783,10 +2364,20 @@ private:
                 auto& v = ops[0];
                 if (v.kind == IRRef::Kind::CONST && v.value.type == AC_IR::IRType::STRING) {
                     std::string s = std::get<std::string>(v.value.data);
+                    // Most Term.display call sites arrive here already $-stripped (upstream
+                    // lowering strips them), but the `fn X & Y` chained-call syntax lowers
+                    // differently and left the raw `$...$` delimiters attached — verified:
+                    // printed literally "$chained-one$" instead of "chained-one". `load()`'s own
+                    // CONST-STRING branch already defensively strips these for the same reason
+                    // (see its comment); mirror that here too rather than special-casing the
+                    // chained-call lowering specifically.
+                    if (s.size() >= 2 && s.front() == '$' && s.back() == '$')
+                        s = s.substr(1, s.size() - 2);
                     int sid = sp.add(s);
                     em.mov_ri64_str(abi.argRegs[0], sid);
                     em.mov_ri32(abi.argRegs[1], (int32_t)s.size());
                     em.call("__ac_print_str__");
+                    if (usesSave_) { em.mov_ri64_str(R::RDI, sid); em.call("__ac_save_append_cstr__"); }
                 } else if ((v.kind == IRRef::Kind::VAR
                             && stringVarNames_.count(varName(v)))
                            || (v.kind == IRRef::Kind::TEMP
@@ -1794,16 +2385,22 @@ private:
                     // String-typed value — slot holds a char* (Term.ask / ilib string return)
                     load(v, abi.argRegs[0]);
                     em.call("__ac_print_cstr__");
+                    if (usesSave_) { load(v, R::RDI); em.call("__ac_save_append_cstr__"); }
                 } else if (isArrRef(v)) {
                     load(v, abi.argRegs[0]);
                     em.call("__ac_print_arr__");   // [e0, e1, …] — matches PY
+                    // Array capture isn't wired up (same narrow, documented scope boundary every
+                    // other backend's emitCapture currently has — Term.display of a plain
+                    // scalar/string is the demonstrated, verified case).
                 } else if (isFloatRef(v)) {
                     load(v, R::RDI);
                     em.movq_xmm0_from_gpr(R::RDI);
                     em.call("ac_print_double");
+                    if (usesSave_) { load(v, R::RDI); em.movq_xmm0_from_gpr(R::RDI); em.call("__ac_save_append_double__"); }
                 } else {
                     load(v, abi.argRegs[0]);
                     em.call("__ac_print_int__");
+                    if (usesSave_) { load(v, R::RDI); em.call("__ac_save_append_int__"); }
                 }
             }
             break;
@@ -1843,6 +2440,19 @@ private:
             }
             break;
         }
+
+        case IROpcode::SAVE_FILE:
+            if (!ops.empty()) {
+                auto& v = ops[0];
+                if (v.kind == IRRef::Kind::CONST && v.value.type == AC_IR::IRType::STRING) {
+                    int sid = sp.add(std::get<std::string>(v.value.data));
+                    em.mov_ri64_str(R::RDI, sid);
+                } else {
+                    load(v, R::RDI);
+                }
+                em.call("__ac_save_file__");
+            }
+            break;
 
         case IROpcode::HALT:
             emitHalt();
@@ -1894,18 +2504,89 @@ private:
             em.mov_ri32(R::RDX, (int32_t)line.size());
             em.mov_ri32(R::RAX, 1);                  // sys_write
             em.syscall();
-            if (clause != "Suggestion" && clause != "Toxic" && clause != "Praise") {
-                em.mov_ri32(R::RAX, 60); em.mov_ri32(R::RDI, 1); em.syscall(); // exit(1)
-            }
+            // `raise Clause(...)` is non-fatal on EVERY other backend (and PY, the reference) —
+            // it prints "Clause: msg" to stderr and execution continues, regardless of whether
+            // the clause is hint/toxic/praise or a custom name. This exit(1) for anything else
+            // was a genuine BNY-only bug, not a deliberate design difference: verified via
+            // `examples/keyword_catalog_core.ac` — `raise MyClause(...)` silently killed the
+            // program before it ever reached the code that follows (a bundle construction, in
+            // this case, but ANY code after a custom raise clause was equally unreachable).
             break;
         }
 
-        case IROpcode::TRY_BEGIN:            // no unwinding on BNY — try body just runs
+        case IROpcode::TRY_BEGIN: {
+            // Real try/catch via a hand-rolled setjmp equivalent (see this class's `usesTry_`
+            // comment for the full design). Saves RSP/RBP/RBX/R12-R15/catch-target into a
+            // depth-indexed 64-byte slot — the ENTIRE callee-saved register set, not just
+            // RSP/RBP: the div-by-zero is usually reached through a CALL into a different
+            // function, and jmp_r bypasses that function's normal epilogue (which would
+            // otherwise pop/restore any callee-saved reg it modified) — so all of them must be
+            // captured here and restored in emitDivZeroTrap, or the catch body could see
+            // corrupted values in whatever the register allocator assigned to RBX/R12-R15
+            // before the try. R8 holds the slot pointer throughout (RBX is now a SAVED VALUE,
+            // not scratch).
+            std::string catchEntryL = uniq("__ac_catch_entry_" + std::to_string(catchCounter_++) + "__");
+            catchEntry_.push_back(catchEntryL);
+            int stackSlot = (*gvarSlots_)["__try_stack_ptr"];
+            int depthSlot = (*gvarSlots_)["__try_depth"];
+
+            std::string haveBufL = uniq("__ac_try_havebuf_" + std::to_string(catchCounter_++) + "__");
+            em.mov_ri64_gvar(R::RCX, stackSlot);
+            em.mov_r_ptr(R::RAX, R::RCX);
+            em.test_rr(R::RAX, R::RAX);
+            em.jne(haveBufL);
+            em.push_r(R::RCX);
+            em.mov_ri32(R::RDI, 32 * 64);      // 32 nesting slots * 64 bytes/slot
+            em.call("__ac_alloc__");
+            em.pop_r(R::RCX);
+            em.mov_ptr_r(R::RCX, R::RAX);
+            em.label(haveBufL);
+            em.mov_r_ptr(R::R8, R::RCX);        // r8 = try-stack base
+
+            em.mov_ri64_gvar(R::RCX, depthSlot);
+            em.mov_r_ptr(R::RAX, R::RCX);
+            em.mov_rr(R::RDX, R::RAX);
+            em.mov_ri32(R::RAX, 64);
+            em.imul_rr(R::RAX, R::RDX);         // rax = depth * 64
+            em.add_rr(R::R8, R::RAX);           // r8 = slot address
+
+            em.mov_ptr_r(R::R8, R::RSP); em.add_ri32(R::R8, 8);
+            em.mov_ptr_r(R::R8, R::RBP); em.add_ri32(R::R8, 8);
+            em.mov_ptr_r(R::R8, R::RBX); em.add_ri32(R::R8, 8);
+            em.mov_ptr_r(R::R8, R::R12); em.add_ri32(R::R8, 8);
+            em.mov_ptr_r(R::R8, R::R13); em.add_ri32(R::R8, 8);
+            em.mov_ptr_r(R::R8, R::R14); em.add_ri32(R::R8, 8);
+            em.mov_ptr_r(R::R8, R::R15); em.add_ri32(R::R8, 8);
+            em.lea_r_label(R::RAX, catchEntryL);  // forward reference — defined in CATCH_BEGIN below
+            em.mov_ptr_r(R::R8, R::RAX);
+
+            em.mov_ri64_gvar(R::RCX, depthSlot);
+            em.mov_r_ptr(R::RAX, R::RCX);
+            em.inc_r(R::RAX);
+            em.mov_ptr_r(R::RCX, R::RAX);
             break;
-        case IROpcode::CATCH_BEGIN: {        // skip the catch body (no exception occurred)
-            std::string skipL = "__ac_catch_skip_" + std::to_string(catchCounter_++) + "__";
+        }
+        case IROpcode::CATCH_BEGIN: {
+            // Reached two ways: (1) the try body completed normally and fell through here — must
+            // decrement depth (TRY_BEGIN incremented it) and skip the catch body entirely; (2) the
+            // div-by-zero guard jmp_r'd directly to catchEntry_'s label (below) after ALREADY
+            // restoring RSP/RBP and decrementing depth itself — falls straight into the catch body.
+            if (!(*gvarSlots_).count("__try_depth")) { // defensive: matches the pre-existing no-op if usesTry_ somehow wasn't set
+                std::string skipL = uniq("__ac_catch_skip_" + std::to_string(catchCounter_++) + "__");
+                em.jmp(skipL);
+                catchSkip_.push_back(skipL);
+                break;
+            }
+            int depthSlot = (*gvarSlots_)["__try_depth"];
+            em.mov_ri64_gvar(R::RCX, depthSlot);
+            em.mov_r_ptr(R::RAX, R::RCX);
+            em.dec_r(R::RAX);
+            em.mov_ptr_r(R::RCX, R::RAX);
+
+            std::string skipL = uniq("__ac_catch_skip_" + std::to_string(catchCounter_++) + "__");
             em.jmp(skipL);
             catchSkip_.push_back(skipL);
+            if (!catchEntry_.empty()) { em.label(catchEntry_.back()); catchEntry_.pop_back(); }
             break;
         }
         case IROpcode::AFTER_BEGIN:          // after-block always runs — close pending skip here
@@ -1942,10 +2623,19 @@ private:
                         x = (a==std::string::npos) ? "" : x.substr(a, b-a+1); };
                     trim(k); trim(v);
                     if (k.size() >= 2 && k.front() == '$' && k.back() == '$') k = k.substr(1, k.size()-2);
-                    int64_t vi = 0; try { vi = std::stoll(v); } catch (...) {}
                     load(ins.result, R::RDI);          // current block
                     em.mov_ri64_str(R::RSI, sp.add(k));
-                    em.mov_ri64(R::RDX, (uint64_t)vi);
+                    // A `$..$`-wrapped value is a string literal — store its string-pool ID
+                    // (same 8-byte-slot representation a plain string var uses elsewhere), not
+                    // an attempted int parse. A dict is naturally heterogeneous per-slot; which
+                    // reads should be treated as strings is decided at LOAD_INDEX call sites via
+                    // dictStrKeysByVar_ (populated from this same $..$ scan during the prescan).
+                    if (v.size() >= 2 && v.front() == '$' && v.back() == '$')
+                        em.mov_ri64_str(R::RDX, sp.add(v.substr(1, v.size()-2)));
+                    else {
+                        int64_t vi = 0; try { vi = std::stoll(v); } catch (...) {}
+                        em.mov_ri64(R::RDX, (uint64_t)vi);
+                    }
                     em.call("__ac_dict_set__");
                     store(ins.result, R::RAX);         // possibly-moved block
                 }
@@ -1954,9 +2644,12 @@ private:
             // arr = alloc "list", "e0,e1,..."  → heap block: [len][e0][e1]...
             // Integer-literal elements are materialized here; others get a 0 placeholder
             // and are typically overwritten via STORE_INDEX.
-            // Elements: integer literals, or user-function NAMES (funcs = [f1, f2] —
-            // store the function's address via a rip-relative lea).
-            struct Elem { int64_t val; std::string funcLabel; };
+            // Elements: integer literals, user-function NAMES (funcs = [f1, f2] — store the
+            // function's address via a rip-relative lea), or a known dict-var NAME (datac
+            // multi-row import: pets = [dc_pets_0, dc_pets_1] — each token already names a
+            // dict block var declared earlier in this same function; load its current value
+            // at runtime rather than treating the name as an unparseable placeholder).
+            struct Elem { int64_t val; std::string funcLabel; std::string varLoad; };
             std::vector<Elem> elems;
             if (ops.size() >= 2 && ops[1].kind == AC_IR::IRRef::Kind::CONST
                     && ops[1].value.type == AC_IR::IRType::STRING) {
@@ -1972,10 +2665,11 @@ private:
                         bool isFn = false;
                         for (auto& fn : prog.functions)
                             if (fn.name == tok) { isFn = true; break; }
-                        if (isFn) elems.push_back({0, tok});
+                        if (isFn) elems.push_back({0, tok, ""});
+                        else if (dictVarNames_.count(tok)) elems.push_back({0, "", tok});
                         else {
-                            try { elems.push_back({std::stoll(tok), ""}); }
-                            catch (...) { elems.push_back({0, ""}); }
+                            try { elems.push_back({std::stoll(tok), "", ""}); }
+                            catch (...) { elems.push_back({0, "", ""}); }
                         }
                     }
                     if (j == std::string::npos) break;
@@ -1991,6 +2685,8 @@ private:
             for (int64_t k = 0; k < N; k++) {
                 if (!elems[k].funcLabel.empty())
                     em.lea_r_label(R::RCX, elems[k].funcLabel);
+                else if (!elems[k].varLoad.empty())
+                    loadNamedVar(elems[k].varLoad, R::RCX);
                 else
                     em.mov_ri64(R::RCX, (uint64_t)elems[k].val);
                 em.mov_ptr_r(R::RDX, R::RCX);
@@ -2124,7 +2820,14 @@ public:
                 // STORE_VAR of a float constant or float-typed source
                 if (ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL
                     || ins.opcode == IROpcode::LOAD_CONST) {   // folded call results
-                    const IRRef& src = ins.typedOperands.empty() ? IRRef() : ins.typedOperands[0];
+                    // The VALUE being stored is operands[0] in the result-form (STORE_VAR result=tgt,
+                    // {value}) but operands[1] in the two-operand form (STORE_VAR {tgt, value}).
+                    // Reading operands[0] unconditionally checked the TARGET's float-ness, not the
+                    // value's → float never propagated through `total = t_2`, the final step of
+                    // `total += math.mod(...)`, so the accumulator stayed int and summed raw bits.
+                    bool hasResultForm = ins.result.isValid() && !ins.typedOperands.empty();
+                    IRRef src = hasResultForm ? ins.typedOperands[0]
+                              : (ins.typedOperands.size() >= 2 ? ins.typedOperands[1] : IRRef());
                     bool srcFloat = (src.kind == IRRef::Kind::CONST && src.value.type == IRType::FLOAT)
                                  || isFloatRef(src);
                     if (srcFloat) {
@@ -2141,11 +2844,15 @@ public:
                     if (isFloatRef(ins.typedOperands[0]) || isFloatRef(ins.typedOperands[1]))
                         markDstFloat(ins.result);
                 }
-                // CALL to a known float-returning function → mark result as float
-                if (ins.opcode == AC_IR::IROpcode::CALL && ins.result.isValid()
-                        && !ins.typedOperands.empty() && floatFuncs_) {
+                // CALL/LIB_CALL to a float-returning function → mark result as float. This must use
+                // the SAME authority (acCallReturnsFloat / type.hpp) the codegen uses — checking only
+                // user `floatFuncs_` missed ilib floats like math.mod, so `total += math.mod(...)`
+                // never promoted `total` and summed a double's raw bits into an int.
+                if ((ins.opcode == AC_IR::IROpcode::CALL || ins.opcode == AC_IR::IROpcode::LIB_CALL)
+                        && ins.result.isValid() && !ins.typedOperands.empty()) {
                     std::string callee = funcName(ins.typedOperands[0]);
-                    if (floatFuncs_->count(callee)) markDstFloat(ins.result);
+                    if ((floatFuncs_ && floatFuncs_->count(callee)) || isFloatReturningCall(callee))
+                        markDstFloat(ins.result);
                 }
             }
         }
@@ -2177,6 +2884,9 @@ public:
                 if ((ins.opcode == OP::STORE_VAR || ins.opcode == OP::LOAD_CONST)
                     && ins.result.isValid() && !ins.typedOperands.empty()) {
                     if (isStrRef(ins.typedOperands[0])) mark(ins.result);
+                } else if (ins.opcode == OP::STORE_VAR && ins.typedOperands.size() >= 2
+                           && ins.typedOperands[0].isValid()) {
+                    if (isStrRef(ins.typedOperands[1])) mark(ins.typedOperands[0]);
                 } else if (ins.opcode == OP::ADD && ins.result.isValid() && ins.typedOperands.size() >= 2) {
                     if (isStrRef(ins.typedOperands[0]) || isStrRef(ins.typedOperands[1])) mark(ins.result);
                 } else if (ins.opcode == OP::LOAD_INDEX && ins.result.isValid()
@@ -2190,6 +2900,17 @@ public:
                 } else if (ins.opcode == OP::LOAD_VAR && ins.result.isValid()
                            && !ins.typedOperands.empty() && isStrRef(ins.typedOperands[0])) {
                     mark(ins.result);   // copying a string pointer keeps it a string
+                } else if (ins.opcode == OP::LOAD_INDEX && ins.result.isValid()
+                           && ins.typedOperands.size() >= 2 && isDictRef(ins.typedOperands[0])
+                           && ins.typedOperands[1].kind == AC_IR::IRRef::Kind::CONST
+                           && ins.typedOperands[1].value.type == AC_IR::IRType::STRING) {
+                    // dict[$key$] where $key$ is a statically-known string-valued field —
+                    // see dictStrKeysByVar_'s comment (dicts are heterogeneous at runtime, so
+                    // this is the only place codegen can know a given read is string-typed).
+                    std::string key = std::get<std::string>(ins.typedOperands[1].value.data);
+                    if (key.size() >= 2 && key.front()=='$' && key.back()=='$') key = key.substr(1, key.size()-2);
+                    auto keys = dictStrKeysFor(ins.typedOperands[0]);
+                    if (keys.count(key)) mark(ins.result);
                 } else if (ins.opcode == OP::CALL && ins.result.isValid() && !ins.typedOperands.empty()) {
                     std::string callee = funcName(ins.typedOperands[0]);
                     if ((stringFuncs_ && stringFuncs_->count(callee)) || returnsCString(callee))
@@ -2221,15 +2942,84 @@ public:
                     size_t v = dictVarNames_.size(), t = dictTempIds_.size();
                     markDstDict(ins.result);
                     if (dictVarNames_.size() != v || dictTempIds_.size() != t) changed = true;
+                    // Record which keys carry a `$..$` string literal — see dictStrKeysByVar_.
+                    std::string content = ins.typedOperands.size() >= 2
+                        && ins.typedOperands[1].kind == AC_IR::IRRef::Kind::CONST
+                        && ins.typedOperands[1].value.type == AC_IR::IRType::STRING
+                        ? std::get<std::string>(ins.typedOperands[1].value.data) : "";
+                    std::set<std::string> strKeys; std::string rest = content;
+                    while (!rest.empty()) {
+                        auto comma = rest.find(',');
+                        std::string pair = comma == std::string::npos ? rest : rest.substr(0, comma);
+                        rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
+                        auto colon = pair.find(':');
+                        if (colon == std::string::npos) continue;
+                        std::string k = pair.substr(0, colon), v2 = pair.substr(colon + 1);
+                        auto trim = [](std::string& x){ size_t a=x.find_first_not_of(' '), b=x.find_last_not_of(' ');
+                            x = (a==std::string::npos) ? "" : x.substr(a, b-a+1); };
+                        trim(k); trim(v2);
+                        if (k.size() >= 2 && k.front()=='$' && k.back()=='$') k = k.substr(1, k.size()-2);
+                        if (v2.size() >= 2 && v2.front()=='$' && v2.back()=='$') strKeys.insert(k);
+                    }
+                    if (mergeDictStrKeysChanged(ins.result, strKeys)) changed = true;
                 } else if ((ins.opcode == OP::STORE_VAR || ins.opcode == OP::LOAD_VAR)
                            && ins.result.isValid() && !ins.typedOperands.empty()
                            && isDictRef(ins.typedOperands[0])) {
                     size_t v = dictVarNames_.size(), t = dictTempIds_.size();
                     markDstDict(ins.result);
                     if (dictVarNames_.size() != v || dictTempIds_.size() != t) changed = true;
+                    if (mergeDictStrKeysChanged(ins.result, dictStrKeysFor(ins.typedOperands[0]))) changed = true;
                 } else if (ins.opcode == OP::CALL && ins.result.isValid() && !ins.typedOperands.empty()
                            && arrayFuncs_ && arrayFuncs_->count(funcName(ins.typedOperands[0]))) {
                     markA(ins.result);
+                }
+                // list-of-dicts propagation: an ALLOC "list" whose every element token names an
+                // already-known dict var (datac multi-row import: pets = [dc_pets_0, dc_pets_1])
+                // is itself a list of dict-block pointers; LOAD_INDEX out of it yields a dict.
+                if (ins.opcode == OP::ALLOC && ins.result.isValid() && ins.typedOperands.size() >= 2
+                    && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::CONST
+                    && ins.typedOperands[0].value.type == AC_IR::IRType::STRING
+                    && std::get<std::string>(ins.typedOperands[0].value.data) == "list"
+                    && ins.typedOperands[1].kind == AC_IR::IRRef::Kind::CONST
+                    && ins.typedOperands[1].value.type == AC_IR::IRType::STRING) {
+                    const std::string& s = std::get<std::string>(ins.typedOperands[1].value.data);
+                    std::vector<std::string> toks; size_t i = 0;
+                    while (i < s.size()) {
+                        size_t j = s.find(',', i);
+                        std::string tok = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
+                        size_t a = tok.find_first_not_of(" \t"), b = tok.find_last_not_of(" \t");
+                        toks.push_back(a != std::string::npos ? tok.substr(a, b - a + 1) : "");
+                        if (j == std::string::npos) break;
+                        i = j + 1;
+                    }
+                    bool allDicts = !toks.empty();
+                    for (auto& t : toks) if (!dictVarNames_.count(t)) { allDicts = false; break; }
+                    if (allDicts) {
+                        size_t v = listOfDictVarNames_.size(), t2 = listOfDictTempIds_.size();
+                        markDstListOfDict(ins.result);
+                        if (listOfDictVarNames_.size() != v || listOfDictTempIds_.size() != t2) changed = true;
+                        // Every row shares the same schema — union each element dict's str-keys
+                        // onto the LIST var itself, so a later `pets[1]` read can look them up
+                        // via dictStrKeysFor(list-ref) same as any plain dict ref.
+                        std::set<std::string> rowKeys;
+                        for (auto& t : toks) {
+                            auto it = dictStrKeysByVar_.find(t);
+                            if (it != dictStrKeysByVar_.end()) rowKeys.insert(it->second.begin(), it->second.end());
+                        }
+                        if (mergeDictStrKeysChanged(ins.result, rowKeys)) changed = true;
+                    }
+                } else if (ins.opcode == OP::LOAD_INDEX && ins.result.isValid()
+                           && !ins.typedOperands.empty() && isListOfDictRef(ins.typedOperands[0])) {
+                    size_t v = dictVarNames_.size(), t = dictTempIds_.size();
+                    markDstDict(ins.result);
+                    if (dictVarNames_.size() != v || dictTempIds_.size() != t) changed = true;
+                    if (mergeDictStrKeysChanged(ins.result, dictStrKeysFor(ins.typedOperands[0]))) changed = true;
+                } else if ((ins.opcode == OP::STORE_VAR || ins.opcode == OP::LOAD_VAR)
+                           && ins.result.isValid() && !ins.typedOperands.empty()
+                           && isListOfDictRef(ins.typedOperands[0])) {
+                    size_t v = listOfDictVarNames_.size(), t = listOfDictTempIds_.size();
+                    markDstListOfDict(ins.result);
+                    if (listOfDictVarNames_.size() != v || listOfDictTempIds_.size() != t) changed = true;
                 }
             }
         }
@@ -2252,10 +3042,28 @@ public:
     }
 
     void compileFn(const AC_IR::IRFunction& fn) {
+        // Bundle methods need a class-qualified label — was just the bare method name (`greet`,
+        // `init`), a collision risk between classes AND a naming mismatch with what any call
+        // site actually needs (`Critter_greet`) — see the field-order pre-scan's comment.
+        std::string label = fn.classOwner.empty() ? fn.name : fn.classOwner + "_" + fn.name;
+        currentClass_ = fn.classOwner;
+        labelPrefix_ = "__fn_" + label + "_";
         buildLocalVarIds(fn.instructions);
         // Pass 0: pre-scan to identify float-typed variables (needed for correct loop codegen)
         preScanFloats(fn.instructions);
         for (const auto& p : forcedStringParams_) stringVarNames_.insert(p);
+        for (const auto& p : forcedFloatParams_)  floatVarNames_.insert(p);
+        // Seed cross-method string-field knowledge BEFORE preScanStrings runs its fixpoint (see
+        // classStringFields_'s comment) — a field this class assigns a string to in ANY method
+        // (commonly `init`) must print as a string in every OTHER method too (`self.field`), not
+        // just the one that assigns it. Must happen before the scan below, not after: a `Term.
+        // display self.name` actually reads through a TEMP (`LOAD_VAR tX, self.name; PRINT tX`),
+        // and preScanStrings only propagates "self.name is a string" onto tX via ITS OWN
+        // fixpoint if "self.name" was already a known string going in — seeding stringVarNames_
+        // after the scan already ran left the temp permanently unmarked (verified: printed the
+        // raw pointer as a decimal integer, "4202497", not "unnamed").
+        if (!fn.classOwner.empty() && classStringFields_ && classStringFields_->count(fn.classOwner))
+            for (auto& f : classStringFields_->at(fn.classOwner)) stringVarNames_.insert("self." + f);
         preScanStrings(fn.instructions);
         recordFloatReturn(fn.instructions, fn.name);
         recordStringReturn(fn.instructions, fn.name);
@@ -2270,6 +3078,15 @@ public:
 
         // Pass 2: frame layout — skip slots 0..nSave-1 (used by callee-save pushes)
         frame.setCalleeSaveBase(nSave);
+        // A method's `self` parameter is NEVER a bare "self" VAR anywhere in the IR — it only
+        // ever appears fused into compound names like "self.hp" (a totally separate symbol from
+        // "self" itself) — so the parameter-storing loop below, which finds a param's slot by
+        // scanning for a VAR whose NAME matches the param string, can never find "self" and
+        // silently never stores its incoming pointer ANYWHERE (verified crash: `self.name = x`
+        // read a slot containing raw zero, `mov (%r11)` on a null pointer). Pre-reserve a real
+        // frame slot under a synthetic ID BEFORE scanInstrs so it's correctly counted in fsize
+        // (reserving it AFTER `sub rsp` was already sized would silently write past the frame).
+        if (!fn.classOwner.empty()) frame.varOffset(kSelfSymId_);
         frame.scanInstrs(fn.instructions);
         fsize = frame.frameSize();
 
@@ -2278,7 +3095,7 @@ public:
         if (nSave % 2 != 0) fsize += 8;
 
         // Emit prologue
-        em.label(fn.name);
+        em.label(label);
         em.push_rbp();
         em.mov_rbp_rsp();
         for (R r : calleeSaves) em.push_r(r);
@@ -2300,6 +3117,8 @@ public:
             }
             if (symId >= 0)
                 em.mov_rbp_r(frame.varOffset(symId), abi.argRegs[i]);
+            else if (i == 0 && !fn.classOwner.empty() && pname == "self")
+                em.mov_rbp_r(frame.varOffset(kSelfSymId_), abi.argRegs[i]);
         }
 
         // Emit instructions
@@ -2315,6 +3134,7 @@ public:
     }
 
     void compileGlobal(const std::vector<AC_IR::IRInstruction>& globalInit) {
+        labelPrefix_ = "__start_";
         buildLocalVarIds(globalInit);
         preScanFloats(globalInit);
         preScanStrings(globalInit);
@@ -2340,6 +3160,19 @@ public:
         em.mov_rbp_rsp();
         for (R r : calleeSaves) em.push_r(r);
         em.sub_rsp_i32(fsize);
+
+        // `use ilib widgets` needs a one-time `ac_widgets_init()` (== gtk_init()) before ANY
+        // widget constructor runs — every other backend's FFI shim already does this
+        // automatically as part of its own module/class init (verified: the Python shim calls
+        // `_lib.ac_widgets_init()` unconditionally at load time), but nothing here ever emitted
+        // the equivalent call. Without it GTK's internal display/style-context state was never
+        // set up, so the FIRST real GTK call (inside `Screen()`) crashed with "Can't create a
+        // GtkStyleContext without a display connection" — this had nothing to do with sandbox/
+        // display availability at all (confirmed: a plain hand-written `gtk_init()` C program
+        // opens a real window fine in this same environment); every "reaches the same GTK
+        // crash point" verification this session was actually hitting THIS bug, not an
+        // environment limit.
+        if (prog.importedLibs.count("widgets")) em.call("ac_widgets_init");
 
         for (auto& ins : globalInit) compileInstr(ins);
 
@@ -2378,6 +3211,30 @@ static void emitAllocLinux(X64Emitter& em, int cursorSlot) {
     em.add_rr(R::RAX, R::RDI);               // rax = old + bytes (new cursor)
     em.mov_ptr_r(R::RCX, R::RAX);            // *cursor = new
     em.mov_rr(R::RAX, R::RDX);               // rax = result
+    em.pop_rbp(); em.ret();
+}
+
+// `atomic` support: a real spinlock, zero libc/syscalls — fits BNY's own "own the CPU"
+// design exactly (the same reason the allocator above is a raw mmap syscall, not malloc).
+// XCHG with a memory operand carries an implicit x86 lock (Intel SDM Vol.2), so try-acquire
+// is a single instruction + a compare; no `lock cmpxchg` or explicit LOCK prefix needed.
+static void emitAtomicLockLinux(X64Emitter& em, int lockSlot) {
+    em.label("__ac_atomic_lock__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.mov_ri64_gvar(R::RCX, lockSlot);      // rcx = &lock
+    em.label("__ac_atomic_spin__");
+    em.mov_ri32(R::RAX, 1);                  // rax = 1 (the "locked" marker)
+    em.xchg_ptr_r(R::RCX, R::RAX);           // atomically: old=[rcx]; [rcx]=1; rax=old
+    em.test_rr(R::RAX, R::RAX);              // old == 0 (was unlocked)?
+    em.jnz("__ac_atomic_spin__");            // old != 0 → someone else holds it, retry
+    em.pop_rbp(); em.ret();                  // acquired
+}
+static void emitAtomicUnlockLinux(X64Emitter& em, int lockSlot) {
+    em.label("__ac_atomic_unlock__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.mov_ri64_gvar(R::RCX, lockSlot);
+    em.mov_ri32(R::RAX, 0);
+    em.mov_ptr_r(R::RCX, R::RAX);            // plain store — fine, we uniquely hold the lock here
     em.pop_rbp(); em.ret();
 }
 
@@ -2520,6 +3377,23 @@ static void emitStrEqLinux(X64Emitter& em) {
     em.ret();
     em.label("__ac_streq_no__");
     em.mov_ri32(R::RAX, 0);
+    em.ret();
+}
+
+// widgets ilib callback trampolines (see widgetVarKind_'s comment for the ctor/method dispatch
+// these back — `btn(root, text, OnClick)` / `.on_click(OnClick)`). GTK's C callback signature is
+// `void (*)(void*)`; the AC user function being bridged to is either 0-arg or 1-arg (arity from
+// userFuncArity()). Mirrors CStrategy's `_ac_widget_call0`/`_ac_widget_call1`
+// (`((ac_int(*)(void))fn)()` / `((ac_int(*)(ac_int))fn)(0)`) as raw machine code.
+static void emitWidgetTrampolinesLinux(X64Emitter& em) {
+    em.label("_ac_widget_call0");        // rdi = fn ptr
+    em.mov_rr(R::R10, R::RDI);
+    em.call_r(R::R10);
+    em.ret();
+    em.label("_ac_widget_call1");        // rdi = fn ptr
+    em.mov_rr(R::R10, R::RDI);
+    em.mov_ri32(R::RDI, 0);
+    em.call_r(R::R10);
     em.ret();
 }
 
@@ -2991,7 +3865,7 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.mov_ri32(R::RAX, 0);
     em.cvtsi2sd_xmm1_from_gpr(R::RAX); // xmm1 = 0.0
     em.ucomisd_xmm0_xmm1();
-    em.je("__acd_nl__");
+    em.je("__acd_dotzero__");          // whole-valued float still prints ".0" (12.0, not 12)
 
     // ── Fractional digits ───────────────────────────────────────────────────
     em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
@@ -3022,6 +3896,13 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.movzx_r64_ptr8(R::RAX, R::R12);
     em.cmp_r_i32(R::RAX, '0'); em.je("__acd_strip__");
     em.inc_r(R::R12);
+    em.jmp("__acd_nl__");               // skip the ".0" block below (that path is for frac==0 only)
+
+    // ── Whole-valued float → append ".0" so a float never prints as a bare integer ──
+    em.label("__acd_dotzero__");
+    em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+    em.mov_ri32(R::RAX, '0'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+    // fall through to newline + write
 
     // ── Newline + write ───────────────────────────────────────────────────
     em.label("__acd_nl__");
@@ -3033,6 +3914,209 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
 
     em.add_rsp_i32(128);
     em.pop_r(R::RBX); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12);
+    em.pop_rbp(); em.ret();
+}
+
+// `save as <file>` — accumulates everything Term.display'd so far into a 64KB buffer (lazily
+// mmap'd via the existing __ac_alloc__ the same way __heap_cursor lazily mmaps its own storage —
+// see this file's `usesSave_` comment), written out via a raw `open`/`write`/`close` syscall
+// sequence when SAVE_FILE fires. Was a complete no-op before this session (`ir.cpp`'s SaveStmt
+// case did nothing at all, on every backend) despite being a real, documented feature.
+//
+// __ac_save_append_cstr__(rdi = null-terminated ptr): strlen-scan (mirrors __ac_print_cstr__),
+// lazy-alloc the buffer on first use, byte-copy the string + a newline onto the end, update len.
+static void emitSaveAppendCStrLinux(X64Emitter& em, int bufPtrSlot, int bufLenSlot) {
+    em.label("__ac_save_append_cstr__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
+
+    em.mov_rr(R::R12, R::RDI);          // r12 = src base ptr
+    em.mov_rr(R::R13, R::RDI);          // r13 = scan cursor
+    em.label("__acsa_scan__");
+    em.movzx_r64_ptr8(R::RAX, R::R13);
+    em.test_rr(R::RAX, R::RAX);
+    em.je("__acsa_scandone__");
+    em.inc_r(R::R13);
+    em.jmp("__acsa_scan__");
+    em.label("__acsa_scandone__");
+    em.sub_rr(R::R13, R::R12);          // r13 = strlen(src)
+
+    // Lazy-allocate the 64KB buffer (same "cursor == 0 means never allocated" check __ac_alloc__
+    // itself uses for __heap_cursor — a proven pattern, not new machinery).
+    em.mov_ri64_gvar(R::RCX, bufPtrSlot);  // rcx = &buf_ptr
+    em.mov_r_ptr(R::R14, R::RCX);          // r14 = buf_ptr
+    em.test_rr(R::R14, R::R14);
+    em.jne("__acsa_havebuf__");
+    em.push_r(R::RCX); em.push_r(R::R12); em.push_r(R::R13);
+    em.mov_ri32(R::RDI, 65536);
+    em.call("__ac_alloc__");
+    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RCX);
+    em.mov_ptr_r(R::RCX, R::RAX);
+    em.mov_rr(R::R14, R::RAX);
+    em.label("__acsa_havebuf__");
+
+    // r15 = write cursor = buf_ptr + buf_len
+    em.mov_ri64_gvar(R::RBX, bufLenSlot);  // rbx = &buf_len
+    em.mov_r_ptr(R::RAX, R::RBX);          // rax = buf_len
+    em.mov_rr(R::R15, R::R14);
+    em.add_rr(R::R15, R::RAX);
+
+    // Byte-copy loop: r12=src cursor, r13=remaining count, r15=dst cursor
+    em.label("__acsa_copy__");
+    em.test_rr(R::R13, R::R13);
+    em.je("__acsa_copydone__");
+    em.movzx_r64_ptr8(R::RAX, R::R12);
+    em.mov_ptr_r8(R::R15, R::RAX);
+    em.inc_r(R::R12); em.inc_r(R::R15); em.dec_r(R::R13);
+    em.jmp("__acsa_copy__");
+    em.label("__acsa_copydone__");
+
+    // Append newline, then buf_len += (copied bytes + 1)
+    em.mov_ri32(R::RAX, '\n');
+    em.mov_ptr_r8(R::R15, R::RAX);
+    em.inc_r(R::R15);
+    em.sub_rr(R::R15, R::R14);          // r15 = new total length
+    em.mov_ptr_r(R::RBX, R::R15);
+
+    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+}
+
+// __ac_save_append_int__(rdi = signed int64): itoa then delegate to the cstr appender.
+static void emitSaveAppendIntLinux(X64Emitter& em) {
+    em.label("__ac_save_append_int__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.call("__ac_itoa__");             // rax = heap-allocated decimal string
+    em.mov_rr(R::RDI, R::RAX);
+    em.call("__ac_save_append_cstr__");
+    em.pop_rbp(); em.ret();
+}
+
+// __ac_save_append_double__(xmm0 = value): same digit-formatting algorithm as ac_print_double
+// (see its comment for the full walkthrough) but appends the formatted text into the save
+// buffer instead of writing it to stdout — kept as a full separate copy rather than trying to
+// share code with ac_print_double at the machine-code level (no clean way to parameterize
+// "where do the bytes go" without restructuring that already-correct, delicate function).
+static void emitSaveAppendDoubleLinux(X64Emitter& em, int bufPtrSlot, int bufLenSlot) {
+    em.label("__ac_save_append_double__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::RBX);
+    em.sub_rsp_i32(128);
+
+    em.lea_r_rbp32(R::R12, -160);       // r12 = write pointer into local buffer
+
+    em.cvttsd2si_r13_xmm0();
+    em.cvtsi2sd_xmm1_from_gpr(R::R13);
+    em.subsd_xmm0_xmm1();
+
+    em.mov_rr(R::RBX, R::R13);
+    em.test_rr(R::RBX, R::RBX);
+    em.jns("__acsd_pos__");
+    em.mov_ri32(R::RAX, '-');
+    em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+    em.neg_r(R::RBX);
+    em.label("__acsd_pos__");
+
+    em.lea_r_rbp32(R::R14, -110);
+    em.label("__acsd_idig__");
+    em.mov_rr(R::RAX, R::RBX);
+    em.mov_ri32(R::RCX, 10);
+    em.cqo(); em.idiv_rcx();
+    em.add_ri32(R::RDX, '0');
+    em.dec_r(R::R14);
+    em.mov_ptr_r8(R::R14, R::RDX);
+    em.mov_rr(R::RBX, R::RAX);
+    em.test_rr(R::RBX, R::RBX);
+    em.jne("__acsd_idig__");
+    em.lea_r_rbp32(R::RBX, -110);
+    em.label("__acsd_icpy__");
+    em.movzx_r64_ptr8(R::RAX, R::R14);
+    em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12); em.inc_r(R::R14);
+    em.cmp_rr(R::R14, R::RBX);
+    em.jl("__acsd_icpy__");
+
+    em.mov_ri32(R::RAX, 0);
+    em.cvtsi2sd_xmm1_from_gpr(R::RAX);
+    em.ucomisd_xmm0_xmm1();
+    em.je("__acsd_dotzero__");
+
+    em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+    em.mov_rr(R::R13, R::R12);
+
+    em.mov_ri32(R::R14, 15);
+    em.label("__acsd_fdig__");
+    em.mov_ri64(R::RAX, (uint64_t)0x4024000000000000ULL); // 10.0
+    em.movq_xmm1_from_gpr(R::RAX);
+    em.mulsd_xmm0_xmm1();
+    em.cvttsd2si_rax_xmm0();
+    em.mov_rr(R::RBX, R::RAX);
+    em.cvtsi2sd_xmm1_from_gpr(R::RAX);
+    em.subsd_xmm0_xmm1();
+    em.add_ri32(R::RBX, '0');
+    em.mov_ptr_r8(R::R12, R::RBX); em.inc_r(R::R12);
+    em.dec_r(R::R14); em.test_rr(R::R14, R::R14); em.je("__acsd_strip__");
+    em.mov_ri32(R::RAX, 0);
+    em.cvtsi2sd_xmm1_from_gpr(R::RAX);
+    em.ucomisd_xmm0_xmm1();
+    em.jne("__acsd_fdig__");
+
+    em.label("__acsd_strip__");
+    em.dec_r(R::R12);
+    em.movzx_r64_ptr8(R::RAX, R::R12);
+    em.cmp_r_i32(R::RAX, '0'); em.je("__acsd_strip__");
+    em.inc_r(R::R12);
+    em.jmp("__acsd_done__");
+
+    em.label("__acsd_dotzero__");
+    em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+    em.mov_ri32(R::RAX, '0'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+
+    em.label("__acsd_done__");
+    // NUL-terminate the local buffer, then hand it to the cstr appender (which strlen-scans it
+    // and does the lazy-alloc + copy against the real global save buffer).
+    em.mov_ri32(R::RAX, 0);
+    em.mov_ptr_r8(R::R12, R::RAX);
+    em.lea_r_rbp32(R::RDI, -160);
+    (void)bufPtrSlot; (void)bufLenSlot;  // reached only via __ac_save_append_cstr__ below
+    em.call("__ac_save_append_cstr__");
+
+    em.add_rsp_i32(128);
+    em.pop_r(R::RBX); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12);
+    em.pop_rbp(); em.ret();
+}
+
+// SAVE_FILE: raw open/write/close syscalls — writes the accumulated buffer to the named file.
+static void emitSaveFileLinux(X64Emitter& em, int bufPtrSlot, int bufLenSlot) {
+    em.label("__ac_save_file__");        // rdi = NUL-terminated path ptr
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12);
+    em.mov_rr(R::R12, R::RDI);           // save path ptr across syscalls
+
+    // open(path, O_WRONLY|O_CREAT|O_TRUNC = 0x241, 0644)
+    em.mov_rr(R::RDI, R::R12);
+    em.mov_ri32(R::RSI, 0x241);
+    em.mov_ri32(R::RDX, 0644);
+    em.mov_ri32(R::RAX, 2);              // sys_open
+    em.syscall();
+    em.mov_rr(R::RBX, R::RAX);           // rbx = fd (or negative errno)
+    em.test_rr(R::RBX, R::RBX);
+    em.jl("__acsf_done__");              // couldn't open — silently skip, matches other backends'
+                                          // "if (_f) {...}" guard rather than crashing the program
+
+    em.mov_ri64_gvar(R::RCX, bufPtrSlot);
+    em.mov_r_ptr(R::RSI, R::RCX);        // rsi = buf ptr
+    em.mov_ri64_gvar(R::RCX, bufLenSlot);
+    em.mov_r_ptr(R::RDX, R::RCX);        // rdx = buf len
+    em.mov_rr(R::RDI, R::RBX);
+    em.mov_ri32(R::RAX, 1);              // sys_write
+    em.syscall();
+
+    em.mov_rr(R::RDI, R::RBX);
+    em.mov_ri32(R::RAX, 3);              // sys_close
+    em.syscall();
+
+    em.label("__acsf_done__");
+    em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
 }
 
@@ -3352,6 +4436,303 @@ struct Elf64Dyn {
 };
 #pragma pack(pop)
 
+// ─── PE32+ (Windows x86-64) Writer ────────────────────────────────────────────
+// Windows has no stable raw-syscall ABI (unlike Linux) — every PE binary needs at
+// least an Import Address Table into kernel32.dll, even for the simplest program
+// (ExitProcess). Proven standalone against Wine + cross-checked structurally
+// against a real MinGW-produced binary via objdump before being wired in here.
+#pragma pack(push,1)
+struct PEDosHeader {
+    uint16_t e_magic = 0x5A4D; // "MZ"
+    uint16_t e_cblp=0,e_cp=0,e_crlc=0,e_cparhdr=0,e_minalloc=0,e_maxalloc=0;
+    uint16_t e_ss=0,e_sp=0,e_csum=0,e_ip=0,e_cs=0,e_lfarlc=0,e_ovno=0;
+    uint16_t e_res[4]={0,0,0,0};
+    uint16_t e_oemid=0,e_oeminfo=0;
+    uint16_t e_res2[10]={0,0,0,0,0,0,0,0,0,0};
+    int32_t  e_lfanew;
+};
+struct PECoffHeader {
+    uint32_t Signature = 0x00004550; // "PE\0\0"
+    uint16_t Machine = 0x8664;       // AMD64
+    uint16_t NumberOfSections;
+    uint32_t TimeDateStamp = 0;
+    uint32_t PointerToSymbolTable = 0;
+    uint32_t NumberOfSymbols = 0;
+    uint16_t SizeOfOptionalHeader;
+    uint16_t Characteristics = 0x0022; // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+};
+struct PEDataDirectory { uint32_t VirtualAddress=0; uint32_t Size=0; };
+struct PEOptionalHeader64 {
+    uint16_t Magic = 0x20b; // PE32+
+    uint8_t  MajorLinkerVersion=1, MinorLinkerVersion=0;
+    uint32_t SizeOfCode=0, SizeOfInitializedData=0, SizeOfUninitializedData=0;
+    uint32_t AddressOfEntryPoint=0;
+    uint32_t BaseOfCode=0;
+    uint64_t ImageBase = 0x140000000ULL;
+    uint32_t SectionAlignment = 0x1000;
+    uint32_t FileAlignment = 0x200;
+    uint16_t MajorOSVersion=6, MinorOSVersion=0;
+    uint16_t MajorImageVersion=0, MinorImageVersion=0;
+    uint16_t MajorSubsystemVersion=6, MinorSubsystemVersion=0;
+    uint32_t Win32VersionValue=0;
+    uint32_t SizeOfImage=0, SizeOfHeaders=0;
+    uint32_t CheckSum=0;
+    uint16_t Subsystem = 3; // IMAGE_SUBSYSTEM_WINDOWS_CUI (console)
+    uint16_t DllCharacteristics = 0x8140; // NX_COMPAT|TERMINAL_SERVER_AWARE|HIGH_ENTROPY_VA
+    uint64_t SizeOfStackReserve=0x100000, SizeOfStackCommit=0x1000;
+    uint64_t SizeOfHeapReserve=0x100000, SizeOfHeapCommit=0x1000;
+    uint32_t LoaderFlags=0;
+    uint32_t NumberOfRvaAndSizes=16;
+    PEDataDirectory DataDir[16];
+};
+struct PESectionHeader {
+    char     Name[8]={0,0,0,0,0,0,0,0};
+    uint32_t VirtualSize=0;
+    uint32_t VirtualAddress=0;
+    uint32_t SizeOfRawData=0;
+    uint32_t PointerToRawData=0;
+    uint32_t PointerToRelocations=0;
+    uint32_t PointerToLinenumbers=0;
+    uint16_t NumberOfRelocations=0;
+    uint16_t NumberOfLinenumbers=0;
+    uint32_t Characteristics=0;
+};
+struct PEImportDescriptor {
+    uint32_t OriginalFirstThunk=0; // RVA -> Import Lookup Table
+    uint32_t TimeDateStamp=0;
+    uint32_t ForwarderChain=0;
+    uint32_t Name=0;               // RVA -> DLL name string
+    uint32_t FirstThunk=0;         // RVA -> Import Address Table (patched by loader)
+};
+#pragma pack(pop)
+
+static uint32_t peAlignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
+
+// One imported function, grouped by DLL for the import table builder below.
+struct PEImport { std::string dll; std::string func; };
+
+// PE always lays out as .text at RVA SECT_ALIGN, .idata at RVA 2*SECT_ALIGN (single
+// code section + single import section — sufficient for what BNY emits for Windows
+// so far). Fixed and public so callers can compute label offsets before layout.
+static constexpr uint32_t PE_SECT_ALIGN = 0x1000;
+static constexpr uint32_t PE_TEXT_RVA   = PE_SECT_ALIGN;
+static constexpr uint32_t PE_IDATA_RVA  = 2 * PE_SECT_ALIGN;
+
+// Shared layout for the .idata section: [descriptors][ILT per dll][IAT per dll]
+// [hint/name per import][dll name strings]. Computed once, consumed both to bind
+// call-site fixup labels (before em.applyFixups()) and to actually build the bytes
+// (in writePE) — keeping both in sync by construction instead of by hand.
+struct PEImportLayout {
+    std::vector<std::string> dlls;
+    std::map<std::string, std::vector<size_t>> byDll;      // dll -> indices into `imports`
+    std::map<std::string, size_t> dllIltOff, dllIatOff, dllNameOff;
+    std::map<size_t, size_t> hintNameOff;                   // import idx -> offset
+    size_t descrBytes = 0;
+    size_t totalSize = 0;
+
+    // RVA of the IAT slot for a given import index — what call sites fix up against.
+    uint32_t iatSlotRVA(size_t importIdx, const std::vector<PEImport>& imports) const {
+        auto& dll = imports[importIdx].dll;
+        auto& v = byDll.at(dll);
+        size_t k = std::find(v.begin(), v.end(), importIdx) - v.begin();
+        return PE_IDATA_RVA + (uint32_t)dllIatOff.at(dll) + (uint32_t)k * 8;
+    }
+};
+
+static PEImportLayout layoutPEImports(const std::vector<PEImport>& imports) {
+    PEImportLayout L;
+    for (size_t i = 0; i < imports.size(); i++) {
+        auto& dll = imports[i].dll;
+        if (L.byDll.find(dll) == L.byDll.end()) L.dlls.push_back(dll);
+        L.byDll[dll].push_back(i);
+    }
+    L.descrBytes = (L.dlls.size() + 1) * sizeof(PEImportDescriptor);
+    size_t cursor = L.descrBytes;
+    for (auto& dll : L.dlls) { L.dllIltOff[dll] = cursor; cursor += (L.byDll[dll].size() + 1) * 8; }
+    for (auto& dll : L.dlls) { L.dllIatOff[dll] = cursor; cursor += (L.byDll[dll].size() + 1) * 8; }
+    for (auto& dll : L.dlls) {
+        for (size_t idx : L.byDll[dll]) {
+            L.hintNameOff[idx] = cursor;
+            size_t len = 2 + imports[idx].func.size() + 1;
+            if (len % 2) len++;
+            cursor += len;
+        }
+    }
+    for (auto& dll : L.dlls) { L.dllNameOff[dll] = cursor; cursor += dll.size() + 1; }
+    L.totalSize = cursor;
+    return L;
+}
+
+// Lay out and write a minimal static PE32+ executable: one .text (code) section and
+// (if `imports` is non-empty) one .idata section. `text` must already have its
+// `call qword ptr [rip+disp32]` sites patched — the caller binds those via
+// em.defineLabelAt(importName, layoutPEImports(imports).iatSlotRVA(idx,imports) -
+// PE_TEXT_RVA) before em.applyFixups(), reusing the existing generic fixup engine
+// instead of a parallel one here.
+static bool writePE(const std::string& path,
+                     std::vector<uint8_t> text,
+                     const std::vector<PEImport>& imports,
+                     uint32_t entryOffset) {
+    const uint32_t SECT_ALIGN = PE_SECT_ALIGN;
+    const uint32_t FILE_ALIGN = 0x200;
+
+    PEImportLayout L = layoutPEImports(imports);
+    std::vector<uint8_t> idata(L.totalSize, 0);
+    auto put64 = [&](size_t off, uint64_t v){ std::memcpy(&idata[off], &v, 8); };
+
+    uint32_t textRVA  = PE_TEXT_RVA;
+    uint32_t idataRVA = PE_IDATA_RVA;
+
+    for (auto& dll : L.dlls) {
+        for (size_t idx : L.byDll[dll]) {
+            size_t off = L.hintNameOff[idx];
+            idata[off] = 0; idata[off+1] = 0; // hint = 0 (name-based lookup)
+            std::memcpy(&idata[off+2], imports[idx].func.c_str(), imports[idx].func.size()+1);
+        }
+        std::memcpy(&idata[L.dllNameOff[dll]], dll.c_str(), dll.size()+1);
+
+        size_t n = L.byDll[dll].size();
+        for (size_t k = 0; k < n; k++) {
+            uint64_t hnRVA = idataRVA + (uint32_t)L.hintNameOff[L.byDll[dll][k]];
+            put64(L.dllIltOff[dll] + k*8, hnRVA);
+            put64(L.dllIatOff[dll] + k*8, hnRVA);
+        }
+        put64(L.dllIltOff[dll] + n*8, 0); // ILT terminator
+        put64(L.dllIatOff[dll] + n*8, 0); // IAT terminator
+    }
+    for (size_t d = 0; d < L.dlls.size(); d++) {
+        PEImportDescriptor id{};
+        id.OriginalFirstThunk = idataRVA + (uint32_t)L.dllIltOff[L.dlls[d]];
+        id.Name               = idataRVA + (uint32_t)L.dllNameOff[L.dlls[d]];
+        id.FirstThunk         = idataRVA + (uint32_t)L.dllIatOff[L.dlls[d]];
+        std::memcpy(&idata[d*sizeof(PEImportDescriptor)], &id, sizeof(id));
+    }
+    // Final descriptor slot stays zeroed (terminator).
+
+    uint32_t numSections = imports.empty() ? 1 : 2;
+    uint32_t hdrSize = sizeof(PEDosHeader) + sizeof(PECoffHeader) + sizeof(PEOptionalHeader64)
+                       + numSections * sizeof(PESectionHeader);
+    uint32_t sizeOfHeaders = peAlignUp(hdrSize, FILE_ALIGN);
+
+    uint32_t textRawOff  = sizeOfHeaders;
+    uint32_t textRawSize = peAlignUp((uint32_t)text.size(), FILE_ALIGN);
+    uint32_t idataRawOff  = textRawOff + textRawSize;
+    uint32_t idataRawSize = peAlignUp((uint32_t)idata.size(), FILE_ALIGN);
+
+    uint32_t sizeOfImage = imports.empty()
+        ? peAlignUp(textRVA + (uint32_t)text.size(), SECT_ALIGN)
+        : peAlignUp(idataRVA + (uint32_t)idata.size(), SECT_ALIGN);
+
+    PEDosHeader dos{};
+    dos.e_lfanew = sizeof(PEDosHeader);
+
+    PECoffHeader coff{};
+    coff.NumberOfSections = numSections;
+    coff.SizeOfOptionalHeader = sizeof(PEOptionalHeader64);
+
+    PEOptionalHeader64 opt{};
+    opt.AddressOfEntryPoint = textRVA + entryOffset;
+    opt.BaseOfCode = textRVA;
+    opt.SizeOfCode = textRawSize;
+    opt.SizeOfInitializedData = idataRawSize;
+    opt.SizeOfImage = sizeOfImage;
+    opt.SizeOfHeaders = sizeOfHeaders;
+    if (!imports.empty()) {
+        opt.DataDir[1].VirtualAddress = idataRVA; // Import Table
+        opt.DataDir[1].Size = (uint32_t)L.descrBytes;
+    }
+
+    PESectionHeader shText{};
+    std::memcpy(shText.Name, ".text", 5);
+    shText.VirtualSize = (uint32_t)text.size();
+    shText.VirtualAddress = textRVA;
+    shText.SizeOfRawData = textRawSize;
+    shText.PointerToRawData = textRawOff;
+    shText.Characteristics = 0x60000020; // CODE|EXECUTE|READ
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.write((char*)&dos, sizeof(dos));
+    f.write((char*)&coff, sizeof(coff));
+    f.write((char*)&opt, sizeof(opt));
+    f.write((char*)&shText, sizeof(shText));
+
+    if (!imports.empty()) {
+        PESectionHeader shIdata{};
+        std::memcpy(shIdata.Name, ".idata", 6);
+        shIdata.VirtualSize = (uint32_t)idata.size();
+        shIdata.VirtualAddress = idataRVA;
+        shIdata.SizeOfRawData = idataRawSize;
+        shIdata.PointerToRawData = idataRawOff;
+        shIdata.Characteristics = 0xC0000040; // INITIALIZED_DATA|READ|WRITE (loader patches the IAT)
+        f.write((char*)&shIdata, sizeof(shIdata));
+    }
+
+    std::vector<uint8_t> pad(sizeOfHeaders - hdrSize, 0);
+    f.write((char*)pad.data(), pad.size());
+
+    text.resize(textRawSize, 0);
+    f.write((char*)text.data(), text.size());
+
+    if (!imports.empty()) {
+        idata.resize(idataRawSize, 0);
+        f.write((char*)idata.data(), idata.size());
+    }
+    f.close();
+    return true;
+}
+
+// ── Minimal relocatable-object (.o) reader for --static-link splicing ─────────────
+// Reads a freestanding ilib object (ET_REL, verified zero undefined externals) and returns its
+// .text bytes + the offset of each defined .text symbol. BNY appends the .text into its own code
+// and points each ilib call at the spliced offset → one standalone binary, no gcc/ld, no DT_NEEDED.
+// Pilot objects have no relocations (pure self-contained code); `hadRelocs` flags any that would.
+struct SplicedObject {
+    std::vector<uint8_t>            text;
+    std::map<std::string, uint64_t> symOffset;  // defined .text symbol → offset within .text
+    bool ok = false;
+    bool hadRelocs = false;
+};
+
+static SplicedObject readFreestandingObject(const std::string& path) {
+    SplicedObject obj;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return obj;
+    std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (b.size() < sizeof(ElfEhdr)) return obj;
+    const ElfEhdr* eh = reinterpret_cast<const ElfEhdr*>(b.data());
+    if (!(eh->e_ident[0]==0x7f && eh->e_ident[1]=='E' && eh->e_ident[2]=='L' && eh->e_ident[3]=='F')) return obj;
+    if (eh->e_type != 1 /*ET_REL*/ || eh->e_machine != 62 /*x86-64*/) return obj;
+    if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(ElfShdr) || eh->e_shnum == 0) return obj;
+    if ((uint64_t)eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(ElfShdr) > b.size()) return obj;
+    const ElfShdr* sh = reinterpret_cast<const ElfShdr*>(b.data() + eh->e_shoff);
+    int nsh = eh->e_shnum;
+    if (eh->e_shstrndx >= (uint16_t)nsh) return obj;
+    const char* shstr = reinterpret_cast<const char*>(b.data() + sh[eh->e_shstrndx].sh_offset);
+    int textIdx = -1, symtabIdx = -1;
+    for (int i = 0; i < nsh; i++) {
+        std::string nm = shstr + sh[i].sh_name;
+        if (nm == ".text") textIdx = i;
+        else if (sh[i].sh_type == 2 /*SHT_SYMTAB*/) symtabIdx = i;
+        if (sh[i].sh_type == 4 /*SHT_RELA*/ || sh[i].sh_type == 9 /*SHT_REL*/) obj.hadRelocs = true;
+    }
+    if (textIdx < 0 || symtabIdx < 0) return obj;
+    int strtabIdx = (int)sh[symtabIdx].sh_link;
+    if (strtabIdx < 0 || strtabIdx >= nsh) return obj;
+    if (sh[textIdx].sh_offset + sh[textIdx].sh_size > b.size()) return obj;
+    obj.text.assign(b.begin() + sh[textIdx].sh_offset,
+                    b.begin() + sh[textIdx].sh_offset + sh[textIdx].sh_size);
+    const Elf64Sym* syms = reinterpret_cast<const Elf64Sym*>(b.data() + sh[symtabIdx].sh_offset);
+    int nsyms = (int)(sh[symtabIdx].sh_size / sizeof(Elf64Sym));
+    const char* strtab = reinterpret_cast<const char*>(b.data() + sh[strtabIdx].sh_offset);
+    for (int i = 0; i < nsyms; i++) {
+        if (syms[i].st_shndx == (uint16_t)textIdx && syms[i].st_name != 0)
+            obj.symOffset[strtab + syms[i].st_name] = syms[i].st_value;
+    }
+    obj.ok = true;
+    return obj;
+}
+
 static bool writeELF(const std::string& path,
                      const std::vector<uint8_t>& text,
                      const std::vector<uint8_t>& rodata,
@@ -3497,6 +4878,14 @@ struct ExtSym {
     std::string lib;        // e.g. "libacmath.so"
 };
 
+static bool isNativeCpuPtrSym(const std::string& name) {
+    static const std::set<std::string> bareCarriedOver = {
+        "ptr_new", "ptr_deref", "ptr_null", "ptr_is_null",
+        "ptr_eq", "ptr_copy", "ptr_update"
+    };
+    return bareCarriedOver.count(name) > 0;
+}
+
 static std::string normalizeExtSym(const std::string& irName) {
     static const std::map<std::string,std::string> tbl = {
         // ── Trig ──────────────────────────────────────────────────────────────
@@ -3555,6 +4944,23 @@ static std::string normalizeExtSym(const std::string& irName) {
         {"web.ac_page",             "ac_web_ac_page"},
         {"web.page_get",            "ac_web_page_get"},
         {"web.help",                "ac_web_help"},
+        // ── web-server library ──────────────────────────────────────────────
+        {"server.db_run",        "ac_server_db_run"},
+        {"server.db_run_p",      "ac_server_db_run_p"},
+        {"server.db_import",     "ac_server_db_import"},
+        {"server.db_reset",      "ac_server_db_reset"},
+        {"server.db_stop",       "ac_server_db_stop"},
+        {"server.listen",        "ac_server_listen"},
+        {"server.accept",        "ac_server_accept"},
+        {"server.req_method",    "ac_server_req_method"},
+        {"server.req_path",      "ac_server_req_path"},
+        {"server.req_query",     "ac_server_req_query"},
+        {"server.req_body",      "ac_server_req_body"},
+        {"server.req_header",    "ac_server_req_header"},
+        {"server.respond",       "ac_server_respond"},
+        {"server.respond_json",  "ac_server_respond_json"},
+        {"server.close",         "ac_server_close"},
+        {"server.help",          "ac_server_help"},
         // ── Native ML library ───────────────────────────────────────────────
         {"ml.tensor",                "ml_tensor"},
         {"ml.grid",                  "ml_grid"},
@@ -3567,18 +4973,28 @@ static std::string normalizeExtSym(const std::string& irName) {
         {"ml.add",                   "ml_add"},
         {"ml.multiply",              "ml_multiply"},
         {"ml.relu",                  "ml_relu"},
+        // "maudio.stop" is the compiler's auto-injected no-arg shutdown call (ir.cpp's
+        // injectAutoShutoff) — must NOT fall through to the generic "maudio." fallback below,
+        // which would produce "ac_maudio_stop" (the PER-TRACK stop, takes a handle int — wrong
+        // arity for a 0-arg call). ac_maudio_stop_all() is the real 0-arg one.
+        {"maudio.stop",              "ac_maudio_stop_all"},
     };
     auto it = tbl.find(irName);
     if (it != tbl.end()) return it->second;
-    // Generic ilib namespace fallback: os.cwd → ac_os_cwd, regex.match → ac_regex_match,
-    // stringm.upper → ac_stringm_upper (the C-core export naming convention).
-    for (const char* ns : {"os.", "regex.", "stringm."}) {
+    // Generic ilib namespace fallback: os.cwd -> ac_os_cwd, regex.match -> ac_regex_match,
+    // stringm.upper -> ac_stringm_upper, ncpu.dha -> ac_ncpu_dha, maudio.speak -> ac_maudio_speak
+    // (the C-core export convention).
+    for (const char* ns : {"os.", "regex.", "stringm.", "ncpu.", "maudio."}) {
         if (irName.rfind(ns, 0) == 0) {
             std::string s = "ac_" + irName;
             for (auto& c : s) if (c == '.') c = '_';
             return s;
         }
     }
+    // native-cpu's carried-over ptr_* functions are called BARE (ptr_new, not
+    // ncpu.ptr_new) but the real .so symbol is still ac_ncpu_ptr_new — map it here,
+    // same as the dotted case above just without a '.' to replace.
+    if (isNativeCpuPtrSym(irName)) return "ac_ncpu_" + irName;
     return irName;
 }
 
@@ -3602,24 +5018,39 @@ static std::string libForSym(const std::string& exportName) {
         exportName.rfind("ac_screen_", 0) == 0)
         return "libaccamera.so";
 
+    // web-server library (libacserver)
+    if (exportName.rfind("ac_server_", 0) == 0)
+        return "libacserver.so";
+
     // Web library (libacweb)
     if (exportName.rfind("ac_web_", 0) == 0)
         return "libacweb.so";
 
-    // os / regex / string-cheese libraries (must precede the generic ac_ math fallback)
+    // Widgets library (libacwidgets) — must precede the generic ac_ math fallback below,
+    // which would otherwise wrongly claim every ac_widgets_* symbol too.
+    if (exportName.rfind("ac_widgets_", 0) == 0)
+        return "libacwidgets.so";
+
+    // os / regex / string-cheese / native-cpu / machine-audio libraries (must precede the
+    // generic ac_ math fallback below, which would otherwise wrongly claim these too)
     if (exportName.rfind("ac_os_", 0) == 0)      return "libacoos.so";
     if (exportName.rfind("ac_regex_", 0) == 0)   return "libacregex.so";
     if (exportName.rfind("ac_stringm_", 0) == 0) return "libacstringcheese.so";
+    if (exportName.rfind("ac_ncpu_", 0) == 0)    return "libacncpu.so";
+    if (exportName.rfind("ac_maudio_", 0) == 0)  return "libacmachinaaudio.so";
+    // native-cpu's carried-over ptr_* functions stay bare (no ac_ncpu_ prefix) — see
+    // isNativeCpuPtrSym().
+    if (isNativeCpuPtrSym(exportName)) return "libacncpu.so";
 
     // Native ML library (libacml)
     if (exportName.rfind("ml_", 0) == 0 ||
         exportName.rfind("pt_", 0) == 0 ||
         exportName.rfind("tf_", 0) == 0)
         return "libacml.so";
-    
+
     // Math library (libacmath)
     if (exportName.rfind("ac_", 0) == 0) return "libacmath.so";
-    
+
     return "";
 }
 
@@ -3894,7 +5325,30 @@ class BinaryCompiler {
     // NA→free: free-var names that must live in shared global slots, and name→slot map.
     std::set<std::string>     promotedGlobals_;
     std::map<std::string,int> gvarSlots_;
+    // Bundle/class support — see the big comment at the `usesTry_`/CLASS_BEGIN pre-scan site for
+    // the full rationale. classFields_: className -> ordered field names (offset = 8*index).
+    // instanceClass_: instance var name -> className, updated live as CONSTRUCT calls are
+    // compiled (a plain map, not a snapshot pre-scan, since which vars hold instances is a
+    // per-statement fact discovered while walking the program, same as ASM's own instanceClass_).
+    std::map<std::string, std::vector<std::string>> classFields_;
+    std::map<std::string, std::string> instanceClass_;
+    // widgets ilib: var name -> constructor kind, whole-program (populated during
+    // collectExternalSymbols()'s scan, BEFORE any per-function FuncCompiler starts codegen) —
+    // see FuncCompiler::widgetVarKind_'s comment for why this must be shared, not per-function.
+    std::map<std::string, std::string> widgetVarKindGlobal_;
+    // className -> field names ever assigned a string. `stringVarNames_` (the type-inference
+    // result "self.field" needs to print correctly) is a PER-FUNCTION-COMPILATION scan
+    // (`preScanStrings` only looks at the ONE function currently being compiled) — a field
+    // assigned a string in `init` (a different function/FuncCompiler instance) is invisible to
+    // `greet`'s own scan, so `Term.display self.name` inside `greet` printed the raw pointer
+    // VALUE as a decimal integer instead of dereferencing it as a string (verified: printed
+    // "4202497", not "unnamed"). Pre-scanned once across ALL of a class's methods, then seeded
+    // into every method's own `stringVarNames_` at compile time (see compileFn).
+    std::map<std::string, std::set<std::string>> classStringFields_;
     std::map<std::string,std::set<std::string>> stringParamHints_;
+    std::map<std::string,std::set<std::string>> floatParamHints_;   // fn → params passed a float
+    bool                      bundleStatic_ = false; // --static-link: splice freestanding ilib .text
+    std::string               runpath_;              // ilib dirs (also where freestanding objs live)
     bool                      usesArrays_ = false; // program allocates lists/arrays
     bool                      usesIpow_   = false; // program uses `^` with a variable exponent
     bool                      usesLength_ = false; // program uses `length` on an array
@@ -3903,6 +5357,9 @@ class BinaryCompiler {
     bool                      usesDict_   = false; // program uses string-keyed dicts
     bool                      usesAtoi_   = false; // program uses to_int/to_dec casts
     bool                      usesRand_   = false; // program uses random.number/choice
+    bool                      usesAtomic_ = false; // program declares an `atomic` var
+    bool                      usesSave_   = false; // program uses `save as`
+    bool                      usesTry_    = false; // program uses try/catch
 
     struct FuncBounds { std::string name; uint64_t startOff, endOff; };
 
@@ -4009,6 +5466,109 @@ class BinaryCompiler {
         usesArrays_ = true;
         gvarSlots_["__heap_cursor"] = slot++;
 
+        // `atomic` vars: reserve one gvar slot for a real spinlock (xchg-based, no libc/syscall
+        // needed — see X64Emitter::xchg_ptr_r) only if the program actually declares one.
+        auto hasAtomic = [&](const std::vector<IRInstruction>& code) {
+            for (auto& ins : code)
+                if (ins.opcode == IROpcode::TYPE_CAST && ins.resultType == AC_IR::IRType::ATOMIC)
+                    return true;
+            return false;
+        };
+        usesAtomic_ = hasAtomic(prog.globalInit);
+        if (!usesAtomic_)
+            for (auto& fn : prog.functions) if (hasAtomic(fn.instructions)) { usesAtomic_ = true; break; }
+        if (usesAtomic_) gvarSlots_["__atomic_lock"] = slot++;
+
+        // `save as <file>` — a 64KB buffer (mirrors AsmStrategy's identical fixed-size choice;
+        // see its comment), lazily mmap'd via the existing __ac_alloc__ bump allocator the exact
+        // same way __heap_cursor's OWN storage lazily mmaps on first use (proven pattern, not new
+        // machinery). __save_buf_ptr==0 means "not yet allocated" — the append helpers check
+        // that themselves.
+        auto hasSave = [&](const std::vector<IRInstruction>& code) {
+            for (auto& ins : code) if (ins.opcode == IROpcode::SAVE_FILE) return true;
+            return false;
+        };
+        usesSave_ = hasSave(prog.globalInit);
+        if (!usesSave_)
+            for (auto& fn : prog.functions) if (hasSave(fn.instructions)) { usesSave_ = true; break; }
+        if (usesSave_) {
+            gvarSlots_["__save_buf_ptr"] = slot++;
+            gvarSlots_["__save_buf_len"] = slot++;
+        }
+
+        // Real try/catch — a hand-rolled setjmp/longjmp equivalent (BNY has no libc to call the
+        // real ones). Previously `TRY_BEGIN` was a no-op and `CATCH_BEGIN` unconditionally
+        // `jmp`'d PAST the catch body ("no exception occurred" hardcoded, always true) — the
+        // catch body was genuinely unreachable dead code, and IDIV/MOD's zero-check always
+        // hard-exited even inside a `try` (verified: `examples/showcase.ac`'s div-by-zero test
+        // crashes instead of printing "caught..."). The div-by-zero usually happens inside a
+        // CALLED FUNCTION, not the same function as the `try`, so a same-function jump can't
+        // cross that boundary — needs a real cross-frame unwind (save RSP/RBP/catch-target at
+        // TRY_BEGIN, restore + indirect-jmp at the error site), same shape as every other
+        // backend's setjmp/longjmp fix this session, just hand-encoded since there's no libc
+        // setjmp/longjmp to call into. `__try_stack_ptr` is a 32-slot buffer (24 bytes/slot:
+        // saved RSP, RBP, catch-label address) lazily mmap'd via __ac_alloc__, same pattern as
+        // __save_buf_ptr right above.
+        auto hasTry = [&](const std::vector<IRInstruction>& code) {
+            for (auto& ins : code) if (ins.opcode == IROpcode::TRY_BEGIN) return true;
+            return false;
+        };
+        usesTry_ = hasTry(prog.globalInit);
+        if (!usesTry_)
+            for (auto& fn : prog.functions) if (hasTry(fn.instructions)) { usesTry_ = true; break; }
+        if (usesTry_) {
+            gvarSlots_["__try_stack_ptr"] = slot++;
+            gvarSlots_["__try_depth"] = slot++;
+        }
+
+        // Bundle/class: field-order pre-scan. BNY had NO bundle/class codegen at all before this
+        // (unlike ASM, which at least emitted plausible-looking method labels) — method labels
+        // were just the bare method name (`greet`/`init`, no class prefix — a collision risk and,
+        // separately, a naming mismatch with what any call site would need), `self.field`/
+        // `instance.field` resolved via the SAME per-function local-slot mechanism as any other
+        // named variable (completely disconnected from any real object memory — a field WRITE
+        // vanished the instant the method returned), `c = Critter()` compiled to a plain `call
+        // Critter` with no such label ever defined (hard link error — the exact failure that
+        // surfaced this), and `c.greet()` silently matched nothing in emitLibCall's function-name
+        // lookup (methods are named "greet", not "c.greet") — a pure no-op. Mirrors AsmStrategy's
+        // own proven design exactly: malloc'd instances (8 bytes/field, declaration order),
+        // `ClassName_method` labels, self/instance field access via pointer+offset.
+        for (auto& fn : prog.functions) {
+            if (fn.classOwner.empty()) continue;
+            auto& fields = classFields_[fn.classOwner];
+            for (auto& ins : fn.instructions) {
+                if (ins.opcode != IROpcode::STORE_VAR && ins.opcode != IROpcode::TYPE_CAST) continue;
+                IRRef tgt;
+                if (ins.opcode == IROpcode::TYPE_CAST) tgt = ins.result;
+                else if (ins.typedOperands.size() >= 2) tgt = ins.typedOperands[0];
+                else if (ins.result.isValid()) tgt = ins.result;
+                if (tgt.kind != IRRef::Kind::VAR || tgt.id < 0) continue;
+                std::string nm = prog.symbols.getName(tgt.id);
+                if (nm.rfind("self.", 0) != 0) continue;
+                std::string field = nm.substr(5);
+                if (std::find(fields.begin(), fields.end(), field) == fields.end())
+                    fields.push_back(field);
+                // Direct string-const assignment (`self.name = $unnamed$`) — the common case;
+                // doesn't chase full data-flow (a field assigned FROM another string var/temp
+                // isn't caught here), but matches the demonstrated, verified bug exactly.
+                // Two STORE_VAR shapes exist (see the target-detection above): {target,source}
+                // in typedOperands[0..1], OR target=ins.result with source=typedOperands[0]
+                // alone. Must match whichever one this instruction actually used, or the source
+                // check silently looks at the wrong operand (verified: `self.name = $unnamed$`
+                // uses the SECOND shape — typedOperands.size()==1 — so checking
+                // typedOperands[1] found nothing, and the field was never marked as a string).
+                const IRRef* srcRef = nullptr;
+                if (ins.typedOperands.size() >= 2) srcRef = &ins.typedOperands[1];
+                else if (!ins.typedOperands.empty()) srcRef = &ins.typedOperands[0];
+                if (srcRef && srcRef->kind == IRRef::Kind::CONST && srcRef->value.type == IRType::STRING)
+                    classStringFields_[fn.classOwner].insert(field);
+            }
+        }
+        // Ensure a class with zero self.field writes (unlikely, but matches the ASM/other-backend
+        // convention of still having a valid, empty entry) still gets a map entry.
+        for (auto& fn : prog.functions)
+            if (!fn.classOwner.empty()) classFields_[fn.classOwner];
+
         // Builtin helper calls (ac_ipow from `^`/ptm/ptd, ac_length from `length`)
         // need their machine-code helpers emitted.
         auto scanHelpers = [&](const std::vector<IRInstruction>& code) {
@@ -4038,7 +5598,9 @@ class BinaryCompiler {
         for (const auto& fn : prog.functions) funcs[fn.name] = &fn;
 
         auto refName = [&](const IRRef& r) -> std::string {
-            return (r.kind == IRRef::Kind::VAR && r.id >= 0) ? prog.symbols.getName(r.id) : "";
+            if (r.kind == IRRef::Kind::VAR && r.id >= 0) return prog.symbols.getName(r.id);
+            if (r.kind == IRRef::Kind::TEMP && r.id >= 0) return "t_" + std::to_string(r.id);
+            return "";
         };
         auto funcNameOf = [&](const IRRef& r) -> std::string {
             if ((r.kind == IRRef::Kind::FUNCTION || r.kind == IRRef::Kind::VAR) && r.id >= 0)
@@ -4050,15 +5612,19 @@ class BinaryCompiler {
                              std::set<std::string> strings) {
             bool changed = false;
             for (const auto& ins : code) {
-                if (ins.opcode == IROpcode::INPUT && ins.result.kind == IRRef::Kind::VAR) {
+                if (ins.opcode == IROpcode::INPUT && ins.result.isValid()) {
                     std::string n = refName(ins.result);
                     if (!n.empty()) strings.insert(n);
                 } else if ((ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL)
-                           && ins.result.kind == IRRef::Kind::VAR && !ins.typedOperands.empty()) {
-                    const IRRef& src = ins.typedOperands[0];
+                           && !ins.typedOperands.empty()
+                           && (ins.result.isValid() || ins.typedOperands.size() >= 2)) {
+                    bool resultForm = ins.result.isValid();
+                    const IRRef& dst = resultForm ? ins.result : ins.typedOperands[0];
+                    const IRRef& src = resultForm ? ins.typedOperands[0] : ins.typedOperands[1];
                     bool isString = (src.kind == IRRef::Kind::CONST && src.value.type == IRType::STRING)
-                                 || (src.kind == IRRef::Kind::VAR && strings.count(refName(src)));
-                    if (isString) strings.insert(refName(ins.result));
+                                 || strings.count(refName(src));
+                    std::string dn = refName(dst);
+                    if (isString && !dn.empty()) strings.insert(dn);
                 } else if ((ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL)
                            && !ins.typedOperands.empty()) {
                     std::string callee = funcNameOf(ins.typedOperands[0]);
@@ -4068,7 +5634,7 @@ class BinaryCompiler {
                     for (size_t i = 1; i < ins.typedOperands.size() && i <= params.size(); i++) {
                         const IRRef& arg = ins.typedOperands[i];
                         bool isString = (arg.kind == IRRef::Kind::CONST && arg.value.type == IRType::STRING)
-                                     || (arg.kind == IRRef::Kind::VAR && strings.count(refName(arg)));
+                                     || strings.count(refName(arg));
                         if (isString && stringParamHints_[callee].insert(params[i - 1]).second)
                             changed = true;
                     }
@@ -4085,6 +5651,78 @@ class BinaryCompiler {
                 std::set<std::string> strings = stringParamHints_[fn.name];
                 changed |= scanBlock(fn.instructions, strings);
             }
+        }
+    }
+
+    // Float-param inference — the analog of computeStringParamHints for doubles. A user function
+    // param that a caller passes a float to must be loaded as a double (movq), not sign-converted
+    // (cvtsi2sd) from its bits. Without this, `nsqrt(2.0)` fed x's raw double-bits through cvtsi2sd
+    // → garbage. Float-ness of an argument is resolved with the SAME authority (acCallReturnsFloat)
+    // used everywhere else, plus the usual float producers (float consts, DIV/FDIV, float arithmetic).
+    void computeFloatParamHints() {
+        using namespace AC_IR;
+        std::map<std::string,const IRFunction*> funcs;
+        for (const auto& fn : prog.functions) funcs[fn.name] = &fn;
+        auto refName = [&](const IRRef& r) -> std::string {
+            return (r.kind == IRRef::Kind::VAR && r.id >= 0) ? prog.symbols.getName(r.id) : "";
+        };
+        auto funcNameOf = [&](const IRRef& r) -> std::string {
+            if ((r.kind == IRRef::Kind::FUNCTION || r.kind == IRRef::Kind::VAR) && r.id >= 0)
+                return prog.symbols.getName(r.id);
+            return "";
+        };
+        auto scanBlock = [&](const std::vector<IRInstruction>& code, std::set<std::string> fvars) {
+            bool changed = false;
+            std::set<int> ftemps;
+            auto isFloat = [&](const IRRef& r) -> bool {
+                if (r.kind == IRRef::Kind::CONST) return r.value.type == IRType::FLOAT;
+                if (r.kind == IRRef::Kind::TEMP)  return ftemps.count(r.id) > 0;
+                if (r.kind == IRRef::Kind::VAR)   { std::string n = refName(r); return !n.empty() && fvars.count(n) > 0; }
+                return false;
+            };
+            auto mark = [&](const IRRef& r) {
+                if (r.kind == IRRef::Kind::TEMP) ftemps.insert(r.id);
+                else if (r.kind == IRRef::Kind::VAR) { std::string n = refName(r); if (!n.empty()) fvars.insert(n); }
+            };
+            for (const auto& ins : code) {
+                if ((ins.opcode == IROpcode::DIV || ins.opcode == IROpcode::FDIV) && ins.result.isValid())
+                    mark(ins.result);
+                if ((ins.opcode == IROpcode::ADD || ins.opcode == IROpcode::SUB
+                  || ins.opcode == IROpcode::MUL || ins.opcode == IROpcode::PMUL)
+                    && ins.result.isValid() && ins.typedOperands.size() >= 2
+                    && (isFloat(ins.typedOperands[0]) || isFloat(ins.typedOperands[1])))
+                    mark(ins.result);
+                if ((ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL
+                  || ins.opcode == IROpcode::LOAD_CONST)) {
+                    bool hasResult = ins.result.isValid() && !ins.typedOperands.empty();
+                    IRRef val = hasResult ? ins.typedOperands[0]
+                              : (ins.typedOperands.size() >= 2 ? ins.typedOperands[1] : IRRef());
+                    if (isFloat(val)) mark(hasResult ? ins.result
+                              : (ins.typedOperands.size() >= 2 ? ins.typedOperands[0] : IRRef()));
+                }
+                if ((ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL)
+                        && !ins.typedOperands.empty()) {
+                    std::string callee = funcNameOf(ins.typedOperands[0]);
+                    if (ins.result.isValid() && acCallReturnsFloat(callee))
+                        mark(ins.result);
+                    auto fit = funcs.find(callee);
+                    if (fit != funcs.end()) {
+                        const auto& params = fit->second->parameters;
+                        for (size_t i = 1; i < ins.typedOperands.size() && i <= params.size(); i++)
+                            if (isFloat(ins.typedOperands[i])
+                                && floatParamHints_[callee].insert(params[i - 1]).second)
+                                changed = true;
+                    }
+                }
+            }
+            return changed;
+        };
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            changed |= scanBlock(prog.globalInit, {});
+            for (const auto& fn : prog.functions)
+                changed |= scanBlock(fn.instructions, floatParamHints_[fn.name]);
         }
     }
 
@@ -4127,6 +5765,78 @@ class BinaryCompiler {
             if (expName.empty()) expName = irName;
             result.push_back({irName, expName, libForSym(expName)});
         };
+        // One-time GTK init (see compileGlobal's matching comment for the full "every widget
+        // test this session was actually hitting THIS bug" story) — registered here so its PLT
+        // stub exists whenever compileGlobal's own call to it needs one.
+        if (prog.importedLibs.count("widgets")) addSym("ac_widgets_init");
+        // widgets: `use ilib widgets` exposes bare ctor calls (`display(root,...)`) and
+        // dot-method calls on the returned handle (`lang_drop.add(...)`) — neither matches
+        // any of the dotted-namespace patterns below, so this static scan (which decides the
+        // PLT stub set BEFORE codegen runs) needs its own tracking, mirroring FuncCompiler's
+        // widgetVarKind_ but simplified to just "what real symbols get called" (see that
+        // member's comment for the full "undefined label" story this closes).
+        auto& wKind = widgetVarKindGlobal_;
+        // Pre-pass: populate wKind from EVERY function's widget ctors before the main scan below
+        // runs (which also needs wKind to resolve method calls) — a widget var's ctor and its
+        // method calls routinely live in DIFFERENT functions scanned in DECLARATION order (e.g.
+        // applicant_form.ac's `OnSubmit` callback, which calls `pos_drop.get()`, is declared
+        // BEFORE `<mainloop>`'s `pos_drop = dropdown(...)` ctor) — without this separate pass,
+        // a single forward scan would miss `pos_drop`'s kind for every method call that happens
+        // to be scanned first.
+        auto prepassCtors = [&](const std::vector<AC_IR::IRInstruction>& instrs) {
+            for (auto& ins : instrs) {
+                if (ins.opcode != AC_IR::IROpcode::CALL || ins.typedOperands.empty()) continue;
+                auto& r = ins.typedOperands[0];
+                std::string irName;
+                if (r.id >= 0) irName = prog.symbols.getName(r.id);
+                if (irName.empty() && r.value.type == AC_IR::IRType::STRING)
+                    irName = std::get<std::string>(r.value.data);
+                if (bnyIsWidgetCtorName(irName) && ins.result.isValid()
+                        && ins.result.kind == AC_IR::IRRef::Kind::VAR && ins.result.id >= 0) {
+                    std::string vn = prog.symbols.getName(ins.result.id);
+                    if (!vn.empty()) wKind[vn] = irName;
+                }
+            }
+        };
+        for (auto& fn : prog.functions) prepassCtors(fn.instructions);
+        prepassCtors(prog.globalInit);
+        // Shared by both the CALL-opcode dotted check (zero-arg method WITH parens, e.g.
+        // `pos_drop.get()`) and the LIB_CALL check (any dotted call WITH args) — see
+        // FuncCompiler::bnyWidgetCtor's sibling comment for why both opcodes need coverage.
+        // Returns true if `mname` was a recognized widget method call (regardless of whether it
+        // needed a real symbol — e.g. a bare `.pack` with no args still "handles" the dotted name).
+        auto tryWidgetMethodSym = [&](const std::string& mname, int argc) -> bool {
+            auto dot = mname.find('.');
+            if (dot == std::string::npos) return false;
+            std::string recv = mname.substr(0, dot);
+            std::string meth = mname.substr(dot + 1);
+            auto wit = wKind.find(recv);
+            if (wit == wKind.end()) return false;
+            const std::string& kind = wit->second;
+            if (meth == "pack") {
+                if (argc >= 2) addSym("ac_widgets_pack_spaced");
+                else { std::string p = bnyWidgetPackFn(kind); if (!p.empty()) addSym(p); }
+            } else if (meth == "mainloop" && kind == "Screen") addSym("ac_widgets_screen_mainloop");
+            else if (meth == "update" && kind == "Screen") addSym("ac_widgets_screen_update");
+            else if (meth == "destroy" && kind == "Screen") addSym("ac_widgets_screen_destroy");
+            else if (meth == "dimensions" && kind == "Screen") addSym("ac_widgets_screen_dimensions");
+            else if (meth == "add")
+                addSym(kind == "dropdown" ? "ac_widgets_dropdown_add" :
+                       kind == "listbox"  ? "ac_widgets_listbox_add"  :
+                       kind == "table"    ? "ac_widgets_table_add"    : "ac_widgets_add");
+            else if (meth == "set" || meth == "config") addSym(bnyWidgetSetFn(kind));
+            else if (meth == "get") addSym(bnyWidgetGetFn(kind));
+            else if (meth == "on_click" && kind == "btn") addSym("ac_widgets_btn_on_click");
+            else if (meth == "add_tab" && kind == "tabs") addSym("ac_widgets_tabs_add_tab");
+            else if (meth == "clear" && kind == "sketch") addSym("ac_widgets_sketch_clear");
+            else if ((meth == "line" || meth == "rect" || meth == "circle" || meth == "text_at") && kind == "sketch")
+                addSym("ac_widgets_sketch_" + (meth == "text_at" ? "text" : meth));
+            else if (meth == "write" && kind == "textbox") addSym("ac_widgets_textbox_write");
+            else if (meth == "find" && kind == "textbox") addSym("ac_widgets_textbox_find");
+            else if (meth == "fix" && kind == "textbox") addSym("ac_widgets_textbox_fix");
+            else return false;
+            return true;
+        };
         auto check = [&](const std::vector<AC_IR::IRInstruction>& instrs) {
             for (auto& ins : instrs) {
                 // CALL: math.sin(x), math.sqrt(x), or bare gcd() with "using header math"
@@ -4137,12 +5847,44 @@ class BinaryCompiler {
                     if (r.id >= 0) irName = prog.symbols.getName(r.id);
                     if (irName.empty() && r.value.type == AC_IR::IRType::STRING)
                         irName = std::get<std::string>(r.value.data);
+                    if (bnyIsWidgetCtorName(irName)) {
+                        addSym(bnyWidgetNewFn(irName));
+                        std::string packFn = bnyWidgetPackFn(irName);
+                        if (!packFn.empty()) addSym(packFn);
+                        // Registered unconditionally (cheap, matches this file's existing
+                        // "unconditional = always-consistent" precedent — see emitConcatLinux's
+                        // comment) rather than trying to detect a trailing `lazy` arg here too —
+                        // simplest way to guarantee the PLT stub exists whenever bnyWidgetCtor's
+                        // own isLazy branch (same ctor call, real codegen pass) needs it.
+                        addSym("ac_widgets_set_lazy");
+                        if (irName == "btn" && ins.typedOperands.size() > 3)
+                            addSym("ac_widgets_btn_on_click");
+                        if (ins.result.isValid() && ins.result.kind == AC_IR::IRRef::Kind::VAR
+                                && ins.result.id >= 0) {
+                            std::string vn = prog.symbols.getName(ins.result.id);
+                            if (!vn.empty()) wKind[vn] = irName;
+                        }
+                        continue;
+                    }
+                    // Zero-arg dotted widget method call WITH parens (`pos_drop.get()`) lowers
+                    // through this plain CALL opcode instead of LIB_CALL — see
+                    // FuncCompiler::bnyWidgetCtor's matching comment for the full story.
+                    if (tryWidgetMethodSym(irName, (int)ins.typedOperands.size() - 1)) continue;
                     if (irName.find("math.") != std::string::npos ||
                         irName.find("web.") != std::string::npos ||
+                        irName.rfind("server.", 0) == 0 ||
                         irName.find("ml.") != std::string::npos ||
                         irName.rfind("os.", 0) == 0 ||
                         irName.rfind("regex.", 0) == 0 ||
-                        irName.rfind("stringm.", 0) == 0) {
+                        irName.rfind("stringm.", 0) == 0 ||
+                        irName.rfind("ncpu.", 0) == 0 ||
+                        irName.rfind("maudio.", 0) == 0) {
+                        addSym(irName);
+                    } else if (isNativeCpuPtrSym(irName)) {
+                        // native-cpu's carried-over ptr_* functions are called bare (no dotted
+                        // receiver, matching the existing pointers-library convention) — `use ilib
+                        // native-cpu` doesn't populate usingHeaders_, so they need their own
+                        // explicit bare-name recognition here.
                         addSym(irName);
                     } else if (!usingHeaders_.empty() && irName.find('.') == std::string::npos && !irName.empty()) {
                         // Bare call + using header — check it's not user-defined
@@ -4162,12 +5904,15 @@ class BinaryCompiler {
                     else if (m.kind == AC_IR::IRRef::Kind::CONST &&
                              m.value.type == AC_IR::IRType::STRING)
                         mname = std::get<std::string>(m.value.data);
+                    if (tryWidgetMethodSym(mname, (int)ins.typedOperands.size() - 1)) continue;
                     if (mname.rfind("ml.", 0) == 0 || mname.rfind("os.", 0) == 0 ||
                         mname.rfind("regex.", 0) == 0 || mname.rfind("stringm.", 0) == 0 ||
-                        mname.rfind("web.", 0) == 0) {
+                        mname.rfind("web.", 0) == 0 || mname.rfind("server.", 0) == 0 ||
+                        mname.rfind("ncpu.", 0) == 0 || mname.rfind("maudio.", 0) == 0) {
                         addSym(mname);
                         continue;
                     }
+                    if (isNativeCpuPtrSym(mname)) { addSym(mname); continue; }
                     if (mname.rfind("Term.", 0) == 0 && mname.size() > 5) {
                         std::string fname = mname.substr(5);
                         if (fname != "display" && fname != "ask")
@@ -4213,40 +5958,31 @@ class BinaryCompiler {
         // Only add PLT entry if explicitly requested via libacmath (e.g. math constants)
         (void)needsPrintDouble;
         
-        // BNY Enhancement: Force-include libc for enhanced binary support
-        // Always available for dynamic linking: printf, dlopen, input support
-        std::vector<std::string> libcFuncs = {
-            "printf",      // Output (via __ac_print_*)
-            "scanf",       // Input (via __ac_input_int__)
-            "dlopen",      // Dynamic library loading
-            "dlsym",       // Symbol resolution
-            "strlen"       // String operations
-        };
-        for (auto& func : libcFuncs) {
-            if (!seen.count(func)) {
-                result.push_back({func, func, "libc.so.6"});
-                seen.insert(func);
-            }
-        }
-        
+        // NO unconditional libc. BNY's own runtime uses raw syscalls (__ac_print_*,
+        // __ac_input_str__, __ac_strlen__) and ilib .so's are resolved as NEEDED deps by
+        // ld-linux — none of printf/scanf/strlen/dlopen/dlsym is ever actually called.
+        // Force-adding them made `result` non-empty on every binary, so the fully-static
+        // path was dead and every trivial program dragged in libc.so.6 + ld-linux.
+        //
+        // Policy: a program with NO imports leaves `result` empty → static, ZERO-dependency
+        // ELF. A program that `use`s an ilib gets exactly that ilib's .so as its dependency
+        // (added above by the CALL/LIB_CALL scan) — nothing more.
         return result;
     }
 
 public:
-    BinaryCompiler(const AC_IR::IRProgram& p)
-        : prog(p), abi(host_abi())
-#ifdef TARGET_WINDOWS
-#else
-#endif
+    BinaryCompiler(const AC_IR::IRProgram& p, bool targetWindows = false)
+        : prog(p), abi((g_bnyTargetWindows = targetWindows, host_abi()))
     {}
 
     bool compile(const std::string& outPath,
                  bool debugInfo = false, const std::string& srcPath = "",
-                 const std::string& runpath = "") {
+                 const std::string& runpath = "", bool bundleStatic = false) {
+        bundleStatic_ = bundleStatic;
+        runpath_ = runpath;
         if (needsCrossCompilation()) {
-            // BNY targets: ELF on Linux x86, x86 ASM on macOS/Windows x86, C on ARM.
-            // The ARM→C route isn't wired yet — fall back to AC->C for now (no roast).
-            std::cerr << "AC->BNY on ARM routes through the C backend (not wired yet) — use AC->C.\n";
+            // BNY's direct emitter is x86-64. The CLI routes ARM through AC->C before calling here.
+            std::cerr << "AC->BNY direct emitter is x86-64 only; use the CLI ARM route through C.\n";
             return false;
         }
         
@@ -4271,17 +6007,43 @@ public:
         scanUsing(prog.globalInit);
         for (auto& fn : prog.functions) scanUsing(fn.instructions);
 
-        // Collect external symbols before emitting any code
+        // Collect external symbols before emitting any code. ELF-specific (ilib .so
+        // DT_NEEDED deps) — the Windows path uses a completely separate mechanism
+        // (PE import table, wired further down) since ilibs aren't built for Windows
+        // at all yet; that's real follow-up work, not something to fake here.
         std::vector<ExtSym> extSyms;
-#ifndef TARGET_WINDOWS
-        extSyms = collectExternalSymbols();
-#endif
-        bool dynamic = !extSyms.empty();
+        if (!g_bnyTargetWindows) extSyms = collectExternalSymbols();
+        // --static-link: can we SPLICE freestanding ilib code instead of dynamic-linking .so's?
+        // Load every freestanding object under the program's ilib dirs and check it defines each
+        // needed external symbol. If ALL are covered (and none carry relocations we can't yet apply),
+        // bundle statically → one zero-dep binary, no gcc/ld, no DT_NEEDED. Else fall back to dynamic.
+        std::vector<SplicedObject> spliceObjs;
+        bool willSplice = false;
+        if (bundleStatic_ && !extSyms.empty()) {
+            std::stringstream ss(runpath_);
+            std::string dir;
+            while (std::getline(ss, dir, ':')) {
+                if (dir.empty()) continue;
+                SplicedObject o = readFreestandingObject(dir + "/freestanding/fsmath.o");
+                if (o.ok && !o.hadRelocs) spliceObjs.push_back(std::move(o));
+            }
+            willSplice = true;
+            for (auto& es : extSyms) {
+                bool prov = false;
+                for (auto& o : spliceObjs) if (o.symOffset.count(es.exportName)) { prov = true; break; }
+                if (!prov) { willSplice = false; break; }
+            }
+            if (!willSplice)
+                std::cerr << "Note: --static-link fell back to dynamic linking — a used ilib function "
+                             "has no freestanding implementation yet (only integer-math is so far).\n";
+        }
+        bool dynamic = !extSyms.empty() && !willSplice;
 
         // Decide promoted free-var slots AND whether the heap is needed — must run before
         // emitting the allocator helper (which depends on usesArrays_ / __heap_cursor slot).
         computePromotedGlobals();
         computeStringParamHints();
+        computeFloatParamHints();
 
         // Emit print helpers
         emitPrintIntLinux(em);
@@ -4291,6 +6053,13 @@ public:
         emitInputIntLinux(em);
         emitInputStrLinux(em, sp);
         if (usesArrays_) { emitAllocLinux(em, gvarSlots_["__heap_cursor"]); emitAppendLinux(em); emitPrintArrLinux(em); }
+        if (usesAtomic_) { emitAtomicLockLinux(em, gvarSlots_["__atomic_lock"]); emitAtomicUnlockLinux(em, gvarSlots_["__atomic_lock"]); }
+        if (usesSave_) {
+            emitSaveAppendCStrLinux(em, gvarSlots_["__save_buf_ptr"], gvarSlots_["__save_buf_len"]);
+            emitSaveAppendIntLinux(em);
+            emitSaveAppendDoubleLinux(em, gvarSlots_["__save_buf_ptr"], gvarSlots_["__save_buf_len"]);
+            emitSaveFileLinux(em, gvarSlots_["__save_buf_ptr"], gvarSlots_["__save_buf_len"]);
+        }
         if (usesIpow_) emitIpowLinux(em);
         emitLengthLinux(em);  // always: ~30 bytes; __ac_strlen__ backs string-FOR/concat/indexing
         // Concat + streq emitted ALWAYS: the constant folder can fold away the only const-string
@@ -4299,6 +6068,7 @@ public:
         emitConcatLinux(em);
         emitStrEqLinux(em);
         emitItoaLinux(em);
+        emitWidgetTrampolinesLinux(em);
         if (usesDict_) { emitDictLinux(em, sp); emitDictSetLinux(em); }
         if (usesAtoi_) emitAtoiLinux(em);
         if (usesRand_) emitRandLinux(em);
@@ -4324,8 +6094,15 @@ public:
             fc.stringFuncs_ = &stringFuncs;
             fc.arrayFuncs_ = &arrayFuncs;
             fc.forcedStringParams_ = stringParamHints_[fn.name];
+            fc.forcedFloatParams_ = floatParamHints_[fn.name];
             fc.promotedGlobals_ = &promotedGlobals_;
             fc.gvarSlots_ = &gvarSlots_;
+            fc.usesSave_ = usesSave_;
+            fc.usesTry_ = usesTry_;
+            fc.classFields_ = &classFields_;
+            fc.instanceClass_ = &instanceClass_;
+            fc.classStringFields_ = &classStringFields_;
+            fc.widgetVarKind_ = &widgetVarKindGlobal_;
             fc.compileFn(fn);
             funcBounds.push_back({fn.name, startOff, em.pos()});
         }
@@ -4339,6 +6116,12 @@ public:
             gc.arrayFuncs_ = &arrayFuncs;
             gc.promotedGlobals_ = &promotedGlobals_;
             gc.gvarSlots_ = &gvarSlots_;
+            gc.usesSave_ = usesSave_;
+            gc.usesTry_ = usesTry_;
+            gc.classFields_ = &classFields_;
+            gc.instanceClass_ = &instanceClass_;
+            gc.classStringFields_ = &classStringFields_;
+            gc.widgetVarKind_ = &widgetVarKindGlobal_;
             gc.compileGlobal(prog.globalInit);
             funcBounds.push_back({"_start", startOff, em.pos()});
         }
@@ -4359,12 +6142,47 @@ public:
             }
         }
 
+        // --static-link: splice the freestanding ilib .text in and bind each ilib call to it. Done
+        // BEFORE applyFixups so em.call("math.gcd") resolves to the spliced code (not a PLT stub).
+        if (willSplice) {
+            std::map<std::string, size_t> exportAddr;   // export symbol → offset in the final text
+            for (auto& o : spliceObjs) {
+                size_t base = em.pos();
+                em.appendSplicedText(o.text);
+                for (auto& [name, off] : o.symOffset) exportAddr[name] = base + off;
+            }
+            for (auto& es : extSyms) {
+                auto it = exportAddr.find(es.exportName);
+                if (it != exportAddr.end()) em.defineLabelAt(es.irName, it->second);
+            }
+        }
+
+        // Windows: bind every Win32 API call (currently just ExitProcess, from
+        // emitHalt()) to its IAT slot BEFORE applyFixups(), exactly like the
+        // --static-link splice above binds ilib calls to spliced code — same
+        // generic fixup engine, just pointed at a different kind of target.
+        std::vector<PEImport> peImports;
+        if (g_bnyTargetWindows) {
+            peImports.push_back({"KERNEL32.DLL", "ExitProcess"});
+            PEImportLayout L = layoutPEImports(peImports);
+            em.defineLabelAt("ExitProcess", L.iatSlotRVA(0, peImports) - PE_TEXT_RVA);
+        }
+
         em.applyFixups();
 
+        if (g_bnyTargetWindows) {
+            // No string/gvar fixups yet — this path targets the trivial (no
+            // print, no NA->free globals) case first; that's real follow-up work
+            // (needs GetStdHandle/WriteFile imports), not faked here.
+            std::vector<uint8_t> text = em.code();
+            uint32_t entryOff = (uint32_t)em.getLabelOffset("_start");
+            return writePE(outPath, text, peImports, entryOff);
+        }
 
         // Platform-specific binary generation:
         // - Linux x86-64: direct ELF64 binary, no C intermediary.
-        
+        // - ARM is intentionally handled one layer up by generating C and invoking gcc/clang.
+
         if (!dynamic) {
             // Static ELF (original path)
             size_t hdrBytes = sizeof(ElfEhdr) + 2*sizeof(ElfPhdr);
@@ -4466,7 +6284,8 @@ public:
 // ─── Public API ───────────────────────────────────────────────────────────────
 bool generateBinaryFromIR(const AC_IR::IRProgram& ir, const std::string& outputFile,
                           bool debugInfo, const std::string& srcPath,
-                          const std::string& runpath) {
-    AC_BinaryGen::BinaryCompiler compiler(ir);
-    return compiler.compile(outputFile, debugInfo, srcPath, runpath);
+                          const std::string& runpath, bool bundleStatic,
+                          bool targetWindows) {
+    AC_BinaryGen::BinaryCompiler compiler(ir, targetWindows);
+    return compiler.compile(outputFile, debugInfo, srcPath, runpath, bundleStatic);
 }

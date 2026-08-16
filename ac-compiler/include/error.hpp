@@ -176,6 +176,11 @@ namespace Toxic {
     inline std::string javacNotHavingIt(int rc) {
         return "Toxic: javac wasn't having it (exit " + std::to_string(rc) + ")";
     }
+    // -supercalifragilisticexpialidocious: a line the parser can't make sense of is
+    // dropped and compilation continues, instead of a Preposterous syntax error + abort.
+    inline std::string confusedToo() {
+        return "Toxic: The compiler is confused as well, get back to the tutorials";
+    }
 }
 
 // Convenience macros for common error patterns

@@ -97,6 +97,7 @@ enum class IROpcode {
     SOFT_HALT,       // /stop    — graceful exit (clean shutdown)
     RESTART_PROGRAM, // /restart — marker replaced by restart-wrap pass in generateIR()
     SLEEP,           // /halt n  — pause execution for n seconds
+    SAVE_FILE,       // save as <name> — write everything printed so far to a file
     
     // Function management
     FUNC_BEGIN,
@@ -143,6 +144,10 @@ enum class IROpcode {
 enum class IRType {
     VOID,
     INT,
+    SHORT,   // 32-bit signed integer (`short x = e`) — narrower/faster than the 64-bit INT default
+    MINI,    // 16-bit signed integer (`mini x = e`) — narrowest wired-in int; below this, diminishing returns
+    ATOMIC,  // 64-bit int (`atomic x = e`) — any statement reading or writing it is a global critical
+             // section (one process-wide lock), so it's safe under real concurrent threads/quickthreads
     FLOAT,
     STRING,
     BOOL,
@@ -152,6 +157,11 @@ enum class IRType {
     FUNCTION,
     POINTER  // For complex types
 };
+
+// Bit width of a wired-in fixed-width integer type (0 = not a fixed-width int).
+inline int irIntWidth(IRType t) {
+    return t == IRType::SHORT ? 32 : t == IRType::MINI ? 16 : 0;
+}
 
 struct IRValue {
     IRType type;
@@ -567,6 +577,8 @@ struct IRProgram {
     std::vector<IRInstruction> mainSection; // main loop body — cache section
     std::string backend;                    // Target backend (PY, JS, RS, etc.)
     std::string target;                     // Same as backend (for compatibility)
+    int optLevel = 2;                       // -O level (0..4). Gates which IR optimization passes run
+                                            // and how many cascade iterations. 4 = heavy (BNY native).
     bool useHighLevelIR = false;            // Use structured control flow instead of jumps
     bool hadExplicitMainloop = false;       // True when <mainloop> or <StartHere> was seen
     bool infiniteMainloop = false;          // True when <mainloop> had NO closing tag → body loops forever (gated by --allow-infinite)
@@ -595,7 +607,7 @@ struct IRProgram {
 };
 
 // Free functions
-IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtimeMode = false);
+IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtimeMode = false, int optLevel = 2);
 std::string generateIRText(const IRProgram& program);
 
 } // namespace AC_IR

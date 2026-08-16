@@ -2,8 +2,8 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../
-#cgo LDFLAGS: -L${SRCDIR}/../ -lacregex -Wl,-rpath,${SRCDIR}/../
+#cgo CFLAGS: -I${SRCDIR}/library/ilib/regex
+#cgo LDFLAGS: -L${SRCDIR}/library/ilib/regex -lacregex -Wl,-rpath,${SRCDIR}/library/ilib/regex
 #include "regex_c.h"
 #include <stdlib.h>
 */

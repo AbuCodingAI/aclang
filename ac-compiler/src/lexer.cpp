@@ -1,4 +1,5 @@
 #include "../include/ac.hpp"
+#include <unordered_set>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -92,6 +93,9 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"to_int",      TokenType::KW_INT},
     {"to_string",   TokenType::KW_STRING},
     {"to_bool",     TokenType::KW_BOOL},
+    {"short",       TokenType::KW_SHORT},
+    {"mini",        TokenType::KW_MINI},
+    {"atomic",      TokenType::KW_ATOMIC},
     {"print_page",  TokenType::KW_PRINT_PAGE},
     {"alert",       TokenType::KW_ALERT},
     {"sure",        TokenType::KW_SURE},
@@ -106,6 +110,8 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"length",   TokenType::KW_LENGTH},
     {"LineUp",   TokenType::KW_LINEUP},
     {"export",   TokenType::KW_EXPORT},
+    {"DEG",      TokenType::KW_DEG},
+    {"RAD",      TokenType::KW_RAD},
 };
 
 // First-byte fast-path: if a word's first byte is NOT in kwFirstByte, it can't be a keyword.
@@ -252,11 +258,11 @@ public:
             // SAME LINE. Otherwise `count <max` (no closing >) was mis-lexed as a tag that
             // swallowed the rest of the line; treat it as the LT comparison operator instead.
             bool tagCloses = false;
-            if (src[pos] == '<' && pos+1 < src.size() && std::isalpha(src[pos+1])) {
+            if (src[pos] == '<' && pos+1 < src.size() && std::isalpha((unsigned char)src[pos+1])) {
                 for (size_t k = pos + 1; k < src.size() && src[k] != '\n'; k++)
                     if (src[k] == '>') { tagCloses = true; break; }
             }
-            if (src[pos] == '<' && pos+1 < src.size() && std::isalpha(src[pos+1]) && tagCloses) {
+            if (src[pos] == '<' && pos+1 < src.size() && std::isalpha((unsigned char)src[pos+1]) && tagCloses) {
                 int sc = col; pos++; col++;
                 std::string name;
                 while (pos < src.size() && src[pos] != '>') { name += src[pos++]; col++; }
@@ -269,7 +275,7 @@ public:
                     std::string raw;
                     const std::string closeTag = "<Foreign>";
                     while (pos < src.size()) {
-                        if (src.substr(pos, closeTag.size()) == closeTag) {
+                        if (src.compare(pos, closeTag.size(), closeTag) == 0) {
                             pos += closeTag.size(); col += closeTag.size();
                             break;
                         }
@@ -311,18 +317,18 @@ public:
             }
 
             // Backend: AC->XX or AC LIB (library header, no mainloop)
-            if (src.substr(pos, 3) == "AC-" || src.substr(pos, 3) == "AI-") {   // AI = interpreted sibling (AI->VM)
+            if (src.compare(pos, 3, "AC-") == 0 || src.compare(pos, 3, "AI-") == 0) {   // AI = interpreted sibling (AI->VM)
                 int sc = col;
                 pos += 3; col += 3;
                 if (pos < src.size() && src[pos] == '>') { pos++; col++; }
                 std::string backend;
-                while (pos < src.size() && (std::isalnum(src[pos]) || src[pos] == '+')) {
+                while (pos < src.size() && (std::isalnum((unsigned char)src[pos]) || src[pos] == '+')) {
                     backend += src[pos++]; col++;
                 }
                 tokens.emplace_back(TokenType::BACKEND, backend, line, sc);
                 continue;
             }
-            if (src.size() > pos + 5 && src.substr(pos, 6) == "AC LIB") {
+            if (src.size() > pos + 5 && src.compare(pos, 6, "AC LIB") == 0) {
                 // Check it's followed by end-of-line or EOF (not "AC LIBRARY" etc.)
                 size_t eol = pos + 6;
                 if (eol >= src.size() || src[eol] == '\n' || src[eol] == '\r' || src[eol] == ' ' || src[eol] == '\t') {
@@ -359,7 +365,7 @@ public:
                 } else {
                     // Regular slash command like /kill, or bare division operator /
                     std::string word;
-                    while (pos < src.size() && std::isalpha(src[pos])) { word += src[pos++]; col++; }
+                    while (pos < src.size() && std::isalpha((unsigned char)src[pos])) { word += src[pos++]; col++; }
                     tokens.emplace_back(TokenType::SLASH, word.empty() ? "/" : word, line, sc);
                 }
                 continue;
@@ -388,18 +394,34 @@ public:
             }
 
             // Numbers — decimal (one '.') or hex (0x + hex digits)
-            if (std::isdigit(src[pos])) {
+            if (std::isdigit((unsigned char)src[pos])) {
                 int sc = col;
                 std::string num;
                 if (src[pos] == '0' && pos + 1 < src.size() && (src[pos+1] == 'x' || src[pos+1] == 'X')) {
                     num += src[pos++]; num += src[pos++]; col += 2;   // "0x"
-                    while (pos < src.size() && std::isxdigit((unsigned char)src[pos])) { num += src[pos++]; col++; }
+                    while (pos < src.size() &&
+                           (std::isxdigit((unsigned char)src[pos]) ||
+                            // `_` digit-group separator (0xDEAD_BEEF): only between two hex
+                            // digits, so it's stripped rather than ever reaching NUMBER's text —
+                            // parser/codegen never need to know underscores were ever there.
+                            (src[pos] == '_' && pos+1 < src.size() && std::isxdigit((unsigned char)src[pos+1]) &&
+                             !num.empty() && std::isxdigit((unsigned char)num.back())))) {
+                        if (src[pos] != '_') num += src[pos];
+                        pos++; col++;
+                    }
                 } else {
                     bool sawDot = false;
-                    while (pos < src.size() && (std::isdigit((unsigned char)src[pos]) ||
-                           (src[pos] == '.' && !sawDot && pos+1 < src.size() && std::isdigit((unsigned char)src[pos+1])))) {
+                    while (pos < src.size() &&
+                           (std::isdigit((unsigned char)src[pos]) ||
+                            (src[pos] == '.' && !sawDot && pos+1 < src.size() && std::isdigit((unsigned char)src[pos+1])) ||
+                            // `_` digit-group separator (100_000_000): only between two digits,
+                            // e.g. never leading/trailing/doubled/adjacent-to-'.' — same
+                            // stripped-at-lex-time treatment as the hex branch above.
+                            (src[pos] == '_' && pos+1 < src.size() && std::isdigit((unsigned char)src[pos+1]) &&
+                             !num.empty() && std::isdigit((unsigned char)num.back())))) {
                         if (src[pos] == '.') sawDot = true;
-                        num += src[pos++]; col++;
+                        if (src[pos] != '_') num += src[pos];
+                        pos++; col++;
                     }
                 }
                 tokens.emplace_back(TokenType::NUMBER, num, line, sc);
@@ -407,7 +429,7 @@ public:
             }
 
             // Identifiers and keywords
-            if (std::isalpha(src[pos]) || src[pos] == '_') {
+            if (std::isalpha((unsigned char)src[pos]) || src[pos] == '_') {
                 int sc = col;
                 std::string word;
                 while (pos < src.size() && (std::isalnum((unsigned char)src[pos]) || src[pos] == '_')) {
@@ -423,8 +445,14 @@ public:
                 // AC has no kebab-case identifiers: '-' is the minus operator, so `n-1`
                 // lexes as n - 1. The one exception is hyphenated KEYWORDS (e.g.
                 // event-listener) — extend across '-' only if the combined token is a keyword.
+                // Fast-out: only a word that can START a hyphenated keyword needs the extend loop.
+                // Every other `ident-...` (i.e. nearly all subtraction, `n-1`/`a-b`) skips the
+                // per-char string build + KEYWORDS.find entirely. Update this set if a new
+                // hyphenated keyword is ever added (currently only "event-listener").
+                static const std::unordered_set<std::string> kHyphenKwLead = { "event" };
                 if (pos < src.size() && src[pos] == '-' && pos + 1 < src.size() &&
-                    (std::isalnum((unsigned char)src[pos+1]) || src[pos+1] == '_')) {
+                    (std::isalnum((unsigned char)src[pos+1]) || src[pos+1] == '_') &&
+                    kHyphenKwLead.count(word)) {
                     // #35: take the LONGEST keyword PREFIX of the hyphen run, not all-or-nothing
                     // (event-listener-foo: "event-listener" is the keyword; "-foo" stays separate).
                     std::string ext = "-";
@@ -447,7 +475,7 @@ public:
                 } else {
                     // Case-insensitive boolean check
                     std::string lower = word;
-                    for (auto& ch : lower) ch = std::tolower(ch);
+                    for (auto& ch : lower) ch = (char)std::tolower((unsigned char)ch);
                     if (lower == "true")
                         tokens.emplace_back(TokenType::KW_TRUE, word, line, sc);
                     else if (lower == "false")
@@ -511,6 +539,7 @@ public:
                     break;
                 case '^': tokens.emplace_back(TokenType::CARET, "^", line, sc); break;
                 case '~': tokens.emplace_back(TokenType::TILDE, "~", line, sc); break;
+                case '%': tokens.emplace_back(TokenType::PERCENT, "%", line, sc); break;  // wildcard (was silently dropped)
                 case '<':
                     tokens.emplace_back(TokenType::LT, "<", line, sc);
                     break;

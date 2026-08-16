@@ -66,9 +66,10 @@ const web = {
         x.send(null);
         return x.responseText;
       }
-      // Node fallback: shell out to curl synchronously.
+      // Node fallback: shell out to curl synchronously. Uses the argv-array form (no
+      // shell string is built), so '$(...)'/backticks/';' etc. in the URL are inert.
       return require("child_process")
-        .execSync("curl -sL --max-time 15 -- " + JSON.stringify(u)).toString();
+        .execFileSync("curl", ["-sL", "--max-time", "15", "--", u]).toString();
     } catch (e) {
       return "";
     }

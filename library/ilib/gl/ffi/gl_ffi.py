@@ -38,7 +38,7 @@ if _gl_lib:
     _gl_lib.ac_gl_obj_curveshape.restype          = None;  _gl_lib.ac_gl_obj_curveshape.argtypes          = [_cs, _cs]
     _gl_lib.ac_gl_obj_vertex.restype              = None;  _gl_lib.ac_gl_obj_vertex.argtypes              = [_cs, _f32, _f32]
     _gl_lib.ac_gl_obj_circle_fall.restype         = None;  _gl_lib.ac_gl_obj_circle_fall.argtypes         = [_cs, _f32, _cs]
-    _gl_lib.ac_gl_obj_circle_fell.restype         = _i32;  _gl_lib.ac_gl_obj_circle_fell.argtypes         = [_cs]
+    _gl_lib.ac_gl_obj_circle_fell.restype         = _i32;  _gl_lib.ac_gl_obj_circle_fell.argtypes         = [_cs, _f32, _cs]
     _gl_lib.ac_gl_obj_set_spawn.restype           = None;  _gl_lib.ac_gl_obj_set_spawn.argtypes           = [_cs]
     _gl_lib.ac_gl_obj_regen.restype               = None;  _gl_lib.ac_gl_obj_regen.argtypes               = [_cs]
     _gl_lib.ac_gl_obj_animate.restype             = None;  _gl_lib.ac_gl_obj_animate.argtypes             = [_cs, _cs, _f32]
@@ -91,7 +91,7 @@ if _gl_lib:
     def gl_obj_curveshape(name, expr):          _gl_lib.ac_gl_obj_curveshape(_b(name), _b(expr))
     def gl_obj_vertex(name, vx, vy):            _gl_lib.ac_gl_obj_vertex(_b(name), vx, vy)
     def gl_obj_circle_fall(name, frac, dir):    _gl_lib.ac_gl_obj_circle_fall(_b(name), frac, _b(dir))
-    def gl_obj_circle_fell(name):               return bool(_gl_lib.ac_gl_obj_circle_fell(_b(name)))
+    def gl_obj_circle_fell(name, frac=0.25, dir="right"): return bool(_gl_lib.ac_gl_obj_circle_fell(_b(name), frac, _b(dir)))
     def gl_obj_set_spawn(name):                 _gl_lib.ac_gl_obj_set_spawn(_b(name))
     def gl_obj_regen(name):                     _gl_lib.ac_gl_obj_regen(_b(name))
     def gl_obj_animate(name, dir, speed):       _gl_lib.ac_gl_obj_animate(_b(name), _b(dir), speed)
@@ -154,7 +154,7 @@ else:
     def gl_obj_curveshape(name,e): pass
     def gl_obj_vertex(name,vx,vy): pass
     def gl_obj_circle_fall(name,f,d): pass
-    def gl_obj_circle_fell(name): return False
+    def gl_obj_circle_fell(name, frac=0.25, dir="right"): return False
     def gl_obj_set_spawn(name): pass
     def gl_obj_regen(name): pass
     def gl_obj_animate(name,d,s): pass
@@ -420,12 +420,13 @@ def ac_gl_obj_pos_from_spec(name, x_spec, y_spec):
         except: return 0
     _pending_locs[n] = (xv, yv)
     gl_obj_pos(n, _rc(xv, True), _rc(yv, False))
+def ac_gl_obj_velocity(name, vx, vy):     gl_obj_velocity(name.strip('"'), float(vx), float(vy))
 def ac_gl_obj_move_y(name, dy):           gl_obj_move_y(name.strip('"'), int(dy))
 def ac_gl_obj_move_x(name, dx):           gl_obj_move_x(name.strip('"'), int(dx))
 def ac_gl_obj_vertex(name, vx, vy):       gl_obj_vertex(name.strip('"'), float(vx), float(vy))
 def ac_gl_obj_curveshape(name, expr):     gl_obj_curveshape(name.strip('"'), str(expr).strip('"'))
 def ac_gl_obj_circle_fall(name, frac, d): gl_obj_circle_fall(name.strip('"'), float(frac), str(d).strip('"'))
-def ac_gl_obj_circle_fell(name):          return gl_obj_circle_fell(name.strip('"'))
+def ac_gl_obj_circle_fell(name, frac=0.25, dir="right"): return gl_obj_circle_fell(name.strip('"'), float(frac), str(dir).strip('"'))
 def ac_gl_obj_regen(name):                gl_obj_regen(name.strip('"'))
 def ac_gl_obj_set_spawn(name):            gl_obj_set_spawn(name.strip('"'))
 def ac_gl_obj_save_spawn(name):           gl_obj_set_spawn(name.strip('"'))

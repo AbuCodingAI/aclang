@@ -81,11 +81,23 @@ web.help()               - Shows this help message'
 }
 
 fn open_url(url string) {
+    // Spawn via os.new_process/execve with the URL as a distinct argv element — NO shell,
+    // so a URL containing '$(...)', backticks, ';', quotes etc. is just a URL, never a command.
+    mut opener := ''
+    mut args := []string{}
     $if windows {
-        os.system('start ${url}')
-    } $else if macos {
-        os.system('open ${url}')
+        opener = 'cmd.exe'
+        args = ['/c', 'start', '', url]
+    } $else $if macos {
+        opener = 'open'
+        args = [url]
     } $else {
-        os.system('xdg-open ${url}')
+        opener = 'xdg-open'
+        args = [url]
     }
+    path := os.find_abs_path_of_executable(opener) or { return }
+    mut p := os.new_process(path)
+    p.set_args(args)
+    p.run()
+    p.wait()
 }

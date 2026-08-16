@@ -23,6 +23,8 @@ int         ac_stringm_startswith(const char* s, const char* prefix);
 int         ac_stringm_endswith(const char* s, const char* suffix);
 int         ac_stringm_count(const char* s, const char* sub);
 const char* ac_stringm_format(const char* template_str);  /* literal passthrough; AC compiler handles {} at IR level */
+const char* ac_stringm_f(const char* s);  /* f-string (formatted) — passthrough; compiler interpolates {} */
+const char* ac_stringm_t(const char* s);  /* t-string (template, PEP 750) — passthrough; resolved at IR level */
 const char* ac_stringm_b(const char* s);  /* bytes of s (identity for char*) */
 long long   ac_stringm_endian(const char* bytes, const char* order);  /* bytes -> unsigned int, "little"/"big" */
 const char* ac_stringm_getline();  /* read line from stdin */
@@ -46,10 +48,13 @@ struct _ac_stringm_ns {
     int         (*find)(const char*, const char*)   = ac_stringm_find;
     const char* (*replace)(const char*, const char*, const char*) = ac_stringm_replace;
     long long   (*len)(const char*)                 = ac_stringm_len;
+    long long   (*length)(const char*)              = ac_stringm_len; /* string-cheese.acl aliases both "length" and "len" to the "stringm.length" call name — Java/Go/Rust/V's FFI wrappers already expose both spellings, C++ needs the member to match */
     int         (*startswith)(const char*, const char*) = ac_stringm_startswith;
     int         (*endswith)(const char*, const char*)   = ac_stringm_endswith;
     int         (*count)(const char*, const char*)  = ac_stringm_count;
     const char* (*b)(const char*)                   = ac_stringm_b;
+    const char* (*f)(const char*)                   = ac_stringm_f;
+    const char* (*t)(const char*)                   = ac_stringm_t;
     long long   (*endian)(const char*, const char*) = ac_stringm_endian;
     const char* (*getline)()                        = ac_stringm_getline;
     int         (*scan)(const char*)                = ac_stringm_scan;
@@ -65,10 +70,13 @@ static _ac_stringm_ns stringm;
 #define stringm_find       ac_stringm_find
 #define stringm_replace    ac_stringm_replace
 #define stringm_len        ac_stringm_len
+#define stringm_length     ac_stringm_len /* string-cheese.acl aliases both "length" and "len" to "stringm.length" — only "length" is ever actually emitted */
 #define stringm_startswith ac_stringm_startswith
 #define stringm_endswith   ac_stringm_endswith
 #define stringm_count      ac_stringm_count
 #define stringm_b          ac_stringm_b
+#define stringm_f          ac_stringm_f
+#define stringm_t          ac_stringm_t
 #define stringm_endian     ac_stringm_endian
 #define stringm_getline    ac_stringm_getline
 #define stringm_scan       ac_stringm_scan

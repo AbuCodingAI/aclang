@@ -22,6 +22,7 @@ enum class TokenType {
     SLASH,          // /
     DOUBLE_SLASH,   // // integer division
     TRIPLE_SLASH,   // /// always-float division
+    PERCENT,        // % — name/string WILDCARD (p%=starts-with, %p=ends-with, %p%=contains). NOT modulo (use math.mod).
     ARROW,          // ->
     LPAREN,         // (
     RPAREN,         // )
@@ -32,7 +33,6 @@ enum class TokenType {
     COMMA,          // ,
     COLON,          // : (for dict key:value pairs)
     KW_FN,          // fn (enables *, &, &&, and "..." with quotes)
-    KW_DISPLAY,     // display $string$ (screen/GUI output)
     PLUS_EQUAL,     // +=
     MINUS_EQUAL,    // -=
     MULTIPLY_EQUAL, // *=
@@ -101,7 +101,6 @@ enum class TokenType {
     KW_IS,          // is  → equality comparison
     KW_PASS,        // pass → no-op placeholder
     KW_SKIP,        // skip → stop rest of if/elseif/other chain
-    KW_BREAK,       // break → exit loop
     KW_CONTINUE,    // continue → next loop iteration
     KW_DESTROY,     // destroy x → remove variable from existence
     KW_PROGRAM_LOOP,// programLoop → controls mainloop continuation
@@ -126,6 +125,9 @@ enum class TokenType {
     KW_INT,         // int x [= expr]  — coerce x to integer
     KW_STRING,      // string x [= expr] — coerce x to string
     KW_BOOL,        // bool x [= expr]   — coerce x to boolean
+    KW_SHORT,       // short x [= expr]  — 32-bit signed integer variable
+    KW_MINI,        // mini x [= expr]   — 16-bit signed integer variable
+    KW_ATOMIC,      // atomic x [= expr] — int variable; any op touching it is a global critical section
     KW_PRINT_PAGE,  // print_page → browser window.print()
     KW_ALERT,       // alert $msg$ → browser window.alert()
     KW_SURE,        // sure $msg$ → browser window.confirm() (returns bool)
@@ -140,6 +142,8 @@ enum class TokenType {
     KW_LENGTH,      // length(x) — array/string length
     KW_LINEUP,      // LineUp — match statement with value: case syntax
     KW_EXPORT,      // export — export function/variable for use in other files
+    KW_DEG,         // DEG <stmt> — math ilib sugar: the assigned value is already in degrees (no-op)
+    KW_RAD,         // RAD <stmt> — math ilib sugar: the assigned value is in radians, convert to degrees
 
     // Tags (block delimiters)
     TAG_OPEN,       // <tagname>

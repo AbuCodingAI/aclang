@@ -10,3 +10,12 @@
 *.html
 *.s
 ac-cache/
+*.class
+*.acb
+*.h
+*.so
+*.o
+*_c
+*_cpp
+*_cxx
+*_lib

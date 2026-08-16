@@ -8,7 +8,15 @@ def _ws(s):
     return s if s != " \t\n\r" else None  # None → Python default strip (all whitespace)
 
 # ── stringm functions ─────────────────────────────────────────────────────────
-# stringm_f (f-string) and stringm_t (template/trim) removed — use `$a$ + $b$` concatenation.
+# b / f / t are the three string-prefix constructors (like Python b"" / f"" / t"").
+# f-string and t-string do their interpolation at the compiler/IR level; the runtime
+# helpers are passthroughs (mirrors ac_stringm_format in string_cheese_c.h).
+
+def stringm_f(s, *args):
+    return str(s)                 # f-string (formatted) — compiler interpolates {} at IR level
+
+def stringm_t(s, *args):
+    return str(s)                 # t-string (template, PEP 750) — template resolved at IR level
 
 def stringm_b(s):
     return str(s).encode('utf-8')

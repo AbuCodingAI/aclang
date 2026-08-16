@@ -2,8 +2,8 @@
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../
-#cgo LDFLAGS: -L${SRCDIR}/../ -lacgl -Wl,-rpath,${SRCDIR}/../
+#cgo CFLAGS: -I${SRCDIR}/library/ilib/gl
+#cgo LDFLAGS: -L${SRCDIR}/library/ilib/gl -lacgl -Wl,-rpath,${SRCDIR}/library/ilib/gl
 #include "gl_c.h"
 #include <stdlib.h>
 */

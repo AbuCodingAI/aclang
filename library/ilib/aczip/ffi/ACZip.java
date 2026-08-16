@@ -6,7 +6,7 @@ public class ACZip {
     public interface ACZipLib extends Library {
         ACZipLib INSTANCE = Native.load("aczip", ACZipLib.class);
 
-        class ByteArray extends Structure {
+        class ByteArray extends Structure implements Structure.ByValue {
             public Pointer data;
             public long size;
 
@@ -25,7 +25,7 @@ public class ACZip {
     }
 
     public static byte[] compress(String path, boolean parallel) throws Exception {
-        ByteArray result = ACZipLib.INSTANCE.ac_zip_compress(
+        ACZipLib.ByteArray result = ACZipLib.INSTANCE.ac_zip_compress(
             path,
             parallel ? 1 : 0
         );
@@ -43,14 +43,14 @@ public class ACZip {
     }
 
     public static byte[] compressHDD(String path) throws Exception {
-        ByteArray result = ACZipLib.INSTANCE.ac_zip_compress_hdd(path);
+        ACZipLib.ByteArray result = ACZipLib.INSTANCE.ac_zip_compress_hdd(path);
         byte[] bytes = result.data.getByteArray(0, (int)result.size);
         ACZipLib.INSTANCE.ac_free_bytes(result);
         return bytes;
     }
 
     public static byte[] compressSATA(String path) throws Exception {
-        ByteArray result = ACZipLib.INSTANCE.ac_zip_compress_sata(path);
+        ACZipLib.ByteArray result = ACZipLib.INSTANCE.ac_zip_compress_sata(path);
         byte[] bytes = result.data.getByteArray(0, (int)result.size);
         ACZipLib.INSTANCE.ac_free_bytes(result);
         return bytes;

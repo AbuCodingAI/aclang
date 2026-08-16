@@ -62,7 +62,10 @@ public:
 
     // Conversion
     long long to_int64() const {
-        return ((long long)high << 64) | ((long long)mid << 32) | (long long)low;
+        // Low 64 bits (mid:low). `high << 64` is undefined (shift >= width) and can't
+        // contribute to the low 64 bits anyway; unsigned casts avoid sign-extending
+        // negative mid/low into the upper bits.
+        return (long long)(((unsigned long long)(unsigned int)mid << 32) | (unsigned int)low);
     }
 
     std::string str() const;
@@ -251,6 +254,7 @@ inline long long gcd(long long a, long long b) {
     return a;
 }
 inline long long lcm(long long a, long long b) {
+    if (a == 0 || b == 0) return 0;   // gcd(0,0)==0 → guard the divide; lcm(0,x)=0 by convention
     return std::llabs(a / gcd(a, b) * b);
 }
 

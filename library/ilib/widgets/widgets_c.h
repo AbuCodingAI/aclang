@@ -19,6 +19,7 @@ ac_widget_t ac_widgets_screen_new(const char* title, const char* geometry);
 void        ac_widgets_screen_mainloop(ac_widget_t screen);
 void        ac_widgets_screen_update(ac_widget_t screen);
 void        ac_widgets_screen_destroy(ac_widget_t screen);
+void        ac_widgets_screen_dimensions(ac_widget_t screen, int width, int height);
 
 /* ── display (label) ─────────────────────────────────────────────────────── */
 ac_widget_t ac_widgets_display_new(ac_widget_t master, const char* text);
@@ -73,6 +74,28 @@ void        ac_widgets_listbox_add(ac_widget_t w, const char* item);
 const char* ac_widgets_listbox_item(ac_widget_t w, int index);
 int         ac_widgets_listbox_count(ac_widget_t w);
 
+/* ── tabs (notebook) — add_tab returns a new master usable by any other
+   widget constructor, exactly like `group`, so widgets can be parented into
+   a specific tab's page ──────────────────────────────────────────────────── */
+ac_widget_t ac_widgets_tabs_new(ac_widget_t master);
+void        ac_widgets_tabs_pack(ac_widget_t w);
+ac_widget_t ac_widgets_tabs_add_tab(ac_widget_t w, const char* name);
+
+/* ── scroller (standalone scrollbar — matches the Python/ttk reference: a
+   bare Scrollbar, not a scrollable container) ───────────────────────────── */
+ac_widget_t ac_widgets_scroller_new(ac_widget_t master, const char* orient);
+void        ac_widgets_scroller_pack(ac_widget_t w);
+
+/* ── table (real multi-column tree view, headers from `columns_csv`).
+   Comma-separated columns/values — simple, no quoting/escaping (a cell value
+   containing a literal comma isn't supported; documented limitation, not a
+   silent one). ───────────────────────────────────────────────────────────── */
+ac_widget_t ac_widgets_table_new(ac_widget_t master, const char* columns_csv, int height);
+void        ac_widgets_table_pack(ac_widget_t w);
+void        ac_widgets_table_add(ac_widget_t w, const char* values_csv);
+const char* ac_widgets_table_row(ac_widget_t w, int index);
+int         ac_widgets_table_count(ac_widget_t w);
+
 /* ── sketch (drawing canvas) ─────────────────────────────────────────────── */
 ac_widget_t ac_widgets_sketch_new(ac_widget_t master, int width, int height);
 void        ac_widgets_sketch_pack(ac_widget_t w);
@@ -81,6 +104,14 @@ void        ac_widgets_sketch_line(ac_widget_t w, double x1, double y1, double x
 void        ac_widgets_sketch_rect(ac_widget_t w, double x1, double y1, double x2, double y2, uint8_t r, uint8_t g, uint8_t b);
 void        ac_widgets_sketch_circle(ac_widget_t w, double cx, double cy, double radius, uint8_t r, uint8_t g, uint8_t b);
 void        ac_widgets_sketch_text(ac_widget_t w, double x, double y, const char* text, uint8_t r, uint8_t g, uint8_t b);
+
+/* ── textbox (plain multi-line text editor, no syntax highlighting) ───────── */
+ac_widget_t ac_widgets_textbox_new(ac_widget_t master, const char* color, const char* font);
+void        ac_widgets_textbox_pack(ac_widget_t w);
+void        ac_widgets_textbox_write(ac_widget_t w, const char* text);
+const char* ac_widgets_textbox_get(ac_widget_t w);
+const char* ac_widgets_textbox_find(ac_widget_t w, const char* needle);
+void        ac_widgets_textbox_fix(ac_widget_t w, const char* text);
 
 /* ── universal helpers ───────────────────────────────────────────────────────── */
 void        ac_widgets_pack(ac_widget_t w);

@@ -22,7 +22,7 @@ inline uint64_t fnv64(const std::string& data) {
 inline uint64_t hashForCache(const std::string& source, const std::string& backend) {
     // IRC_VERSION bumped on any IR format change — invalidates caches without relying
     // on build timestamp (which would invalidate every cache on every recompile).
-    static const char CACHE_VER[] = "ac-irc-v12-longint-alias";
+    static const char CACHE_VER[] = "ac-irc-v13-short-mini";
     return fnv64(source + '\0' + backend + '\0' + CACHE_VER);
 }
 

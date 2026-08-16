@@ -1,7 +1,7 @@
 // AC ilib: camera — V C interop (libaccamera.so / libaccamera.dll)
 #flag -L library/camera -laccamera
 #flag -Wl,-rpath,library/camera
-#include "library/camera/camera_c.h"
+#include "library/ilib/camera/camera_c.h"
 
 fn C.ac_camera_init() int
 fn C.ac_camera_capture(filename &char) int

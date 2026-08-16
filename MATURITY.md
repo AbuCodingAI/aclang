@@ -45,7 +45,7 @@ It's a **working language with solid foundations** at the **pre-release stage** 
 - **Logical operators**: and, or, xor, not with short-circuit evaluation
 - **Bitwise operators**: &, |, bor, ~
 - **Smart constant folding**: compfold keyword with Toxic warnings
-- **I/O system**: Term.display (multi-type), Term.ask on text backends; BNY string input still needs repair
+- **I/O system**: Term.display (multi-type), Term.ask on text backends and BNY string input
 - **Type system**: Implicit type inference across backends
 - **Bundles**: Class-like structures with methods
 - **Tag blocks**: <mainloop>, custom tags, control flow
@@ -58,9 +58,9 @@ It's a **working language with solid foundations** at the **pre-release stage** 
 ### ✅ **Cross-Platform Strategy**
 
 - Unified IR means consistent behavior across 11 backends
-- Smart architecture detection for refusing unsupported native ARM paths
+- Smart architecture detection (BNY x86 native, BNY ARM via intentional C intermediary)
 - Platform-specific optimizations
-- ARM native ASM/BNY is not implemented; use AC->C explicitly for C output
+- Automatic compiler selection (GCC/Clang for BNY's ARM C-backed route)
 
 ### ✅ **Professional Tooling**
 
@@ -94,7 +94,7 @@ It's a **working language with solid foundations** at the **pre-release stage** 
 | **x86 ASM** | ✅ Tested | Tested on Linux x86, verified via Wine on Windows |
 | **Windows PE** | ✅ Tested | Validated via Wine (ac.exe compiles and runs) |
 | **macOS Mach-O** | 🟡 Not tested | Code generated, untested on native macOS |
-| **ARM** | ❌ Native backend missing | Use AC->C explicitly; AC->ASM/BNY refuse fake C-derived ARM output |
+| **ARM** | 🟡 Infrastructure | AC->BNY uses an intentional C-backed route; AC->ASM reports ARM unsupported until native ARM assembly exists |
 | **Complex math** | 🟡 Limited | 15M operation limit with runtime fallback |
 | **Large programs** | ❌ Untested | No stress tests |
 | **Memory management** | 🟡 Unsafe | Pointers exist but incomplete |
@@ -136,8 +136,8 @@ It's a **working language with solid foundations** at the **pre-release stage** 
 |---------|--------|-----|
 | **Windows x86 PE** | 🟡 Generates | Not tested, no system integration |
 | **macOS Mach-O** | 🟡 Generates | Not tested, no system integration |
-| **Linux ARM** | ❌ Native backend missing | Needs ARM ASM/ELF codegen (Phase TBD) |
-| **Android ARM** | ❌ Native backend missing | Use AC->C explicitly; AC->BNY ARM not implemented |
+| **Linux ARM** | 🟡 Infrastructure | AC->BNY C-backed route exists; native ARM ASM/ELF still Phase TBD |
+| **Android ARM** | 🟡 Via C | AC->BNY native ARM not implemented |
 | **RISC-V** | ❌ Not planned | No hardware to develop on |
 
 ### ❌ **Language Gaps**
@@ -209,7 +209,7 @@ recursion: fib(n-1) + fib(n-2)     // Works but no tail-call optimization
 
 ❌ **Web services** — No HTTP library (concurrency exists but untested)
 ❌ **Microservices** — No networking stack
-❌ **Mobile apps** — native ARM ASM/BNY post-v1.0; use AC->C explicitly today
+❌ **Mobile apps** — BNY ARM via C works; native ARM ASM/BNY post-v1.0
 ❌ **Desktop apps** — GUI library incomplete
 ❌ **Game engines** — Graphics/audio incomplete
 ❌ **Real-time systems** — No deterministic guarantees

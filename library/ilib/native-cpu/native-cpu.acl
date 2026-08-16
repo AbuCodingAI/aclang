@@ -1,0 +1,37 @@
+# ilib/native-cpu - Bare-metal / low-level toolkit lowering rules
+# Maps native-cpu library calls to backend-specific implementations
+# (renamed from `pointers`; the `ptr_*` functions carry over unchanged)
+# Call token: ncpu.  Directory keeps the hyphen (native-cpu); the in-source
+# call receiver has none (matches machine-audio dir -> maudio, string-cheese
+# dir -> stringm).
+
+# Pointer creation and access (carried over from `pointers`)
+native-cpu:ptr_new      -> ncpu.ptr_new
+native-cpu:ptr_deref    -> ncpu.ptr_deref
+native-cpu:ptr_null     -> ncpu.ptr_null
+native-cpu:ptr_is_null  -> ncpu.ptr_is_null
+native-cpu:ptr_eq       -> ncpu.ptr_eq
+native-cpu:ptr_copy     -> ncpu.ptr_copy
+native-cpu:ptr_update   -> ncpu.ptr_update
+
+# Allocation (dha = dynamic heap allocation, z = zeroed, bm = bare-metal/raw mmap)
+native-cpu:dha          -> ncpu.dha
+native-cpu:zdha         -> ncpu.zdha
+native-cpu:realloc      -> ncpu.realloc
+native-cpu:bmdha        -> ncpu.bmdha
+native-cpu:bmzdha       -> ncpu.bmzdha
+native-cpu:bmrealloc    -> ncpu.bmrealloc
+
+# Arena allocator (bump allocator, bulk free)
+native-cpu:arena_create  -> ncpu.arena_create
+native-cpu:arena_alloc   -> ncpu.arena_alloc
+native-cpu:arena_dealloc -> ncpu.arena_dealloc
+native-cpu:arena_destroy -> ncpu.arena_destroy
+native-cpu:arena_abort   -> ncpu.arena_abort
+
+# Control
+native-cpu:abort         -> ncpu.abort
+
+# Messaging (between quickthreads) — spelling "recieve" is intentional (author's choice)
+native-cpu:broadcast     -> ncpu.broadcast
+native-cpu:recieve       -> ncpu.recieve

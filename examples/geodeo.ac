@@ -63,7 +63,7 @@ use ilib gl
 
                 /* ── Event listener — space bar triggers jump ─────── */
                 configure event-listener
-                    use listener to establish rule
+                    establish listener of keys
                         on value is space
                             jump(Character)
 

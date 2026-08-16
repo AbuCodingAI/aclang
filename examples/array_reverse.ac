@@ -3,8 +3,10 @@ AC->BNY
 /* Reverse an array by copying backwards (1-indexed) */
 
 Make reverse func(arr)
-    out = arr[-0]
-    
+    out = []
+    n = length arr
+    FOR i in sequence(1, n + 1)
+        out.append(arr[n - i + 1])
     return out
 
 <mainloop>

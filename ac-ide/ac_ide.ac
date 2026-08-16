@@ -1,0 +1,69 @@
+AC->BNY
+
+/* AC IDE — a plain, IDLE-style editor for AC source: open/save a file, pick a
+   backend, compile & run it, see the output. No syntax highlighting, no
+   minimap — just a real editable text box. Native AC->BNY standalone binary,
+   replacing the Electron+Monaco ac-ide with an AC program written in AC. */
+
+use ilib widgets
+use ilib os
+
+Make OnOpen func()
+    content = os.read(path_inp.get())
+    src_box.write(content)
+
+Make OnSave func()
+    os.write_to(path_inp.get(), src_box.get())
+
+Make OnRun func()
+    path = path_inp.get()
+    os.write_to(path, src_box.get())
+    backend = backend_drop.get()
+    os.bash($ac $ + path + $ --target $ + backend + $ --no-cache > /tmp/ac_ide_out.txt 2>&1$)
+    result = os.read($/tmp/ac_ide_out.txt$)
+    out_box.write(result)
+
+<mainloop>
+    root = Screen($AC IDE$, $900x650$)
+
+    path_lbl = display(root, $File:$)
+    path_inp = ask(root, 60)
+    path_inp.set($scratch.ac$)
+
+    open_btn = btn(root, $Open$, OnOpen)
+    save_btn = btn(root, $Save$, OnSave)
+    run_btn = btn(root, $Run$, OnRun)
+
+    backend_lbl = display(root, $Backend:$)
+    backend_drop = dropdown(root, lazy)
+    backend_drop.add($BNY$)
+    backend_drop.add($PY$)
+    backend_drop.add($JS$)
+    backend_drop.add($C$)
+    backend_drop.add($CPP$)
+    backend_drop.add($Java$)
+    backend_drop.add($RS$)
+    backend_drop.add($GO$)
+    backend_drop.add($V$)
+    backend_drop.add($ASM$)
+    backend_drop.add($HTML$)
+    backend_drop.set($BNY$)
+    backend_drop.pack
+
+    out_lbl = display(root, $Output:$)
+
+    src_box = textbox(root, $white$, $monospace$, lazy)
+    src_box.write($AC->BNY
+
+/*You can input functions here*/
+
+<mainloop>
+    Term.display \$This is AC-IDE, built in AC using the widgets library\$
+<mainloop>$)
+    src_box.pack
+
+    out_box = textbox(root, $white$, $monospace$, lazy)
+    out_box.pack
+
+    root.mainloop
+<mainloop>

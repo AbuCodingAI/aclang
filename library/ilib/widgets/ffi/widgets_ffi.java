@@ -13,7 +13,7 @@ final class AcWidgets {
         String _os  = System.getProperty("os.name").toLowerCase();
         String _lib = _os.contains("win") ? "acwidgets.dll" : "libacwidgets.so";
         Path   _p   = Path.of(System.getProperty("user.dir"))
-                          .resolve("library/widgets/" + _lib).toAbsolutePath();
+                          .resolve("library/ilib/widgets/" + _lib).toAbsolutePath();
         _SYM = SymbolLookup.libraryLookup(_p, Arena.global());
     }
     private static MethodHandle _mh(String n, FunctionDescriptor fd) {
@@ -27,6 +27,7 @@ final class AcWidgets {
     private static final AddressLayout        A  = ValueLayout.ADDRESS;
 
     private static final MethodHandle _init            = _mh("ac_widgets_init",            FunctionDescriptor.ofVoid());
+    private static final MethodHandle _setLazy         = _mh("ac_widgets_set_lazy",        FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _screenNew       = _mh("ac_widgets_screen_new",      FunctionDescriptor.of(W,A,A));
     private static final MethodHandle _screenMainloop  = _mh("ac_widgets_screen_mainloop", FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _screenUpdate    = _mh("ac_widgets_screen_update",   FunctionDescriptor.ofVoid(W));
@@ -41,6 +42,7 @@ final class AcWidgets {
     private static final MethodHandle _askSet          = _mh("ac_widgets_ask_set",         FunctionDescriptor.ofVoid(W,A));
     private static final MethodHandle _btnNew          = _mh("ac_widgets_btn_new",         FunctionDescriptor.of(W,W,A));
     private static final MethodHandle _btnPack         = _mh("ac_widgets_btn_pack",        FunctionDescriptor.ofVoid(W));
+    private static final MethodHandle _btnOnClick      = _mh("ac_widgets_btn_on_click",    FunctionDescriptor.ofVoid(W,A,A));
     private static final MethodHandle _ckbtnNew        = _mh("ac_widgets_ckbtn_new",       FunctionDescriptor.of(W,W,A));
     private static final MethodHandle _ckbtnPack       = _mh("ac_widgets_ckbtn_pack",      FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _ckbtnGet        = _mh("ac_widgets_ckbtn_get",       FunctionDescriptor.of(I,W));
@@ -60,6 +62,14 @@ final class AcWidgets {
     private static final MethodHandle _sliderSet       = _mh("ac_widgets_slider_set",      FunctionDescriptor.ofVoid(W,D));
     private static final MethodHandle _groupNew        = _mh("ac_widgets_group_new",       FunctionDescriptor.of(W,W,A));
     private static final MethodHandle _groupPack       = _mh("ac_widgets_group_pack",      FunctionDescriptor.ofVoid(W));
+    private static final MethodHandle _tabsNew         = _mh("ac_widgets_tabs_new",        FunctionDescriptor.of(W,W));
+    private static final MethodHandle _tabsPack        = _mh("ac_widgets_tabs_pack",       FunctionDescriptor.ofVoid(W));
+    private static final MethodHandle _tabsAddTab      = _mh("ac_widgets_tabs_add_tab",    FunctionDescriptor.of(W,W,A));
+    private static final MethodHandle _scrollNew       = _mh("ac_widgets_scroller_new",    FunctionDescriptor.of(W,W,A));
+    private static final MethodHandle _scrollPack      = _mh("ac_widgets_scroller_pack",   FunctionDescriptor.ofVoid(W));
+    private static final MethodHandle _tblNew          = _mh("ac_widgets_table_new",       FunctionDescriptor.of(W,W,A,I));
+    private static final MethodHandle _tblPack         = _mh("ac_widgets_table_pack",      FunctionDescriptor.ofVoid(W));
+    private static final MethodHandle _tblAdd          = _mh("ac_widgets_table_add",       FunctionDescriptor.ofVoid(W,A));
     private static final MethodHandle _lbNew           = _mh("ac_widgets_listbox_new",     FunctionDescriptor.of(W,W,I,I));
     private static final MethodHandle _lbPack          = _mh("ac_widgets_listbox_pack",    FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _lbAdd           = _mh("ac_widgets_listbox_add",     FunctionDescriptor.ofVoid(W,A));
@@ -81,38 +91,44 @@ final class AcWidgets {
 
     static { _v(_init); }
 
-    private static String _str(MemorySegment p) { return p == null || p.equals(MemorySegment.NULL) ? "" : p.reinterpret(Long.MAX_VALUE).getString(0); }
+    public static void setLazy(long h) { _v(_setLazy, h); }
+
+    private static String _str(MemorySegment p) { return p == null || p.equals(MemorySegment.NULL) ? "" : p.reinterpret(Long.MAX_VALUE).getUtf8String(0); }
 
     public static long   screenNew(String title, String geometry) {
-        try (Arena a=Arena.ofConfined()){return _l(_screenNew,a.allocateFrom(title),a.allocateFrom(geometry));}
+        try (Arena a=Arena.ofConfined()){return _l(_screenNew,a.allocateUtf8String(title),a.allocateUtf8String(geometry));}
     }
     public static void   screenMainloop(long h) { _v(_screenMainloop, h); }
     public static void   screenUpdate(long h)   { _v(_screenUpdate, h); }
     public static void   screenDestroy(long h)  { _v(_screenDestroy, h); }
 
-    public static long   displayNew(long m, String text)  { try(Arena a=Arena.ofConfined()){return _l(_displayNew,m,a.allocateFrom(text));} }
+    public static long   displayNew(long m, String text)  { try(Arena a=Arena.ofConfined()){return _l(_displayNew,m,a.allocateUtf8String(text));} }
     public static void   displayPack(long h)              { _v(_displayPack, h); }
-    public static void   displaySet(long h, String t)     { try(Arena a=Arena.ofConfined()){_v(_displaySet,h,a.allocateFrom(t));} }
+    public static void   displaySet(long h, String t)     { try(Arena a=Arena.ofConfined()){_v(_displaySet,h,a.allocateUtf8String(t));} }
     public static String displayGet(long h)               { return _str(_a(_displayGet, h)); }
 
     public static long   askNew(long m, int width)        { return _l(_askNew, m, width); }
     public static void   askPack(long h)                  { _v(_askPack, h); }
     public static String askGet(long h)                   { return _str(_a(_askGet, h)); }
-    public static void   askSet(long h, String t)         { try(Arena a=Arena.ofConfined()){_v(_askSet,h,a.allocateFrom(t));} }
+    public static void   askSet(long h, String t)         { try(Arena a=Arena.ofConfined()){_v(_askSet,h,a.allocateUtf8String(t));} }
 
-    public static long   btnNew(long m, String text)      { try(Arena a=Arena.ofConfined()){return _l(_btnNew,m,a.allocateFrom(text));} }
+    public static long   btnNew(long m, String text)      { try(Arena a=Arena.ofConfined()){return _l(_btnNew,m,a.allocateUtf8String(text));} }
     public static void   btnPack(long h)                  { _v(_btnPack, h); }
+    // `stub` is a native upcall trampoline for `void (*)(void*)` — see the AC-generated class's
+    // own static block (per-callback bridge + MethodHandle + Linker.upcallStub) for how it's
+    // built; userdata is unused (each stub is already bound to one specific AC function).
+    public static void   btnOnClick(long h, MemorySegment stub) { _v(_btnOnClick, h, stub, MemorySegment.NULL); }
 
-    public static long   ckbtnNew(long m, String text)    { try(Arena a=Arena.ofConfined()){return _l(_ckbtnNew,m,a.allocateFrom(text));} }
+    public static long   ckbtnNew(long m, String text)    { try(Arena a=Arena.ofConfined()){return _l(_ckbtnNew,m,a.allocateUtf8String(text));} }
     public static void   ckbtnPack(long h)                { _v(_ckbtnPack, h); }
     public static boolean ckbtnGet(long h)                { return _i(_ckbtnGet, h) != 0; }
     public static void   ckbtnSet(long h, boolean v)      { _v(_ckbtnSet, h, v ? 1 : 0); }
 
     public static long   dropdownNew(long m)              { return _l(_dropNew, m); }
     public static void   dropdownPack(long h)             { _v(_dropPack, h); }
-    public static void   dropdownAdd(long h, String item) { try(Arena a=Arena.ofConfined()){_v(_dropAdd,h,a.allocateFrom(item));} }
+    public static void   dropdownAdd(long h, String item) { try(Arena a=Arena.ofConfined()){_v(_dropAdd,h,a.allocateUtf8String(item));} }
     public static String dropdownGet(long h)              { return _str(_a(_dropGet, h)); }
-    public static void   dropdownSet(long h, String item) { try(Arena a=Arena.ofConfined()){_v(_dropSet,h,a.allocateFrom(item));} }
+    public static void   dropdownSet(long h, String item) { try(Arena a=Arena.ofConfined()){_v(_dropSet,h,a.allocateUtf8String(item));} }
 
     public static long   advanceNew(long m, int length)   { return _l(_advNew, m, length); }
     public static void   advancePack(long h)              { _v(_advPack, h); }
@@ -120,18 +136,31 @@ final class AcWidgets {
     public static double advanceGet(long h)               { return _d(_advGet, h); }
 
     public static long   sliderNew(long m, double from_val, double to_val, String orient) {
-        try(Arena a=Arena.ofConfined()){return _l(_sliderNew,m,from_val,to_val,a.allocateFrom(orient));}
+        try(Arena a=Arena.ofConfined()){return _l(_sliderNew,m,from_val,to_val,a.allocateUtf8String(orient));}
     }
     public static void   sliderPack(long h)               { _v(_sliderPack, h); }
     public static double sliderGet(long h)                { return _d(_sliderGet, h); }
     public static void   sliderSet(long h, double v)      { _v(_sliderSet, h, v); }
 
-    public static long   groupNew(long m, String text)    { try(Arena a=Arena.ofConfined()){return _l(_groupNew,m,a.allocateFrom(text));} }
+    public static long   groupNew(long m, String text)    { try(Arena a=Arena.ofConfined()){return _l(_groupNew,m,a.allocateUtf8String(text));} }
     public static void   groupPack(long h)                { _v(_groupPack, h); }
+
+    public static long   tabsNew(long m)                  { return _l(_tabsNew, m); }
+    public static void   tabsPack(long h)                 { _v(_tabsPack, h); }
+    public static long   tabsAddTab(long h, String name)  { try(Arena a=Arena.ofConfined()){return _l(_tabsAddTab,h,a.allocateUtf8String(name));} }
+
+    public static long   scrollerNew(long m, String orient) { try(Arena a=Arena.ofConfined()){return _l(_scrollNew,m,a.allocateUtf8String(orient));} }
+    public static void   scrollerPack(long h)                { _v(_scrollPack, h); }
+
+    public static long   tableNew(long m, String columnsCsv, int height) {
+        try(Arena a=Arena.ofConfined()){return _l(_tblNew,m,a.allocateUtf8String(columnsCsv),height);}
+    }
+    public static void   tablePack(long h)                { _v(_tblPack, h); }
+    public static void   tableAdd(long h, String valuesCsv){ try(Arena a=Arena.ofConfined()){_v(_tblAdd,h,a.allocateUtf8String(valuesCsv));} }
 
     public static long   listboxNew(long m, int w, int ht){ return _l(_lbNew, m, w, ht); }
     public static void   listboxPack(long h)              { _v(_lbPack, h); }
-    public static void   listboxAdd(long h, String item)  { try(Arena a=Arena.ofConfined()){_v(_lbAdd,h,a.allocateFrom(item));} }
+    public static void   listboxAdd(long h, String item)  { try(Arena a=Arena.ofConfined()){_v(_lbAdd,h,a.allocateUtf8String(item));} }
     public static String listboxItem(long h, int idx)     { return _str(_a(_lbItem, h, idx)); }
     public static int    listboxCount(long h)             { return _i(_lbCount, h); }
 
@@ -142,7 +171,7 @@ final class AcWidgets {
     public static void   sketchRect(long h, double x1, double y1, double x2, double y2, byte r, byte g, byte b) { _v(_skRect,h,x1,y1,x2,y2,r,g,b); }
     public static void   sketchCircle(long h, double cx, double cy, double rad, byte r, byte g, byte b)         { _v(_skCircle,h,cx,cy,rad,r,g,b); }
     public static void   sketchText(long h, double x, double y, String t, byte r, byte g, byte b) {
-        try(Arena a=Arena.ofConfined()){_v(_skText,h,x,y,a.allocateFrom(t),r,g,b);}
+        try(Arena a=Arena.ofConfined()){_v(_skText,h,x,y,a.allocateUtf8String(t),r,g,b);}
     }
 }
 
@@ -158,6 +187,10 @@ class Screen {
 class AcDisplay {
     long _h;
     AcDisplay(Screen m, String text) { this._h = AcWidgets.displayNew(m._h, text); }
+    // A "master" isn't always a Screen — `tabber.add_tab(...)` returns a plain handle usable as
+    // any other widget's master too (AC's own model is fully untyped: every widget is just a
+    // scalar). javac picks this overload automatically for a `long`-typed master argument.
+    AcDisplay(long m, String text) { this._h = AcWidgets.displayNew(m, text); }
     void pack()           { AcWidgets.displayPack(this._h); }
     void set(String v)    { AcWidgets.displaySet(this._h, v); }
     String get()          { return AcWidgets.displayGet(this._h); }
@@ -174,6 +207,7 @@ class AcBtn {
     long _h;
     AcBtn(Screen m, String text) { this._h = AcWidgets.btnNew(m._h, text); }
     void pack() { AcWidgets.btnPack(this._h); }
+    void onClick(java.lang.foreign.MemorySegment stub) { AcWidgets.btnOnClick(this._h, stub); }
 }
 class AcCkbtn {
     long _h;
@@ -190,13 +224,18 @@ class AcRadbtn {
 }
 class AcDropdown {
     long _h;
+    // AC's `dropdown(root)` constructs empty, then adds items one at a time via separate
+    // `.add(...)` calls — the bulk comma-split constructor below predates that call shape and
+    // is kept only for any caller still using it directly.
+    AcDropdown(Screen m) { this._h = AcWidgets.dropdownNew(m._h); }
     AcDropdown(Screen m, String values) {
         this._h = AcWidgets.dropdownNew(m._h);
         for (String v : values.split(",")) AcWidgets.dropdownAdd(this._h, v.trim());
     }
-    void pack()        { AcWidgets.dropdownPack(this._h); }
-    String get()       { return AcWidgets.dropdownGet(this._h); }
-    void set(String v) { AcWidgets.dropdownSet(this._h, v); }
+    void pack()          { AcWidgets.dropdownPack(this._h); }
+    void add(String item){ AcWidgets.dropdownAdd(this._h, item); }
+    String get()         { return AcWidgets.dropdownGet(this._h); }
+    void set(String v)   { AcWidgets.dropdownSet(this._h, v); }
 }
 class AcAdvance {
     long _h;
@@ -219,20 +258,23 @@ class AcGroup {
 }
 class AcTabs {
     long _h;
-    AcTabs(Screen m) { this._h = AcWidgets.groupNew(m._h, ""); }
-    void pack()              { AcWidgets.groupPack(this._h); }
-    AcTabs add_tab(String n) { return this; }
+    AcTabs(Screen m) { this._h = AcWidgets.tabsNew(m._h); }
+    void pack()          { AcWidgets.tabsPack(this._h); }
+    // Returns the new page as a plain handle (usable as any other widget's "master"), matching
+    // the C header's own doc comment on ac_widgets_tabs_add_tab — NOT `this` (the tabs widget
+    // itself), which the previous stub incorrectly returned while doing nothing else at all.
+    long add_tab(String n) { return AcWidgets.tabsAddTab(this._h, n); }
 }
 class AcScroller {
     long _h;
-    AcScroller(Screen m) { this._h = AcWidgets.groupNew(m._h, ""); }
-    void pack() { AcWidgets.groupPack(this._h); }
+    AcScroller(Screen m, String orient) { this._h = AcWidgets.scrollerNew(m._h, orient); }
+    void pack() { AcWidgets.scrollerPack(this._h); }
 }
 class AcTable {
     long _h;
-    AcTable(Screen m) { this._h = AcWidgets.listboxNew(m._h, 40, 10); }
-    void pack()       { AcWidgets.listboxPack(this._h); }
-    void add(Object row) { AcWidgets.listboxAdd(this._h, String.valueOf(row)); }
+    AcTable(Screen m, String columnsCsv, int height) { this._h = AcWidgets.tableNew(m._h, columnsCsv, height); }
+    void pack()           { AcWidgets.tablePack(this._h); }
+    void add(String valuesCsv) { AcWidgets.tableAdd(this._h, valuesCsv); }
 }
 class AcListbox {
     long _h;

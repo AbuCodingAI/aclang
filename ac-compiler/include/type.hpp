@@ -3,6 +3,26 @@
 #include <variant>
 #include <optional>
 #include <memory>
+#include <set>
+
+// ── Assumed result type of a built-in / ilib AC call ─────────────────────────────
+// The IR carries no per-function signatures for ilib calls, so AC infers their return type BY NAME.
+// This is the ONE authority every stage must consult — the IR float pre-scan, the text backends,
+// AND the native BNY backend — so they can never disagree. (They used to: BNY's float pre-scan only
+// recognized *user* float functions, so `total += math.mod(m,10)` never promoted `total` to float
+// and a double's raw bits were summed into an int accumulator → garbage. Centralizing it here fixes
+// that whole class of "type-mangled" bugs instead of patching each backend's private guesswork.)
+inline bool acCallReturnsFloat(const std::string& irName) {
+    if (irName == "ml.take" || irName == "ml_take") return true;
+    bool isMath = irName.rfind("math.", 0) == 0 || irName.rfind("math_", 0) == 0;
+    if (!isMath) return false;
+    // math.* return a double EXCEPT this small set of genuinely integer-valued ones.
+    static const std::set<std::string> intValued = {
+        "math.to_int", "math.abs_int", "math.mod_int", "math.gcd", "math.lcm", "math.is_prime",
+        "math_to_int", "math_abs_int", "math_mod_int", "math_gcd", "math_lcm", "math_is_prime",
+    };
+    return intValued.find(irName) == intValued.end();
+}
 
 // ─────────────────────────────────────────────────────────────
 // Core AC type system (semantic level)
@@ -24,8 +44,22 @@ enum class NumeralSubtype {
     PosInt,
     PosDec,
     NegInt,
-    NegDec
+    NegDec,
+    Short,   // 32-bit signed integer  (`short x = e`)
+    Mini     // 16-bit signed integer  (`mini x = e`)
 };
+
+// ── Fixed-width integer backend type names ─────────────────────────────────
+// `short` = 32-bit, `mini` = 16-bit. This is the ONE place the width→type-name
+// mapping lives, so every backend reads the same fixed-width type from the type
+// include instead of scattering literals (or truncating values) through codegen.
+// bits: 32 → short, 16 → mini; any other value → the backend's default 64-bit int.
+inline const char* acIntTypeCpp (int bits) { return bits==32 ? "int32_t" : bits==16 ? "int16_t" : "long long"; }
+inline const char* acIntTypeC   (int bits) { return acIntTypeCpp(bits); }
+inline const char* acIntTypeRs  (int bits) { return bits==32 ? "i32"     : bits==16 ? "i16"     : "i64"; }
+inline const char* acIntTypeGo  (int bits) { return bits==32 ? "int32"   : bits==16 ? "int16"   : "int64"; }
+inline const char* acIntTypeJava(int bits) { return bits==32 ? "int"     : bits==16 ? "short"   : "long"; }
+inline const char* acIntTypeV   (int bits) { return bits==32 ? "int"     : bits==16 ? "i16"     : "i64"; }
 
 struct Type {
     TypeKind kind = TypeKind::Unknown;
@@ -97,7 +131,16 @@ struct Type {
     bool isInt() const {
         return isNumeral() &&
               (numSub == NumeralSubtype::PosInt ||
-               numSub == NumeralSubtype::NegInt);
+               numSub == NumeralSubtype::NegInt ||
+               numSub == NumeralSubtype::Short  ||
+               numSub == NumeralSubtype::Mini);
+    }
+
+    // Fixed-width bit count for `short`/`mini` (0 = default 64-bit int / not applicable).
+    int intWidth() const {
+        if (numSub == NumeralSubtype::Short) return 32;
+        if (numSub == NumeralSubtype::Mini)  return 16;
+        return 0;
     }
 
     bool isDec() const {
@@ -113,13 +156,14 @@ struct Type {
 
     std::string toCpp() const {
         if (!isNumeral()) return "auto";
+        if (intWidth()) return acIntTypeCpp(intWidth());
         return isDec() ? "double" : "int";
     }
 
     std::string toC() const { return toCpp(); }
 
     std::string toPy() const {
-        return isDec() ? "float" : "int";
+        return isDec() ? "float" : "int";   // Python has no fixed-width int
     }
 
     std::string toJs() const {
@@ -127,15 +171,23 @@ struct Type {
     }
 
     std::string toJava() const {
+        if (intWidth()) return acIntTypeJava(intWidth());
         return isDec() ? "double" : "int";
     }
 
     std::string toGo() const {
+        if (intWidth()) return acIntTypeGo(intWidth());
         return isDec() ? "float64" : "int";
     }
 
     std::string toRs() const {
         if (!isNumeral()) return "i64";
+        if (intWidth()) return acIntTypeRs(intWidth());
+        return isDec() ? "f64" : "i64";
+    }
+
+    std::string toV() const {
+        if (intWidth()) return acIntTypeV(intWidth());
         return isDec() ? "f64" : "i64";
     }
 
@@ -152,7 +204,10 @@ struct Type {
                     case NumeralSubtype::PosDec: return "Numeral(PosDec)";
                     case NumeralSubtype::NegInt: return "Numeral(NegInt)";
                     case NumeralSubtype::NegDec: return "Numeral(NegDec)";
+                    case NumeralSubtype::Short:  return "Numeral(Short/32)";
+                    case NumeralSubtype::Mini:   return "Numeral(Mini/16)";
                 }
+                return "Numeral";   // guard: don't fall through into the String case
             case TypeKind::String:  return "String";
             case TypeKind::List:    return "List";
             case TypeKind::Tuple:   return "Tuple";

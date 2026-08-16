@@ -132,6 +132,7 @@ static std::string opcodeStr(IROpcode op) {
         case IROpcode::ALIAS_DECL:    return "alias_decl";
         case IROpcode::CONST_DECL:    return "const_decl";
         case IROpcode::RAISE_CLAUSE:  return "raise_clause";
+        case IROpcode::SAVE_FILE:     return "save_file";
         case IROpcode::LAZY_EVAL:     return "lazy_eval";
         case IROpcode::TYPE_CAST:     return "cast";
         case IROpcode::LOAD_INDEX:    return "ldi";
@@ -179,6 +180,43 @@ class IRGenerator {
     std::string      currentCustomTag_;     // non-empty while inside a def tag body
     std::vector<std::string> currentTagObjects_; // ObjDecl names declared inside current custom tag
     std::set<std::string>    glObjects_;    // variable names declared as GL objects via ObjDecl
+    // Vars assigned via a `.datac` row (`__dict__`-tagged AssignStmt, from injectDatacImports).
+    // The immediately-following `__list__` assign (`pets = [_dc_pets_0, _dc_pets_1, ...]`)
+    // wraps these — checked so those bare-identifier elements go straight into the ALLOC's
+    // literal content text instead of through the generic placeholder-then-STORE_INDEX path
+    // every OTHER "computed expression" list element takes. Skipping that path matters because
+    // it's the only way codegen ever sees the REAL dict-var names in one place to recognize
+    // "this is a list of dicts, not a list of ints" (see ir_codegen.cpp's listOfDictVars_ for
+    // the consuming half — verified: examples/keyword_catalog_modules.ac's datac-imported
+    // `pets`, "cannot convert std::map<...> to long long" on C++/Java/Go/V/Rust alike, since
+    // the placeholder path always left plain "0,0" in the ALLOC text for these elements,
+    // invisible to any dict-var check on the codegen side).
+    std::set<std::string>    datacDictVars_;
+    // Vars constructed via a bare widgets-ilib ctor call (`tb = textbox(...)`) — needed so the
+    // string-cheese "receiver.method(args)" rewrite (below) can tell a WIDGET var apart from a
+    // plain string var when a widget's OWN method name happens to collide with a string-cheese
+    // one. `find` is the concrete case: it's both `stringm.find` (string search) AND
+    // `textbox.find` (Abu's widget search method) — with no receiver-type info available at
+    // this backend-agnostic lowering stage otherwise, `tb.find($x$)` was always rewritten to
+    // `stringm.find(tb, $x$)`, calling the string utility on a raw widget HANDLE instead of the
+    // widget's own method (verified: garbage int output instead of the matched text).
+    static const std::set<std::string>& widgetCtorNames() {
+        static const std::set<std::string> names = {
+            "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
+            "advance", "slider", "group", "tabs", "scroller", "listbox", "table",
+            "sketch", "textbox"
+        };
+        return names;
+    }
+    std::set<std::string>    widgetCtorVars_;
+    // Every `on value is <key>` binding registered via `configure event-listener`, tracked so
+    // the auto-generated `<StartHere>` game loop can poll+trigger them for real every frame —
+    // see that case's own comment for why this was previously entirely dead (EVENT_BIND/
+    // EVENT_TRIGGER worked fine, but nothing ever called EVENT_TRIGGER except an explicit
+    // `input <key>` statement; real SDL key state and the callback table were never connected).
+    // (key, callback-function-name, isContinuous — true for a nested `WHILST value is <samekey>`
+    // body, meaning poll via key_pressed/held every frame rather than key_just_pressed once).
+    std::vector<std::tuple<std::string,std::string,bool>> polledKeyBindings_;
 
     // loop label stacks for break/continue
     std::stack<IRRef> loopStart;
@@ -232,15 +270,26 @@ class IRGenerator {
         return IRRef::constant(IRValue(v));
     }
 
+    // Find the first comma NOT nested inside (), [], {} — so "f(a,b),c" splits at the
+    // top-level comma, not the inner one. Returns npos if there is no top-level comma.
+    static size_t topLevelComma(const std::string& s) {
+        int depth = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (c == '(' || c == '[' || c == '{') ++depth;
+            else if (c == ')' || c == ']' || c == '}') { if (depth > 0) --depth; }
+            else if (c == ',' && depth == 0) return i;
+        }
+        return std::string::npos;
+    }
+
     // Convert 1-based index (AC) to 0-based (target languages)
     IRRef adjustIndex(const IRRef& idx) {
         // DICT keys are strings — pass through untouched (the -1 adjust is for LIST positions;
         // SUB(stringconst, 1) folded to -1 and broke every dict read: ages[$bob$] → ages[-1]).
-        if (idx.kind == IRRef::Kind::CONST && idx.value.type == IRType::STRING)
-            return idx;
-        // Same for a VAR the symbol table knows is a STRING (k = $bob$; ages[k]).
-        if (idx.kind == IRRef::Kind::VAR && idx.id >= 0
-            && prog.symbols.getType(idx.id) == IRType::STRING)
+        // typeOfRef covers a string CONST, a string VAR, AND a computed string TEMP
+        // (e.g. ages[first + last], ages[getKey()]) — all of which are dict keys, not positions.
+        if (typeOfRef(idx) == IRType::STRING)
             return idx;
         if (idx.kind == IRRef::Kind::CONST && idx.value.type == IRType::INT) {
             int64_t n = std::get<int64_t>(idx.value.data);
@@ -325,7 +374,20 @@ class IRGenerator {
                     const std::string& typeStr = expr.attrs[0];
                     if (typeStr == "INT") {
                         try {
-                            return mkConstInt(std::stoll(expr.value));
+                            // std::stoll defaults to base 10, which silently truncates a hex
+                            // literal at its first non-decimal-digit character — "0xDEADBEEF"
+                            // parsed as base 10 stops at '0' (the leading zero) before ever
+                            // reaching 'x', returning 0 with no error (base-10 accepts a lone
+                            // "0" and treats 'x' as trailing garbage stoll simply ignores).
+                            // Hex literals are the ONLY non-decimal form the lexer emits (see
+                            // lexer.cpp's NUMBER scan — only "0x"/"0X" triggers a separate hex
+                            // path), so detecting that exact prefix and parsing base 16 is safe
+                            // without risking reinterpreting an ordinary leading-zero decimal
+                            // literal (e.g. "010") as octal, which a blanket base-0 auto-detect
+                            // would do.
+                            bool isHex = expr.value.size() > 2 && expr.value[0] == '0' &&
+                                         (expr.value[1] == 'x' || expr.value[1] == 'X');
+                            return mkConstInt(std::stoll(expr.value, nullptr, isHex ? 16 : 10));
                         } catch (...) {
                             return mkConst(expr.value);
                         }
@@ -459,12 +521,18 @@ class IRGenerator {
                     IROpcode opcode = IROpcode::NOP;
                     const std::string& op = expr.value;
                     // 16b: arithmetic requires NUMERIC operands (ADD excluded — string concat).
-                    if (op == "-" || op == "*" || op == "/" || op == "//" || op == "///" || op == "@") {
+                    {
                         auto isStrConst = [](const ASTNode* n) {
                             return n && n->type == NodeType::LiteralExpr && !n->attrs.empty() && n->attrs[0] == "STRING";
                         };
-                        if (expr.children.size() >= 2 &&
-                            (isStrConst(expr.children[0].get()) || isStrConst(expr.children[1].get())))
+                        bool l = expr.children.size() >= 2 && isStrConst(expr.children[0].get());
+                        bool r = expr.children.size() >= 2 && isStrConst(expr.children[1].get());
+                        // These require numeric operands (ADD excluded — string concat).
+                        if ((op == "-" || op == "*" || op == "/" || op == "//" || op == "///") && (l || r))
+                            throw ACError::nonNumericArith(op);
+                        // `@` is polymorphic multiply: `str @ n` / `list @ n` repeat are valid;
+                        // only `str @ str` is meaningless.
+                        if (op == "@" && l && r)
                             throw ACError::nonNumericArith(op);
                     }
                     if (op == "+") opcode = IROpcode::ADD;
@@ -505,9 +573,36 @@ class IRGenerator {
                         };
                         IRRef dst = mkTemp();
                         IRInstruction libcall(IROpcode::LIB_CALL, dst, {});
-                        libcall.typedOperands.push_back(mkConst("gl:hitbox.overlap"));
-                        libcall.typedOperands.push_back(mkConst(extractBase(lRef)));
-                        libcall.typedOperands.push_back(mkConst(extractBase(rRef)));
+                        // `X.hitbox overlap boundary` — bare `boundary` as the RHS operand routes
+                        // to the real (already-implemented) ac_gl_hitbox_overlap_boundary(name)
+                        // instead of the two-object overlap check. `boundary` isn't a keyword, so
+                        // this is purely a text match on the extracted base name — matches how
+                        // `X.overlap_boundary()` (method-call syntax) already reaches the same
+                        // function; this just gives the infix-operator form the same destination
+                        // (verified: examples/pong.ac's `ball.hitbox overlap boundary`).
+                        std::string rBase = extractBase(rRef);
+                        if (rBase == "boundary") {
+                            libcall.typedOperands.push_back(mkConst("gl:hitbox.overlap_boundary"));
+                            libcall.typedOperands.push_back(mkConst(extractBase(lRef)));
+                        } else if (!rBase.empty() && rBase.back() == '%') {
+                            // `ball.hitbox.coords overlap p%.hitbox.coords` — a trailing-`%`
+                            // object-name PATTERN (parser.cpp folds the `%` into the identifier
+                            // text — see its matching comment) checks overlap against every
+                            // currently-live object whose name starts with the text before the
+                            // `%`, not one fixed object. `ac_gl_hitbox_overlap_pattern(name,
+                            // pattern)` already exists and does exactly this (gl.cpp's `_wmatch`
+                            // against the live object registry) — it was simply never reachable
+                            // from AC source before, since `%` was a hard parse error. Routes
+                            // through the same `gl:X.Y -> ac_gl_X_Y` LibLowering fallback every
+                            // other gl:hitbox.* call already uses — no new backend/.acl wiring.
+                            libcall.typedOperands.push_back(mkConst("gl:hitbox.overlap_pattern"));
+                            libcall.typedOperands.push_back(mkConst(extractBase(lRef)));
+                            libcall.typedOperands.push_back(mkConst(rBase));
+                        } else {
+                            libcall.typedOperands.push_back(mkConst("gl:hitbox.overlap"));
+                            libcall.typedOperands.push_back(mkConst(extractBase(lRef)));
+                            libcall.typedOperands.push_back(mkConst(rBase));
+                        }
                         emit(std::move(libcall));
                         return dst;
                     }
@@ -523,9 +618,14 @@ class IRGenerator {
                             int64_t base = std::get<int64_t>(lRef.value.data);
                             int64_t exp  = std::get<int64_t>(rRef.value.data);
                             if (exp >= 0) {
-                                int64_t r = 1;
-                                for (int64_t k = 0; k < exp; k++) r *= base;
-                                return mkConstInt(r);
+                                // Bound the loop so a huge constant exponent (e.g. 2 ^ 1000000000)
+                                // can't spin the compiler; compute in UNSIGNED so overflow wraps
+                                // (defined) instead of signed-overflow UB. Past 2^64 every result is
+                                // int64-overflow garbage anyway, so the cap loses nothing meaningful.
+                                uint64_t r = 1, ub = (uint64_t)base;
+                                int64_t iters = exp < 4096 ? exp : 4096;
+                                for (int64_t k = 0; k < iters; k++) r *= ub;
+                                return mkConstInt((int64_t)r);
                             }
                         }
                         IRRef dst = mkTemp();
@@ -540,7 +640,11 @@ class IRGenerator {
                             rRef.kind == IRRef::Kind::CONST && rRef.value.type == IRType::INT) {
                             int64_t a = std::get<int64_t>(lRef.value.data);
                             int64_t b = std::get<int64_t>(rRef.value.data);
-                            return mkConstInt(op == "ptm" ? (a << b) : (a >> b));
+                            // Only fold an in-range shift (0..63). A shift >= 64 or negative is UB;
+                            // left-shift via unsigned so a negative `a` doesn't hit signed-shift UB.
+                            if (b >= 0 && b < 64)
+                                return mkConstInt(op == "ptm" ? (int64_t)((uint64_t)a << b) : (a >> b));
+                            // out-of-range shift → leave as a runtime PTM/PTD op (don't fold to UB)
                         }
                         IRRef dst = mkTemp();
                         emit(IRInstruction(op == "ptm" ? IROpcode::PTM : IROpcode::PTD,
@@ -582,12 +686,26 @@ class IRGenerator {
                                         };
                                         folded = IRRef::constant(IRValue(toStr(L) + toStr(R)));
                                     } else {
-                                        folded = anyFloat ? IRRef::constant(IRValue(asDouble(L)+asDouble(R))) : IRRef::constant(IRValue(asInt(L)+asInt(R)));
+                                        // Integer folds wrap in UNSIGNED: signed overflow is UB, and
+                                        // the two's-complement wrap matches every backend's int64 runtime.
+                                        folded = anyFloat ? IRRef::constant(IRValue(asDouble(L)+asDouble(R)))
+                                                          : IRRef::constant(IRValue((int64_t)((uint64_t)asInt(L)+(uint64_t)asInt(R))));
                                     }
                                     break;
-                                case IROpcode::SUB:  folded = anyFloat ? IRRef::constant(IRValue(asDouble(L)-asDouble(R))) : IRRef::constant(IRValue(asInt(L)-asInt(R))); break;
-                                case IROpcode::MUL:
-                                case IROpcode::PMUL: folded = anyFloat ? IRRef::constant(IRValue(asDouble(L)*asDouble(R))) : IRRef::constant(IRValue(asInt(L)*asInt(R))); break;
+                                case IROpcode::SUB:  folded = anyFloat ? IRRef::constant(IRValue(asDouble(L)-asDouble(R))) : IRRef::constant(IRValue((int64_t)((uint64_t)asInt(L)-(uint64_t)asInt(R)))); break;
+                                case IROpcode::MUL: folded = anyFloat ? IRRef::constant(IRValue(asDouble(L)*asDouble(R))) : IRRef::constant(IRValue((int64_t)((uint64_t)asInt(L)*(uint64_t)asInt(R)))); break;
+                                case IROpcode::PMUL:
+                                    // Polymorphic multiply: `str @ n` repeats the string.
+                                    if (L.type == IRType::STRING && R.type == IRType::INT) {
+                                        const std::string& s = std::get<std::string>(L.data);
+                                        int64_t n = std::get<int64_t>(R.data);
+                                        std::string outp;
+                                        if (n > 0 && n < 1000000) { outp.reserve(s.size()*(size_t)n); for (int64_t i=0;i<n;i++) outp += s; }
+                                        folded = IRRef::constant(IRValue(outp));
+                                    } else {
+                                        folded = anyFloat ? IRRef::constant(IRValue(asDouble(L)*asDouble(R))) : IRRef::constant(IRValue(asInt(L)*asInt(R)));
+                                    }
+                                    break;
                                 case IROpcode::DIV: {
                                     double dR = asDouble(R);
                                     if (dR == 0.0) { did_fold = false; break; }
@@ -610,19 +728,41 @@ class IRGenerator {
                                     folded = IRRef::constant(IRValue(asInt(L) / iR));
                                     break;
                                 }
-                                case IROpcode::MOD:
-                                    if (asInt(R) != 0) folded = IRRef::constant(IRValue(asInt(L) % asInt(R)));
-                                    else did_fold = false;
+                                case IROpcode::MOD: {
+                                    int64_t b = asInt(R);
+                                    if (b == 0) { did_fold = false; break; }
+                                    int64_t r = asInt(L) % b;                    // floor-mod (matches PY/runtime)
+                                    if (r != 0 && ((r < 0) != (b < 0))) r += b;
+                                    folded = IRRef::constant(IRValue(r));
                                     break;
+                                }
                                 // Comparisons/logicals fold to int64 0/1 (AC's canonical truth —
                                 // matches BNY/C runtime output and keeps typed backends compiling;
                                 // a bool const like `true` can't initialise an int64 in Go/Java/Rust).
-                                case IROpcode::EQ:   folded = mkConstInt((anyFloat ? (asDouble(L)==asDouble(R)) : (asInt(L)==asInt(R))) ? 1 : 0); break;
-                                case IROpcode::NEQ:  folded = mkConstInt((anyFloat ? (asDouble(L)!=asDouble(R)) : (asInt(L)!=asInt(R))) ? 1 : 0); break;
-                                case IROpcode::LT:   folded = mkConstInt((anyFloat ? (asDouble(L)< asDouble(R)) : (asInt(L)< asInt(R))) ? 1 : 0); break;
-                                case IROpcode::GT:   folded = mkConstInt((anyFloat ? (asDouble(L)> asDouble(R)) : (asInt(L)> asInt(R))) ? 1 : 0); break;
-                                case IROpcode::LTE:  folded = mkConstInt((anyFloat ? (asDouble(L)<=asDouble(R)) : (asInt(L)<=asInt(R))) ? 1 : 0); break;
-                                case IROpcode::GTE:  folded = mkConstInt((anyFloat ? (asDouble(L)>=asDouble(R)) : (asInt(L)>=asInt(R))) ? 1 : 0); break;
+                                case IROpcode::EQ:  case IROpcode::NEQ:
+                                case IROpcode::LT:  case IROpcode::GT:
+                                case IROpcode::LTE: case IROpcode::GTE: {
+                                    // STRING operands must compare as strings, not via asInt()
+                                    // (which returns 0 for any string → "cat" is "dog" folded to 1).
+                                    if (L.type == IRType::STRING || R.type == IRType::STRING) {
+                                        // Only fold string-vs-string; mixed string/number → defer to runtime.
+                                        if (L.type != IRType::STRING || R.type != IRType::STRING) { did_fold = false; break; }
+                                        int c = std::get<std::string>(L.data).compare(std::get<std::string>(R.data));
+                                        bool r = (opcode==IROpcode::EQ) ? (c==0) : (opcode==IROpcode::NEQ) ? (c!=0)
+                                               : (opcode==IROpcode::LT) ? (c<0)  : (opcode==IROpcode::GT)  ? (c>0)
+                                               : (opcode==IROpcode::LTE)? (c<=0) : (c>=0);
+                                        folded = mkConstInt(r ? 1 : 0);
+                                        break;
+                                    }
+                                    bool r = (opcode==IROpcode::EQ)  ? (anyFloat ? asDouble(L)==asDouble(R) : asInt(L)==asInt(R))
+                                           : (opcode==IROpcode::NEQ) ? (anyFloat ? asDouble(L)!=asDouble(R) : asInt(L)!=asInt(R))
+                                           : (opcode==IROpcode::LT)  ? (anyFloat ? asDouble(L)< asDouble(R) : asInt(L)< asInt(R))
+                                           : (opcode==IROpcode::GT)  ? (anyFloat ? asDouble(L)> asDouble(R) : asInt(L)> asInt(R))
+                                           : (opcode==IROpcode::LTE) ? (anyFloat ? asDouble(L)<=asDouble(R) : asInt(L)<=asInt(R))
+                                           :                           (anyFloat ? asDouble(L)>=asDouble(R) : asInt(L)>=asInt(R));
+                                    folded = mkConstInt(r ? 1 : 0);
+                                    break;
+                                }
                                 case IROpcode::AND:  folded = mkConstInt((asBool(L) && asBool(R)) ? 1 : 0); break;
                                 case IROpcode::OR:   folded = mkConstInt((asBool(L) || asBool(R)) ? 1 : 0); break;
                                 case IROpcode::XOR:  folded = mkConstInt((asBool(L) != asBool(R)) ? 1 : 0); break;
@@ -631,13 +771,56 @@ class IRGenerator {
                                 case IROpcode::BAND: if (!anyFloat) folded = mkConstInt(asInt(L) & asInt(R)); else did_fold = false; break;
                                 case IROpcode::BOR:  if (!anyFloat) folded = mkConstInt(asInt(L) | asInt(R)); else did_fold = false; break;
                                 case IROpcode::BXOR: if (!anyFloat) folded = mkConstInt(asInt(L) ^ asInt(R)); else did_fold = false; break;
-                                case IROpcode::XSUB: { int64_t d = asInt(L)-asInt(R); folded = IRRef::constant(IRValue((d<0?-d:d)+1)); break; }
+                                case IROpcode::XSUB: {
+                                    // |a-b|+1 with overflow guard — compute the distance in unsigned
+                                    // (signed a-b and -INT64_MIN are UB) and defer to runtime if +1 overflows.
+                                    int64_t a = asInt(L), b = asInt(R);
+                                    unsigned long long diff = (a >= b)
+                                        ? (unsigned long long)a - (unsigned long long)b
+                                        : (unsigned long long)b - (unsigned long long)a;
+                                    if (diff >= (unsigned long long)std::numeric_limits<int64_t>::max()) { did_fold = false; break; }
+                                    folded = IRRef::constant(IRValue((int64_t)diff + 1));
+                                    break;
+                                }
                                 default: did_fold = false; break;
                             }
                             if (did_fold) return folded;
                         }
                         // Propagate float type: / always produces float; // always produces int; others propagate
                         IRType lt = typeOfRef(lRef), rt = typeOfRef(rRef);
+                        // AC widening rule: on a fixed-width mismatch, promote the narrower operand to
+                        // the BIGGER integer type before the op (mini + int → to_int(mini) + int;
+                        // short + mini → short + to_short(mini)). Done once here so every backend sees
+                        // matched widths — the strict ones (Rust/Go/V) stop rejecting `i16 + i32`, and
+                        // the result width is consistent everywhere. Rank: mini(16) < short(32) < int(64).
+                        // A CONST literal ADAPTS to the other operand's width (short a * 4 stays
+                        // short — 4 is not "an int" forcing a promotion), so only promote when BOTH
+                        // sides are typed values.
+                        if (opcode != IROpcode::DIV
+                            && lRef.kind != IRRef::Kind::CONST && rRef.kind != IRRef::Kind::CONST
+                            && lt != IRType::FLOAT && rt != IRType::FLOAT
+                            && lt != IRType::STRING && rt != IRType::STRING
+                            && (lt == IRType::SHORT || lt == IRType::MINI
+                             || rt == IRType::SHORT || rt == IRType::MINI)) {
+                            auto rank = [](IRType t){ return t==IRType::MINI?16 : t==IRType::SHORT?32 : 64; };
+                            if (rank(lt) != rank(rt)) {
+                                // Mixed widths → promote both to the 64-bit INT (the biggest wired-in
+                                // int). Simpler and more consistent than promoting to the wider narrow:
+                                // the result is i64 on EVERY backend, so no backend chokes on the mix
+                                // and there's no i32-result-declared-i64 skew on the strict ones.
+                                auto promote = [&](IRRef& ref, IRType t){
+                                    if (rank(t) < 64) {
+                                        IRRef c = mkTemp();
+                                        IRInstruction ci(IROpcode::TYPE_CAST, c, {ref});
+                                        ci.resultType = IRType::INT; setRefType(c, IRType::INT);
+                                        emit(std::move(ci));
+                                        ref = c;
+                                    }
+                                };
+                                promote(lRef, lt); promote(rRef, rt);
+                                lt = rt = IRType::INT;
+                            }
+                        }
                         IRType resType = (opcode == IROpcode::DIV)
                                          ? IRType::FLOAT
                                          : (opcode == IROpcode::IDIV)
@@ -675,12 +858,17 @@ class IRGenerator {
                         emit(std::move(i));
                         return dst;
                     } else if (expr.value == "TO_STRING" || expr.value == "TO_INT" ||
-                               expr.value == "TO_DEC" || expr.value == "TO_BOOL") {
+                               expr.value == "TO_DEC" || expr.value == "TO_BOOL" ||
+                               expr.value == "TO_SHORT" || expr.value == "TO_MINI" ||
+                               expr.value == "TO_ATOMIC") {
                         IRInstruction i(IROpcode::TYPE_CAST);
                         i.typedOperands = {operand};
                         i.result = dst;
                         i.resultType = expr.value == "TO_STRING" ? IRType::STRING
                                      : expr.value == "TO_INT"    ? IRType::INT
+                                     : expr.value == "TO_SHORT"  ? IRType::SHORT
+                                     : expr.value == "TO_MINI"   ? IRType::MINI
+                                     : expr.value == "TO_ATOMIC" ? IRType::ATOMIC
                                      : expr.value == "TO_DEC"    ? IRType::FLOAT : IRType::BOOL;
                         emit(std::move(i));
                         return dst;
@@ -829,16 +1017,18 @@ class IRGenerator {
                 // No-arg property/constant reference or explicit empty-arg call
                 if (expr.children.empty()) {
                     bool explicitCall = !expr.attrs.empty() && expr.attrs[0] == "__called__";
-                    if (explicitCall) {
-                        // ball.x() — empty-arg method call, not property access
-                        IRRef dst = mkTemp();
-                        std::vector<IRRef> ops = {mkVar(mname)};
-                        IRInstruction i(IROpcode::CALL, dst, ops);
-                        emit(std::move(i));
-                        return dst;
-                    }
-                    // receiver.method with no args — check for string-cheese methods
-                    // Only fires when receiver is NOT a known library namespace
+                    // receiver.method with no args — check for string-cheese methods FIRST,
+                    // before the generic `explicitCall` shortcut below claims it. Both
+                    // `speech.lower()` (a real string-cheese call) and `ball.x()` (property-
+                    // style access on a GL object) parse identically here — zero children,
+                    // attrs[0]=="__called__" — so the explicitCall branch used to run
+                    // unconditionally and return early, making THIS check dead code for every
+                    // zero-arg case (verified: jarvis.ac's `speech.lower()` flattened to a
+                    // literal, undefined `speech_lower()`/`speech.lower` callee on every backend
+                    // — C: "implicit declaration of function 'speech_lower'"; the WITH-ARGS
+                    // sibling check below, `speech.strip($x$)`, was never affected since it
+                    // lives outside this `children.empty()` gate entirely).
+                    // Only fires when receiver is NOT a known library namespace.
                     auto dotPos2 = mname.rfind('.');
                     if (dotPos2 != std::string::npos && dotPos2 > 0) {
                         std::string recv2 = mname.substr(0, dotPos2);
@@ -863,6 +1053,14 @@ class IRGenerator {
                             }
                         }
                     }
+                    if (explicitCall) {
+                        // ball.x() — empty-arg method call, not property access
+                        IRRef dst = mkTemp();
+                        std::vector<IRRef> ops = {mkVar(mname)};
+                        IRInstruction i(IROpcode::CALL, dst, ops);
+                        emit(std::move(i));
+                        return dst;
+                    }
                     return mkVar(mname);
                 }
                 // receiver.method(args) — check for string-cheese methods with arguments
@@ -883,7 +1081,7 @@ class IRGenerator {
                                 "stringm","term","Term","sidebar","screen"
                             };
                             if (strMethodsN.count(meth3) && !libNamespaces.count(recv3)
-                                && !prog.importedLibs.count(recv3)) {
+                                && !prog.importedLibs.count(recv3) && !widgetCtorVars_.count(recv3)) {
                                 IRRef dst = mkTemp();
                                 IRInstruction call(IROpcode::LIB_CALL);
                                 call.result = dst;
@@ -946,8 +1144,8 @@ class IRGenerator {
                     aRef = lowerExprNode(*expr.children[0]);
                     bRef = lowerExprNode(*expr.children[1]);
                 } else {
-                    // Legacy: value = "a,b"
-                    size_t comma = expr.value.find(',');
+                    // Legacy: value = "a,b" — split at the TOP-LEVEL comma so "f(a,b),c" is safe.
+                    size_t comma = topLevelComma(expr.value);
                     aRef = lowerExpr(comma != std::string::npos ? expr.value.substr(0, comma) : "0");
                     bRef = lowerExpr(comma != std::string::npos ? expr.value.substr(comma + 1) : expr.value);
                 }
@@ -1628,16 +1826,52 @@ class IRGenerator {
     IRRef lowerExpr(const std::string& expr) {
         if (expr.empty()) return mkConst("");
 
-        // strip outer $…$ string literal
-        if (expr.size() >= 2 && expr.front() == '$' && expr.back() == '$') {
-            return mkConst(expr.substr(1, expr.size() - 2));
+        // strip outer $…$ string literal — but only when the two boundary characters are the
+        // ONLY `$`s present. A reconstructed multi-part concatenation (`$a$ + x + $b$`, from a
+        // parser-side token-value rebuild — see the FunctionCall/MethodCall arg-collectors'
+        // matching comment) ALSO happens to start and end with `$`, with more `$`s embedded in
+        // the middle; blindly stripping just the outer pair turned the whole concatenation into
+        // one literal string with the inner `$`s left in as literal text instead of actually
+        // being evaluated (verified: `os.bash($ac $ + path + $ --target $ + backend + $
+        // --no-cache...$)` — every `+`-joined part collapsed into one string containing the
+        // literal text "$+path+$..." instead of the real interpolated command).
+        {
+            int dollarCount = 0;
+            for (char c : expr) if (c == '$') dollarCount++;
+            if (expr.size() >= 2 && expr.front() == '$' && expr.back() == '$' && dollarCount == 2)
+                return mkConst(expr.substr(1, expr.size() - 2));
         }
 
-        // integer literal
-        bool isInt = !expr.empty();
-        for (char c : expr) if (!std::isdigit((unsigned char)c) && c != '-') { isInt = false; break; }
+        // integer literal — a '-' is only a sign at position 0, NOT an interior operator.
+        // (Old check allowed '-' anywhere → "5-3" passed, then stoll stopped at '-' and
+        //  returned 5, silently dropping the subtraction.)
+        bool isInt = !expr.empty() && expr != "-";
+        for (size_t ci = 0; isInt && ci < expr.size(); ++ci) {
+            char c = expr[ci];
+            if (!std::isdigit((unsigned char)c) && !(c == '-' && ci == 0)) { isInt = false; break; }
+        }
         if (isInt) {
             try { return mkConstInt(std::stoll(expr)); } catch (...) {}
+        }
+
+        // float literal — same shape as the int check, one interior '.' allowed. Was
+        // completely missing: a bare decimal like "0.785398163" fell all the way through
+        // every branch below to the final "plain variable name" catch-all, silently treating
+        // a FLOAT CONSTANT as a variable REFERENCE named "0.785398163" — invisible until a
+        // typed backend tried to sanitize/emit that "identifier" (verified: RAD's
+        // math.rad2deg(0.785398163) wrapping — C emitted `math_rad2deg(0_785398163)`, gcc:
+        // "invalid suffix on integer constant" — the dot became an underscore via whatever
+        // identifier-safety pass a VAR-kind ref goes through, since nothing upstream ever
+        // recognized this text as a literal in the first place).
+        bool isFloat = !expr.empty() && expr != "-" && expr != ".";
+        bool sawDot = false;
+        for (size_t ci = 0; isFloat && ci < expr.size(); ++ci) {
+            char c = expr[ci];
+            if (c == '.' && !sawDot) { sawDot = true; continue; }
+            if (!std::isdigit((unsigned char)c) && !(c == '-' && ci == 0)) { isFloat = false; break; }
+        }
+        if (isFloat && sawDot) {
+            try { return IRRef::constant(IRValue(std::stod(expr))); } catch (...) {}
         }
 
         // boolean / null / nil literals
@@ -1715,6 +1949,23 @@ class IRGenerator {
         int opPos = -1;
         IROpcode opcode = IROpcode::NOP;
 
+        // Marks which character positions fall INSIDE a `$...$` string region (between an
+        // opening $ and its matching close) — the operator scans below only track paren depth,
+        // so a literal `-`/`+` that's meant to be STRING CONTENT (e.g. `$--no-cache$`'s leading
+        // `--`, a CLI flag) was being read as a real SUB/ADD operator instead of text (verified:
+        // `os.bash($ac $ + path + $ --target $ + backend + $ --no-cache...$)` — the `--` inside
+        // "--no-cache" produced a spurious SUBTRACT of two unrelated temps instead of leaving
+        // that text alone; only surfaced once the dollar-count fix above stopped short-circuiting
+        // this whole expression as one opaque literal in the first place).
+        std::vector<bool> inStrMask(expr.size(), false);
+        {
+            bool inside = false;
+            for (size_t i = 0; i < expr.size(); i++) {
+                if (expr[i] == '$') { inside = !inside; continue; }
+                inStrMask[i] = inside;
+            }
+        }
+
         // Space-delimited WORD operators (bxor/band/bor/and/or/xor) — lowest precedence first,
         // rightmost at paren-depth 0. Without this, `arr[i] = a bxor 17` reached the string path
         // and emitted raw "a bxor17" (operator untranslated) on C/etc.
@@ -1733,8 +1984,11 @@ class IRGenerator {
                 for (int i = (int)expr.size() - (int)tok.size(); i > 0; --i) {
                     char c = expr[i];
                     if (c == ')' || c == ']') d++; else if (c == '(' || c == '[') d--;
-                    else if (d == 0 && expr.compare(i, tok.size(), tok) == 0
-                             && !idc(expr[i-1])) {   // left word-boundary; bracket depth guards [...]
+                    else if (d == 0 && !inStrMask[i] && expr.compare(i, tok.size(), tok) == 0
+                             && !idc(expr[i-1])                                            // left word-boundary
+                             && (i + (int)tok.size() >= (int)expr.size()
+                                 || !idc(expr[i + (int)tok.size()]))) {                     // right word-boundary
+                        // both boundaries → won't match "or" inside "orbit"/"factor" etc.
                         wOpPos = i; wOpLen = (int)tok.size(); wOpc = oc; break;
                     }
                 }
@@ -1756,7 +2010,7 @@ class IRGenerator {
             char c = expr[i];
             if (c == ')') depth++;
             else if (c == '(') depth--;
-            else if (depth == 0 && (c == '+' || c == '-') && i > 0) {
+            else if (depth == 0 && !inStrMask[i] && (c == '+' || c == '-') && i > 0) {
                 opPos = i;
                 opcode = (c == '+') ? IROpcode::ADD : IROpcode::SUB;
                 break;
@@ -1769,7 +2023,7 @@ class IRGenerator {
                 char c = expr[i];
                 if (c == ')') depth++;
                 else if (c == '(') depth--;
-                else if (depth == 0 && (c == '*' || c == '/' || c == '@') && i > 0) {
+                else if (depth == 0 && !inStrMask[i] && (c == '*' || c == '/' || c == '@') && i > 0) {
                     opPos = i;
                     opcode = (c == '*') ? IROpcode::MUL : (c == '@') ? IROpcode::PMUL : IROpcode::DIV;
                     break;
@@ -1873,6 +2127,41 @@ class IRGenerator {
         }
     }
 
+    // ── else-chain helper (low-level IR: BNY/ASM) ────────────────────────────
+    // `NodeType::ElseIfStmt`'s OWN handler (see its case below) only jumps past ITS OWN body on
+    // the FALSE path (`skipL`) — it has no way to jump past the REST of an IF/ELSEIF/OTHER chain
+    // on the TRUE path, because the plain `for (i = bodyIndex+1..) gen(children[i])` loop this
+    // used to be called from treats ElseIf/OTHER as a flat sibling list with no shared "end"
+    // label threaded through. Concretely: `IF a ELSEIF b {body} OTHER {other}` — when `b` is
+    // true, `body` ran, but execution then fell straight through into `other` too (verified:
+    // `examples/keyword_catalog_core.ac`'s ELSEIF branch printed "small" AND "other-branch",
+    // matching neither PY nor the language's own control-flow semantics). Mirrors the
+    // high-level `genElseChain` above structurally, but threads a real jump-to-`endL` (owned by
+    // the outer IfStmt) through each ElseIf link instead of relying on IF_BEGIN/IF_ELSE/IF_END
+    // nesting (which only the high-level backends consume).
+    void genElseChainLowLevel(const std::vector<std::unique_ptr<ASTNode>>& children, size_t idx,
+                              const IRRef& endL) {
+        if (idx >= children.size()) return;
+        const ASTNode& node = *children[idx];
+
+        if (node.type == NodeType::ElseIfStmt) {
+            if (node.children.empty() || node.children[0]->type == NodeType::Block)
+                return; // malformed elseif — no condition
+            IRRef condRef = lowerExprNode(*node.children[0]);
+            size_t bodyIdx = 1;
+
+            IRRef skipL = mkLabel();
+            emitJF(condRef, skipL);
+            if (bodyIdx < node.children.size()) gen(*node.children[bodyIdx]);
+            bool hasMore = idx + 1 < children.size();
+            if (hasMore) emitJump(endL);   // the missing piece: skip the rest of the chain
+            emitLabel(skipL);
+            genElseChainLowLevel(children, idx + 1, endL);
+        } else if (node.type == NodeType::IfStmt && node.value == "OTHER") {
+            if (!node.children.empty()) gen(*node.children[0]);
+        }
+    }
+
     // ── node visitor ────────────────────────────────────────────────────────
 
     void gen(const ASTNode& n) {
@@ -1930,6 +2219,43 @@ class IRGenerator {
                 prog.hadExplicitMainloop = true;
                 inMainSection = true;
                 emitTag(IROpcode::TAG_BEGIN, tag);
+                // Poll every `configure event-listener` binding's real SDL key state and call
+                // its callback directly (bypassing EVENT_TRIGGER/_ac_trigger's table lookup —
+                // we already have the exact callback name from KeyBinding's lowering). This is
+                // the piece that was ENTIRELY MISSING before: EVENT_BIND correctly registered
+                // callbacks and EVENT_TRIGGER correctly invoked them, but nothing ever CALLED
+                // EVENT_TRIGGER based on actual keyboard state — only an explicit `input <key>`
+                // statement did, which no game loop ever wrote. `gl:key.just_pressed`/
+                // `gl:key.pressed` reach the already-implemented (previously unreferenced from
+                // anywhere) ac_gl_key_just_pressed/ac_gl_key_pressed via the same "gl:noun.verb"
+                // → "ac_gl_noun_verb" resolution every other gl: call already goes through.
+                auto emitKeyPolling = [&]() {
+                    for (auto& [key, cbName, continuous] : polledKeyBindings_) {
+                        IRRef pdst = mkTemp();
+                        IRInstruction poll(IROpcode::LIB_CALL, pdst, {});
+                        poll.typedOperands.push_back(mkConst(continuous ? "gl:key.pressed" : "gl:key.just_pressed"));
+                        poll.typedOperands.push_back(mkConst(key));
+                        emit(std::move(poll));
+                        if (prog.useHighLevelIR) {
+                            IRInstruction ifb(IROpcode::IF_BEGIN);
+                            ifb.typedOperands = {pdst};
+                            emit(std::move(ifb));
+                            IRInstruction call(IROpcode::CALL);
+                            call.typedOperands = {mkVar(cbName)};
+                            emit(std::move(call));
+                            emit(IRInstruction(IROpcode::IF_END));
+                        } else {
+                            IRRef skipL = mkLabel();
+                            IRInstruction jf(IROpcode::JUMP_IF_FALSE);
+                            jf.typedOperands = {pdst, skipL};
+                            emit(std::move(jf));
+                            IRInstruction call(IROpcode::CALL);
+                            call.typedOperands = {mkVar(cbName)};
+                            emit(std::move(call));
+                            emitLabel(skipL);
+                        }
+                    }
+                };
                 if (prog.useHighLevelIR) {
                     IRRef breakSentinel = mkConst("__break__");
                     loopEnd.push(breakSentinel);
@@ -1952,6 +2278,8 @@ class IRGenerator {
                       u.typedOperands = {mkConst("gl:frame.update"), IRRef::constant(IRValue(0.016))};
                       emit(std::move(u)); }
 
+                    emitKeyPolling();
+
                     for (auto& c : n.children) gen(*c);
 
                     // gl:frame.render(); gl:frame.end() at bottom of loop
@@ -1970,6 +2298,7 @@ class IRGenerator {
                     { IRInstruction b(IROpcode::LIB_CALL); b.typedOperands = {mkConst("gl:frame.begin")}; emit(std::move(b)); }
                     { IRInstruction u(IROpcode::LIB_CALL);
                       u.typedOperands = {mkConst("gl:frame.update"), IRRef::constant(IRValue(0.016))}; emit(std::move(u)); }
+                    emitKeyPolling();
                     for (auto& c : n.children) gen(*c);
                     { IRInstruction r(IROpcode::LIB_CALL); r.typedOperands = {mkConst("gl:frame.render")}; emit(std::move(r)); }
                     { IRInstruction e(IROpcode::LIB_CALL); e.typedOperands = {mkConst("gl:frame.end")}; emit(std::move(e)); }
@@ -2043,8 +2372,18 @@ class IRGenerator {
         }
 
         case NodeType::BackendDecl:
-        case NodeType::SaveStmt:
             break; // metadata only
+
+        case NodeType::SaveStmt: {
+            // `save as <file>` — writes everything Term.display'd SO FAR (from program start up
+            // to this statement) to the named file. Was a complete no-op before ("metadata
+            // only") despite being a real, documented feature (CHANGELOG: "save as records a
+            // save directive") — no file was ever written, on any backend.
+            IRInstruction i(IROpcode::SAVE_FILE);
+            i.typedOperands = {mkConst(n.value)};
+            emit(std::move(i));
+            break;
+        }
 
         // ── function definition ─────────────────────────────────────────────
         case NodeType::FuncDef: {
@@ -2270,19 +2609,50 @@ class IRGenerator {
                     if (!n.children.empty() && n.children[0]->type == NodeType::FunctionCall) {
                         auto& fc = *n.children[0];
                         std::vector<IRRef> ops = {mkVar(fc.value)};
-                        for (auto& a : mergeBracketAttrs(fc.attrs)) {
+                        for (auto& a0 : mergeBracketAttrs(fc.attrs)) {
+                            std::string a = a0;
+                            // Keyword-arg sugar for widget ctors: `Screen(title=$X$)` — strip a
+                            // recognized "paramName=" prefix so the value flows through the
+                            // SAME literal/ident/expr handling below as a plain positional arg
+                            // would. A small, targeted table (not a general language keyword-arg
+                            // feature) — only correctly positions a SINGLE kwarg matching the
+                            // Nth param when the first N-1 positional args are also omitted
+                            // (exactly Abu's `Screen(title=$X$)`, no geometry, case); it does NOT
+                            // reorder multiple out-of-sequence kwargs.
+                            {
+                                static const std::unordered_map<std::string, std::vector<std::string>> ctorParamNames = {
+                                    {"Screen", {"title", "geometry"}},
+                                };
+                                auto pit = ctorParamNames.find(fc.value);
+                                if (pit != ctorParamNames.end()) {
+                                    auto eq = a.find('=');
+                                    if (eq != std::string::npos) {
+                                        std::string key = a.substr(0, eq);
+                                        bool keyIsIdent = !key.empty();
+                                        for (char c : key) if (!std::isalnum((unsigned char)c) && c != '_') { keyIsIdent = false; break; }
+                                        if (keyIsIdent) {
+                                            bool known = false;
+                                            for (auto& nm : pit->second) if (nm == key) { known = true; break; }
+                                            if (known) a = a.substr(eq + 1);
+                                        }
+                                    }
+                                }
+                            }
                             // Check if attr is a variable name or a constant
                             // If it's a number, make it a const int
                             bool isInt = !a.empty();
                             for (size_t ci = 0; ci < a.size(); ++ci) if (!std::isdigit((unsigned char)a[ci]) && !(a[ci]=='-'&&ci==0)) { isInt = false; break; }
                             if (isInt) {
                                 try {
-                                    ops.push_back(mkConstInt(std::stoi(a)));
+                                    ops.push_back(mkConstInt(std::stoll(a)));
                                 } catch (...) {
                                     ops.push_back(mkConst(a));
                                 }
-                            } else if (a.size() >= 2 && a.front() == '$' && a.back() == '$') {
-                                // String literal
+                            } else if (a.size() >= 2 && a.front() == '$' && a.back() == '$'
+                                       && [&]{ int n=0; for (char c : a) if (c=='$') n++; return n; }() == 2) {
+                                // String literal — see the sibling FunctionCall-arg lowering's
+                                // matching comment (~line 3131) for why the dollar-count check
+                                // is needed here too, not just a first/last-char check.
                                 ops.push_back(mkConst(a));
                             } else if (lowerListLiteralArg(a, ops)) {
                                 // list literal argument — lowered to an ALLOC temp
@@ -2298,11 +2668,12 @@ class IRGenerator {
                         }
                         IRInstruction i(IROpcode::CALL, dst, ops);
                         emit(std::move(i));
+                        if (widgetCtorNames().count(fc.value)) widgetCtorVars_.insert(n.value);
                         break;
                     }
                 }
             }
-            
+
             // Check if we have a structured expression as child
             if (!n.children.empty()) {
                 // a = [elem] @ n  → ALLOC directly into `a` + fill loop (typed backends
@@ -2378,11 +2749,15 @@ class IRGenerator {
                       else cur += c;
                   }
                   if (!cur.empty()) elems.push_back(cur); }
-                auto isLiteral = [](std::string e) {
+                auto isLiteral = [this](std::string e) {
                     size_t a=e.find_first_not_of(' '), b=e.find_last_not_of(' ');
                     if (a==std::string::npos) return false;
                     e = e.substr(a, b-a+1);
                     if (e.size()>=2 && e.front()=='$' && e.back()=='$') return true;
+                    // A `.datac` row var (see datacDictVars_'s comment) is a bare identifier
+                    // reference, not a literal — but it must go into the ALLOC's literal content
+                    // text the same as one, so the codegen-side dict-var check can ever see it.
+                    if (datacDictVars_.count(e)) return true;
                     size_t i = (e[0]=='-')?1:0; if (i>=e.size()) return false;
                     bool dot=false;
                     for (; i<e.size(); ++i) {
@@ -2416,6 +2791,7 @@ class IRGenerator {
             } else if (raw.substr(0, 8) == "__dict__") {
                 IRInstruction i(IROpcode::ALLOC, dst, {mkConst("dict"), mkConst(raw.substr(8))});
                 emit(std::move(i));
+                datacDictVars_.insert(n.value);
             } else if (raw == "__range__") {
                 // Range with structured expression
                 if (n.children.size() > 0) {
@@ -2575,6 +2951,21 @@ class IRGenerator {
                     emit(std::move(i));
                     break;
                 }
+                IRInstruction i(IROpcode::LIB_CALL);
+                i.typedOperands = {mkVar(n.value), val};
+                emit(std::move(i));
+                break;
+            }
+            // `recv.write(expr)` — the parser's "display/print/log/write" no-paren-required
+            // special case (see its own comment) puts ALL FOUR of these method names' argument
+            // into `n.children[0]` uniformly, but this consumer only ever handled "display" (+
+            // alert/sure) — "write" (a real widget method, e.g. `textbox.write(...)`; `Term.write`
+            // itself is already rejected above) fell through every later branch, which only
+            // reads `n.attrs` (empty here, since the parser used `.children` for this shape),
+            // silently dropping the argument entirely (verified: `src_box.write(content)`
+            // compiled to a bare `src_box.write()` call on every backend — content never sent).
+            if (!n.children.empty() && endsWith(mname, ".write")) {
+                IRRef val = lowerExprNode(*n.children[0]);
                 IRInstruction i(IROpcode::LIB_CALL);
                 i.typedOperands = {mkVar(n.value), val};
                 emit(std::move(i));
@@ -2763,9 +3154,22 @@ class IRGenerator {
                     // identifier branch → raw "True"/"False", undefined on C/Rust. AC lists are
                     // i64, so lower to 1/0 (fits []i64 and reads truthy everywhere).
                     ops.push_back(mkConstInt((trimmed == "True" || trimmed == "true") ? 1 : 0));
-                } else if (trimmed.size() >= 2 && trimmed.front() == '$' && trimmed.back() == '$') {
-                    // String literal
-                    ops.push_back(mkConst(trimmed));
+                } else if (trimmed.size() >= 2 && trimmed.front() == '$' && trimmed.back() == '$'
+                           && [&]{ int n=0; for (char c : trimmed) if (c=='$') n++; return n; }() == 2) {
+                    // String literal — strip the `$...$` delimiters (matches lowerExpr's own
+                    // string handling a few hundred lines up). This generic attrs-based LIB_CALL
+                    // lowering is what a chained method call (`fn Term.display $x$ & Term.display
+                    // $y$`) routes through instead of the optimized PRINT opcode path (which
+                    // handles a real expression CHILD, not a raw attrs STRING) — leaving the
+                    // delimiters attached here made every backend that doesn't independently
+                    // re-strip them (verified: BNY) print the literal text "$chained-one$"
+                    // instead of "chained-one". The dollar-count guard additionally fixes a
+                    // multi-part concatenation reconstructed by the parser's method-call arg
+                    // collector (`Name.method(args)`, parser.cpp) — WITHOUT it, `os.bash($a$ +
+                    // path + $b$ + backend + $c$)` collapsed into one literal string containing
+                    // the un-evaluated text "$+path+$..." instead of falling through to
+                    // lowerExpr below to actually parse the concatenation.
+                    ops.push_back(mkConst(trimmed.substr(1, trimmed.size() - 2)));
                 } else if (!trimmed.empty() && std::isdigit((unsigned char)trimmed.front())) {
                     // Mixed digit-alpha token like "60fps" — treat as string constant
                     ops.push_back(mkConst(trimmed));
@@ -2786,6 +3190,21 @@ class IRGenerator {
                 } else {
                     // Empty - skip
                 }
+            }
+            // Sugar: `widget.add($a$, $b$, $c$)` — every widget "add" method (dropdown/listbox/
+            // table/generic) only ever took ONE item per call; passing extra args used to just
+            // load them into unused argument registers and silently drop them (verified on BNY:
+            // ac_widgets_dropdown_add(w, item) ignores anything past its 2nd param). No existing
+            // "add" use in the language takes 2+ positional args (checked examples/), so it's
+            // safe to desugar N args into N sequential single-arg LIB_CALLs here — works on every
+            // backend for free since each already handles the single-arg form correctly.
+            if (ops.size() > 2 && n.value.size() >= 4 && n.value.compare(n.value.size()-4, 4, ".add") == 0) {
+                for (size_t k = 1; k < ops.size(); k++) {
+                    IRInstruction i(IROpcode::LIB_CALL);
+                    i.typedOperands = {ops[0], ops[k]};
+                    emit(std::move(i));
+                }
+                break;
             }
             IRInstruction i(IROpcode::LIB_CALL);
             i.typedOperands = ops;
@@ -2821,12 +3240,27 @@ class IRGenerator {
                 for (size_t ci = 0; ci < a.size(); ++ci) if (!std::isdigit((unsigned char)a[ci]) && !(a[ci]=='-'&&ci==0)) { isInt = false; break; }
                 if (isInt) {
                     try {
-                        ops.push_back(mkConstInt(std::stoi(a)));
+                        ops.push_back(mkConstInt(std::stoll(a)));
                     } catch (...) {
                         ops.push_back(mkConst(a));
                     }
-                } else if (a.size() >= 2 && a.front() == '$' && a.back() == '$') {
-                    // String literal
+                } else if (a.size() >= 2 && a.front() == '$' && a.back() == '$'
+                           && [&]{ int n=0; for (char c : a) if (c=='$') n++; return n; }() == 2) {
+                    // A genuine single string literal has EXACTLY the two boundary `$`s. The
+                    // parser reconstructs a call argument's source text by concatenating token
+                    // values (see parser.cpp's positional-argument loop, which re-wraps every
+                    // STRING token as "$" + value + "$") — a multi-part concatenation like
+                    // `$a$ + x + $b$` reconstructs to a string that ALSO happens to start and
+                    // end with `$`, with MORE `$`s embedded in the middle. The old first/last-
+                    // char-only check couldn't tell the two apart and treated the whole
+                    // concatenation as one literal string, dollar signs and all (verified:
+                    // `os.bash($ac $ + path + $ --target $ + backend + $ --no-cache...$)` —
+                    // 3+ concatenated parts inside a call's parens produced a single string
+                    // containing the literal text "$+path+$" instead of actually concatenating;
+                    // exactly 2 parts happened to dodge this by never re-closing with `$`, which
+                    // is why it looked backend/widget-specific until isolated). Anything with
+                    // extra embedded `$`s falls through to lowerExpr below instead, which
+                    // correctly re-tokenizes and parses the whole expression.
                     ops.push_back(mkConst(a));
                 } else if (lowerListLiteralArg(a, ops)) {
                     // list literal argument — lowered to an ALLOC temp
@@ -2850,8 +3284,32 @@ class IRGenerator {
             // name.prop = value  OR  name.prop /= value (compound, attrs[0] = "/=")
             IRRef dst = mkVar(n.value);
             // Compound assignment: attr[0] is the op ("/=", "*=", etc.), rhs in children[0]
+            if (!n.attrs.empty() && !n.children.empty() && n.attrs[0] == "@=") {
+                // `<glObj>.speed@=X` — the runtime's OWN documented convention for this exact
+                // syntax (gl_c.h: "speed *= mult (ball.speed@=-1)") is ac_gl_obj_speed_mult,
+                // which existed already but was completely orphaned — neither glMethods nor
+                // glMethodsExpr referenced it, and the parser didn't even accept AT_EQUAL here
+                // until now (see the parser-side comment on this same construct). Falls through
+                // to the generic __compound_assign__ path below (unchanged, existing behavior)
+                // for anything that isn't `<glObj>.speed` — e.g. `@=` on a plain variable is
+                // handled entirely differently, via AtEqualStmt, never reaching PropAssign at all.
+                auto dotPos = n.value.find('.');
+                if (dotPos != std::string::npos) {
+                    std::string receiver = n.value.substr(0, dotPos);
+                    std::string prop = n.value.substr(dotPos + 1);
+                    if (glObjects_.count(receiver) && prop == "speed") {
+                        IRRef rhs = lowerExprNode(*n.children[0]);
+                        IRInstruction i(IROpcode::LIB_CALL);
+                        i.typedOperands = {mkConst("gl:obj.speed_mult"), mkConst(receiver), rhs};
+                        emit(std::move(i));
+                        break;
+                    }
+                }
+            }
+            // Compound assignment: attr[0] is the op ("/=", "*=", etc.), rhs in children[0]
             if (!n.attrs.empty() && !n.children.empty() &&
-                (n.attrs[0] == "/=" || n.attrs[0] == "*=" || n.attrs[0] == "+=" || n.attrs[0] == "-=")) {
+                (n.attrs[0] == "/=" || n.attrs[0] == "*=" || n.attrs[0] == "+=" || n.attrs[0] == "-=" ||
+                 n.attrs[0] == "@=")) {
                 // Skip compound assigns on function-attribute style (e.g. jump.vertex /= 2)
                 // where the receiver is not a GL object — such "closure attributes" have no
                 // cross-backend representation and would produce undeclared-variable errors.
@@ -2861,14 +3319,58 @@ class IRGenerator {
                     if (glObjects_.count(receiver) == 0) break; // skip
                 }
                 IRRef rhs = lowerExprNode(*n.children[0]);
+                // "@=" isn't a real operator in ANY target language outside this one (Python's
+                // `@=` means matrix-multiply, not this) — only reachable here for a fallthrough
+                // `@=` the gl:obj.speed_mult special-case above didn't claim (a non-GL-object
+                // receiver, or a GL property other than "speed"). `@` is AC's general multiply
+                // operator everywhere else, so translate the op text to the already-fully-
+                // supported "*=" rather than ever emitting raw "@=" into generated code.
+                std::string op = (n.attrs[0] == "@=") ? "*=" : n.attrs[0];
                 // emit as LIB_CALL("__compound_assign__", dst, op, rhs) so codegen can render X op= Y
                 IRInstruction i(IROpcode::LIB_CALL);
-                i.typedOperands = {mkConst("__compound_assign__"), dst, mkConst(n.attrs[0]), rhs};
+                i.typedOperands = {mkConst("__compound_assign__"), dst, mkConst(op), rhs};
                 emit(std::move(i));
             } else {
-                IRRef src = n.attrs.empty() ? mkConst("") : lowerExpr(n.attrs[0]);
-                IRInstruction i(IROpcode::STORE_VAR, dst, {src});
-                emit(std::move(i));
+                // DEG/RAD prefix sugar (`DEG x.prop=45` / `RAD x.prop=0.785`) — set by the
+                // parser's statement-prefix handling (see its comment). DEG is a no-op (AC's
+                // angle-taking functions, e.g. gl's set_direction, already take degrees); RAD
+                // wraps the raw value text in a real math.rad2deg(...) call before it's lowered
+                // — reuses the exact same textual call-lowering path every other `name(args)`
+                // expression already goes through just below, not a duplicated formula.
+                std::string valText = n.attrs.empty() ? "" : n.attrs[0];
+                if (n.angleUnit == 2 && !valText.empty())
+                    valText = "math.rad2deg(" + valText + ")";
+                IRRef src = valText.empty() ? mkConst("") : lowerExpr(valText);
+                // A GL object's `direction`/`speed` PROPERTY ASSIGNMENT (`ball.direction=45`)
+                // must reach the real `ac_gl_obj_set_direction`/`set_speed` — without this it
+                // fell through to a plain STORE_VAR on a flattened "ball.direction" name (the
+                // same convention bundle self.field assignment uses), which silently updates
+                // nothing in the gl runtime at all (verified: examples/pong.ac's
+                // `DEG ball.direction=45`). `X.set_direction(Y)` (method-CALL syntax) already
+                // worked via glMethods (ir.cpp's statement dispatch table) — this just gives the
+                // equivalent property-ASSIGN syntax the same real destination.
+                static const std::unordered_map<std::string,std::string> glPropSetters = {
+                    {"direction", "gl:obj.set_direction"}, {"speed", "gl:obj.set_speed"},
+                };
+                auto dotPos = n.value.find('.');
+                bool routedToGl = false;
+                if (dotPos != std::string::npos) {
+                    std::string receiver = n.value.substr(0, dotPos);
+                    std::string prop = n.value.substr(dotPos + 1);
+                    if (glObjects_.count(receiver)) {
+                        auto pit = glPropSetters.find(prop);
+                        if (pit != glPropSetters.end()) {
+                            IRInstruction i(IROpcode::LIB_CALL);
+                            i.typedOperands = {mkConst(pit->second), mkConst(receiver), src};
+                            emit(std::move(i));
+                            routedToGl = true;
+                        }
+                    }
+                }
+                if (!routedToGl) {
+                    IRInstruction i(IROpcode::STORE_VAR, dst, {src});
+                    emit(std::move(i));
+                }
             }
             break;
         }
@@ -2977,7 +3479,7 @@ class IRGenerator {
                 if (hasElse) emitJump(endL);
                 emitLabel(elseL);
 
-                for (size_t i = bodyIndex + 1; i < n.children.size(); i++) gen(*n.children[i]);
+                genElseChainLowLevel(n.children, bodyIndex + 1, endL);
                 if (hasElse) emitLabel(endL);
             }
             break;
@@ -3159,7 +3661,7 @@ class IRGenerator {
                         if (collNode.children.size() >= 3) stepRef = lowerExprNode(*collNode.children[2]);
                     } else {
                         std::string val = collNode.value;
-                        size_t comma = val.find(',');
+                        size_t comma = topLevelComma(val);
                         aRef = lowerExpr(comma != std::string::npos ? val.substr(0, comma) : "0");
                         bRef = lowerExpr(comma != std::string::npos ? val.substr(comma + 1) : val);
                     }
@@ -3169,7 +3671,13 @@ class IRGenerator {
                 emitLabel(startL);
 
                 IRRef cmpT = mkTemp();
-                emit(IRInstruction(IROpcode::LT, cmpT, {iter, bRef}));
+                // A negative constant step counts DOWN → terminate on iter > b, not iter < b
+                // (stream(10,0,-1) with a fixed `iter < 0` test ran zero iterations).
+                bool negStep = (stepRef.kind == IRRef::Kind::CONST && stepRef.value.type == IRType::INT
+                                && std::get<int64_t>(stepRef.value.data) < 0)
+                             || (collNode.children.size() >= 3 && collNode.children[2]
+                                 && collNode.children[2]->type == NodeType::UnaryExpr && collNode.children[2]->value == "-");
+                emit(IRInstruction(negStep ? IROpcode::GT : IROpcode::LT, cmpT, {iter, bRef}));
                 emitJF(cmpT, endL);
 
                 if (bodyIndex < n.children.size()) gen(*n.children[bodyIndex]);
@@ -3210,7 +3718,11 @@ class IRGenerator {
                 emit(IRInstruction(IROpcode::ADD, incT, {iter, stepRef}));
                 emit(IRInstruction(IROpcode::STORE_VAR, iter, {incT}));
                 IRRef cmpT = mkTemp();
-                emit(IRInstruction(IROpcode::LT, cmpT, {iter, bRef}));
+                bool negStep2 = (stepRef.kind == IRRef::Kind::CONST && stepRef.value.type == IRType::INT
+                                 && std::get<int64_t>(stepRef.value.data) < 0)
+                              || (collNode.children.size() >= 3 && collNode.children[2]
+                                  && collNode.children[2]->type == NodeType::UnaryExpr && collNode.children[2]->value == "-");
+                emit(IRInstruction(negStep2 ? IROpcode::GT : IROpcode::LT, cmpT, {iter, bRef}));
                 {
                     IRInstruction jfb(IROpcode::JUMP_IF_FALSE);
                     jfb.typedOperands = {cmpT, breakSentinel};
@@ -3224,9 +3736,16 @@ class IRGenerator {
                 break;
             }
 
-            // For iteration, iota/stream behave as range/sequence (lazy values), NOT as the
-            // concatenated-string value form. Emit the matching range/sequence ALLOC so the
-            // high-level FOR_BEGIN iterates numbers.
+            // For iteration, iota/stream behave as range/sequence (LAZY, one-value-per-iteration
+            // generation — NOT materializing anything upfront) — this is the entire point of
+            // having iota/stream as a separate keyword from range/sequence in a FOR context:
+            // `FOR item in iota 6` is a counter that gets asked for the next value each pass,
+            // never a precomputed [0,1,2,3,4,5]. Reverted a wrong "fix" from earlier this session
+            // that misread this as an inconsistency and made it iterate a materialized string's
+            // characters instead — that's backwards: it made a lazy generator even MORE eager
+            // (fully building a string) rather than keeping it lazy. Only the VALUE form (`Term.
+            // display iota 3` → "012", outside a FOR loop) is a real string — see IotaExpr/
+            // StreamExpr's `lowerExpr` case above; that contract was never in question.
             IRRef collRef;
             if (collNode.type == NodeType::IotaExpr) {
                 IRRef bound = !collNode.children.empty() ? lowerExprNode(*collNode.children[0]) : mkConstInt(0);
@@ -3459,6 +3978,9 @@ class IRGenerator {
             if (!n.attrs.empty()) {
                 if      (n.attrs[0] == "DEC")    targetType = IRType::FLOAT;
                 else if (n.attrs[0] == "INT")    targetType = IRType::INT;
+                else if (n.attrs[0] == "SHORT")  targetType = IRType::SHORT;
+                else if (n.attrs[0] == "MINI")   targetType = IRType::MINI;
+                else if (n.attrs[0] == "ATOMIC") targetType = IRType::ATOMIC;
                 else if (n.attrs[0] == "STRING") targetType = IRType::STRING;
                 else if (n.attrs[0] == "BOOL")   targetType = IRType::BOOL;
                 else if (n.attrs[0] == "LONGINT") targetType = IRType::STRING;
@@ -3526,6 +4048,22 @@ class IRGenerator {
 
             // Source: either provided expr, or the variable itself (coerce in-place)
             IRRef src = n.children.empty() ? mkVar(varName) : lowerExprNode(*n.children[0]);
+            // Fixed-width overflow check: a `short`/`mini` initialised with a constant that doesn't
+            // fit is a mistake — reject it uniformly on EVERY backend (C/C++/Java silently wrapped;
+            // Rust/Go/V errored at their own compiler → cross-backend divergence). Runtime values
+            // still truncate to the width; only compile-time constants are range-checked here.
+            if ((targetType == IRType::SHORT || targetType == IRType::MINI)
+                && src.kind == IRRef::Kind::CONST && src.value.type == IRType::INT) {
+                int64_t v = std::get<int64_t>(src.value.data);
+                int bits = (targetType == IRType::SHORT) ? 32 : 16;
+                int64_t lo = -(int64_t(1) << (bits - 1));
+                int64_t hi =  (int64_t(1) << (bits - 1)) - 1;
+                if (v < lo || v > hi)
+                    throw ACError::type("value " + std::to_string(v) + " doesn't fit in `"
+                        + std::string(targetType == IRType::SHORT ? "short" : "mini")
+                        + "` (" + std::to_string(bits) + "-bit: " + std::to_string(lo)
+                        + " to " + std::to_string(hi) + ")");
+            }
             IRRef varRef = mkVar(varName);
             setRefType(varRef, targetType);
             IRInstruction i(IROpcode::TYPE_CAST);
@@ -3637,7 +4175,30 @@ class IRGenerator {
             for (char& c : safeName) if (!std::isalnum((unsigned char)c)) c = '_';
             std::string cbName = "__keycb_" + safeName;
 
-            if (!n.children.empty()) {
+            // `WHILST value is <samekey>` nested directly inside `on value is <samekey>` is
+            // this system's spelling for "run this every frame while the key is held" (vs the
+            // default "run once when the key transitions to pressed"). `value`/`is`/the key
+            // token all parse as an ordinary BinaryExpr("is", Identifier("value"),
+            // Identifier(key)) — there's no dedicated grammar for it, it's recognized purely by
+            // shape here. When matched, the WHILST's OWN body becomes the callback (the
+            // redundant "value is X" condition is discarded — polling via key_pressed every
+            // frame already IS the "while held" semantics, see the <StartHere> injection below).
+            const NodeList* bodyChildren = &n.children;
+            bool continuous = false;
+            if (n.children.size() == 1 && n.children[0]->type == NodeType::WhilstLoop) {
+                const ASTNode& w = *n.children[0];
+                if (!w.children.empty() && w.children[0]->type == NodeType::BinaryExpr &&
+                    w.children[0]->value == "is" && w.children[0]->children.size() == 2 &&
+                    w.children[0]->children[0]->type == NodeType::Identifier &&
+                    w.children[0]->children[0]->value == "value" &&
+                    w.children[0]->children[1]->type == NodeType::Identifier &&
+                    w.children[0]->children[1]->value == key) {
+                    continuous = true;
+                    bodyChildren = &w.children;   // children[0] is the condition, skipped below
+                }
+            }
+
+            if (!bodyChildren->empty()) {
                 // Lower children as a function body
                 int funcId = prog.symbols.intern(cbName, IRType::FUNCTION);
                 IRFunction fn(cbName);
@@ -3647,16 +4208,21 @@ class IRGenerator {
                 IRInstruction entry(IROpcode::FUNC_BEGIN);
                 entry.typedOperands = {IRRef::func(funcId)};
                 emit(std::move(entry));
-                for (auto& c : n.children) gen(*c);
+                size_t startIdx = continuous ? 1 : 0;   // skip the WHILST's condition child
+                for (size_t ci = startIdx; ci < bodyChildren->size(); ci++) gen(*(*bodyChildren)[ci]);
                 IRInstruction ret(IROpcode::RETURN); ret.typedOperands = {}; emit(std::move(ret));
                 IRInstruction end(IROpcode::FUNC_END); end.typedOperands = {IRRef::func(funcId)}; emit(std::move(end));
                 cur = nullptr;
             }
 
-            // Emit EVENT_BIND: {key_string, callback_name}
+            // Emit EVENT_BIND: {key_string, callback_name} — kept for explicit `input <key>`
+            // statements, which still look this up via EVENT_TRIGGER/_ac_trigger unchanged.
             IRInstruction i(IROpcode::EVENT_BIND);
             i.typedOperands = {mkConst(key), mkVar(cbName)};
             emit(std::move(i));
+            // Additionally record it so <StartHere>'s auto-generated per-frame loop can poll
+            // real SDL key state and call the callback directly every frame — see its comment.
+            polledKeyBindings_.push_back({key, cbName, continuous});
             break;
         }
 
@@ -3670,25 +4236,56 @@ class IRGenerator {
             break;
         }
 
+        case NodeType::BindStmt: {
+            // bind <key> to <function> — same EVENT_BIND opcode `configure event-listener`'s
+            // KeyBinding case uses, but referencing an EXISTING user function directly instead
+            // of synthesizing a wrapper callback (there's no inline block body here to wrap).
+            IRInstruction i(IROpcode::EVENT_BIND);
+            std::string func = n.attrs.empty() ? "" : n.attrs[0];
+            i.typedOperands = {mkConst(n.value), mkVar(func)};
+            emit(std::move(i));
+            break;
+        }
+
         // ── library / misc ──────────────────────────────────────────────────
         case NodeType::UseStmt:
         case NodeType::UseLibStmt: {
             // track imported lib name (strip "ilib:", "elib:", etc.)
+            std::string effValue = n.value;
+            std::vector<std::string> effAttrs = n.attrs;
             {
-                std::string libName = n.value;
-                auto colon = libName.find(':');
-                if (colon != std::string::npos) libName = libName.substr(colon + 1);
-                prog.importedLibs.insert(libName);
+                std::string libType = effValue, libName = effValue;
+                auto colon = effValue.find(':');
+                if (colon != std::string::npos) { libType = effValue.substr(0, colon); libName = effValue.substr(colon + 1); }
+
+                // `from ilib web use web-server` — web-server is a sub-ilib of web, not
+                // a restricted symbol list of web's own functions. Rewrite to a plain
+                // import of web-server (and ONLY web-server — `use ilib web` on its own
+                // stays client-only, importing one never pulls in the other).
+                if (libType == "ilib" && libName == "web") {
+                    auto it = std::find(effAttrs.begin(), effAttrs.end(), "web-server");
+                    if (it != effAttrs.end()) {
+                        effValue = "ilib:web-server";
+                        effAttrs.clear();
+                    }
+                }
+
+                std::string trackedName = libName;
+                if (effValue != n.value) {
+                    auto c2 = effValue.find(':');
+                    trackedName = (c2 != std::string::npos) ? effValue.substr(c2 + 1) : effValue;
+                }
+                prog.importedLibs.insert(trackedName);
             }
             IRInstruction i(IROpcode::LIB_CALL);
             // operands: "import", "ilib:math"[, "sin,cos,sqrt" if selective]
-            i.typedOperands = {mkConst("import"), mkConst(n.value)};
-            if (!n.attrs.empty()) {
+            i.typedOperands = {mkConst("import"), mkConst(effValue)};
+            if (!effAttrs.empty()) {
                 // Build comma-separated symbol list from attrs
                 std::string symbols;
-                for (size_t k = 0; k < n.attrs.size(); k++) {
+                for (size_t k = 0; k < effAttrs.size(); k++) {
                     if (k) symbols += ',';
-                    symbols += n.attrs[k];
+                    symbols += effAttrs[k];
                 }
                 i.typedOperands.push_back(mkConst(symbols));
             }
@@ -4122,7 +4719,7 @@ static IRValue applyBinOp(IROpcode op, const IRValue& L, const IRValue& R) {
         // the exception (try/catch around `x // 0` never fired on ANY backend).
         case IROpcode::FDIV: { double d = asDbl(R); return d != 0.0 ? IRValue(asDbl(L)/d) : IRValue(); }
         case IROpcode::IDIV: { int64_t r = asInt(R); return r != 0 ? IRValue(asInt(L)/r) : IRValue(); }
-        case IROpcode::MOD:  { int64_t r = asInt(R); return r != 0 ? IRValue(asInt(L)%r) : IRValue(); }
+        case IROpcode::MOD:  { int64_t b = asInt(R); if (b==0) return IRValue(); int64_t r = asInt(L)%b; if (r!=0 && ((r<0)!=(b<0))) r+=b; return IRValue(r); }
         // Comparisons/logicals return int64 0/1 (AC's canonical truth) — a BOOL here breaks
         // typed backends (Go/Java/Rust can't put `true` in an int64) and diverges from BNY/C.
         case IROpcode::EQ:   return IRValue((int64_t)((anyFloat ? (asDbl(L)==asDbl(R)) : (asInt(L)==asInt(R))) ? 1 : 0));
@@ -4139,7 +4736,15 @@ static IRValue applyBinOp(IROpcode op, const IRValue& L, const IRValue& R) {
         case IROpcode::BAND: return IRValue(asInt(L) & asInt(R));
         case IROpcode::BOR:  return IRValue(asInt(L) | asInt(R));
         case IROpcode::BXOR: return IRValue(asInt(L) ^ asInt(R));
-        case IROpcode::XSUB: { int64_t d = asInt(L)-asInt(R); return IRValue((d<0?-d:d)+1); }
+        case IROpcode::XSUB: {
+            // |a-b|+1 computed in unsigned to avoid signed-overflow / -INT64_MIN UB; clamp on overflow.
+            int64_t a = asInt(L), b = asInt(R);
+            unsigned long long diff = (a >= b)
+                ? (unsigned long long)a - (unsigned long long)b
+                : (unsigned long long)b - (unsigned long long)a;
+            int64_t mx = std::numeric_limits<int64_t>::max();
+            return IRValue(diff >= (unsigned long long)mx ? mx : (int64_t)diff + 1);
+        }
         default: return IRValue(0);
     }
 }
@@ -4335,7 +4940,7 @@ static bool isSideEffect(IROpcode op) {
         case IROpcode::HALT: case IROpcode::SOFT_HALT: case IROpcode::SLEEP:
         case IROpcode::EVENT_BIND: case IROpcode::EVENT_TRIGGER:
         case IROpcode::EVAL: case IROpcode::RESTART_PROGRAM:
-        case IROpcode::ALIAS_DECL:
+        case IROpcode::ALIAS_DECL: case IROpcode::SAVE_FILE:
             return true;
         default: return false;
     }
@@ -4598,8 +5203,20 @@ static void runMathConstantRefs(std::vector<IRInstruction>& instrs, const IRProg
     };
 
     for (auto& ins : instrs) {
-        for (auto& op : ins.typedOperands)
-            foldRef(op);
+        // operand[0] of a CALL/LIB_CALL is the CALLEE NAME, not a value reference — for the
+        // precision-argument form (`math.pi(5)`), that operand holds "math.pi.prec", which
+        // normalizeMathName folds right back down to "math.pi" (the bare-constant name), so
+        // foldRef was blindly replacing the call's OWN function-name operand with the constant
+        // 3.14159... — every backend then tried to emit a "call" to a raw float literal (verified:
+        // even the PY reference crashed, `TypeError: 'float' object is not callable`, on
+        // `t_0 = 3.141592653589793(5)` — this was never ASM-specific, just visibly a hard NASM
+        // assembly error there instead of a runtime crash elsewhere). Skip index 0 for these two
+        // opcodes; every other opcode's operands are all genuine value references.
+        bool isCallLike = ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL;
+        for (size_t idx = 0; idx < ins.typedOperands.size(); idx++) {
+            if (isCallLike && idx == 0) continue;
+            foldRef(ins.typedOperands[idx]);
+        }
     }
 }
 
@@ -4920,34 +5537,62 @@ static void runOptPasses(IRProgram& prog) {
         // (function params appear in readVarsPre if they're used inside the function)
     }
 
-    // Constexpr folding: run multiple passes so nested folds cascade
-    // (inner call folds → copy-prop propagates → outer call folds)
-    for (int pass = 0; pass < 3; ++pass) {
+    // Rewrite math-constant-named VARs (math.pi → CONST) ONCE up front: variable names never
+    // change and folding never introduces new math-constant VARs, so re-running it each pass was
+    // pure wasted string work. The folding below still cascades on the substituted constants.
+    for (auto& fn : prog.functions) runMathConstantRefs(fn.instructions, prog);
+    runMathConstantRefs(prog.globalInit, prog);
+
+    // ── -O level gating — TCC on the low end, GCC at the top ─────────────────
+    // Design: -O0..-O3 optimize for COMPILE SPEED (TCC-style — every level stays fast to build);
+    // -O4 optimizes for RUNTIME SPEED (GCC-style — pay compile time to make the binary fast). So the
+    // one *expensive* transform, constexpr folding (inline pure fns + evaluate whole constant calls
+    // like fib(35) at compile time), lives ONLY at -O4; the low levels do only cheap linear passes.
+    //   -O0  none    : no folding/copy-prop. Fastest possible build.
+    //   -O1  basic   : local constant folding (2+3→5), 1 pass. Cheap.
+    //   -O2  standard: + copy-prop + DCE, 2 passes. (default — fast compile, tidy code)
+    //   -O3  max-fast: same passes, 3 iterations — the best you get while STILL optimizing for compile time.
+    //   -O4  runtime : GCC tier — turns on constexpr folding (8-pass cascade) and is the home for the
+    //                  machine-level runtime optimizations (strength reduction, loop-var regalloc,
+    //                  peephole). Slow compile, fast binary. BNY-only; text backends clamp to -O3
+    //                  (they hand runtime optimization to gcc/rustc via the matching -O flag).
+    int lvl = prog.optLevel;
+    if (prog.backend != "BNY" && lvl > 3) lvl = 3;
+    // constexpr folding AND copy-propagation both live at -O4. copy-prop is control-flow-unaware
+    // (it can hoist a def across a branch) — safe in practice ONLY next to constexpr folding, which
+    // reshapes the branchy IR first. Keeping both at -O4 makes the TCC tiers (-O1..-O3) do only the
+    // cheap, provably-safe passes (local folding + DCE) → fast AND correct.
+    const bool doConstexpr = (lvl >= 4);
+    const bool doCopyProp  = (lvl >= 4);
+    const int  passes      = (lvl <= 0) ? 0 : (lvl == 1) ? 1 : (lvl == 2) ? 2 : (lvl == 3) ? 3 : 8;
+    for (int pass = 0; pass < passes; ++pass) {
         for (auto& fn : prog.functions) {
-            runMathConstantRefs(fn.instructions, prog);
             runLocalConstFolding(fn.instructions, prog);
-            runConstexprFolding(fn.instructions, prog);
+            if (doConstexpr) runConstexprFolding(fn.instructions, prog);
         }
-        runMathConstantRefs(prog.globalInit, prog);
         runLocalConstFolding(prog.globalInit, prog);
-        runConstexprFolding(prog.globalInit, prog);
-        for (auto& fn : prog.functions) {
-            runCopyProp(fn.instructions);
-            runDCE(fn.instructions);
+        if (doConstexpr) runConstexprFolding(prog.globalInit, prog);
+        if (doCopyProp) {
+            for (auto& fn : prog.functions) { runCopyProp(fn.instructions); runDCE(fn.instructions); }
+            runCopyProp(prog.globalInit);
+            runDCE(prog.globalInit);
         }
-        runCopyProp(prog.globalInit);
-        runDCE(prog.globalInit);
+    }
+    // Smart `/` MUST become a concrete DIV/FDIV before any backend sees it — a CORRECTNESS pass,
+    // run once at every level including -O0. Likewise a final DCE keeps strict backends (Go rejects
+    // unused vars) compiling even at -O0.
+    for (auto& fn : prog.functions) { resolveDivisions(fn.instructions); runDCE(fn.instructions); }
+    resolveDivisions(prog.globalInit);
+    runDCE(prog.globalInit);
 
-        // Kill smart DIV before it reaches a backend, wherever the types resolve it (#div-resolve).
-        for (auto& fn : prog.functions) resolveDivisions(fn.instructions);
-        resolveDivisions(prog.globalInit);
-
-        // Dead-const-store elimination (PROGRAM-WIDE): after folding, a var whose reads were all
-        // constant-propagated leaves `x = stv <const>` stores that no one reads. Go hard-errors on
-        // unused variables, and every backend wins by dropping them. A var counts as READ if any
-        // instruction references it as a non-target VAR operand, a FREE_DECL names it, or its name
-        // appears inside any CONST STRING (legacy text-expression paths evaluate strings verbatim).
-        {
+    // Dead-const-store elimination (PROGRAM-WIDE) — run ONCE after folding converges. After folding,
+    // a var whose reads were all constant-propagated leaves `x = stv <const>` stores that no one
+    // reads. The dead-store set is monotonic and removing write-only const stores can't affect any
+    // earlier fold/copy-prop, so a single pass here is identical to running it every fold pass. Go
+    // hard-errors on unused vars, and every backend wins by dropping them. A var counts as READ if
+    // any instruction references it as a non-target VAR operand, a FREE_DECL names it, or its name
+    // appears inside any CONST STRING (legacy text-expression paths evaluate strings verbatim).
+    {
             std::set<std::string> readNames;
             auto scanReads = [&](const std::vector<IRInstruction>& code) {
                 for (const auto& ins : code) {
@@ -4983,12 +5628,19 @@ static void runOptPasses(IRProgram& prog) {
                     else if (ins.result.isValid() && !ins.typedOperands.empty()) { tgt = &ins.result; val = &ins.typedOperands[0]; }
                     if (!tgt || !val || tgt->kind != IRRef::Kind::VAR || tgt->id < 0) return false;
                     if (val->kind != IRRef::Kind::CONST) return false;
-                    return readNames.count(prog.symbols.getName(tgt->id)) == 0;
+                    // Bundle fields (self.x inside a method) are read through a DIFFERENT var
+                    // name once instantiated (instance.x outside the method) — this pass only
+                    // tracks read names textually, so it can never see that aliasing. Treating
+                    // "self.*" stores as dead here silently dropped every bundle field
+                    // initializer (found via `bundle X / x = default` producing an instance
+                    // with unset fields). Never eliminate them.
+                    const std::string& tgtName = prog.symbols.getName(tgt->id);
+                    if (tgtName.rfind("self.", 0) == 0) return false;
+                    return readNames.count(tgtName) == 0;
                 }), code.end());
             };
             dropDead(prog.globalInit);
             for (auto& fn : prog.functions) dropDead(fn.instructions);
-        }
     }
 
     // Toxic warnings: unused variables, functions (skip in AC->LIB)
@@ -5148,9 +5800,10 @@ static void wrapWithRestartLoop(IRProgram& prog) {
     prog.globalInit = std::move(out);
 }
 
-IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtimeMode) {
+IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtimeMode, int optLevel) {
     IRGenerator g;
     auto prog = g.generate(ast, backend);
+    prog.optLevel = optLevel;
     if (!runtimeMode) runOptPasses(prog);
     else {
         // --runtime: skip constexpr but still run copy-prop/DCE and toxic warnings

@@ -14,7 +14,25 @@ INCLUDES = -I.
 LIBS = $(OPENCV_FLAGS)
 
 # Targets
-all: motion_tracker_example
+TARGET_SO = libaccamera.so
+TARGET_A  = libaccamera.a
+
+all: $(TARGET_SO) $(TARGET_A) motion_tracker_example
+
+# The shared/static libs AC's compiled backends actually link against — camera.cpp
+# owns the global Camera/SidebarConsole/Screen instances (WebCam/sidebar/etc.) that
+# camera_c.cpp's extern "C" shim declares `extern` and wraps.
+$(TARGET_SO): camera.o camera_c.o
+	$(CXX) -shared -o $@ $^ $(LIBS)
+
+$(TARGET_A): camera.o camera_c.o
+	ar rcs $@ $^
+
+camera.o: camera.cpp camera.hpp
+	$(CXX) $(CXXFLAGS) -fPIC $(INCLUDES) -c camera.cpp -o $@ $(LIBS)
+
+camera_c.o: camera_c.cpp camera_c.h camera.hpp
+	$(CXX) $(CXXFLAGS) -fPIC $(INCLUDES) -c camera_c.cpp -o $@ $(LIBS)
 
 motion_tracker_example: camera.cpp camera.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -DAC_CAMERA_EXAMPLE camera.cpp -o motion_tracker_example $(LIBS)
@@ -23,7 +41,7 @@ example: example.cpp camera.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) example.cpp -o example $(LIBS)
 
 clean:
-	rm -f motion_tracker_example example *.o pic.png
+	rm -f motion_tracker_example example *.o pic.png $(TARGET_SO) $(TARGET_A)
 
 test: motion_tracker_example
 	./motion_tracker_example

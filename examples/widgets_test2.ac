@@ -1,0 +1,45 @@
+AC->JS
+
+use ilib widgets
+
+<mainloop>
+
+    root = Screen($AC Widgets Test 2$, $600x600$)
+
+    box = group(root, $Settings$)
+    box.pack
+
+    tabber = tabs(root)
+    tabber.pack
+
+    page_one = tabber.add_tab($One$)
+    page_two = tabber.add_tab($Two$)
+
+    lbl_one = display(page_one, $hi from page one$)
+    lbl_two = display(page_two, $hi from page two$)
+
+    bar = scroller(root, $vertical$)
+    bar.pack
+
+    lst = listbox(root, 20, 4)
+    lst.pack
+    lst.add($alpha$)
+    lst.add($beta$)
+    lst.add($gamma$)
+
+    grid = table(root, $Name,Age$, 10)
+    grid.pack
+    grid.add($Alice,30$)
+    grid.add($Bob,25$)
+
+    canvas = sketch(root, 200, 150)
+    canvas.pack
+    canvas.clear
+    canvas.line(0, 0, 100, 100, 255, 0, 0)
+    canvas.rect(10, 10, 60, 40, 0, 255, 0)
+    canvas.circle(100, 75, 20, 0, 0, 255)
+    canvas.text_at(5, 140, $done$, 0, 0, 0)
+
+    root.mainloop
+
+<mainloop>

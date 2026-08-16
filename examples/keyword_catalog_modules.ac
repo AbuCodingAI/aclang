@@ -1,0 +1,36 @@
+AC->PY
+
+/* AC keyword catalog — MODULES: use/ilib/elib/clib/flib/datac/from/using/export/save.
+   conglomer is native-backend-only (raw C header linking) — see kw_conglomer.ac. */
+
+use ilib math
+from ilib math use sin, cos
+use elib greet
+use clib kwdemo
+use flib flib_helper/helper.ac
+use datac kw_pets.datac as pets
+using math.sqrt
+
+export local_double
+
+Make local_double func(x)
+    return x * 2
+
+<mainloop>
+    Term.display math.sqrt(16)
+    Term.display sin(0)
+    Term.display cos(0)
+    Term.display sqrt(9)
+    Term.display greet_count(4)
+    Term.display double_it(5)
+    Term.display clib_triple(3)
+    Term.display flib_double(6)
+    Term.display local_double(7)
+    p1 = pets[1]
+    p2 = pets[2]
+    Term.display p1[$name$]
+    Term.display p1[$age$]
+    Term.display p2[$name$]
+    /* save as X — writes everything Term.display'd so far to the named file. */
+    save as kw_modules_out.txt
+<mainloop>

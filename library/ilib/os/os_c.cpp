@@ -70,12 +70,21 @@ int ac_os_sbash(const char* cmd) {
 
 int ac_os_app_open(const char* app) {
     if (!app) return -1;
-    std::string cmd;
-    if (system("which xdg-open > /dev/null 2>&1") == 0) cmd = "xdg-open ";
-    else if (system("which open > /dev/null 2>&1") == 0) cmd = "open ";
-    else cmd = "";
-    cmd += std::string(app) + " &";
-    return system(cmd.c_str()) == 0 ? 0 : -1;
+    // Detect an opener via FIXED-string probes (no injection possible).
+    const char* opener = nullptr;
+    if (system("which xdg-open > /dev/null 2>&1") == 0) opener = "xdg-open";
+    else if (system("which open > /dev/null 2>&1") == 0) opener = "open";
+    // Launch WITHOUT a shell (execvp with `app` as a distinct argv element), detached in
+    // the background. The old `system(app + " &")` let `app` inject shell commands.
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        setsid();  // detach so it keeps running in the background
+        if (opener) { char* av[] = { (char*)opener, (char*)app, nullptr }; execvp(opener, av); }
+        else        { char* av[] = { (char*)app, nullptr };                execvp(app, av); }
+        _exit(127);
+    }
+    return 0;  // launched
 }
 
 int ac_os_mkfile(const char* path) {

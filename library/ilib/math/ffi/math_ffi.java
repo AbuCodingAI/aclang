@@ -12,7 +12,7 @@ final class AcMath {
         String _os = System.getProperty("os.name").toLowerCase();
         String _libFile = _os.contains("win") ? "acmath.dll" : "libacmath.so";
         Path _libPath = Path.of(System.getProperty("user.dir"))
-            .resolve("library/math/" + _libFile).toAbsolutePath();
+            .resolve("library/ilib/math/" + _libFile).toAbsolutePath();
         _SYM = SymbolLookup.libraryLookup(_libPath, Arena.global());
     }
     private static MethodHandle _mh(String name, FunctionDescriptor fd) {

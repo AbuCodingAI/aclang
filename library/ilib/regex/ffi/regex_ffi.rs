@@ -36,27 +36,27 @@ fn _list(arr: *mut *mut c_char, n: c_int) -> Vec<String> {
 }
 
 pub fn regex_match(s: &str, p: &str) -> bool {
-    let cs, cp = _cs(s), _cs(p);
+    let (cs, cp) = (_cs(s), _cs(p));
     unsafe { ac_regex_match(cs.as_ptr(), cp.as_ptr()) != 0 }
 }
 pub fn regex_test(s: &str, p: &str) -> bool {
-    let cs, cp = _cs(s), _cs(p);
+    let (cs, cp) = (_cs(s), _cs(p));
     unsafe { ac_regex_test(cs.as_ptr(), cp.as_ptr()) != 0 }
 }
 pub fn regex_search(s: &str, p: &str) -> String {
-    let cs, cp = _cs(s), _cs(p);
+    let (cs, cp) = (_cs(s), _cs(p));
     _gs(unsafe { ac_regex_search(cs.as_ptr(), cp.as_ptr()) })
 }
 pub fn regex_replace(s: &str, p: &str, r: &str) -> String {
-    let cs, cp, cr = _cs(s), _cs(p), _cs(r);
+    let (cs, cp, cr) = (_cs(s), _cs(p), _cs(r));
     _gs(unsafe { ac_regex_replace(cs.as_ptr(), cp.as_ptr(), cr.as_ptr()) })
 }
 pub fn regex_replace_all(s: &str, p: &str, r: &str) -> String {
-    let cs, cp, cr = _cs(s), _cs(p), _cs(r);
+    let (cs, cp, cr) = (_cs(s), _cs(p), _cs(r));
     _gs(unsafe { ac_regex_replace_all(cs.as_ptr(), cp.as_ptr(), cr.as_ptr()) })
 }
 pub fn regex_count(s: &str, p: &str) -> i32 {
-    let cs, cp = _cs(s), _cs(p);
+    let (cs, cp) = (_cs(s), _cs(p));
     unsafe { ac_regex_count(cs.as_ptr(), cp.as_ptr()) }
 }
 pub fn regex_escape(s: &str) -> String {
@@ -64,15 +64,15 @@ pub fn regex_escape(s: &str) -> String {
     _gs(unsafe { ac_regex_escape(cs.as_ptr()) })
 }
 pub fn regex_find_all(s: &str, p: &str) -> Vec<String> {
-    let cs, cp = _cs(s), _cs(p); let mut n: c_int = 0;
+    let (cs, cp) = (_cs(s), _cs(p)); let mut n: c_int = 0;
     _list(unsafe { ac_regex_find_all(cs.as_ptr(), cp.as_ptr(), &mut n) }, n)
 }
 pub fn regex_split(s: &str, p: &str) -> Vec<String> {
-    let cs, cp = _cs(s), _cs(p); let mut n: c_int = 0;
+    let (cs, cp) = (_cs(s), _cs(p)); let mut n: c_int = 0;
     _list(unsafe { ac_regex_split(cs.as_ptr(), cp.as_ptr(), &mut n) }, n)
 }
 pub fn regex_groups(s: &str, p: &str) -> Vec<String> {
-    let cs, cp = _cs(s), _cs(p); let mut n: c_int = 0;
+    let (cs, cp) = (_cs(s), _cs(p)); let mut n: c_int = 0;
     _list(unsafe { ac_regex_groups(cs.as_ptr(), cp.as_ptr(), &mut n) }, n)
 }
 
