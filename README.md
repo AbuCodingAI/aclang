@@ -346,10 +346,10 @@ other = dict-{name: $Grace$, age: 85}
 
 ```ac
 FOR i in range 10          /* i = 0..9 */
-FOR n in sequence(3, 7)    /* n = 3..7 */
+FOR n in sequence(3, 7)    /* n = 3..6 */
 ```
 
-`range N` generates integers 0 to N−1. `sequence(x, y)` generates x to y inclusive and stops early if x > y.
+`range N` generates integers 0 to N−1. `sequence(x, y)` generates x up to (but not including) y — exclusive of y, like Python's `range` — and stops early if x >= y.
 
 ---
 

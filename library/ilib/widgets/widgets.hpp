@@ -32,13 +32,16 @@ inline void _ac_pack_or_spaced(ac_widget_t h, void(*packFn)(ac_widget_t), int sx
 struct _AcMasterHandle { ac_widget_t _h; };
 
 struct Screen : _AcMasterHandle {
-    Screen(const std::string& title = "AC App", const std::string& geometry = "800x600") {
+    // title is mandatory — no default, no geometry positional arg. Use .dimensions(w, h)
+    // to size the window explicitly.
+    Screen(const std::string& title) {
         _ac_widgets_init_once();
-        _h = ac_widgets_screen_new(title.c_str(), geometry.c_str());
+        _h = ac_widgets_screen_new(title.c_str());
     }
     void mainloop() { ac_widgets_screen_mainloop(_h); }
     void update()   { ac_widgets_screen_update(_h); }
     void destroy()  { ac_widgets_screen_destroy(_h); }
+    void dimensions(int w, int h) { ac_widgets_screen_dimensions(_h, w, h); }
 };
 
 struct display {
@@ -257,4 +260,20 @@ struct sketch {
     void text_at(double x, double y, const std::string& t, uint8_t r=0, uint8_t g=0, uint8_t b=0) {
         ac_widgets_sketch_text(_h, x, y, t.c_str(), r, g, b);
     }
+};
+
+struct textbox {
+    ac_widget_t _h;
+    textbox(_AcMasterHandle& master, const std::string& color = "black", const std::string& font = "monospace", const char* lz = nullptr) {
+        _h = ac_widgets_textbox_new(master._h, color.c_str(), font.c_str());
+        _ac_auto_or_lazy(_h, ac_widgets_textbox_pack, lz);
+    }
+    void pack()                     { ac_widgets_textbox_pack(_h); }
+    void write(const std::string& s){ ac_widgets_textbox_write(_h, s.c_str()); }
+    std::string get() const         { const char* p = ac_widgets_textbox_get(_h); return p ? p : ""; }
+    std::string find(const std::string& needle) const {
+        const char* p = ac_widgets_textbox_find(_h, needle.c_str());
+        return p ? p : "";
+    }
+    void fix(const std::string& s)  { ac_widgets_textbox_fix(_h, s.c_str()); }
 };

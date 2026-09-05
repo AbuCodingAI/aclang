@@ -73,4 +73,17 @@ class ml {
         back(loss, 1.0);
         return 1;
     }
+    // ml.acl maps ml:grad -> ml.grad / ml:optimize -> ml.optimize — both were entirely
+    // missing here (same naming gap fixed in ml.cpp/every other binding). grad() mirrors
+    // native's ml_get_grad: a NEW node holding a copy of the accumulated gradient.
+    static long grad(long tensorId) {
+        Node n = node(tensorId);
+        return put(n == null ? 0.0 : n.grad, "", 0, 0);
+    }
+    static long optimize(double learningRate, long tensorId) {
+        Node n = node(tensorId);
+        if (n == null) return 0;
+        n.value -= learningRate * n.grad;
+        return 1;
+    }
 }

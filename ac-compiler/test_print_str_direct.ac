@@ -1,6 +1,0 @@
-AC->BNY
-
-<mainloop>
-    Term.display $Test string$
-    /end
-<mainloop>

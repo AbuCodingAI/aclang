@@ -15,10 +15,11 @@ extern "C" {
     fn ac_widgets_add(h: AcW, item: *const c_char);
     fn ac_widgets_set_d(h: AcW, v: c_double);
 
-    fn ac_widgets_screen_new(title: *const c_char, geometry: *const c_char) -> AcW;
+    fn ac_widgets_screen_new(title: *const c_char) -> AcW;
     fn ac_widgets_screen_mainloop(h: AcW);
     fn ac_widgets_screen_update(h: AcW);
     fn ac_widgets_screen_destroy(h: AcW);
+    fn ac_widgets_screen_dimensions(h: AcW, width: c_int, height: c_int);
 
     fn ac_widgets_display_new(master: AcW, text: *const c_char) -> AcW;
     fn ac_widgets_display_set(h: AcW, text: *const c_char);
@@ -59,6 +60,13 @@ extern "C" {
     fn ac_widgets_sketch_circle(h: AcW, cx: c_double, cy: c_double, radius: c_double, r: u8, g: u8, b: u8);
     fn ac_widgets_sketch_text(h: AcW, x: c_double, y: c_double, text: *const c_char, r: u8, g: u8, b: u8);
     fn ac_widgets_tabs_add_tab(h: AcW, name: *const c_char) -> AcW;
+    fn ac_widgets_get(h: AcW) -> *const c_char;
+    fn ac_widgets_set(h: AcW, v: *const c_char);
+    fn ac_widgets_textbox_new(master: AcW, color: *const c_char, font: *const c_char) -> AcW;
+    fn ac_widgets_textbox_write(h: AcW, text: *const c_char);
+    fn ac_widgets_textbox_get(h: AcW) -> *const c_char;
+    fn ac_widgets_textbox_find(h: AcW, needle: *const c_char) -> *const c_char;
+    fn ac_widgets_textbox_fix(h: AcW, text: *const c_char);
 }
 
 fn _cs(s: &str) -> CString { CString::new(s).unwrap_or_default() }
@@ -75,6 +83,7 @@ pub trait AcWidgetExt {
     fn pack_s(self, sx: i64, sy: i64);
     fn mainloop(self);
     fn update(self);
+    fn dimensions(self, w: i64, h: i64);
     fn destroy(self);
     fn add(self, item: &str);
     fn set(self, v: i64);
@@ -82,6 +91,9 @@ pub trait AcWidgetExt {
     fn set_val(self, v: f64);
     fn get(self) -> String;
     fn get_val(self) -> f64;
+    fn write(self, s: &str);
+    fn find(self, needle: &str) -> String;
+    fn fix(self, s: &str);
     fn clear(self);
     fn add_tab(self, name: &str) -> i64;
     fn line(self, x1: i64, y1: i64, x2: i64, y2: i64, r: i64, g: i64, b: i64);
@@ -95,13 +107,27 @@ impl AcWidgetExt for i64 {
     fn pack_s(self, sx: i64, sy: i64) { unsafe { ac_widgets_pack_spaced(self as AcW, sx as c_int, sy as c_int) } }
     fn mainloop(self)           { unsafe { ac_widgets_screen_mainloop(self as AcW) } }
     fn update(self)             { unsafe { ac_widgets_screen_update(self as AcW) } }
+    fn dimensions(self, w: i64, h: i64) { unsafe { ac_widgets_screen_dimensions(self as AcW, w as c_int, h as c_int) } }
     fn destroy(self)            { unsafe { ac_widgets_screen_destroy(self as AcW) } }
     fn add(self, item: &str)    { let c = _cs(item); unsafe { ac_widgets_add(self as AcW, c.as_ptr()) } }
     fn set(self, v: i64)        { unsafe { ac_widgets_set_d(self as AcW, v as c_double) } }
-    fn set_str(self, v: &str)   { let c = _cs(v); unsafe { ac_widgets_display_set(self as AcW, c.as_ptr()) } }
+    fn set_str(self, v: &str)   { let c = _cs(v); unsafe { ac_widgets_set(self as AcW, c.as_ptr()) } }
     fn set_val(self, v: f64)    { unsafe { ac_widgets_set_d(self as AcW, v as c_double) } }
-    fn get(self) -> String      { unsafe { _gs(ac_widgets_display_get(self as AcW)) } }
+    // Was hardcoded to ac_widgets_display_get/_set regardless of the actual widget kind — a
+    // bare i64 handle carries no kind info for the trait impl to dispatch on at COMPILE
+    // time, wrong for ask/dropdown/textbox (GTK_ENTRY/GTK_COMBO_BOX/GTK_TEXT_VIEW casts, not
+    // GTK_LABEL). Fixed via ac_widgets_get/_set (widgets.cpp) — the widget handle already
+    // carries its own real kind at RUNTIME, so the C library dispatches on that instead of
+    // needing Rust to track it. textbox still gets its own uniquely-named write/find/fix
+    // (below) since those have no display/ask/dropdown equivalent to share a name with.
+    fn get(self) -> String      { unsafe { _gs(ac_widgets_get(self as AcW)) } }
     fn get_val(self) -> f64     { unsafe { ac_widgets_advance_get(self as AcW) } }
+    fn write(self, s: &str)     { let c = _cs(s); unsafe { ac_widgets_textbox_write(self as AcW, c.as_ptr()) } }
+    fn find(self, needle: &str) -> String {
+        let c = _cs(needle);
+        unsafe { _gs(ac_widgets_textbox_find(self as AcW, c.as_ptr())) }
+    }
+    fn fix(self, s: &str)       { let c = _cs(s); unsafe { ac_widgets_textbox_fix(self as AcW, c.as_ptr()) } }
     fn clear(self)              { unsafe { ac_widgets_sketch_clear(self as AcW) } }
     fn add_tab(self, name: &str) -> i64 {
         let c = _cs(name);
@@ -138,10 +164,11 @@ fn _auto_pack(h: i64, lz: i64) {
     else          { unsafe { ac_widgets_pack(h as AcW) } }
 }
 
-pub fn Screen(title: &str, geometry: &str) -> i64 {
+// title is mandatory — no geometry positional arg. Use .dimensions(w, h) instead.
+pub fn Screen(title: &str) -> i64 {
     _init();
-    let ct = _cs(title); let cg = _cs(geometry);
-    unsafe { ac_widgets_screen_new(ct.as_ptr(), cg.as_ptr()) as i64 }
+    let ct = _cs(title);
+    unsafe { ac_widgets_screen_new(ct.as_ptr()) as i64 }
 }
 
 pub fn display(master: i64, text: &str) -> i64 {
@@ -229,5 +256,13 @@ pub fn listbox(master: i64, width: i64, height: i64) -> i64 {
 
 pub fn sketch(master: i64, width: i64, height: i64) -> i64 {
     let h = unsafe { ac_widgets_sketch_new(master as AcW, width as c_int, height as c_int) as i64 };
+    unsafe { ac_widgets_pack(h as AcW) }; h
+}
+
+// Lazy packing isn't implemented in Rust's widget wrapper (see emitCall's `func == "textbox"`
+// comment) — always packs immediately, same as dropdown() above.
+pub fn textbox(master: i64, color: &str, font: &str) -> i64 {
+    let cc = _cs(color); let cf = _cs(font);
+    let h = unsafe { ac_widgets_textbox_new(master as AcW, cc.as_ptr(), cf.as_ptr()) as i64 };
     unsafe { ac_widgets_pack(h as AcW) }; h
 }

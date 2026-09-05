@@ -32,6 +32,9 @@ enum class TokenType {
     RBRACE,         // }
     COMMA,          // ,
     COLON,          // : (for dict key:value pairs)
+    SEMICOLON,      // ; — MID-LINE only (e.g. tuple type-annotation separator, `(1,2;int)`).
+                    // A trailing end-of-line ';' (C muscle memory) is still silently dropped by
+                    // the lexer with a one-time roast, never reaches the parser as this token.
     KW_FN,          // fn (enables *, &, &&, and "..." with quotes)
     PLUS_EQUAL,     // +=
     MINUS_EQUAL,    // -=
@@ -39,7 +42,6 @@ enum class TokenType {
     DIVIDE_EQUAL,   // /=
     AT_EQUAL,       // @= (compound multiplication)
     PIPE,           // | (bitwise XOR)
-    PIPE_EQUAL,     // |= (bitwise XOR-assign)
     TILDE,          // ~ (bitwise NOT)
     HASH,           // #  (unary NOT — legacy, use 'not' instead)
     HASH_GT,        // #> (NOT greater → <=)
@@ -66,6 +68,7 @@ enum class TokenType {
     KW_IN,
     KW_WHILST,
     KW_RETURN,
+    KW_YIELD,      // yield expr — marks the enclosing Make func as a generator
     KW_USE,
     KW_SAVE,
     KW_AS,
@@ -94,10 +97,13 @@ enum class TokenType {
     KW_CONGLOMER,   // conglomer <file.h> — dynamically link a native C/C++ header (not `use`)
     KW_DATAC,       // datac — import a .datac data file (baked in at compile time)
     KW_FROM,        // from (submodule import: from ilib math use statistics)
+    KW_FETCH,       // fetch math.sin — sugar for `from ilib math use sin` (one dotted symbol)
     KW_RANGE,       // range N  → [0..N], Numeral Pos only
     KW_SEQUENCE,    // sequence(x,y) → [x..y], breaks if x > y
-    KW_IOTA,        // iota N  → lazy 0..N-1, displays concatenated (no list)
-    KW_STREAM,      // stream(x,y[,step]) → lazy sequence, displays concatenated
+    KW_IOTA,        // iota N  → lazy 0..N-1, generates numbers on the spot (never a string)
+    KW_STREAM,      // stream(x,y[,step]) → lazy sequence, generates numbers on the spot
+    KW_XRANGE,      // xrange N → [1..N], 1-indexed range (desugars to sequence(1, N+1))
+    KW_XIOTA,       // xiota N  → lazy 1..N, 1-indexed iota (desugars to stream(1, N+1))
     KW_IS,          // is  → equality comparison
     KW_PASS,        // pass → no-op placeholder
     KW_SKIP,        // skip → stop rest of if/elseif/other chain
@@ -121,10 +127,15 @@ enum class TokenType {
     KW_BOUND,       // bound x = e — persist across the loop, scoped to the enclosing function
     KW_ALIAS,       // alias x = y — bidirectional live binding
     KW_LAZY_EVAL,   // lazy_eval(expr) — deferred safe evaluation
-    KW_DEC,         // dec x [= expr]  — coerce x to decimal/float
-    KW_INT,         // int x [= expr]  — coerce x to integer
-    KW_STRING,      // string x [= expr] — coerce x to string
-    KW_BOOL,        // bool x [= expr]   — coerce x to boolean
+    KW_DEC,         // to_dec(expr) [call form] or to_dec x [= expr] [decl form] — coerce to decimal/float
+    KW_INT,         // to_int(expr) [call form] or to_int x [= expr] [decl form] — coerce to integer
+    KW_STRING,      // to_string(expr) [call] or to_string x [= expr] [decl] — coerce to string
+    KW_BOOL,        // to_bool(expr) [call] or to_bool x [= expr] [decl] — coerce to boolean
+    // (the lexer maps keyword TEXT "to_dec"/"to_int"/"to_string"/"to_bool" — NOT bare
+    // "dec"/"int"/"string"/"bool", which parse as ordinary identifiers — to these tokens.
+    // Verified: `dec x = 5` is "Unidentified syntax"; `to_dec x = 5` correctly coerces to
+    // 5.0. Which of the two forms above a use produces depends on whether `(` immediately
+    // follows — see parsePrefix's conversion-call check vs. the TypeCoerceStmt check.)
     KW_SHORT,       // short x [= expr]  — 32-bit signed integer variable
     KW_MINI,        // mini x [= expr]   — 16-bit signed integer variable
     KW_ATOMIC,      // atomic x [= expr] — int variable; any op touching it is a global critical section

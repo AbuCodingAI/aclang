@@ -9,9 +9,9 @@ const _lib=_path.join(
 const _W='int64',_I='int',_D='double',_U8='uint8',_V='void',_S='string';
 
 const _m=_ffi.Library(_lib,{
-    'ac_widgets_init':            [_V,[]],'ac_widgets_screen_new':      [_W,[_S,_S]],
+    'ac_widgets_init':            [_V,[]],'ac_widgets_screen_new':      [_W,[_S]],
     'ac_widgets_screen_mainloop': [_V,[_W]],'ac_widgets_screen_update':  [_V,[_W]],
-    'ac_widgets_screen_destroy':  [_V,[_W]],
+    'ac_widgets_screen_destroy':  [_V,[_W]],'ac_widgets_screen_dimensions':[_V,[_W,_I,_I]],
     'ac_widgets_display_new':     [_W,[_W,_S]],'ac_widgets_display_pack': [_V,[_W]],
     'ac_widgets_display_set':     [_V,[_W,_S]],'ac_widgets_display_get':  [_S,[_W]],
     'ac_widgets_ask_new':         [_W,[_W,_I]],'ac_widgets_ask_pack':     [_V,[_W]],
@@ -39,6 +39,9 @@ const _m=_ffi.Library(_lib,{
     'ac_widgets_sketch_text':     [_V,[_W,_D,_D,_S,_U8,_U8,_U8]],
     'ac_widgets_set_lazy':        [_V,[_W]],
     'ac_widgets_pack_spaced':     [_V,[_W,_I,_I]],
+    'ac_widgets_textbox_new':     [_W,[_W,_S,_S]],'ac_widgets_textbox_pack': [_V,[_W]],
+    'ac_widgets_textbox_write':   [_V,[_W,_S]],'ac_widgets_textbox_get':    [_S,[_W]],
+    'ac_widgets_textbox_find':    [_S,[_W,_S]],'ac_widgets_textbox_fix':    [_V,[_W,_S]],
 });
 
 _m.ac_widgets_init();
@@ -61,10 +64,12 @@ function _stripLazy(...args) {
 }
 
 // Factory functions — callable without `new`, positional args matching AC codegen output
-function Screen(title='AC App', geometry='800x600') {
-    const o={_h:_m.ac_widgets_screen_new(String(title),String(geometry))};
+// title is mandatory — no geometry positional/default arg. Use .dimensions(w, h) instead.
+function Screen(title) {
+    const o={_h:_m.ac_widgets_screen_new(String(title))};
     o.mainloop=()=>_m.ac_widgets_screen_mainloop(o._h);
     o.update=()=>_m.ac_widgets_screen_update(o._h);
+    o.dimensions=(w,h)=>_m.ac_widgets_screen_dimensions(o._h,w|0,h|0);
     o.destroy=()=>_m.ac_widgets_screen_destroy(o._h);
     return o;
 }
@@ -187,5 +192,16 @@ function sketch(master,width=400,height=300,lz=null) {
     o.rect=(x1,y1,x2,y2,r=0,g=0,b=0)=>_m.ac_widgets_sketch_rect(o._h,x1,y1,x2,y2,r,g,b);
     o.circle=(cx,cy,rad,r=0,g=0,b=0)=>_m.ac_widgets_sketch_circle(o._h,cx,cy,rad,r,g,b);
     o.text=(x,y,t,r=0,g=0,b=0)=>_m.ac_widgets_sketch_text(o._h,x,y,String(t),r,g,b);
+    return o;
+}
+
+function textbox(master,color='black',font='monospace',lz=null) {
+    const o={_h:_m.ac_widgets_textbox_new(master._h,String(color),String(font))};
+    _autoOrLazy(o._h,_m.ac_widgets_textbox_pack,lz);
+    o.pack=(sx=0,sy=0)=>_packOrSpaced(o._h,_m.ac_widgets_textbox_pack,sx,sy);
+    o.write=(s)=>_m.ac_widgets_textbox_write(o._h,String(s));
+    o.get=()=>_m.ac_widgets_textbox_get(o._h);
+    o.find=(needle)=>_m.ac_widgets_textbox_find(o._h,String(needle));
+    o.fix=(s)=>_m.ac_widgets_textbox_fix(o._h,String(s));
     return o;
 }

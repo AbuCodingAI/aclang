@@ -91,13 +91,13 @@ void ac_widgets_init(void) {
 }
 
 // ── Screen ────────────────────────────────────────────────────────────────────
-ac_widget_t ac_widgets_screen_new(const char* title, const char* geometry) {
+// title is mandatory (enforced at the AC-language level — see ir.cpp's Screen ctor
+// handling); there is no geometry positional arg anymore — use .dimensions(w, h).
+ac_widget_t ac_widgets_screen_new(const char* title) {
     AcWidget* w = new AcWidget{AcWidget::SCREEN};
     w->widget = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(w->widget), title ? title : "AC App");
-    int ww = 800, hh = 600;
-    if (geometry) sscanf(geometry, "%dx%d", &ww, &hh);
-    gtk_window_set_default_size(GTK_WINDOW(w->widget), ww, hh);
+    gtk_window_set_default_size(GTK_WINDOW(w->widget), 800, 600);
     g_signal_connect(w->widget, "destroy", G_CALLBACK(gtk_main_quit), nullptr);
     gtk_container_set_border_width(GTK_CONTAINER(w->widget), 8);
     w->container = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
@@ -449,15 +449,31 @@ const char* ac_widgets_textbox_find(ac_widget_t h, const char* needle) {
     }
     return buf.c_str();
 }
-// fix($text$) — writes `text` as the box's content and locks it read-only: "fixes it so it
-// cannot be edited". Composes with find: `tb.fix(tb.find($x$))` sets the box to the matched
-// text (or clears it, if not found) and finalizes it in one step.
+// fix($text$) — locks every occurrence of `text` IN PLACE within the box's current content
+// as read-only (a protected boilerplate token, e.g. `<mainloop>`/`AC->`), leaving everything
+// else in the box fully editable. Composes with find: `tb.fix(tb.find($x$))` — find confirms
+// `x` is present (or returns "", making this a safe no-op); fix re-locates every occurrence
+// and applies a real per-range GTK text tag (`editable=FALSE`) rather than touching the
+// view's own editability or the buffer's content at all. Previously this called
+// `gtk_text_buffer_set_text` (replacing the ENTIRE box with just `text`) and
+// `gtk_text_view_set_editable(FALSE)` on the whole view — locking a template's boilerplate
+// markers destroyed everything else in the box and made the whole editor permanently
+// uneditable. Fixed after Abu caught it live: the whole point was for specific tokens to
+// become locked while the rest of the template stays a normal, editable text box.
 void ac_widgets_textbox_fix(ac_widget_t h, const char* text) {
+    if (!text || !*text) return;
     AcWidget* w = U(h);
-    gtk_text_buffer_set_text(w->textBuffer, text ? text : "", -1);
-    if (w->container) {
-        gtk_text_view_set_editable(GTK_TEXT_VIEW(w->container), FALSE);
-        gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(w->container), FALSE);
+    GtkTextBuffer* tb = w->textBuffer;
+    GtkTextTagTable* table = gtk_text_buffer_get_tag_table(tb);
+    GtkTextTag* tag = gtk_text_tag_table_lookup(table, "ac_fixed");
+    if (!tag)
+        tag = gtk_text_buffer_create_tag(tb, "ac_fixed", "editable", FALSE, "foreground", "#888888", nullptr);
+    GtkTextIter cursor;
+    gtk_text_buffer_get_start_iter(tb, &cursor);
+    GtkTextIter matchStart, matchEnd;
+    while (gtk_text_iter_forward_search(&cursor, text, GTK_TEXT_SEARCH_TEXT_ONLY, &matchStart, &matchEnd, nullptr)) {
+        gtk_text_buffer_apply_tag(tb, tag, &matchStart, &matchEnd);
+        cursor = matchEnd;
     }
 }
 
@@ -490,6 +506,32 @@ void ac_widgets_set_d(ac_widget_t h, double v) {
         gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(w->widget), v / 100.0);
     else if (w->kind == AcWidget::SLIDER)
         gtk_range_set_value(GTK_RANGE(w->widget), v);
+}
+
+// Same "untyped-handle backend can't dispatch on kind at compile time" story as
+// ac_widgets_add/ac_widgets_set_d above — but for `.get()`/`.set(string)`. Rust's
+// AcWidgetExt trait (a bare i64 handle, one shared `impl` block, no per-kind wrapper
+// types) had `get()`/`set_str()` hardcoded to ac_widgets_display_get/_set regardless of
+// the ACTUAL widget — wrong for ask (GTK_ENTRY), dropdown (GTK_COMBO_BOX), textbox
+// (GTK_TEXT_VIEW): different underlying GTK types, a real (if usually non-fatal, GTK's
+// cast macros warn-and-return-null rather than segfault) bug, not just a style issue.
+// The widget handle already carries its own real kind at runtime — dispatch here once,
+// instead of needing every "untyped" backend to track kind at compile time itself.
+const char* ac_widgets_get(ac_widget_t h) {
+    switch (U(h)->kind) {
+        case AcWidget::ASK:      return ac_widgets_ask_get(h);
+        case AcWidget::DROPDOWN: return ac_widgets_dropdown_get(h);
+        case AcWidget::TEXTBOX:  return ac_widgets_textbox_get(h);
+        default:                 return ac_widgets_display_get(h);
+    }
+}
+void ac_widgets_set(ac_widget_t h, const char* v) {
+    switch (U(h)->kind) {
+        case AcWidget::ASK:      ac_widgets_ask_set(h, v); return;
+        case AcWidget::DROPDOWN: ac_widgets_dropdown_set(h, v); return;
+        case AcWidget::TEXTBOX:  ac_widgets_textbox_write(h, v); return;
+        default:                 ac_widgets_display_set(h, v); return;
+    }
 }
 
 // ── lazy / spaced-pack ────────────────────────────────────────────────────────

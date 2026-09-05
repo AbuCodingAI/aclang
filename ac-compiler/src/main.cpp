@@ -32,6 +32,7 @@
   #define ac_mkdir(path) mkdir(path, 0755)
 #endif
 #include <utility>
+#include <map>
 
 // ── Shell-free process execution ────────────────────────────────────────────
 // Run a program via an argv array — NO shell — so a path/flag containing
@@ -161,6 +162,158 @@ static void writeFile(const std::string& path, const std::string& content) {
     f << content;
 }
 
+// ── --lsp-check: JSON-lines diagnostics+symbols for the ac-lsp server ──────
+// Minimal hand-written escaper — the only untrusted text going into a JSON
+// string value here is a parse-error message / an AC identifier, never
+// attacker-controlled beyond what the file itself contains.
+static std::string jsonEscape(const std::string& s) {
+    std::string out; out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if ((unsigned char)c < 0x20) { /* skip other control chars */ }
+                else out += c;
+        }
+    }
+    return out;
+}
+
+// Extracts top-level symbol declarations directly from the TOKEN STREAM rather
+// than the AST — ASTNode (include/ast.hpp) carries no line/col at all, only
+// Parser::ParseError does, so a plain AST walk can't answer "what line is this
+// function on." Tokens DO carry line/col (Token in token.hpp), and AC's
+// declaration shapes are few and regular enough that a direct token scan is
+// simpler and less invasive than threading position info through every
+// ASTNode-creation site in the whole parser.
+// Returns the set of declared symbol names, for emitLspReferences below — Find
+// References / Rename need to know which identifiers are "real" symbols (funcs,
+// bundles, free/bound vars, plain assignments) so they don't also match every
+// unrelated identifier in the file (ilib receiver names like `math`, bundle field
+// names, etc., which never got a "symbol" line of their own in the first place).
+static std::set<std::string> emitLspSymbols(const std::vector<Token>& tokens) {
+    std::set<std::string> names;
+    bool atStmtStart = true; // true at position 0 and right after NEWLINE/INDENT/DEDENT
+    for (size_t i = 0; i < tokens.size(); i++) {
+        const Token& t = tokens[i];
+        if (t.type == TokenType::NEWLINE || t.type == TokenType::INDENT || t.type == TokenType::DEDENT) {
+            atStmtStart = true;
+            continue;
+        }
+        if (!atStmtStart) continue;
+        atStmtStart = false; // consumed; reset until the next NEWLINE/INDENT/DEDENT
+
+        if (t.type == TokenType::KW_MAKE && i + 2 < tokens.size() &&
+            tokens[i + 1].type == TokenType::IDENTIFIER && tokens[i + 2].type == TokenType::KW_FUNC) {
+            const Token& nameTok = tokens[i + 1];
+            std::string params;
+            size_t j = i + 3;
+            if (j < tokens.size() && tokens[j].type == TokenType::LPAREN) {
+                j++;
+                bool first = true;
+                while (j < tokens.size() && tokens[j].type != TokenType::RPAREN) {
+                    if (tokens[j].type == TokenType::IDENTIFIER) {
+                        if (!first) params += ",";
+                        params += tokens[j].value;
+                        first = false;
+                    }
+                    j++;
+                }
+            }
+            std::cout << "{\"type\":\"symbol\",\"kind\":\"function\",\"name\":\""
+                      << jsonEscape(nameTok.value) << "\",\"line\":" << nameTok.line
+                      << ",\"col\":" << nameTok.col << ",\"params\":\""
+                      << jsonEscape(params) << "\"}\n";
+            names.insert(nameTok.value);
+        } else if (t.type == TokenType::KW_BUNDLE && i + 1 < tokens.size() &&
+                   tokens[i + 1].type == TokenType::IDENTIFIER) {
+            const Token& nameTok = tokens[i + 1];
+            std::cout << "{\"type\":\"symbol\",\"kind\":\"class\",\"name\":\""
+                      << jsonEscape(nameTok.value) << "\",\"line\":" << nameTok.line
+                      << ",\"col\":" << nameTok.col << "}\n";
+            names.insert(nameTok.value);
+        } else if (t.type == TokenType::KW_FREE || t.type == TokenType::KW_BOUND) {
+            // `free x, y = ...` / `bound x = ...` — one or more comma-separated names.
+            size_t j = i + 1;
+            while (j < tokens.size() && tokens[j].type == TokenType::IDENTIFIER) {
+                const Token& nameTok = tokens[j];
+                std::cout << "{\"type\":\"symbol\",\"kind\":\"variable\",\"name\":\""
+                          << jsonEscape(nameTok.value) << "\",\"line\":" << nameTok.line
+                          << ",\"col\":" << nameTok.col << "}\n";
+                names.insert(nameTok.value);
+                j++;
+                if (j < tokens.size() && tokens[j].type == TokenType::COMMA) j++;
+                else break;
+            }
+        } else if (t.type == TokenType::IDENTIFIER && i + 1 < tokens.size() &&
+                   tokens[i + 1].type == TokenType::ASSIGN) {
+            std::cout << "{\"type\":\"symbol\",\"kind\":\"variable\",\"name\":\""
+                      << jsonEscape(t.value) << "\",\"line\":" << t.line
+                      << ",\"col\":" << t.col << "}\n";
+            names.insert(t.value);
+        }
+    }
+    return names;
+}
+
+// Every occurrence of a declared symbol name (see emitLspSymbols) anywhere in the
+// token stream, INCLUDING the declaration site itself — Find References highlights
+// all of them, Rename replaces all of them. Deliberately name-based, not scope-aware:
+// this is a token scan, not a real symbol-resolution pass, so two different `x`
+// variables in two different functions are indistinguishable and both get every
+// occurrence reported. A real fix needs the AST-level scope info this whole file
+// (see emitLspSymbols' own comment) explicitly avoided depending on; documented
+// limitation, not an oversight — good enough for the common case (rename a
+// function, rename a variable that's only used in one scope) and no worse than
+// what most editors' plain-text "highlight all occurrences" already does.
+static void emitLspReferences(const std::vector<Token>& tokens, const std::set<std::string>& names) {
+    if (names.empty()) return;
+    for (const auto& t : tokens) {
+        if (t.type != TokenType::IDENTIFIER) continue;
+        if (!names.count(t.value)) continue;
+        std::cout << "{\"type\":\"reference\",\"name\":\""
+                  << jsonEscape(t.value) << "\",\"line\":" << t.line
+                  << ",\"col\":" << t.col << "}\n";
+    }
+}
+
+// ParseErrorRecord::message is captured from a caught ACError's what() (see
+// parser.cpp's `errors.push_back({..., e.what(), ""})`), which already bakes in
+// the full CLI-display wrapper: "Preposterous: SyntaxError (It's all Greek to
+// me) at line N char M: <actual text>". An editor tooltip already shows the
+// squiggle at that exact line/col, so repeating "at line N char M" inside the
+// message itself is redundant noise — strip everything up through the LAST
+// "char <col>: " (using the real, already-parsed col so this doesn't depend on
+// guessing the flavor-text wording), falling back to the untouched message if
+// that marker isn't found for some reason (e.g. a non-syntax ACError shape).
+static std::string stripDiagnosticPrefix(const std::string& msg, int col) {
+    std::string marker = "char " + std::to_string(col) + ": ";
+    size_t p = msg.rfind(marker);
+    return (p == std::string::npos) ? msg : msg.substr(p + marker.size());
+}
+
+// Runs lex + lenient-parse ONLY (no codegen) and prints diagnostics + symbols as
+// JSON lines to stdout, one JSON object per line — deliberately not a single
+// JSON blob, so the ac-lsp server can stream-parse line by line with no need
+// for a JSON library on the C++ side beyond this hand-written emitter.
+static int runLspCheck(const std::string& source) {
+    std::vector<Token> tokens = lex(source);
+    NodePtr ast = parse(tokens, /*lenient=*/true);
+    (void)ast; // only g_parseErrors and the token stream are consumed below
+    for (const auto& e : g_parseErrors) {
+        std::cout << "{\"type\":\"diagnostic\",\"severity\":\"error\",\"line\":" << e.line
+                  << ",\"col\":" << e.col << ",\"message\":\""
+                  << jsonEscape(stripDiagnosticPrefix(e.message, e.col)) << "\"}\n";
+    }
+    std::set<std::string> names = emitLspSymbols(tokens);
+    emitLspReferences(tokens, names);
+    return 0; // problems are reported as data, not process failure
+}
+
 // Sentinel returned for "AC LIB" — source-only, cannot be compiled directly.
 static constexpr const char* BACKEND_AC_LIB_NOCOMPILE = "__AC_LIB__";
 
@@ -183,7 +336,7 @@ static void printUsage() {
     std::cerr << "Usage: ac <file.ac> [options]\n"
               << "\n"
               << "Options:\n"
-              << "  --target <backend>    Specify backend (PY, JS, C, CPP, Java, RS, GO, V, ASM, BNY, LIB)\n"
+              << "  --target <backend>    Specify backend (PY, JS, C, CPP, Java, RS, GO, V, ASM, BNY, ARM, RISC, LIB)\n"
               << "  --backend <backend>   Same as --target\n"
               << "  --all, -all           Compile to all registered backends at once\n"
               << "  --output, -o <file>   Rename the generated output file\n"
@@ -213,7 +366,9 @@ static void printUsage() {
               << "  --save-ast            Save AST to .acc (enabled by default for caching)\n"
               << "  --save-ir             Save IR to .lir (enabled by default)\n"
               << "  --time, -time         Time compilation and execution separately\n"
-              << "  --version, -v         Print compiler version\n";
+              << "  --version, -v         Print compiler version\n"
+              << "  --lsp-check           Lex+parse only, emit JSON-lines diagnostics+symbols\n"
+              << "                        for the ac-lsp server (file may be '-' for stdin)\n";
 }
 
 // Inject functions and bundles from flib .ac/.ai modules into the AST.
@@ -247,7 +402,15 @@ static std::string acLibRoot() {
     return "./library";
 }
 
-static void injectFlibModules(ASTNode& root, const std::string& srcDir) {
+// `visited` tracks every flib file's RESOLVED ABSOLUTE PATH already being injected somewhere
+// in the current import chain — without it, two files that `use flib` each other (A imports B,
+// B imports A) recurse forever and crash the compiler with a stack overflow (verified real
+// bug: a minimal mutual-import pair reliably segfaults `ac`, no timeout needed). Passed BY
+// REFERENCE so the check is chain-wide (a file imported via two different paths in the same
+// tree is still caught), not just "have I imported this exact file with `resolve()` earlier"—the
+// visited set holds resolve()'d absolute paths precisely so the SAME file reached via two
+// different relative spellings is recognized as the same entry.
+static void injectFlibModules(ASTNode& root, const std::string& srcDir, std::set<std::string>& visited) {
     NodeList toAppend;
     for (auto& child : root.children) {
         if (!child || child->type != NodeType::UseLibStmt) continue;
@@ -311,6 +474,29 @@ static void injectFlibModules(ASTNode& root, const std::string& srcDir) {
         std::string fullPath = (!libpath.empty() && libpath[0] == '/')
             ? libpath : (srcDir + "/" + libpath);
 
+        // Canonicalize for the visited-set key so the SAME file reached via two different
+        // relative spellings (or a symlink) is recognized as one entry, not two.
+        std::string canonicalPath = fullPath;
+        char realBuf2[4096] = {};
+        if (realpath(fullPath.c_str(), realBuf2)) canonicalPath = realBuf2;
+
+        if (visited.count(canonicalPath)) {
+            // Mutual/cyclic `use flib` imports (A imports B, B imports A) would otherwise
+            // recurse forever and stack-overflow the compiler — skip re-injecting a file
+            // already in the current import chain instead of crashing. Mark it inlined (not
+            // just `continue`) so this UseLibStmt node doesn't propagate up through toAppend
+            // as an unresolved "flib:" value — every backend's codegen treats an unresolved
+            // flib: UseLibStmt as a real import it must emit, which would otherwise surface
+            // as a broken raw `import <name>` statement referencing a module that was never
+            // written to disk. The file's symbols are already being inlined via whichever
+            // earlier point in the chain first imported it.
+            std::cerr << "Preposterous: FlibError: cyclic flib import detected, skipping re-import of: "
+                      << canonicalPath << "\n";
+            child->value = "flib:__inlined__:" + libpath;
+            continue;
+        }
+        visited.insert(canonicalPath);
+
         std::ifstream ff(fullPath);
         if (!ff) {
             std::cerr << "Preposterous: FlibError: cannot open flib file: " << fullPath << "\n";
@@ -330,7 +516,7 @@ static void injectFlibModules(ASTNode& root, const std::string& srcDir) {
         flibDir = (slash == std::string::npos) ? "." : flibDir.substr(0, slash);
 
         // Recursively inject any flib imports inside the flib file
-        injectFlibModules(*flibAst, flibDir);
+        injectFlibModules(*flibAst, flibDir, visited);
 
         // Collect FuncDef, BundleDef, and resolved UseLibStmt nodes.
         // If the file uses `export`, only exported items are visible to importers
@@ -573,6 +759,8 @@ int main(int argc, char* argv[]) {
     bool targetWindows   = false; // --windows: BNY cross-compiles to a PE32+ .exe instead of ELF
     bool lenientParse    = false; // -supercalifragilisticexpialidocious: drop unparseable
                                    // lines instead of erroring out
+    bool lspCheck        = false; // --lsp-check: lex+lenient-parse only, emit JSON-lines
+                                   // diagnostics+symbols for the ac-lsp server; no codegen
     std::string outputOverride;          // --output/-o: rename the generated file
     std::vector<std::string> cmdlineImports; // --input: imports injected from the CLI
 
@@ -598,6 +786,8 @@ int main(int argc, char* argv[]) {
             targetWindows = true; // BNY only: emit a PE32+ .exe instead of ELF
         } else if (arg == "-supercalifragilisticexpialidocious") {
             lenientParse = true; // a line the parser can't understand gets dropped, not fatal
+        } else if (arg == "--lsp-check") {
+            lspCheck = true; // ac-lsp mode: diagnostics+symbols as JSON lines, no compile
         } else if (arg == "--no-run") {
             runAfterCompile = false;
         } else if (arg == "--force") {
@@ -676,7 +866,13 @@ int main(int argc, char* argv[]) {
     (void)stopAfterCFG; (void)stopAfterSSA; (void)stopAfterOpt;
 
     try {
-        std::string source = readFile(inputFile);
+        // `--lsp-check -`: read the editor's unsaved buffer from stdin instead of a saved
+        // file, so ac-lsp never needs to write/clean up a temp file per keystroke.
+        std::string source = (lspCheck && inputFile == "-")
+            ? std::string(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>())
+            : readFile(inputFile);
+
+        if (lspCheck) return runLspCheck(source);
 
         // --input: splice command-line imports in as `use <libtype> <name>` lines, right
         // after the `AC->XXX` header so the parser handles them exactly like in-source `use`.
@@ -801,7 +997,10 @@ int main(int argc, char* argv[]) {
         }
 
         // Inject .ac/.ai flib modules into the AST before IR generation
-        injectFlibModules(*ast, srcDir);
+        {
+            std::set<std::string> flibVisited;
+            injectFlibModules(*ast, srcDir, flibVisited);
+        }
         // Bake .datac files into the AST as list-of-dict variable assignments
         injectDatacImports(*ast, srcDir);
 
@@ -888,7 +1087,7 @@ int main(int argc, char* argv[]) {
 
             // Save human-readable LIR — only for low-level backends (BNY/ASM) where it aids debugging
             // Higher-level backends (PY, JS, C++, etc.) don't benefit from the LIR text dump
-            bool saveLir = (tgt == "BNY" || tgt == "ASM");
+            bool saveLir = (tgt == "BNY" || tgt == "ASM" || tgt == "ARM" || tgt == "RISC");
             if (!lirFile.empty() && saveLir)
                 writeFile(lirFile, AC_IR::generateIRText(irProg));
 
@@ -925,6 +1124,67 @@ int main(int argc, char* argv[]) {
 
             const auto& info = BackendRegistry::getBackend(tgt);
 
+            // Native ARM (AArch64) dispatch, shared by the explicit "ARM"/"RISC" targets AND
+            // by "BNY"/"ASM" auto-detecting the host and routing to them instead of hardcoding
+            // x86-64 — see the tgt=="BNY"/"ASM" isARM branches below.
+            auto runArmBinary = [&](const std::string& outFile) -> bool {
+                if (!generateArmBinaryFromIR(irProg, outFile)) {
+                    std::cerr << "Preposterous: BackendError: Binary generation failed for ARM (AArch64 Linux ELF64 only)\n";
+                    return false;
+                }
+                std::cout << "Generated: " << outFile << " [exp_arm]\n";
+#ifndef _WIN32
+                chmod(outFile.c_str(), 0755);
+#endif
+                if (runAfterCompile && !compileAll) {
+                    bool hostIsArm = false;
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    hostIsArm = true;
+#endif
+#ifndef _WIN32
+                    if (hostIsArm && !doTime) {
+                        char* argv0 = const_cast<char*>(outFile.c_str());
+                        char* const exec_argv[] = { argv0, nullptr };
+                        execv(outFile.c_str(), exec_argv);
+                    }
+#endif
+                    // Cross-running on a non-ARM host: qemu-aarch64 user-mode emulation.
+                    if (hostIsArm) timedRunArgv({outFile});
+                    else timedRunArgv({"qemu-aarch64", outFile});
+                }
+                printTiming();
+                return true;
+            };
+            auto runArmAsm = [&](const std::string& outFile) -> bool {
+                if (!generateArmAsmFromIR(irProg, outFile)) {
+                    std::cerr << "Preposterous: BackendError: ASM generation failed for RISC\n";
+                    return false;
+                }
+                std::cout << "Generated: " << outFile << " [exp_arm_asm]\n";
+                if (runAfterCompile && !compileAll) {
+                    std::string objFile = base + "_arm.o";
+                    std::string binFile = base + "_arm_bin";
+                    int rc = run_argv({"aarch64-linux-gnu-as", outFile, "-o", objFile});
+                    if (rc != 0) {
+                        std::cerr << "Preposterous: BackendError: aarch64-linux-gnu-as failed for RISC\n";
+                        return false;
+                    }
+                    rc = run_argv({"aarch64-linux-gnu-ld", objFile, "-o", binFile});
+                    if (rc != 0) {
+                        std::cerr << "Preposterous: BackendError: aarch64-linux-gnu-ld failed for RISC\n";
+                        return false;
+                    }
+                    bool hostIsArm = false;
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    hostIsArm = true;
+#endif
+                    if (hostIsArm) timedRunArgv({binFile});
+                    else timedRunArgv({"qemu-aarch64", binFile});
+                }
+                printTiming();
+                return true;
+            };
+
             if (tgt == "BNY") {
                 std::string outFile = (!outputOverride.empty() && !compileAll)
                                       ? outputOverride : base + info.extension;
@@ -933,6 +1193,19 @@ int main(int argc, char* argv[]) {
                 isARM = true;
 #endif
                 if (isARM) {
+                    // Auto-detected ARM host: try the real hand-rolled AArch64 raw-ELF backend
+                    // (exp_arm.cpp, the same one reachable explicitly via --target ARM) first —
+                    // it's a genuine native BNY-equivalent for ARM now, not a gcc-mediated
+                    // stand-in. It throws ACError::backend() on anything it doesn't support yet
+                    // (v1 has no ilib/dynamic-linking support — see exp_arm.cpp's header), in
+                    // which case fall back to the previous "route through AC->C" path below,
+                    // which CAN link ilib .so deps via gcc.
+                    try {
+                        if (runArmBinary(outFile)) return true;
+                        // else: e.g. the fixed-page slot-count limit was hit — fall through.
+                    } catch (const ACError&) {
+                        // Unsupported opcode/feature — fall through to the AC->C route below.
+                    }
                     // Intentional portability path: BNY's direct emitter is x86-64. On ARM,
                     // route through AC->C and the platform C compiler, then delete the .c
                     // intermediary. This is a C-backed native binary route, not X64Emitter output.
@@ -1001,7 +1274,8 @@ int main(int argc, char* argv[]) {
                 {
                     std::string lr = acLibRoot();
                     const char* dirs[] = {"math","camera","os","regex","string-cheese","web",
-                                          "machine-audio","widgets","native-cpu","ml","web-server"};
+                                          "machine-audio","widgets","native-cpu","ml","web-server",
+                                          "aczip"};
                     for (const char* d : dirs) {
                         if (!bnyRunpath.empty()) bnyRunpath += ":";
                         bnyRunpath += lr + "/ilib/" + d;
@@ -1029,7 +1303,9 @@ int main(int argc, char* argv[]) {
                         char* argv0 = const_cast<char*>(outFile.c_str());
                         char* const exec_argv[] = { argv0, nullptr };
                         execv(outFile.c_str(), exec_argv);
-                        // execv only returns on error — fall through to system() below
+                        // execv only returns on error — fall through to the argv-based
+                        // timedRunArgv() below (stale comment: this used to fall through to a
+                        // real system() call before the shell-free hardening pass).
                     }
 #endif
                     timedRunArgv({outFile},
@@ -1037,6 +1313,19 @@ int main(int argc, char* argv[]) {
                 }
                 printTiming();
                 return true;
+            }
+
+            if (tgt == "ARM") {
+                std::string outFile = (!outputOverride.empty() && !compileAll)
+                                      ? outputOverride : base + info.extension;
+                return runArmBinary(outFile);
+            }
+
+            if (tgt == "RISC") {
+                std::string outFile = (!outputOverride.empty() && !compileAll)
+                                      ? outputOverride : base + info.extension;
+                return runArmAsm(outFile);
+            }
 
             if (tgt == "ASM") {
                 bool isARM = false;
@@ -1044,14 +1333,18 @@ int main(int argc, char* argv[]) {
                 isARM = true;
 #endif
                 if (isARM) {
-                    std::cerr << "Preposterous: ARM not supported yet\n";
-                    printTiming();
-                    return false;
+                    // Auto-detected ARM host: route to the real GNU-assembler-text backend
+                    // (exp_arm_asm.cpp, the same one reachable explicitly via --target RISC)
+                    // instead of x86-64 NASM syntax, which would neither assemble nor mean
+                    // anything on this machine. ".s" (not ASM's own ".asm") because the
+                    // content is AArch64 GNU-as syntax, not x86 NASM syntax.
+                    std::string outFile = (!outputOverride.empty() && !compileAll)
+                                          ? outputOverride : base + ".s";
+                    return runArmAsm(outFile);
                 }
             }
             // Non-ARM AC->ASM falls through to generateFromIR below → AsmStrategy emits x86-64 NASM
             // (assemble with `nasm -f elf64`).
-            }
 
             std::string outFile = (!outputOverride.empty() && !compileAll)
                                   ? outputOverride : base + info.extension;
@@ -1059,6 +1352,15 @@ int main(int argc, char* argv[]) {
             // trample each other's file mid-compile. Give the aliases distinct names in that mode.
             if (compileAll && tgt == "C++") outFile = base + "_cxx.cpp";
             if (compileAll && tgt == "LIB") outFile = base + "_lib.cpp";
+            // C/C++/LIB/RS compile this intermediate source with a SEPARATE native-toolchain
+            // step, whose final binary is also being fixed (this same session) to honor `-o`
+            // directly — meaning outFile and that binary path would otherwise be IDENTICAL
+            // ("input file is the same as output file", gcc/g++/rustc all refuse this).
+            // Suffix the source with its real extension in that case so the two never collide;
+            // every other backend (PY/JS/etc, where outFile IS the sole deliverable) is untouched.
+            if (!outputOverride.empty() && !compileAll &&
+                (tgt == "C" || tgt == "C++" || tgt == "CPP" || tgt == "LIB" || tgt == "RS"))
+                outFile += info.extension;
             size_t slash = base.find_last_of("/\\");
             std::string stem = (slash == std::string::npos) ? base : base.substr(slash + 1);
             // Java requires the .java FILE NAME (and the "java <class>" run invocation) to
@@ -1068,7 +1370,20 @@ int main(int argc, char* argv[]) {
             // javac/java invocations below, which all read this same variable) rather than a
             // separate copy, so every one of those stays consistent (verified: examples/
             // hello-world.ac — javac rejected the unsanitized class/file name outright).
-            if (tgt == "Java" && outputOverride.empty()) {
+            if (tgt == "Java") {
+                // `-o X` (X extensionless) hit the SAME family of bug as C/C++/LIB/RS (see
+                // their matching comments above, found+fixed same session): this whole
+                // sanitization block used to be skipped entirely whenever outputOverride was
+                // set, so `outFile` fell back to the raw, unsanitized, extensionless
+                // `outputOverride` — javac saw a bare word with no `.java` suffix and refused
+                // it outright ("invalid flag"), AND even where it might have accepted it, Java
+                // requires the FILENAME to exactly match the `public class` name generated
+                // from `stem`, which `-o` never fed into. Derive `stem`/`dir` from
+                // `outputOverride` (when given) instead of the input file's own basename, so
+                // the same sanitization applies either way and the two stay consistent.
+                std::string javaBase = (!outputOverride.empty() && !compileAll) ? outputOverride : base;
+                size_t jSlash = javaBase.find_last_of("/\\");
+                stem = (jSlash == std::string::npos) ? javaBase : javaBase.substr(jSlash + 1);
                 for (char& c : stem)
                     if (!isalnum((unsigned char)c) && c != '_') c = '_';
                 if (!stem.empty() && isdigit((unsigned char)stem[0])) stem = "_" + stem;
@@ -1083,7 +1398,7 @@ int main(int argc, char* argv[]) {
                     "gl", "widgets", "camera", "server",
                 };
                 if (javaReservedShimNames.count(stem)) stem += "_ac";
-                std::string dir = (slash == std::string::npos) ? "" : base.substr(0, slash + 1);
+                std::string dir = (jSlash == std::string::npos) ? "" : javaBase.substr(0, jSlash + 1);
                 outFile = dir + stem + info.extension;
             }
             std::string content = generateFromIR(irProg, stem, base);
@@ -1121,7 +1436,17 @@ int main(int argc, char* argv[]) {
                         std::ofstream dst(runFile, std::ios::binary);
                         dst << src.rdbuf();
                     }
-                    timedRunArgv({"go", "run", runFile});
+                    // `go run` compiles to a temp binary (e.g. /tmp/go-buildNNN/b001/exe/...),
+                    // so an ilib's own os.Executable()-relative fallback (see web-server_ffi.go's
+                    // ilibDir) can never find the real library/ilib/X directory that way — pass
+                    // AC_PATH explicitly (the compiler already knows the real root) so that
+                    // fallback chain's FIRST check succeeds regardless of go run's temp binary.
+                    // acLibRoot() returns the "library" dir itself; AC_PATH wants its PARENT
+                    // (Go's ilibDir joins AC_PATH + "library/ilib/" + lib itself).
+                    { std::string lr = acLibRoot();
+                      std::string projRoot = lr.size() > 8 && lr.compare(lr.size()-8, 8, "/library") == 0
+                          ? lr.substr(0, lr.size()-8) : lr;
+                      timedRunArgv({"go", "run", runFile}, {{"AC_PATH", projRoot}}); }
                     if (isGoTestFile) std::remove(runFile.c_str());
                 }
                 printTiming();
@@ -1135,11 +1460,29 @@ int main(int argc, char* argv[]) {
                 // measured ~6x SLOWER to compile (0.4s -> 2.7s on a trivial program) in exchange
                 // for optimized native code, so it's only worth it at AC's own heaviest -O4
                 // level; every lower level keeps V's normal fast dev-loop `run` untouched.
-                std::vector<std::string> vArgs = {"v", "-enable-globals"};
-                if (optLevel >= 4) vArgs.push_back("-prod");
-                vArgs.push_back("run");
-                vArgs.push_back(outFile);
-                if (doRun) timedRunArgv(vArgs);
+                if (doRun) {
+                    // V has the exact same "_test.X" trap as Go (see GO's own block above,
+                    // verified there via audio_test.ac/widgets_test.ac): `v run foo_test.v`
+                    // refuses to run at all — "a _test.v file should have *at least* one
+                    // `test_` function" — treating it as a V test file, not a normal
+                    // program, regardless of what's actually inside it. Same workaround:
+                    // run a same-directory copy under a name that doesn't end in "_test.v".
+                    std::string runFile = outFile;
+                    bool isVTestFile = outFile.size() > 7 &&
+                        outFile.compare(outFile.size() - 7, 7, "_test.v") == 0;
+                    if (isVTestFile) {
+                        runFile = outFile.substr(0, outFile.size() - 2) + "_run.v";
+                        std::ifstream src(outFile, std::ios::binary);
+                        std::ofstream dst(runFile, std::ios::binary);
+                        dst << src.rdbuf();
+                    }
+                    std::vector<std::string> vArgs = {"v", "-enable-globals"};
+                    if (optLevel >= 4) vArgs.push_back("-prod");
+                    vArgs.push_back("run");
+                    vArgs.push_back(runFile);
+                    timedRunArgv(vArgs);
+                    if (isVTestFile) std::remove(runFile.c_str());
+                }
                 printTiming();
                 return true;
             }
@@ -1166,7 +1509,16 @@ int main(int argc, char* argv[]) {
 #else
                 if (getcwd(cwdbuf, sizeof(cwdbuf))) cwd = cwdbuf;
 #endif
-                std::string binFile = base;
+                // Both bugs found live 2026-08-19 (gl_bounce.ac -o testing): `-o X` was
+                // silently ignored for the actual compiled binary (always named from the
+                // INPUT file instead), and `outFile` — the intermediate .c source gcc is
+                // about to read — has NO extension whenever `-o` is set (outFile ==
+                // outputOverride verbatim, see its computation above), which gcc can't
+                // recognize as C source by extension; it silently hands the text straight
+                // to `ld`, producing "file format not recognized; treating as linker
+                // script". `-x c` makes gcc trust the language explicitly, sidestepping
+                // extension detection entirely — simpler and more robust than renaming files.
+                std::string binFile = (!outputOverride.empty() && !compileAll) ? outputOverride : base;
                 if (compileAll) binFile = base + "_c";
                 // linkFlags already contains absolute -L and -Wl,-rpath from the codegen.
                 // -O2: AC leans on the native compiler for runtime speed (see /division -O3 note).
@@ -1174,7 +1526,11 @@ int main(int argc, char* argv[]) {
                 // Native optimization follows the user's -O level (gcc caps at -O3; AC's -O4 → -O3).
                 std::vector<std::string> gccArgs = {"gcc", "-O" + std::to_string(std::min(optLevel, 3))};
                 if (staticLink) gccArgs.push_back("-static");
+                // -x c / -x none: see the CPP block's matching comment (sticky language
+                // override, reset before any subsequent link-flag file paths).
+                gccArgs.push_back("-x"); gccArgs.push_back("c");
                 gccArgs.push_back(outFile);
+                gccArgs.push_back("-x"); gccArgs.push_back("none");
                 gccArgs.push_back("-I.");
                 for (auto& t : shell_split(linkFlags)) gccArgs.push_back(t);
                 gccArgs.push_back("-o"); gccArgs.push_back(binFile);
@@ -1193,7 +1549,10 @@ int main(int argc, char* argv[]) {
 
             // ── C++: compile with g++ then run ───────────────────────────────
             if (tgt == "C++" || tgt == "CPP") {
-                std::string binFile = base;
+                // See the C block's matching comment above — same two bugs (-o ignored for
+                // the real binary name; extensionless outFile misdetected by g++ as a
+                // linker script), same fix shape (-x c++ + respect outputOverride).
+                std::string binFile = (!outputOverride.empty() && !compileAll) ? outputOverride : base;
                 if (compileAll) binFile = base + (tgt == "C++" ? "_cxx" : "_cpp");
                 // Parse FLIB_SO_LINK directives: link .so files directly by path
                 std::string flibLinkFlags;
@@ -1225,8 +1584,13 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+                // `-x c++` is sticky — applies to every FOLLOWING input, not just outFile — so
+                // it's immediately reset with `-x none` before any .so/link-flag paths get
+                // appended below (flibLinkFlags/glinkFlags), or those would get misdetected
+                // as C++ source too.
                 std::vector<std::string> gxxArgs = {"g++", "-std=c++17", "-fpermissive",
-                                                    "-O" + std::to_string(std::min(optLevel, 3)), "-I.", outFile};
+                                                    "-O" + std::to_string(std::min(optLevel, 3)), "-I.",
+                                                    "-x", "c++", outFile, "-x", "none"};
                 for (auto& t : shell_split(flibLinkFlags)) gxxArgs.push_back(t);
                 for (auto& t : shell_split(glinkFlags))    gxxArgs.push_back(t);
                 gxxArgs.push_back("-o"); gxxArgs.push_back(binFile);
@@ -1274,15 +1638,21 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+                // Same -o-ignored gap as the C/C++ blocks above — soFile always derived from
+                // the input filename (`base`), never `outputOverride`.
+                std::string soBase = (!outputOverride.empty() && !compileAll) ? outputOverride : base;
 #ifdef _WIN32
-                std::string soFile = base + ".dll";
+                std::string soFile = soBase + ".dll";
 #else
-                std::string soFile = base + ".so";
+                std::string soFile = soBase + ".so";
 #endif
                 // Same missing-optimization gap as the plain g++/gcc paths above (see rustc's
                 // own comment) — the shared-library build never forwarded `-O` at all.
+                // -x c++ / -x none: see the C++ block's matching comment (extensionless outFile
+                // when -o is set + resetting the sticky language override before link-flag paths).
                 std::vector<std::string> soArgs = {"g++","-std=c++17","-fpermissive",
-                    "-O" + std::to_string(std::min(optLevel, 3)),"-I.","-shared","-fPIC",outFile};
+                    "-O" + std::to_string(std::min(optLevel, 3)),"-I.","-shared","-fPIC",
+                    "-x","c++",outFile,"-x","none"};
                 for (auto& t : shell_split(flibLinkFlags)) soArgs.push_back(t);
                 for (auto& t : shell_split(glinkFlags))    soArgs.push_back(t);
                 soArgs.push_back("-o"); soArgs.push_back(soFile);
@@ -1290,12 +1660,58 @@ int main(int argc, char* argv[]) {
                 if (rc == 0) {
                     std::cout << "Compiled:  " << soFile << " [shared lib]\n";
                     // Generate companion .h header with extern "C" declarations
-                    std::string hFile = base + ".h";
+                    std::string hFile = soBase + ".h";
                     std::ostringstream hdr;
                     hdr << "#pragma once\n";
                     hdr << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+                    // Same exclusion this header already applies to generators (see the
+                    // isGenerator check just below): a free function whose every `return`
+                    // traces to a directly-constructed bundle instance returns that class BY
+                    // VALUE (ir_codegen.cpp's own classFuncs_ prescan), never the blanket
+                    // `long long name(...)` shape this header emits for everything else —
+                    // declaring it here the same way would silently mismatch the REAL `Point
+                    // makePoint();` signature the .cpp actually compiles. This is a self-
+                    // contained re-derivation of the same "does this function's return trace to
+                    // one known class name" check ir_codegen.cpp's classFuncs_ builds — that
+                    // one lives inside the codegen driver's own local state and isn't reachable
+                    // from here, so it's recomputed directly against irProg instead of shared.
+                    std::set<std::string> libClassNames;
+                    for (const auto& fn : irProg.functions)
+                        if (fn.name == "init" && !fn.classOwner.empty()) libClassNames.insert(fn.classOwner);
+                    auto libFnReturnsClass = [&](const AC_IR::IRFunction& f) {
+                        std::map<std::string, std::string> varClass;
+                        for (const auto& ins : f.instructions) {
+                            if (ins.opcode == AC_IR::IROpcode::CALL && ins.result.kind == AC_IR::IRRef::Kind::VAR
+                                    && ins.result.id >= 0 && !ins.typedOperands.empty()
+                                    && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::VAR
+                                    && ins.typedOperands[0].id >= 0) {
+                                std::string callee = irProg.symbols.getName(ins.typedOperands[0].id);
+                                if (libClassNames.count(callee))
+                                    varClass[irProg.symbols.getName(ins.result.id)] = callee;
+                            }
+                        }
+                        for (const auto& ins : f.instructions) {
+                            if (ins.opcode != AC_IR::IROpcode::RETURN || ins.typedOperands.empty()) continue;
+                            const auto& rv = ins.typedOperands[0];
+                            if (rv.kind == AC_IR::IRRef::Kind::VAR && rv.id >= 0
+                                    && varClass.count(irProg.symbols.getName(rv.id)))
+                                return true;
+                        }
+                        return false;
+                    };
                     for (const auto& fn : irProg.functions) {
                         if (!fn.classOwner.empty()) continue;
+                        if (libFnReturnsClass(fn)) continue;
+                        // A generator's real symbol returns a synthesized AcGen_<name>* struct
+                        // pointer and (matching the codegen's own emitFunctionPrototype skip for
+                        // generators — see ir_codegen.cpp) is never wrapped in extern "C", so its
+                        // true ABI doesn't match this header's blanket `long long name(...)`
+                        // shape at all — declaring it here would let an external caller link
+                        // against a name that either fails to resolve (C++ mangling) or, worse,
+                        // silently miscalls it under the wrong signature/calling convention.
+                        // Generators are consumption-internal for this pass (see the plan's
+                        // explicit scope cut); omit them from the public C header entirely.
+                        if (fn.isGenerator) continue;
                         hdr << "long long " << fn.name << "(";
                         for (size_t pi = 0; pi < fn.parameters.size(); pi++) {
                             if (pi) hdr << ", ";
@@ -1317,7 +1733,10 @@ int main(int argc, char* argv[]) {
 
             // ── Rust: compile with rustc then run ─────────────────────────────
             if (tgt == "RS") {
-                std::string binFile = base;
+                // Same -o-ignored gap as C/C++/LIB above (rustc itself doesn't care about
+                // outFile's missing extension, verified directly — only the binary-naming
+                // half of that bug applies here).
+                std::string binFile = (!outputOverride.empty() && !compileAll) ? outputOverride : base;
                 // Detect ilib libraries from generated source and add link paths
                 std::string libFlags;
                 std::string libRoot = acLibRoot();
@@ -1341,7 +1760,10 @@ int main(int argc, char* argv[]) {
                 static const std::vector<std::pair<std::string,std::string>> otherIlibs = {
                     {"gl", "acgl"}, {"machine-audio", "acmachinaaudio"}, {"os", "acoos"},
                     {"string-cheese", "acstringcheese"}, {"native-cpu", "acncpu"},
-                    {"web", "acweb"}, {"web-server", "acserver"}, {"aczip", "acaczip"},
+                    {"web", "acweb"}, {"web-server", "acserver"},
+                    // aczip's name already reads as "AC Zip" — the real file is libaczip.so,
+                    // NOT libacaczip.so (same fix as the C/C++ codegen link-name tables).
+                    {"aczip", "aczip"},
                 };
                 for (auto& [dir, lname] : otherIlibs) {
                     if (content.find("#[link(name = \"" + lname + "\")]") != std::string::npos)
@@ -1400,8 +1822,18 @@ int main(int argc, char* argv[]) {
                 int rc = run_argv({"javac","--enable-preview","--release","21",outFile});
                 if (rc == 0) {
                     std::cout << "Compiled:  " << stem << ".class [javac]\n";
-                    if (doRun)
-                        timedRunArgv({"java","--enable-preview","-cp",javaDir,stem});
+                    if (doRun) {
+                        // AC_PATH explicitly, matching Go's fix above — web-server_ffi.java's own
+                        // ilibDir() has a jar/class-location-relative fallback that SHOULD find
+                        // library/ilib/web-server even without this, but a `java -cp .` classpath
+                        // (not an actual jar) can leave getCodeSource().getLocation() pointing
+                        // somewhere that fallback doesn't expect; passing AC_PATH is the same
+                        // direct fix regardless of that fallback's own behavior.
+                        std::string lr = acLibRoot();
+                        std::string projRoot = lr.size() > 8 && lr.compare(lr.size()-8, 8, "/library") == 0
+                            ? lr.substr(0, lr.size()-8) : lr;
+                        timedRunArgv({"java","--enable-preview","-cp",javaDir,stem}, {{"AC_PATH", projRoot}});
+                    }
                 } else {
                     std::cerr << Toxic::javacNotHavingIt(rc) << "\n";
                     printTiming();

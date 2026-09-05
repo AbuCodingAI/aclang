@@ -3,7 +3,9 @@
 'use strict';
 const _child = require('child_process');
 const _fs    = require('fs');
-const _path  = require('path');
+// (no 'path' module use in this file — a dead `const _path = require('path')` here used to
+// collide with widgets_ffi.js's own _path when both ilibs were inlined into one program,
+// "Identifier '_path' has already been declared" — verified: ac_ide.ac, which uses both.)
 
 const _SBASH_FORBIDDEN = [
     /\bsudo\b/,

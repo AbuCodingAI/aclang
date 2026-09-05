@@ -1,72 +1,38 @@
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
+// AC ilib: aczip — Rust FFI (libaczip.so / libaczip.dll)
+//
+// AC has no raw byte-buffer type, so this binding calls the file-to-file convenience
+// functions in aczip_c.h/.cpp (shared with every other backend's FFI — see that file's
+// own comment) instead of marshaling ACZipByteArray by hand.
+// (No #![allow(non_upper_case_globals)] here — this file is inlined mid-program, not
+// at the top, so an inner `#![...]` attribute is a hard syntax error there; the
+// resulting "static variable `aczip` should have an upper case name" is just a
+// warning, same as camera_ffi.rs's own `pub static camera` leaves unaddressed.)
 
-use std::os::raw::{c_char, c_int, c_double};
-use std::ffi::{CString, CStr};
-use std::ptr;
+use std::os::raw::{c_char, c_int, c_longlong};
+use std::ffi::CString;
 
-#[repr(C)]
-pub struct ByteArray {
-    pub data: *mut u8,
-    pub size: usize,
-}
-
+#[link(name = "aczip")]
 extern "C" {
-    pub fn ac_zip_compress(path: *const c_char, parallel: c_int) -> ByteArray;
-    pub fn ac_zip_decompress(data: *const u8, size: usize, output_path: *const c_char) -> c_int;
-    pub fn ac_zip_compress_hdd(path: *const c_char) -> ByteArray;
-    pub fn ac_zip_compress_sata(path: *const c_char) -> ByteArray;
-    pub fn ac_get_compression_ratio(original: usize, compressed: usize) -> c_double;
-    pub fn ac_free_bytes(arr: ByteArray);
+    fn ac_zip_compress_to_file(path: *const c_char, parallel: c_int, output_path: *const c_char) -> c_longlong;
+    fn ac_zip_decompress_from_file(archive_path: *const c_char, output_path: *const c_char) -> c_int;
+    fn ac_get_compression_ratio(original: usize, compressed: usize) -> f64;
 }
 
-pub fn compress(path: &str, parallel: bool) -> Result<Vec<u8>, &'static str> {
-    let c_path = CString::new(path).map_err(|_| "Invalid path")?;
-    let parallel_flag = if parallel { 1 } else { 0 };
+fn _cs(s: &str) -> CString { CString::new(s).unwrap_or_default() }
 
-    unsafe {
-        let result = ac_zip_compress(c_path.as_ptr(), parallel_flag);
-        let bytes = std::slice::from_raw_parts(result.data, result.size).to_vec();
-        ac_free_bytes(result);
-        Ok(bytes)
+pub struct AcZip;
+impl AcZip {
+    pub fn compress(&self, path: &str, parallel: i64, output_path: &str) -> i64 {
+        let p = _cs(path); let o = _cs(output_path);
+        unsafe { ac_zip_compress_to_file(p.as_ptr(), (parallel != 0) as c_int, o.as_ptr()) as i64 }
+    }
+    pub fn decompress(&self, archive_path: &str, output_path: &str) -> i64 {
+        let a = _cs(archive_path); let o = _cs(output_path);
+        unsafe { ac_zip_decompress_from_file(a.as_ptr(), o.as_ptr()) as i64 }
+    }
+    pub fn get_ratio(&self, original: i64, compressed: i64) -> f64 {
+        unsafe { ac_get_compression_ratio(original as usize, compressed as usize) }
     }
 }
 
-pub fn decompress(data: &[u8], output_path: &str) -> Result<(), &'static str> {
-    let c_output_path = CString::new(output_path).map_err(|_| "Invalid path")?;
-
-    unsafe {
-        let ret = ac_zip_decompress(data.as_ptr(), data.len(), c_output_path.as_ptr());
-        if ret != 0 {
-            return Err("Decompression failed");
-        }
-        Ok(())
-    }
-}
-
-pub fn compress_hdd(path: &str) -> Result<Vec<u8>, &'static str> {
-    let c_path = CString::new(path).map_err(|_| "Invalid path")?;
-
-    unsafe {
-        let result = ac_zip_compress_hdd(c_path.as_ptr());
-        let bytes = std::slice::from_raw_parts(result.data, result.size).to_vec();
-        ac_free_bytes(result);
-        Ok(bytes)
-    }
-}
-
-pub fn compress_sata(path: &str) -> Result<Vec<u8>, &'static str> {
-    let c_path = CString::new(path).map_err(|_| "Invalid path")?;
-
-    unsafe {
-        let result = ac_zip_compress_sata(c_path.as_ptr());
-        let bytes = std::slice::from_raw_parts(result.data, result.size).to_vec();
-        ac_free_bytes(result);
-        Ok(bytes)
-    }
-}
-
-pub fn get_ratio(original_size: usize, compressed_size: usize) -> f64 {
-    unsafe { ac_get_compression_ratio(original_size, compressed_size) as f64 }
-}
+pub static aczip: AcZip = AcZip;

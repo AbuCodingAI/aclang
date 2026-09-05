@@ -1,6 +1,0 @@
-AC->LIB
-
-using header string-cheese
-
-line = stringm.getline()
-Term.display line

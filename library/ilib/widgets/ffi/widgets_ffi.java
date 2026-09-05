@@ -9,11 +9,29 @@ import java.util.*;
 final class AcWidgets {
     private static final Linker     _L   = Linker.nativeLinker();
     private static final SymbolLookup _SYM;
+    // AC_PATH-aware resolution — see camera_ffi.java's _resolveLib for why the plain
+    // user.dir-relative path broke whenever `ac` ran from anywhere but the project root.
+    private static Path _resolveLib(String rel) {
+        Path relP = Path.of("library", "ilib", "widgets", rel);
+        String acp = System.getenv("AC_PATH");
+        if (acp != null) {
+            Path cand = Path.of(acp).resolve(relP);
+            if (Files.exists(cand)) return cand.toAbsolutePath();
+        }
+        Path cwdCand = Path.of(".").resolve(relP);
+        if (Files.exists(cwdCand)) return cwdCand.toAbsolutePath();
+        try {
+            Path self = Path.of(AcWidgets.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            Path base = Files.isDirectory(self) ? self : self.getParent();
+            Path fromClass = base.resolve("..").resolve(relP).normalize();
+            if (Files.exists(fromClass)) return fromClass.toAbsolutePath();
+        } catch (Exception ignored) {}
+        return cwdCand.toAbsolutePath();
+    }
     static {
         String _os  = System.getProperty("os.name").toLowerCase();
         String _lib = _os.contains("win") ? "acwidgets.dll" : "libacwidgets.so";
-        Path   _p   = Path.of(System.getProperty("user.dir"))
-                          .resolve("library/ilib/widgets/" + _lib).toAbsolutePath();
+        Path   _p   = _resolveLib(_lib);
         _SYM = SymbolLookup.libraryLookup(_p, Arena.global());
     }
     private static MethodHandle _mh(String n, FunctionDescriptor fd) {
@@ -28,10 +46,11 @@ final class AcWidgets {
 
     private static final MethodHandle _init            = _mh("ac_widgets_init",            FunctionDescriptor.ofVoid());
     private static final MethodHandle _setLazy         = _mh("ac_widgets_set_lazy",        FunctionDescriptor.ofVoid(W));
-    private static final MethodHandle _screenNew       = _mh("ac_widgets_screen_new",      FunctionDescriptor.of(W,A,A));
+    private static final MethodHandle _screenNew       = _mh("ac_widgets_screen_new",      FunctionDescriptor.of(W,A));
     private static final MethodHandle _screenMainloop  = _mh("ac_widgets_screen_mainloop", FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _screenUpdate    = _mh("ac_widgets_screen_update",   FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _screenDestroy   = _mh("ac_widgets_screen_destroy",  FunctionDescriptor.ofVoid(W));
+    private static final MethodHandle _screenDimensions = _mh("ac_widgets_screen_dimensions", FunctionDescriptor.ofVoid(W,I,I));
     private static final MethodHandle _displayNew      = _mh("ac_widgets_display_new",     FunctionDescriptor.of(W,W,A));
     private static final MethodHandle _displayPack     = _mh("ac_widgets_display_pack",    FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _displaySet      = _mh("ac_widgets_display_set",     FunctionDescriptor.ofVoid(W,A));
@@ -82,6 +101,12 @@ final class AcWidgets {
     private static final MethodHandle _skRect          = _mh("ac_widgets_sketch_rect",     FunctionDescriptor.ofVoid(W,D,D,D,D,B,B,B));
     private static final MethodHandle _skCircle        = _mh("ac_widgets_sketch_circle",   FunctionDescriptor.ofVoid(W,D,D,D,B,B,B));
     private static final MethodHandle _skText          = _mh("ac_widgets_sketch_text",     FunctionDescriptor.ofVoid(W,D,D,A,B,B,B));
+    private static final MethodHandle _tbNew           = _mh("ac_widgets_textbox_new",     FunctionDescriptor.of(W,W,A,A));
+    private static final MethodHandle _tbPack          = _mh("ac_widgets_textbox_pack",    FunctionDescriptor.ofVoid(W));
+    private static final MethodHandle _tbWrite         = _mh("ac_widgets_textbox_write",   FunctionDescriptor.ofVoid(W,A));
+    private static final MethodHandle _tbGet           = _mh("ac_widgets_textbox_get",     FunctionDescriptor.of(A,W));
+    private static final MethodHandle _tbFind          = _mh("ac_widgets_textbox_find",    FunctionDescriptor.of(A,W,A));
+    private static final MethodHandle _tbFix           = _mh("ac_widgets_textbox_fix",     FunctionDescriptor.ofVoid(W,A));
 
     private static long  _l(MethodHandle h, Object... a) { try{return (long)h.invokeWithArguments(a);}catch(Throwable t){throw new RuntimeException(t);} }
     private static int   _i(MethodHandle h, Object... a) { try{return (int)h.invokeWithArguments(a);}catch(Throwable t){throw new RuntimeException(t);} }
@@ -95,11 +120,13 @@ final class AcWidgets {
 
     private static String _str(MemorySegment p) { return p == null || p.equals(MemorySegment.NULL) ? "" : p.reinterpret(Long.MAX_VALUE).getUtf8String(0); }
 
-    public static long   screenNew(String title, String geometry) {
-        try (Arena a=Arena.ofConfined()){return _l(_screenNew,a.allocateUtf8String(title),a.allocateUtf8String(geometry));}
+    // title is mandatory — no geometry positional arg. Use screenDimensions(h, w, h) instead.
+    public static long   screenNew(String title) {
+        try (Arena a=Arena.ofConfined()){return _l(_screenNew,a.allocateUtf8String(title));}
     }
     public static void   screenMainloop(long h) { _v(_screenMainloop, h); }
     public static void   screenUpdate(long h)   { _v(_screenUpdate, h); }
+    public static void   screenDimensions(long h, int w, int hh) { _v(_screenDimensions, h, w, hh); }
     public static void   screenDestroy(long h)  { _v(_screenDestroy, h); }
 
     public static long   displayNew(long m, String text)  { try(Arena a=Arena.ofConfined()){return _l(_displayNew,m,a.allocateUtf8String(text));} }
@@ -173,15 +200,28 @@ final class AcWidgets {
     public static void   sketchText(long h, double x, double y, String t, byte r, byte g, byte b) {
         try(Arena a=Arena.ofConfined()){_v(_skText,h,x,y,a.allocateUtf8String(t),r,g,b);}
     }
+
+    public static long   textboxNew(long m, String color, String font) {
+        try (Arena a=Arena.ofConfined()){return _l(_tbNew,m,a.allocateUtf8String(color),a.allocateUtf8String(font));}
+    }
+    public static void   textboxPack(long h)  { _v(_tbPack, h); }
+    public static void   textboxWrite(long h, String s) { try(Arena a=Arena.ofConfined()){_v(_tbWrite,h,a.allocateUtf8String(s));} }
+    public static String textboxGet(long h)   { return _str(_a(_tbGet, h)); }
+    public static String textboxFind(long h, String needle) {
+        try(Arena a=Arena.ofConfined()){return _str(_a(_tbFind,h,a.allocateUtf8String(needle)));}
+    }
+    public static void   textboxFix(long h, String s) { try(Arena a=Arena.ofConfined()){_v(_tbFix,h,a.allocateUtf8String(s));} }
 }
 
 // ── Wrapper classes — AC-generated Java uses Screen(title=...), display(master=...) etc. ──
 
 class Screen {
     long _h;
-    Screen(String title, String geometry) { this._h = AcWidgets.screenNew(title, geometry); }
+    // title is mandatory — no geometry positional arg. Use .dimensions(w, h) instead.
+    Screen(String title) { this._h = AcWidgets.screenNew(title); }
     void mainloop() { AcWidgets.screenMainloop(this._h); }
     void update()   { AcWidgets.screenUpdate(this._h); }
+    void dimensions(int w, int h) { AcWidgets.screenDimensions(this._h, w, h); }
     void destroy()  { AcWidgets.screenDestroy(this._h); }
 }
 class AcDisplay {
@@ -297,4 +337,13 @@ class AcSketch {
     void rect(double x1, double y1, double x2, double y2, byte r, byte g, byte b) { AcWidgets.sketchRect(this._h,x1,y1,x2,y2,r,g,b); }
     void circle(double cx, double cy, double rad, byte r, byte g, byte b)          { AcWidgets.sketchCircle(this._h,cx,cy,rad,r,g,b); }
     void text_at(double x, double y, String t, byte r, byte g, byte b)             { AcWidgets.sketchText(this._h,x,y,t,r,g,b); }
+}
+class AcTextbox {
+    long _h;
+    AcTextbox(Screen m, String color, String font) { this._h = AcWidgets.textboxNew(m._h, color, font); }
+    void pack()             { AcWidgets.textboxPack(this._h); }
+    void write(String s)    { AcWidgets.textboxWrite(this._h, s); }
+    String get()            { return AcWidgets.textboxGet(this._h); }
+    String find(String needle) { return AcWidgets.textboxFind(this._h, needle); }
+    void fix(String s)      { AcWidgets.textboxFix(this._h, s); }
 }

@@ -7,7 +7,7 @@ Make OnClick func(arg)
 
 <mainloop>
 
-    root = Screen($AC Widget Demo$, $480x520$)
+    root = Screen(title=$AC Widget Demo$, dimensions(480x520))
 
     title_lbl = display(root, $=== AC Widgets Library ===$)
 

@@ -11,3 +11,5 @@
 #include "tags.hpp"
 #include "backend_registry.hpp"
 #include "exp_bny.hpp"
+#include "exp_arm.hpp"
+#include "exp_arm_asm.hpp"

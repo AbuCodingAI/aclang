@@ -1,5 +1,5 @@
 /*
-#cgo LDFLAGS: -L@AC_LIBDIR@ -lacml
+#cgo LDFLAGS: -L@AC_LIBDIR@ -lacml -Wl,-rpath,@AC_LIBDIR@
 #include <stdint.h>
 extern int64_t ml_tensor(double value);
 extern int64_t ml_grid(int64_t rows, int64_t cols, double fill);
@@ -11,6 +11,8 @@ extern int64_t ml_add(int64_t a, int64_t b);
 extern int64_t ml_multiply(int64_t a, int64_t b);
 extern int64_t ml_relu(int64_t x);
 extern int ml_backward(int64_t loss);
+extern int64_t ml_grad(int64_t tensor_id);
+extern int ml_optimize(double learning_rate, int64_t tensor_id);
 */
 import "C"
 
@@ -36,3 +38,7 @@ func (mlNamespace) multiply(a int64, b int64) int64 {
 }
 func (mlNamespace) relu(x int64) int64 { return int64(C.ml_relu(C.int64_t(x))) }
 func (mlNamespace) backward(loss int64) int64 { return int64(C.ml_backward(C.int64_t(loss))) }
+func (mlNamespace) grad(tensorId int64) int64 { return int64(C.ml_grad(C.int64_t(tensorId))) }
+func (mlNamespace) optimize(learningRate float64, tensorId int64) int64 {
+	return int64(C.ml_optimize(C.double(learningRate), C.int64_t(tensorId)))
+}

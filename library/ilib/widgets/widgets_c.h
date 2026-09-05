@@ -15,7 +15,9 @@ typedef intptr_t ac_widget_t;  /* opaque handle returned by every constructor */
 void ac_widgets_init(void);
 
 /* ── Screen ──────────────────────────────────────────────────────────────── */
-ac_widget_t ac_widgets_screen_new(const char* title, const char* geometry);
+/* title is mandatory — there is no geometry positional arg; use .dimensions(w, h)
+   to size the window explicitly. */
+ac_widget_t ac_widgets_screen_new(const char* title);
 void        ac_widgets_screen_mainloop(ac_widget_t screen);
 void        ac_widgets_screen_update(ac_widget_t screen);
 void        ac_widgets_screen_destroy(ac_widget_t screen);
@@ -117,6 +119,10 @@ void        ac_widgets_textbox_fix(ac_widget_t w, const char* text);
 void        ac_widgets_pack(ac_widget_t w);
 void        ac_widgets_add(ac_widget_t w, const char* item);
 void        ac_widgets_set_d(ac_widget_t w, double v);
+/* Runtime-dispatches on the handle's own widget kind — for backends (Rust) whose shared
+   trait/interface has no per-kind type to dispatch on at compile time. */
+const char* ac_widgets_get(ac_widget_t w);
+void        ac_widgets_set(ac_widget_t w, const char* v);
 
 /* ── lazy / spaced-pack ──────────────────────────────────────────────────────── */
 void        ac_widgets_set_lazy(ac_widget_t w);

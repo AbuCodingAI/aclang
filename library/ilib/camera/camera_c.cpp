@@ -3,11 +3,11 @@
 #include <string>
 
 namespace AC {
-    extern Camera WebCam;
+    extern Camera camera;
     extern Camera latestFrame;
     extern Camera firstFrame;
     extern SidebarConsole sidebar;
-    extern Screen Background;
+    extern Screen screen;
 }
 
 static std::string g_lastInput;
@@ -16,11 +16,11 @@ extern "C" {
 
 // Camera functions
 int ac_camera_init() {
-    return AC::WebCam.init() ? 1 : 0;
+    return AC::camera.init() ? 1 : 0;
 }
 
 int ac_camera_capture(const char* filename) {
-    return AC::WebCam.capture(filename) ? 1 : 0;
+    return AC::camera.capture(filename) ? 1 : 0;
 }
 
 int ac_camera_capture_latest(const char* filename) {
@@ -32,7 +32,7 @@ int ac_camera_capture_first(const char* filename) {
 }
 
 void ac_camera_release() {
-    AC::WebCam.release();
+    AC::camera.release();
 }
 
 // Sidebar functions
@@ -64,12 +64,12 @@ const char* ac_sidebar_getinput() {
 
 // Screen functions
 void ac_screen_setmode(const char* mode) {
-    AC::Background.setMode(mode);
+    AC::screen.setMode(mode);
 }
 
 void ac_screen_update() {
 #if HAVE_OPENCV
-    AC::Background.updateFrame(AC::WebCam);
+    AC::screen.updateFrame(AC::camera);
 #endif
 }
 

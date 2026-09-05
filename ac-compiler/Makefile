@@ -1,7 +1,7 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -O2 -MMD -MP
 
-SRC = src/main.cpp src/lexer.cpp src/parser.cpp src/backend_registry.cpp src/ir.cpp src/ir_codegen.cpp src/exp_bny.cpp
+SRC = src/main.cpp src/lexer.cpp src/parser.cpp src/backend_registry.cpp src/ir.cpp src/ir_codegen.cpp src/exp_bny.cpp src/exp_arm.cpp src/exp_arm_asm.cpp
 OBJ = $(SRC:.cpp=.o)
 DEP = $(SRC:.cpp=.d)
 OUT = ac

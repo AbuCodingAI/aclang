@@ -1,0 +1,43 @@
+AC->PY
+
+/* web-server ilib — server.* is a sub-library of web (see web-server.acl), so the
+   import spelling must go through `from ilib web use web-server`, never a bare
+   `use ilib web-server`. Covers both halves: the JaSQL database (fully self-
+   contained, no client needed) and a real one-request HTTP listener (run this
+   program, then in another terminal: curl http://127.0.0.1:8099/hello). */
+
+from ilib web use web-server
+
+<mainloop>
+    header.display $JaSQL: create, insert, query$
+    made = server.db_run($CREATE TABLE users { id:int, name:text }$)
+    Term.display made
+    ins1 = server.db_run($INSERT users { id: 1, name: "Alice" }$)
+    Term.display ins1
+    ins2 = server.db_run($INSERT users { id: 2, name: "Bob" }$)
+    Term.display ins2
+    rows = server.db_run($TAKE * FROM users$)
+    Term.display rows
+
+    header.display $JaSQL: parameterized query (the safe path for request-derived data)$
+    one = server.db_run_p($TAKE * FROM users IF id = ?$, $[1]$)
+    Term.display one
+
+    header.display $HTTP: one real request$
+    Term.display $listening on http://127.0.0.1:8099 — send it one request, e.g.:$
+    Term.display $  curl http://127.0.0.1:8099/hello$
+    listening = server.listen(8099)
+    Term.display $server.listen(8099) = $ + to_string(listening)
+    got = server.accept()
+    Term.display $server.accept() = $ + to_string(got)
+    method = server.req_method()
+    path = server.req_path()
+    Term.display $request was $ + method + $ $ + path
+    server.respond(200, $Hello from AC web-server$)
+    server.close()
+    Term.display $responded and closed the connection$
+
+    header.display $Cleanup$
+    dropped = server.db_reset()
+    Term.display dropped
+<mainloop>

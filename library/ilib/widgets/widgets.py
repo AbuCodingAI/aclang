@@ -7,26 +7,27 @@ import tkinter as tk
 from tkinter import ttk
 
 class Screen:
-    def __init__(self, title=None, geometry=None):
+    # title is mandatory — no geometry positional/keyword arg. Use .dimensions(w, h).
+    def __init__(self, title):
         self.root = tk.Tk()
-        if title:
-            self.root.title(title)
-        if geometry:
-            self.root.geometry(geometry)
-    
+        self.root.title(title)
+
     def mainloop(self):
         self.root.mainloop()
-    
+
     def update(self):
         self.root.update()
-    
+
+    def dimensions(self, w, h):
+        self.root.geometry(f"{w}x{h}")
+
     def after(self, ms, func=None):
         """Schedule a function to be called after ms milliseconds, or just delay"""
         if func:
             self.root.after(ms, func)
         else:
             self.root.after(ms)
-    
+
     def destroy(self):
         self.root.destroy()
 
@@ -288,4 +289,37 @@ class sketch:
     
     def clear(self):
         self.canvas.delete("all")
+
+
+class textbox:
+    def __init__(self, master=None, color=None, font=None, lazy=None):
+        self.text = tk.Text(
+            master.root if isinstance(master, Screen) else master,
+            fg=color or 'black',
+            font=(font or 'monospace',),
+        )
+        if lazy != 'lazy':
+            self.text.pack(fill='both', expand=True)
+
+    def pack(self, space_x=None, space_y=None):
+        kwargs = {'fill': 'both', 'expand': True}
+        if space_x is not None:
+            kwargs['padx'] = space_x
+        if space_y is not None:
+            kwargs['pady'] = space_y
+        self.text.pack(**kwargs)
+
+    def write(self, s):
+        self.text.delete('1.0', tk.END)
+        self.text.insert('1.0', s)
+
+    def get(self):
+        return self.text.get('1.0', tk.END + '-1c')
+
+    def find(self, needle):
+        return needle if needle in self.get() else ''
+
+    def fix(self, s):
+        self.write(s)
+        self.text.config(state='disabled')
 

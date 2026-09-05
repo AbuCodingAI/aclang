@@ -234,6 +234,26 @@ public:
         else { modrm(0,sl,pl); }
     }
 
+    // mov r64, [base+disp32] — general register+offset load (`yield`/generators: state-block
+    // field access). mov_r_rbp/mov_rbp_r above are the same encoding hardcoded to base=RBP;
+    // this generalizes to any base register, always via the mod=10 (disp32) form for simplicity
+    // (a few bytes larger than the disp8 form mov_r_rbp uses, but avoids that function's own
+    // mod=00-means-RIP-relative special case for rbp/r13 at disp==0 — our field offset 0 (`done`)
+    // would otherwise silently misencode as %rip-relative addressing instead of [base+0]).
+    void mov_r_based(R d, R base, int32_t disp) {
+        rex(true,(int)d,(int)base); emit(0x8B);
+        int rm = (int)base & 7;
+        if (rm == 4) { modrm(2,(int)d,4); emit(0x24); emit32(disp); } // rsp/r12 need SIB
+        else { modrm(2,(int)d,rm); emit32(disp); }
+    }
+    // mov [base+disp32], r64
+    void mov_based_r(R base, int32_t disp, R s) {
+        rex(true,(int)s,(int)base); emit(0x89);
+        int rm = (int)base & 7;
+        if (rm == 4) { modrm(2,(int)s,4); emit(0x24); emit32(disp); }
+        else { modrm(2,(int)s,rm); emit32(disp); }
+    }
+
     // ── LEA ──────────────────────────────────────────────────────────────────
     void lea_r_rbp8(R d, int8_t disp) {
         rex(true,(int)d,5); emit(0x8D); modrm(1,(int)d,5); emit((uint8_t)disp);
@@ -785,6 +805,8 @@ static bool callArgTakesDouble(const std::string& irName, int argIndex) {
         return argIndex == 2;
     if (irName == "ml.weights" || irName == "ml_weights")
         return argIndex == 0;
+    if (irName == "ml.optimize" || irName == "ml_optimize")
+        return argIndex == 0;
     if (irName.rfind("math.", 0) == 0)
         return !isIntReturningMathCall(irName);
     return false;
@@ -839,12 +861,110 @@ public:
     std::map<std::string,int>*   gvarSlots_       = nullptr;
     bool                         usesSave_        = false; // program uses `save as` (set by orchestrator)
     bool                         usesTry_         = false; // program uses try/catch (set by orchestrator)
+    bool                         usesGenerators_  = false; // program has a `yield` generator (set by orchestrator)
+    bool                         curFnIsGenerator_ = false; // true while compiling a generator body
+
+    // `yield`/generators: state-block field offsets (byte offsets into a heap-allocated block —
+    // see compileGeneratorFn's own comment for the full design). Both halves (gen-side and
+    // caller-side) save/restore the SAME register set — RSP/RBP/RBX/R12-R15 — because that's
+    // BOTH the exact set a fiber switch needs to preserve AND, not by coincidence,
+    // LinearScanAlloc::POOL's own allocation pool: any live temp the register allocator ever put
+    // in one of these registers survives a swap for free, symmetrically, with no extra spill
+    // logic anywhere (see emitFiberSwap's own comment).
+    static const int GEN_OFF_DONE        = 0;
+    static const int GEN_OFF_VALUE       = 8;
+    static const int GEN_OFF_GEN_RSP     = 16;
+    static const int GEN_OFF_GEN_RBP     = 24;
+    static const int GEN_OFF_GEN_RBX     = 32;
+    static const int GEN_OFF_GEN_R12     = 40;
+    static const int GEN_OFF_GEN_R13     = 48;
+    static const int GEN_OFF_GEN_R14     = 56;
+    static const int GEN_OFF_GEN_R15     = 64;
+    static const int GEN_OFF_GEN_RIP     = 72;
+    static const int GEN_OFF_CALLER_RSP  = 80;
+    static const int GEN_OFF_CALLER_RBP  = 88;
+    static const int GEN_OFF_CALLER_RBX  = 96;
+    static const int GEN_OFF_CALLER_R12  = 104;
+    static const int GEN_OFF_CALLER_R13  = 112;
+    static const int GEN_OFF_CALLER_R14  = 120;
+    static const int GEN_OFF_CALLER_R15  = 128;
+    static const int GEN_OFF_CALLER_RIP  = 136;
+    static const int GEN_HEADER_BYTES    = 144;  // args[] start here
+    static const int GEN_STACK_BYTES     = 65536;
+
+    // Loads the currently-active generator's state-block pointer (the "am I resuming, and which
+    // one" context a fiber-native design gets for free from its call stack — BNY has to thread it
+    // through this one global slot instead, same as every other backend's ac_gen_cur/lastGen*).
+    void loadGenCur(R dst) {
+        int slot = (*gvarSlots_)["__ac_gen_cur"];
+        em.mov_ri64_gvar(dst, slot);
+        em.mov_r_ptr(dst, dst);
+    }
+
+    // The actual two-way context switch. `state` holds the state-block pointer (MUST NOT be one
+    // of RSP/RBP/RBX/R12-R15 — those are exactly the registers being read/overwritten mid-
+    // sequence, so the base pointer itself would be corrupted partway through; callers always
+    // pass R11, which is caller-saved/volatile and never in LinearScanAlloc::POOL). Symmetric:
+    // save the currently-live side's registers + a resume label into its own half of the state
+    // block, then load the OTHER side's saved registers + jump to ITS resume point. Used by
+    // GEN_NEXT (caller→gen) and by YIELD/a generator's RETURN (gen→caller).
+    void emitFiberSwap(R state, bool intoGenerator) {
+        int selfRSP  = intoGenerator ? GEN_OFF_CALLER_RSP : GEN_OFF_GEN_RSP;
+        int selfRBP  = intoGenerator ? GEN_OFF_CALLER_RBP : GEN_OFF_GEN_RBP;
+        int selfRBX  = intoGenerator ? GEN_OFF_CALLER_RBX : GEN_OFF_GEN_RBX;
+        int selfR12  = intoGenerator ? GEN_OFF_CALLER_R12 : GEN_OFF_GEN_R12;
+        int selfR13  = intoGenerator ? GEN_OFF_CALLER_R13 : GEN_OFF_GEN_R13;
+        int selfR14  = intoGenerator ? GEN_OFF_CALLER_R14 : GEN_OFF_GEN_R14;
+        int selfR15  = intoGenerator ? GEN_OFF_CALLER_R15 : GEN_OFF_GEN_R15;
+        int selfRIP  = intoGenerator ? GEN_OFF_CALLER_RIP : GEN_OFF_GEN_RIP;
+        int otherRSP = intoGenerator ? GEN_OFF_GEN_RSP : GEN_OFF_CALLER_RSP;
+        int otherRBP = intoGenerator ? GEN_OFF_GEN_RBP : GEN_OFF_CALLER_RBP;
+        int otherRBX = intoGenerator ? GEN_OFF_GEN_RBX : GEN_OFF_CALLER_RBX;
+        int otherR12 = intoGenerator ? GEN_OFF_GEN_R12 : GEN_OFF_CALLER_R12;
+        int otherR13 = intoGenerator ? GEN_OFF_GEN_R13 : GEN_OFF_CALLER_R13;
+        int otherR14 = intoGenerator ? GEN_OFF_GEN_R14 : GEN_OFF_CALLER_R14;
+        int otherR15 = intoGenerator ? GEN_OFF_GEN_R15 : GEN_OFF_CALLER_R15;
+        int otherRIP = intoGenerator ? GEN_OFF_GEN_RIP : GEN_OFF_CALLER_RIP;
+
+        em.mov_based_r(state, selfRSP, R::RSP);
+        em.mov_based_r(state, selfRBP, R::RBP);
+        em.mov_based_r(state, selfRBX, R::RBX);
+        em.mov_based_r(state, selfR12, R::R12);
+        em.mov_based_r(state, selfR13, R::R13);
+        em.mov_based_r(state, selfR14, R::R14);
+        em.mov_based_r(state, selfR15, R::R15);
+        std::string resumeL = uniq("__ac_gen_resume_" + std::to_string(catchCounter_++) + "__");
+        em.lea_r_label(R::RAX, resumeL);        // RAX: safe scratch, `state` is R11 (see above)
+        em.mov_based_r(state, selfRIP, R::RAX);
+
+        em.mov_r_based(R::RSP, state, otherRSP);
+        em.mov_r_based(R::RBP, state, otherRBP);
+        em.mov_r_based(R::RBX, state, otherRBX);
+        em.mov_r_based(R::R12, state, otherR12);
+        em.mov_r_based(R::R13, state, otherR13);
+        em.mov_r_based(R::R14, state, otherR14);
+        em.mov_r_based(R::R15, state, otherR15);
+        em.mov_r_based(R::RAX, state, otherRIP);
+        em.jmp_r(R::RAX);
+        em.label(resumeL);
+    }
+    // `return` inside a generator body (explicit, or the implicit trailing one every function
+    // body ends with): mark done, swap back to the caller. No resume label is ever jumped back
+    // to afterward (GEN_NEXT's own done-check guards that), but emitFiberSwap emits one anyway —
+    // harmless, and keeps this one code path shared instead of a near-duplicate without it.
+    void emitGenReturnSwap() {
+        loadGenCur(R::R11);
+        em.mov_ri32(R::RAX, 1);
+        em.mov_based_r(R::R11, GEN_OFF_DONE, R::RAX);
+        emitFiberSwap(R::R11, false);
+    }
     // Bundle/class — shared (pointer, like gvarSlots_/promotedGlobals_) since instanceClass_ is
     // mutated live as CONSTRUCT calls are compiled, visible across whichever FuncCompiler
     // instance (global-section or a specific function) processes a given statement.
     std::map<std::string, std::vector<std::string>>* classFields_ = nullptr;
     std::map<std::string, std::string>* instanceClass_ = nullptr;
     std::map<std::string, std::set<std::string>>* classStringFields_ = nullptr;
+    std::map<std::string, std::string>* classReturnFuncs_ = nullptr;   // fn.name -> class name (see the prescan's comment)
     // widgets ilib var-kind map — pointer (like classFields_/instanceClass_ above) so a
     // WHOLE-PROGRAM prescan (a widget var built in one function, e.g. `<mainloop>`, is routinely
     // used from another — an on_click callback declared earlier in source, scanned first)
@@ -1011,7 +1131,9 @@ private:
         if (!isWidgetCtorName(func) || !ins.result.isValid()) return false;
         struct A { bool isStr; std::string def; };
         std::string newFn; std::vector<A> specs;
-        if (func == "Screen") { newFn = "ac_widgets_screen_new"; specs = {{true,"AC App"},{true,"800x600"}}; }
+        // title is mandatory (enforced at the ir.cpp level) — no geometry arg; use
+        // .dimensions(w, h) to size the window.
+        if (func == "Screen") { newFn = "ac_widgets_screen_new"; specs = {{true,"AC App"}}; }
         else if (func == "display") { newFn = "ac_widgets_display_new"; specs = {{false,"0"},{true,""}}; }
         else if (func == "ask") { newFn = "ac_widgets_ask_new"; specs = {{false,"0"},{false,"20"}}; }
         else if (func == "btn") { newFn = "ac_widgets_btn_new"; specs = {{false,"0"},{true,"Button"}}; }
@@ -1215,6 +1337,7 @@ private:
     std::vector<std::string> catchEntry_;  // pending catch-body ENTRY labels (longjmp landing pad)
     int catchCounter_ = 0;
     int ifCounter_ = 0;
+    int rangeCounter_ = 0;   // range/sequence ALLOC's own inline fill-loop labels (per-occurrence)
     // Per-function prefix for internally-generated labels. FuncCompiler is re-instantiated per
     // function so catchCounter_/ifCounter_ reset to 0 each time; without a prefix, two functions
     // both emit "__ac_idiv_ok_0__"/"__if0_else__" into the SHARED emitter map → applyFixups binds
@@ -1263,7 +1386,7 @@ private:
         em.mov_ri32(R::RDI, 2);
         em.mov_ri32(R::RDX, (int32_t)msg.size());
         em.mov_ri32(R::RAX, 1); em.syscall();      // write(2, msg)
-        em.mov_ri32(R::RAX, 60); em.mov_ri32(R::RDI, 1); em.syscall(); // exit(1)
+        em.mov_ri32(R::RAX, 231); em.mov_ri32(R::RDI, 1); em.syscall(); // exit(1)
     }
     // floatFuncs_ moved to public section above
 
@@ -1478,7 +1601,15 @@ private:
             em.mov_ri32(R::RCX, 0);
             em.call_rip_rel("ExitProcess"); // real IAT call, not a PLT-style direct call
         } else {
-            em.mov_ri32(R::RAX, 60);
+            // 231 = exit_group, NOT 60 = exit. Plain `exit` only terminates the CALLING
+            // thread — harmless for every purely-BNY-code program (single-threaded), but
+            // once a dynamically-linked ilib spawns its own background pthreads (verified:
+            // camera_demo.ac — libaccamera.so's OpenCV/GStreamer capture thread), the main
+            // thread's `exit(0)` left those threads running and the process never actually
+            // terminated (hung until each one's own internal ~15s timeout independently
+            // fired). exit_group kills every thread in the process and is identical to
+            // plain exit for the single-threaded case, so this is a strict, safe upgrade.
+            em.mov_ri32(R::RAX, 231);
             em.xor_rr(R::RDI, R::RDI);
             em.syscall();
         }
@@ -1620,7 +1751,18 @@ private:
         if (method.rfind("ml.", 0) == 0 || method.rfind("os.", 0) == 0 ||
             method.rfind("regex.", 0) == 0 || method.rfind("stringm.", 0) == 0 ||
             method.rfind("web.", 0) == 0 || method.rfind("ncpu.", 0) == 0 ||
-            method.rfind("maudio.", 0) == 0) {
+            method.rfind("maudio.", 0) == 0 ||
+            // camera/sidebar/screen/aczip/server were missing from this allowlist — the
+            // REAL reason every one of their calls was broken, not just an unresolved-label
+            // gap: falling through this whole block sent them into the "Term.display" LIB_CALL
+            // fallback further down (which also matches on "method, arg" shape), so e.g.
+            // `sidebar.config($mode$, $manual$)` printed "mode" as if it were `Term.display
+            // $mode$` instead of calling ac_sidebar_config at all (verified: camera_demo.ac's
+            // BNY output had stray "mode"/"0,0,320,240"/"0"/"Ready to capture." lines — its
+            // own string args, printed — interleaved with the real output).
+            method.rfind("camera.", 0) == 0 || method.rfind("sidebar.", 0) == 0 ||
+            method.rfind("screen.", 0) == 0 || method.rfind("aczip.", 0) == 0 ||
+            method.rfind("server.", 0) == 0) {
             if (method == "ml.weights" && ins.typedOperands.size() >= 3) {
                 load(ins.typedOperands[1], R::RAX);
                 if (isFloatRef(ins.typedOperands[1])) em.movq_xmm0_from_gpr(R::RAX);
@@ -1763,40 +1905,57 @@ private:
                         }
                     }
                     if (srcIsString) markDstString(dst);
-                    if (srcIsFloat) {
+                    // A float source landing on an `atomic` destination needs a real
+                    // truncating float->int conversion, not a raw bit copy — `atomic` is
+                    // always an int variable (its own doc comment, token.hpp), and this is
+                    // exactly the plain-reassignment path ir.cpp's sticky-keep routes
+                    // through as a STORE_VAR (not TYPE_CAST) once a var's type doesn't
+                    // change, e.g. `atomic x = 5; x = 5.5` stays ATOMIC end-to-end. Missing
+                    // this let 5.5's raw IEEE754 bits land straight in x's int slot
+                    // (verified: printed as the huge decimal those bits read as, not `5`)
+                    // — including this float-tracking mark below, which ran unconditionally
+                    // and made a LATER Term.display of x print via the float path even
+                    // after the value itself got correctly truncated to an int.
+                    bool dstIsAtomic = dst.kind == AC_IR::IRRef::Kind::VAR
+                        && atomicVarNames_.count(varName(dst));
+                    if (srcIsFloat && !dstIsAtomic) {
                         if (dst.kind == AC_IR::IRRef::Kind::TEMP) floatTempIds_.insert(dst.id);
                         else if (dst.kind == AC_IR::IRRef::Kind::VAR) {
                             std::string vn = varName(dst);
                             if (!vn.empty()) floatVarNames_.insert(vn);
                         }
                     }
-                    load(src, R::RAX);
-                    // Storing an int value into a float-typed destination: convert to double
-                    // so the bit pattern is a valid IEEE-754 value, not a raw integer.
-                    if (!srcIsFloat && isFloatRef(dst)) {
-                        em.cvtsi2sd_xmm0_from_gpr(R::RAX);
-                        em.movq_gpr_from_xmm0(R::RAX);
+                    if (srcIsFloat && dstIsAtomic) {
+                        load(src, R::RAX);
+                        em.movq_xmm0_from_gpr(R::RAX);
+                        em.cvttsd2si_rax_xmm0();
+                        store(dst, R::RAX);
+                    } else {
+                        load(src, R::RAX);
+                        // Storing an int value into a float-typed destination: convert to double
+                        // so the bit pattern is a valid IEEE-754 value, not a raw integer.
+                        if (!srcIsFloat && isFloatRef(dst)) {
+                            em.cvtsi2sd_xmm0_from_gpr(R::RAX);
+                            em.movq_gpr_from_xmm0(R::RAX);
+                        }
+                        store(dst, R::RAX);
                     }
-                    store(dst, R::RAX);
                 }
             };
-            // `atomic` var reassignment (`x = x + 1`, ...): wrap the WHOLE statement (the read
-            // of the current value that computed `src`, plus this write) in the real spinlock —
-            // same statement-level critical section every other backend's `atomic` codegen uses.
-            auto isAtomicDst = [&](const AC_IR::IRRef& dst) {
-                return dst.kind == AC_IR::IRRef::Kind::VAR
-                    && atomicVarNames_.count(varName(dst)) > 0;
-            };
+            // `atomic` var reassignment: no inline spinlock wrap here anymore. The IR
+            // lowering (ir.cpp's emitCompoundRef/AssignStmt) now brackets the WHOLE
+            // read-modify-write span with real LOCK_BEGIN/LOCK_END instructions (see
+            // the IROpcode::LOCK_BEGIN/LOCK_END cases below), closing the TOCTOU race
+            // this old single-store wrap could never actually close — despite this
+            // comment's own earlier claim, it only ever locked THIS instruction; the
+            // read that computed `src` for a compound update (`x = x + 1`) was always a
+            // separate, earlier, unlocked ADD instruction. Leaving this old wrap in
+            // place too would double-acquire the spinlock and deadlock (it's not
+            // reentrant — see xchg_ptr_r's own comment).
             if (ins.result.isValid()) {
-                bool atomic = isAtomicDst(ins.result);
-                if (atomic) em.call("__ac_atomic_lock__");
                 handleSrc(op0(), ins.result);
-                if (atomic) em.call("__ac_atomic_unlock__");
             } else if (ops.size() >= 2) {
-                bool atomic = isAtomicDst(ops[0]);
-                if (atomic) em.call("__ac_atomic_lock__");
                 handleSrc(ops[1], ops[0]);
-                if (atomic) em.call("__ac_atomic_unlock__");
             }
             break;
         }
@@ -1836,6 +1995,26 @@ private:
             case IRType::SHORT:   // native BNY has no sub-word slots; short/mini use the 64-bit
             case IRType::MINI:    // integer path (width advisory here — no manual truncation)
             case IRType::INT:
+                // Automatic-retype (ir.cpp's AssignStmt) can emit a `resultType==INT`
+                // TYPE_CAST for a var that's ALREADY tracked float from an EARLIER cast in
+                // this same var's lifetime (`x=5; x=5.5; x=10` — the third assignment is
+                // its own INT-typed TYPE_CAST, since ITS OWN literal is an int, even though
+                // `x` conceptually stays float for the rest of the program — every OTHER
+                // backend's emitTypeCast already defends against this by checking `floatVars
+                // .count(var) || t==FLOAT` before dispatching on `t` alone; BNY dispatched
+                // purely on `ins.resultType` with no such check). Without this, `x`'s slot
+                // got the RAW INT64 BITS of 10 while every later read still (correctly)
+                // treated the slot as a double — printing the denormalized bit-reinterpretation
+                // garbage of int64 10 as a float instead of 10.0.
+                if (isFloatRef(ins.result)) {
+                    load(ops[0], R::RDI);
+                    if (srcIsStr) { em.call("__ac_atoi__"); em.cvtsi2sd_xmm0_from_gpr(R::RAX); }
+                    else if (!isFloatRef(ops[0])) em.cvtsi2sd_xmm0_from_gpr(R::RDI);
+                    else em.movq_xmm0_from_gpr(R::RDI);
+                    em.movq_gpr_from_xmm0(R::RAX);
+                    store(ins.result, R::RAX);
+                    break;
+                }
                 load(ops[0], R::RDI);
                 if (srcIsStr) {
                     em.call("__ac_atoi__");
@@ -1857,7 +2036,19 @@ private:
                 }
                 load(ops[0], R::RDI);
                 em.call("__ac_atomic_lock__");
-                em.mov_rr(R::RAX, R::RDI);
+                // `atomic` is always an int variable (see its own doc comment, token.hpp) —
+                // a float source needs a real truncating conversion here, same as the
+                // plain-INT case right above this one already does. Missing this let a
+                // raw double bit-pattern get copied straight into an atomic var's slot
+                // (verified: `atomic x = 5; x = 5.5` printed 5.5's IEEE754 bits reinterpreted
+                // as a huge int64, not 5) — a plain register copy is only correct when the
+                // source is already a genuine integer.
+                if (isFloatRef(ops[0])) {
+                    em.movq_xmm0_from_gpr(R::RDI);
+                    em.cvttsd2si_rax_xmm0();
+                } else {
+                    em.mov_rr(R::RAX, R::RDI);
+                }
                 store(ins.result, R::RAX);
                 em.call("__ac_atomic_unlock__");
                 break;
@@ -1886,6 +2077,16 @@ private:
                 if (srcIsStr) {
                     load(ops[0], R::RAX);          // already a string — copy the pointer
                 } else if (isFloatRef(ops[0])) {
+                    // float→string: truncate to int, then itoa. NOT a bug — matches every
+                    // other typed backend's own to_string(float) (C/C++/V all truncate the
+                    // same way via an implicit double->int argument conversion into their
+                    // own int-only ac_to_str helpers; see CStrategy's ac_to_str(ac_int n)).
+                    // A real digit-formatting version (__ac_dtoa__, still defined below)
+                    // was tried here first, but it broke dec_to_bin.ac — its algorithm
+                    // builds a binary string by concatenating to_string(math.mod(n,2)) one
+                    // digit at a time, relying on "1"/"0", not "1.0"/"0.0" — and made BNY
+                    // diverge from C/C++/V's matching (if imperfect) convention. Keep the
+                    // three consistent rather than "fixing" this one in isolation.
                     load(ops[0], R::RDI);          // float→string: truncate to int, then itoa
                     em.movq_xmm0_from_gpr(R::RDI);
                     em.cvttsd2si_rax_xmm0();
@@ -2232,6 +2433,27 @@ private:
                     }
                 }
             }
+            // Same "zero-arg dot-call-with-parens takes a different IR path than a with-args
+            // one" gap, this time for a BUNDLE INSTANCE method call (`q.getx()`, no args) — the
+            // WITH-args case (`p.setx(5)`) already has this exact check inside LIB_CALL's own
+            // handling (see its `instanceClass_->count(recv)` block); a zero-arg call never
+            // reaches LIB_CALL at all, so it needs the identical check here too. Verified real
+            // bug: "BNY: undefined label 'q.getx' referenced" — fell all the way through to
+            // treating the dotted text as a literal (nonexistent) function label.
+            {
+                auto dot = rawFn.find('.');
+                if (dot != std::string::npos && instanceClass_ && instanceClass_->count(rawFn.substr(0, dot))) {
+                    std::string recv = rawFn.substr(0, dot);
+                    std::string mname = rawFn.substr(dot + 1);
+                    std::string cls = instanceClass_->at(recv);
+                    loadNamedVar(recv, R::RDI);
+                    for (size_t ai = 1; ai < ops.size() && ai < abi.argRegs.size(); ai++)
+                        load(ops[ai], abi.argRegs[ai]);
+                    em.call(cls + "_" + mname);
+                    if (ins.result.isValid()) store(ins.result, R::RAX);
+                    break;
+                }
+            }
             // `c = Critter()` — bundle construction. Must be checked against the RAW function
             // name, BEFORE resolveFunc's using-namespace prefixing runs: no function is ever
             // literally named "Critter" (only class-qualified METHODS like "Critter_init" are,
@@ -2300,7 +2522,7 @@ private:
                 break;
             }
             bool floatReturn = isFloatReturningCall(fn);
-            if ((fn == "ml.weights" || fn == "ml_weights") && ops.size() >= 3) {
+            if ((fn == "ml.weights" || fn == "ml_weights" || fn == "ml.optimize" || fn == "ml_optimize") && ops.size() >= 3) {
                 load(ops[1], R::RAX);
                 if (isFloatRef(ops[1])) em.movq_xmm0_from_gpr(R::RAX);
                 else                    em.cvtsi2sd_xmm0_from_gpr(R::RAX);
@@ -2342,18 +2564,113 @@ private:
                     if (!vn.empty()) stringVarNames_.insert(vn);
                 }
             }
-            if (ins.result.isValid())
+            if (ins.result.isValid()) {
                 store(ins.result, R::RAX);
+                // `q = f()` where f always constructs+returns one bundle class
+                // (classReturnFuncs_'s prescan) — same treatment as a direct construct-call
+                // (see its own block above) for resolveFieldAccess's instanceClass_ lookup,
+                // even though the instance arrived across a function-return boundary. Verified
+                // real bug: without this, `q.x` after `q = f()` silently read a field OFFSET
+                // from whatever garbage/zeroed memory `q`'s own (wrongly untracked) slot held,
+                // printing 0 instead of the real value — not a crash, just silently wrong.
+                if (classReturnFuncs_ && ins.result.kind == AC_IR::IRRef::Kind::VAR) {
+                    auto crf = classReturnFuncs_->find(rawFn);
+                    if (crf != classReturnFuncs_->end()) {
+                        std::string resName = varName(ins.result);
+                        if (!resName.empty() && instanceClass_) (*instanceClass_)[resName] = crf->second;
+                    }
+                }
+            }
             break;
         }
 
         case IROpcode::RETURN:
+            // A generator's `return` (explicit or implicit-trailing) ends iteration, discarding
+            // any value — matches every other backend's documented non-goal (no StopIteration
+            // value). It never falls through to the normal call/ret epilogue below: nothing
+            // ever `call`s into a generator body in the first place (see compileGeneratorFn),
+            // so there's no return address on this stack to `ret` to.
+            if (curFnIsGenerator_) { emitGenReturnSwap(); break; }
             if (!ops.empty())
                 load(ops[0], R::RAX);
             else
                 em.mov_ri32(R::RAX, 0);
             emitEpilogue();
             break;
+
+        case IROpcode::YIELD: {
+            R val = ops.empty() ? R::RAX : load(ops[0], R::RAX);
+            loadGenCur(R::R11);
+            em.mov_based_r(R::R11, GEN_OFF_VALUE, val);
+            emitFiberSwap(R::R11, false);   // gen -> caller; falls back through on next GEN_NEXT
+            break;
+        }
+
+        case IROpcode::GEN_CREATE: {
+            // ops[0] = mkVar(calleeName) (matches CALL's own callee-ref convention), ops[1..] =
+            // the generator's arguments.
+            std::string calleeName = varName(ops[0]);
+            int nargs = (int)ops.size() - 1;
+            int totalBytes = GEN_HEADER_BYTES + 8 * nargs;
+            totalBytes = (totalBytes + 15) & ~15;   // keep __ac_alloc__'s bump cursor 16-aligned
+                                                     // for the stack allocation right after
+            em.mov_ri32(abi.argRegs[0], totalBytes);
+            em.call("__ac_alloc__");                // rax = state block
+            em.push_r(R::RAX);
+            em.mov_ri32(abi.argRegs[0], GEN_STACK_BYTES);
+            em.call("__ac_alloc__");                // rax = fiber stack base
+            em.mov_rr(R::R10, R::RAX);
+            em.pop_r(R::R11);                       // r11 = state block, r10 = stack base
+
+            // Stack top = align_down_16(base + size) — stacks grow down; align defensively
+            // rather than trust the bump allocator's own running alignment (see the 16-round
+            // above, which only guarantees THIS call started aligned, not that every earlier
+            // caller of __ac_alloc__ elsewhere in the program did the same).
+            em.add_ri32(R::R10, GEN_STACK_BYTES);
+            em.mov_ri32(R::RAX, -16);
+            em.and_rr(R::R10, R::RAX);
+
+            em.mov_ri32(R::RAX, 0);
+            em.mov_based_r(R::R11, GEN_OFF_DONE, R::RAX);
+            em.mov_based_r(R::R11, GEN_OFF_GEN_RSP, R::R10);
+            // genRBP/RBX/R12-R15 are left uninitialized: the body's own prologue (push_rbp;
+            // mov_rbp_rsp) overwrites RBP immediately, and RBX/R12-R15 are pure scratch until
+            // the body's FIRST yield/return saves real values into them — nothing ever reads
+            // these particular slots before that first save writes them for real (locals live
+            // on the fiber's own stack, not in these slots — see compileGeneratorFn's comment).
+            em.lea_r_label(R::RAX, calleeName);     // generator body is compiled under its own name
+            em.mov_based_r(R::R11, GEN_OFF_GEN_RIP, R::RAX);
+
+            for (int i = 0; i < nargs; i++) {
+                R v = load(ops[1 + i], R::RAX);
+                em.mov_based_r(R::R11, GEN_HEADER_BYTES + 8 * i, v);
+            }
+            store(ins.result, R::R11);
+            break;
+        }
+
+        case IROpcode::GEN_NEXT: {
+            load(ops[0], R::R11);                   // r11 = handle
+            std::string skipL = uniq("__ac_gen_skip_" + std::to_string(catchCounter_++) + "__");
+            em.mov_r_based(R::RAX, R::R11, GEN_OFF_DONE);
+            em.test_rr(R::RAX, R::RAX);
+            em.jne(skipL);                          // never resume an already-done fiber
+            em.mov_ri64_gvar(R::RAX, (*gvarSlots_)["__ac_gen_cur"]);
+            em.mov_ptr_r(R::RAX, R::R11);            // ac_gen_cur = handle, so the body's own
+                                                       // prologue/YIELD/RETURN can find it
+            emitFiberSwap(R::R11, true);              // caller -> gen (resumes here on next yield)
+            em.label(skipL);
+            em.mov_r_based(R::RAX, R::R11, GEN_OFF_VALUE);
+            store(ins.result, R::RAX);
+            break;
+        }
+
+        case IROpcode::GEN_DONE: {
+            load(ops[0], R::R11);
+            em.mov_r_based(R::RAX, R::R11, GEN_OFF_DONE);
+            store(ins.result, R::RAX);
+            break;
+        }
 
         case IROpcode::LIB_CALL:
             emitLibCall(ins);
@@ -2460,7 +2777,7 @@ private:
 
         // ── #29: these were silently DROPPED (no case → try+catch both ran, /stop ignored) ──
         case IROpcode::SOFT_HALT:            // /stop — graceful exit(0)
-            em.mov_ri32(R::RAX, 60);
+            em.mov_ri32(R::RAX, 231);
             em.xor_rr(R::RDI, R::RDI);
             em.syscall();
             break;
@@ -2596,15 +2913,23 @@ private:
 
         // ─── Phase 3: Memory & Pointers (Stubs - pointers not in AC yet) ─────
         case IROpcode::ALLOC: {
-            // dict = alloc "dict", "$k$:v,..." → heap block: [n][k0][v0][k1][v1]...
+            // dict = alloc "dict", "$k$:v,..." → heap block: [cap][n][k0][v0][k1][v1]...
+            // Hidden capacity word at ptr[-8] (one slot before the n word every other
+            // dict-reading path already knows about — length/get only ever read ptr[0]=n
+            // and ptr[8+16i]/ptr[16+16i] for keys/values) — mirrors the array literal's
+            // [cap][len][e0]... header. Lets __ac_dict_set__ grow in place (amortized O(1))
+            // instead of allocating+copying on every single insert.
             if (!ops.empty() && ops[0].kind == AC_IR::IRRef::Kind::CONST
                 && ops[0].value.type == AC_IR::IRType::STRING
                 && std::get<std::string>(ops[0].value.data) == "dict"
                 && ins.result.isValid()) {
-                em.mov_ri32(R::RDI, 8);
+                em.mov_ri32(R::RDI, 16 * (8 + 1));      // seed cap = 8 pairs
                 em.call("__ac_alloc__");
+                em.mov_ri32(R::RCX, 8);
+                em.mov_ptr_r(R::RAX, R::RCX);          // raw[0] = cap
+                em.add_ri32(R::RAX, 8);                // rax = ptr (skip cap word)
                 em.mov_ri32(R::RCX, 0);
-                em.mov_ptr_r(R::RAX, R::RCX);          // [block] = n = 0
+                em.mov_ptr_r(R::RAX, R::RCX);          // ptr[0] = n = 0
                 store(ins.result, R::RAX);
                 markDstDict(ins.result);
                 // materialize literal pairs via __ac_dict_set__ (block may move on growth)
@@ -2639,6 +2964,131 @@ private:
                     em.call("__ac_dict_set__");
                     store(ins.result, R::RAX);         // possibly-moved block
                 }
+                break;
+            }
+            // range N → [0..N-1]; sequence(a,b) → [a..b-1] (both exclusive upper bound, step 1;
+            // xrange/xiota/stream/iota all desugar to one of these two — see ir.cpp). A REAL
+            // materialized array, same [cap][len][elems] layout "list" uses below, computed via
+            // a runtime fill loop since the bound(s) may be dynamic, not compile-time literals.
+            // Verified real bug this closes: NEITHER kind was ever handled here at all before —
+            // `ins.result` was simply never stored to, leaving it holding whatever was already
+            // in that slot (stale stack/register value, non-deterministic under ASLR) —
+            // `Term.display iota 5` printed a huge random-looking integer instead of the range.
+            if (!ops.empty() && ops[0].kind == AC_IR::IRRef::Kind::CONST
+                && ops[0].value.type == AC_IR::IRType::STRING
+                && (std::get<std::string>(ops[0].value.data) == "range"
+                 || std::get<std::string>(ops[0].value.data) == "sequence")
+                && ins.result.isValid()) {
+                // Unique per-occurrence labels — this block is INLINED at every call site (not
+                // a shared subroutine like ac_print_double), so a function with more than one
+                // range/sequence/xrange/xiota/stream in it needs each instance's labels to be
+                // distinct. Verified real bug: without this, two such ALLOCs in one function
+                // both defined "__acr_fill__" etc into the SAME shared label map — the SECOND
+                // definition wins for BOTH occurrences (same class of collision the FATAL
+                // cross-function fix above this class already closed, just within one function
+                // instead of across two) — every EARLIER range/sequence in that function silently
+                // printed nothing (its jumps landed in the LAST occurrence's fill loop instead).
+                std::string cntokL = uniq("__acr" + std::to_string(rangeCounter_) + "_cntok__");
+                std::string fillL  = uniq("__acr" + std::to_string(rangeCounter_) + "_fill__");
+                std::string doneL  = uniq("__acr" + std::to_string(rangeCounter_) + "_filldone__");
+                rangeCounter_++;
+                bool isRange = std::get<std::string>(ops[0].value.data) == "range";
+                // `sequence(a,b,step)`/`stream(a,b,step)` carry an explicit 3rd/step operand
+                // (see ir.cpp's SequenceExpr/StreamExpr lowering, sops[3]). Verified real bug
+                // this closes: this materialize-as-array path always assumed step==1 (count =
+                // end-start, fill via start+i) — a step operand was computed by the caller but
+                // never read here at all, silently ignored (only the far more common direct
+                // `FOR v in sequence(a,b,step)` loop, a completely separate lowering path in
+                // ir.cpp, honored it). `range`/`iota` have no step concept (always 0..N-1).
+                bool hasStep = !isRange && ops.size() >= 4;
+                if (isRange) {
+                    em.mov_ri32(R::R13, 0);
+                    R endR = load(ops[1], R::R14);
+                    if (endR != R::R14) em.mov_rr(R::R14, endR);
+                } else {
+                    R startR = load(ops[1], R::R13);
+                    if (startR != R::R13) em.mov_rr(R::R13, startR);
+                    R endR = load(ops.size() >= 3 ? ops[2] : ops[1], R::R14);
+                    if (endR != R::R14) em.mov_rr(R::R14, endR);
+                }
+                if (hasStep) {
+                    R stepR = load(ops[3], R::R12);
+                    if (stepR != R::R12) em.mov_rr(R::R12, stepR);
+                }
+                if (!hasStep) {
+                    em.mov_rr(R::R15, R::R14);
+                    em.sub_rr(R::R15, R::R13);          // r15 = count = end - start
+                    em.cmp_r_i32(R::R15, 0);
+                    em.jge(cntokL);
+                    em.mov_ri32(R::R15, 0);              // clamp: descending/empty range → 0 elements
+                    em.label(cntokL);
+                } else {
+                    // Pass 1: count iterations by walking start→end in `step` increments
+                    // (R11: iterator copy, not in the allocator's pool, safe scratch here).
+                    // Direction (ascending vs. descending) is decided at RUNTIME from step's
+                    // actual sign in R12 — a literal `-3` step lowers to a SUB(0,3) temp, not
+                    // a negative CONST IRRef (constant folding, if it runs, keeps this operand
+                    // as a TEMP backed by a LOAD_CONST rather than rewriting the ALLOC's operand
+                    // list itself — verified by testing), so a compile-time-only sign check
+                    // (mirroring the FOR-loop lowering's own limited negStep heuristic, ir.cpp
+                    // ~5107) silently misses every literal-negative-step case here. A real
+                    // runtime branch handles literal, computed, and variable steps uniformly.
+                    std::string descL   = uniq("__acr" + std::to_string(rangeCounter_) + "_desc__");
+                    std::string cloopAL = uniq("__acr" + std::to_string(rangeCounter_) + "_cloopA__");
+                    std::string cloopDL = uniq("__acr" + std::to_string(rangeCounter_) + "_cloopD__");
+                    em.mov_ri32(R::R15, 0);              // count
+                    em.mov_rr(R::R11, R::R13);           // iter = start
+                    em.cmp_r_i32(R::R12, 0);
+                    em.jl(descL);
+                    em.label(cloopAL);
+                    em.cmp_rr(R::R11, R::R14);
+                    em.jge(cntokL);
+                    em.inc_r(R::R15);
+                    em.add_rr(R::R11, R::R12);
+                    em.jmp(cloopAL);
+                    em.label(descL);
+                    em.label(cloopDL);
+                    em.cmp_rr(R::R11, R::R14);
+                    em.jle(cntokL);
+                    em.inc_r(R::R15);
+                    em.add_rr(R::R11, R::R12);
+                    em.jmp(cloopDL);
+                    em.label(cntokL);
+                }
+                em.mov_rr(R::RDI, R::R15);
+                em.add_ri32(R::RDI, 2);
+                em.shl_r_i8(R::RDI, 3);              // rdi = (count+2)*8 bytes
+                em.call("__ac_alloc__");
+                em.mov_ptr_r(R::RAX, R::R15);        // raw[0] = cap = count
+                em.add_ri32(R::RAX, 8);              // rax = ptr (skip cap word)
+                em.mov_rr(R::RBX, R::RAX);           // rbx = ptr, held through the fill loop
+                em.mov_ptr_r(R::RBX, R::R15);        // ptr[0] = len = count
+                em.mov_rr(R::RDX, R::RBX); em.add_ri32(R::RDX, 8); // rdx = &ptr[1], write cursor
+                em.mov_ri32(R::RCX, 0);              // rcx = loop index i
+                if (!hasStep) {
+                    em.label(fillL);
+                    em.cmp_rr(R::RCX, R::R15);
+                    em.jge(doneL);
+                    em.mov_rr(R::RAX, R::R13);
+                    em.add_rr(R::RAX, R::RCX);           // rax = start + i
+                    em.mov_ptr_r(R::RDX, R::RAX);
+                    em.add_ri32(R::RDX, 8);
+                    em.inc_r(R::RCX);
+                    em.jmp(fillL);
+                    em.label(doneL);
+                } else {
+                    em.mov_rr(R::R11, R::R13);           // iter = start (reset for pass 2)
+                    em.label(fillL);
+                    em.cmp_rr(R::RCX, R::R15);
+                    em.jge(doneL);
+                    em.mov_ptr_r(R::RDX, R::R11);
+                    em.add_ri32(R::RDX, 8);
+                    em.add_rr(R::R11, R::R12);           // iter += step
+                    em.inc_r(R::RCX);
+                    em.jmp(fillL);
+                    em.label(doneL);
+                }
+                store(ins.result, R::RBX);
                 break;
             }
             // arr = alloc "list", "e0,e1,..."  → heap block: [len][e0][e1]...
@@ -2677,11 +3127,23 @@ private:
                 }
             }
             int64_t N = (int64_t)elems.size();
-            em.mov_ri32(R::RDI, (int32_t)((N + 1) * 8));
-            em.call("__ac_alloc__");                  // RAX = block ptr
+            // Layout: [cap][len][e0][e1]...  — a hidden capacity word lives ONE slot before
+            // the length word that every other array-reading path already knows about
+            // (indexing/iteration/print all only ever touch ptr[0]=len and ptr[8+8i]=elem_i,
+            // completely unaware ptr[-8] exists). This lets __ac_append__ grow in place
+            // (O(1) amortized, capacity-doubling) without any other code path changing —
+            // "ptr" returned here still means exactly what it always meant. Every array must
+            // be created here (the only ALLOC "list" site in BNY) so every array consistently
+            // carries this header; seed cap >= 4 so small lists don't immediately re-grow.
+            int64_t CAP0 = N > 4 ? N : 4;
+            em.mov_ri32(R::RDI, (int32_t)((CAP0 + 2) * 8));
+            em.call("__ac_alloc__");                  // RAX = raw block
+            em.mov_ri32(R::RCX, (int32_t)CAP0);
+            em.mov_ptr_r(R::RAX, R::RCX);             // raw[0] = cap
+            em.add_ri32(R::RAX, 8);                   // RAX = ptr (skip cap word)
             em.mov_ri32(R::RCX, (int32_t)N);
-            em.mov_ptr_r(R::RAX, R::RCX);             // [block] = length
-            em.mov_rr(R::RDX, R::RAX); em.add_ri32(R::RDX, 8); // RDX = &block[1]
+            em.mov_ptr_r(R::RAX, R::RCX);             // ptr[0] = length
+            em.mov_rr(R::RDX, R::RAX); em.add_ri32(R::RDX, 8); // RDX = &ptr[1]
             for (int64_t k = 0; k < N; k++) {
                 if (!elems[k].funcLabel.empty())
                     em.lea_r_label(R::RCX, elems[k].funcLabel);
@@ -2789,6 +3251,46 @@ private:
             break;
         }
 
+        // Event-listener (`configure event-listener`/`on value is X`/`bind KEY to FUNC`) —
+        // see emitEventBindLinux/emitEventTriggerLinux's own header comment for why BNY needed
+        // this ported specially (no fixed .bss array primitive). ops = {key_const, callback_var}
+        // for EVENT_BIND (mirrors ir.cpp's `i.typedOperands = {mkConst(key), mkVar(cbName)}`),
+        // {key_const} for EVENT_TRIGGER.
+        case IROpcode::EVENT_BIND:
+            if (ops.size() >= 2 && ops[0].kind == IRRef::Kind::CONST
+                && ops[0].value.type == AC_IR::IRType::STRING) {
+                std::string key = std::get<std::string>(ops[0].value.data);
+                if (key.size() >= 2 && key.front() == '$' && key.back() == '$')
+                    key = key.substr(1, key.size() - 2);
+                int sid = sp.add(key);
+                em.mov_ri64_str(R::RDI, sid);
+                em.lea_r_label(R::RSI, funcName(ops[1]));
+                em.call("__ac_bind__");
+            }
+            break;
+        case IROpcode::EVENT_TRIGGER:
+            if (!ops.empty() && ops[0].kind == IRRef::Kind::CONST
+                && ops[0].value.type == AC_IR::IRType::STRING) {
+                std::string key = std::get<std::string>(ops[0].value.data);
+                if (key.size() >= 2 && key.front() == '$' && key.back() == '$')
+                    key = key.substr(1, key.size() - 2);
+                int sid = sp.add(key);
+                em.mov_ri64_str(R::RDI, sid);
+                em.call("__ac_trigger__");
+            }
+            break;
+
+        // `atomic` read-modify-write brackets (see the STORE_VAR case's own comment
+        // above, and ir.cpp's emitCompoundRef/AssignStmt) — the same real spinlock
+        // every atomic var already uses, just held across the whole bracketed span
+        // instead of a single instruction.
+        case IROpcode::LOCK_BEGIN:
+            em.call("__ac_atomic_lock__");
+            break;
+        case IROpcode::LOCK_END:
+            em.call("__ac_atomic_unlock__");
+            break;
+
         case IROpcode::NOP:
         default:
             break;
@@ -2830,11 +3332,35 @@ public:
                               : (ins.typedOperands.size() >= 2 ? ins.typedOperands[1] : IRRef());
                     bool srcFloat = (src.kind == IRRef::Kind::CONST && src.value.type == IRType::FLOAT)
                                  || isFloatRef(src);
-                    if (srcFloat) {
+                    // A STORE_VAR whose OWN resultType is a non-float qualifier (ATOMIC/
+                    // SHORT/MINI) means the value is being COERCED into that type at this
+                    // exact store, not turning the var float — ir.cpp's sticky-keep emits
+                    // a plain STORE_VAR (not TYPE_CAST) whenever a var's type doesn't
+                    // actually change, e.g. `atomic x = 5; x = 5.5` stays ATOMIC
+                    // end-to-end, so the literal source being float-typed doesn't mean x
+                    // itself should be. Verified real bug this closes: without this guard
+                    // x got marked float program-wide from that LATER store, corrupting
+                    // the EARLIER `x += 3` (computed/stored assuming x was a genuine
+                    // double, garbage result) even though it runs first.
+                    bool coercedNonFloat = ins.resultType != IRType::VOID
+                        && ins.resultType != IRType::FLOAT
+                        && (ins.resultType == IRType::ATOMIC || irIntWidth(ins.resultType));
+                    if (srcFloat && !coercedNonFloat) {
                         if (ins.result.isValid()) markDstFloat(ins.result);
                         else if (ins.typedOperands.size() >= 2) markDstFloat(ins.typedOperands[0]);
                     }
                 }
+                // TYPE_CAST to FLOAT — needed for automatic-retype (ir.cpp's AssignStmt: a
+                // plain reassignment auto-inserts a TYPE_CAST the moment a var's value type
+                // changes, e.g. `x=5; x=5.5;`). Without this, `x`'s FIRST assignment (a
+                // plain STORE_VAR, emitted before the fixpoint has ever seen the LATER
+                // TYPE_CAST) had no way to know `x` would eventually be float, so it stored
+                // a real int64 that every subsequent float-typed read then reinterpreted as
+                // raw double bits (verified: printed a denormalized garbage float instead
+                // of the real integer value for the pre-retype print).
+                if (ins.opcode == IROpcode::TYPE_CAST && ins.resultType == IRType::FLOAT
+                    && ins.result.isValid())
+                    markDstFloat(ins.result);
                 // DIV always produces float
                 if ((ins.opcode == IROpcode::DIV || ins.opcode == IROpcode::FDIV) && ins.result.isValid()) markDstFloat(ins.result);
                 // Arithmetic with any float operand → float result
@@ -2925,7 +3451,14 @@ public:
                 if (ins.opcode == OP::ALLOC && ins.result.isValid() && !ins.typedOperands.empty()
                     && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::CONST
                     && ins.typedOperands[0].value.type == AC_IR::IRType::STRING
-                    && std::get<std::string>(ins.typedOperands[0].value.data) == "list") {
+                    && (std::get<std::string>(ins.typedOperands[0].value.data) == "list"
+                     || std::get<std::string>(ins.typedOperands[0].value.data) == "range"
+                     || std::get<std::string>(ins.typedOperands[0].value.data) == "sequence")) {
+                    // `range N`/`iota N` (desugars to "range") and `sequence(a,b)`/`xrange`/
+                    // `xiota`/`stream` (desugar to "sequence") are, on BNY, materialized as REAL
+                    // arrays with the exact same [cap][len][elems] layout "list" uses (see the
+                    // new ALLOC case below) — they need the same array-print/length/index
+                    // dispatch as "list", so they must be recognized here too.
                     markA(ins.result);
                 } else if (ins.opcode == OP::STORE_VAR && ins.result.isValid()
                            && !ins.typedOperands.empty() && isArrRef(ins.typedOperands[0])) {
@@ -3049,6 +3582,20 @@ public:
         currentClass_ = fn.classOwner;
         labelPrefix_ = "__fn_" + label + "_";
         buildLocalVarIds(fn.instructions);
+        // A bundle/tuple-instance parameter referenced ONLY via dotted field access
+        // ("p.x"/"p.y", each its own separate symbol) never appears as a bare "p" VAR anywhere
+        // in fn.instructions — buildLocalVarIds' scan (just above) can't find it, so
+        // loadNamedVar("p", ...) (the field-access base-pointer load resolveFieldAccess routes
+        // through) silently fell through to its "shouldn't happen" `mov $0, reg` fallback,
+        // making every `p.field` read dereference a null pointer instead of the real struct
+        // (verified real segfault without this — the frame-slot side of this exact gap is
+        // fixed separately, just above the prologue's parameter-storing loop; this is the
+        // read-side twin of that same fix).
+        for (auto& pname : fn.parameters) {
+            if (localVarIds_.count(pname) || !instanceClass_ || !instanceClass_->count(pname)) continue;
+            int sid = prog.symbols.lookupAnyScope(pname);
+            if (sid >= 0) localVarIds_.emplace(pname, sid);
+        }
         // Pass 0: pre-scan to identify float-typed variables (needed for correct loop codegen)
         preScanFloats(fn.instructions);
         for (const auto& p : forcedStringParams_) stringVarNames_.insert(p);
@@ -3087,6 +3634,15 @@ public:
         // frame slot under a synthetic ID BEFORE scanInstrs so it's correctly counted in fsize
         // (reserving it AFTER `sub rsp` was already sized would silently write past the frame).
         if (!fn.classOwner.empty()) frame.varOffset(kSelfSymId_);
+        // Same "self" bug, same fix, for a bundle/tuple-typed FREE-FUNCTION parameter (see the
+        // comment just above): referenced in the body only via "p.x"/"p.y" (separate symbols),
+        // never as a bare "p" VAR, so it needs the identical pre-scanInstrs reservation or its
+        // incoming pointer has nowhere to land (verified real segfault without this).
+        for (auto& pname : fn.parameters) {
+            if (!instanceClass_ || !instanceClass_->count(pname)) continue;
+            int sid = prog.symbols.lookupAnyScope(pname);
+            if (sid >= 0) frame.varOffset(sid);
+        }
         frame.scanInstrs(fn.instructions);
         fsize = frame.frameSize();
 
@@ -3115,6 +3671,16 @@ public:
                 for (auto& op : ins.typedOperands) checkRef(op);
                 if (symId >= 0) break;
             }
+            // A param proven (instanceClass_, see the classParamTypes discovery above) to hold
+            // a bundle/tuple instance is referenced in the body ONLY via dotted field access
+            // ("p.x"/"p.y", each its own separate symbol) — the plain bare name "p" the scan
+            // above looks for never appears at all, so symId stayed -1 and the incoming pointer
+            // was silently dropped (verified real crash: `show(t): Term.display p.x` segfaulted
+            // — resolveFieldAccess correctly found "p" is a Point, but the slot it dereferenced
+            // was never written). ir.cpp's FuncDef case unconditionally interns every parameter
+            // name regardless of body usage (`prog.symbols.intern(p)`), so a plain name lookup
+            // always finds the real symbol id here — just needs to be tried explicitly.
+            if (symId < 0 && instanceClass_ && instanceClass_->count(pname)) symId = prog.symbols.lookupAnyScope(pname);
             if (symId >= 0)
                 em.mov_rbp_r(frame.varOffset(symId), abi.argRegs[i]);
             else if (i == 0 && !fn.classOwner.empty() && pname == "self")
@@ -3131,6 +3697,89 @@ public:
         // Implicit void return
         em.mov_ri32(R::RAX, 0);
         emitEpilogue();
+    }
+
+    // A generator function body — compiled as a real fiber (see emitFiberSwap's comment for the
+    // full save/restore design), NOT via BNY's normal call/ret convention: nothing ever `call`s
+    // this label at all. GEN_CREATE just arms a fresh state block/stack pointing at it; GEN_NEXT
+    // jumps straight in with RSP already pointing at that fresh stack.
+    //
+    // This mirrors compileFn's own structure closely (same register allocation, same frame
+    // layout, same "push callee-saves then reserve locals" prologue shape — a generator's own
+    // temps/locals get exactly the same treatment as any other function's, including landing in
+    // the SAME POOL registers emitFiberSwap already saves/restores) and diverges at exactly two
+    // points: where parameters come from (the state block's args area, via the shared
+    // `__ac_gen_cur` slot — there's no real incoming `call` to read abi.argRegs from), and what
+    // "returning" means (emitGenReturnSwap's mark-done-and-swap-back, not a normal `ret` — see
+    // RETURN's own curFnIsGenerator_ branch in compileInstr).
+    //
+    // Bundle-method generators are an explicit scope cut for this pass, matching every other
+    // backend (`self` has nowhere to come from without a real incoming call either).
+    void compileGeneratorFn(const AC_IR::IRFunction& fn) {
+        std::string label = fn.name;
+        currentClass_.clear();
+        curFnIsGenerator_ = true;
+        labelPrefix_ = "__fn_" + label + "_";
+        buildLocalVarIds(fn.instructions);
+        preScanFloats(fn.instructions);
+        for (const auto& p : forcedStringParams_) stringVarNames_.insert(p);
+        for (const auto& p : forcedFloatParams_)  floatVarNames_.insert(p);
+        preScanStrings(fn.instructions);
+        recordFloatReturn(fn.instructions, fn.name);
+        recordStringReturn(fn.instructions, fn.name);
+        recordArrayReturn(fn.instructions, fn.name);
+
+        regAlloc.run(fn.instructions);
+        calleeSaves.clear();
+        for (int i = 0; i < LinearScanAlloc::POOL_SIZE; i++)
+            if (regAlloc.usedCalleeSaved.count(LinearScanAlloc::POOL[i]))
+                calleeSaves.push_back(LinearScanAlloc::POOL[i]);
+        int nSave = (int)calleeSaves.size();
+
+        frame.setCalleeSaveBase(nSave);
+        frame.scanInstrs(fn.instructions);
+        fsize = frame.frameSize();
+        if (nSave % 2 != 0) fsize += 8;
+
+        em.label(label);
+        em.push_rbp();
+        em.mov_rbp_rsp();
+        for (R r : calleeSaves) em.push_r(r);
+        em.sub_rsp_i32(fsize);
+
+        // Parameters: copied from the state block's args area (GEN_CREATE laid them out at
+        // GEN_HEADER_BYTES, GEN_HEADER_BYTES+8, ...), not from abi.argRegs — same param→symbol
+        // lookup compileFn uses, just a different source register.
+        loadGenCur(R::RAX);
+        for (int i = 0; i < (int)fn.parameters.size(); i++) {
+            const std::string& pname = fn.parameters[i];
+            int symId = -1;
+            for (auto& ins : fn.instructions) {
+                auto checkRef = [&](const AC_IR::IRRef& r) {
+                    if (r.kind == AC_IR::IRRef::Kind::VAR && r.id >= 0 &&
+                        prog.symbols.getName(r.id) == pname)
+                        symId = r.id;
+                };
+                checkRef(ins.result);
+                for (auto& op : ins.typedOperands) checkRef(op);
+                if (symId >= 0) break;
+            }
+            if (symId < 0) continue;
+            em.mov_r_based(R::RCX, R::RAX, GEN_HEADER_BYTES + 8 * i);
+            em.mov_rbp_r(frame.varOffset(symId), R::RCX);
+        }
+
+        for (auto& ins : fn.instructions) {
+            if (ins.opcode == AC_IR::IROpcode::FUNC_BEGIN) continue;
+            if (ins.opcode == AC_IR::IROpcode::FUNC_END) continue;
+            compileInstr(ins);
+        }
+
+        // Implicit trailing return — same "mark done, swap back" as an explicit `return` inside
+        // a generator; see RETURN's curFnIsGenerator_ branch. Never a normal emitEpilogue(): this
+        // body was never `call`d, so there's no return address on this stack to `ret` to.
+        emitGenReturnSwap();
+        curFnIsGenerator_ = false;
     }
 
     void compileGlobal(const std::vector<AC_IR::IRInstruction>& globalInit) {
@@ -3238,36 +3887,60 @@ static void emitAtomicUnlockLinux(X64Emitter& em, int lockSlot) {
     em.pop_rbp(); em.ret();
 }
 
-// __ac_append__(rdi = old block, rsi = value) -> rax = new block (grow-by-copy)
-// Layout: [len][e0][e1]...  → new block has len+1 elements.
+// __ac_append__(rdi = ptr, rsi = value) -> rax = ptr (SAME pointer whenever capacity
+// allows — O(1) amortized; only allocates+copies once every doubling interval, matching
+// the ALLOC "list" site's [cap][len][e0][e1]... layout: ptr[-8]=cap, ptr[0]=len,
+// ptr[8+8i]=elem_i. Previously this allocated a fresh (len+2)*8-byte block and copied
+// every existing element on EVERY append — O(n^2) total memory traffic for an N-append
+// loop. Every array is created via the one ALLOC "list" site, which always seeds cap>=4,
+// so cap is never 0 here.
 static void emitAppendLinux(X64Emitter& em) {
     em.label("__ac_append__");
     em.push_rbp(); em.mov_rbp_rsp();
     em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14);
-    em.mov_rr(R::RBX, R::RDI);                // rbx = old block
+    em.mov_rr(R::RBX, R::RDI);                // rbx = ptr
     em.mov_rr(R::R12, R::RSI);                // r12 = value
-    em.mov_r_ptr(R::R13, R::RBX);             // r13 = len = [old]
-    // new = __ac_alloc__((len+2)*8)
-    em.mov_rr(R::RDI, R::R13); em.add_ri32(R::RDI, 2);
-    em.mov_ri32(R::RDX, 8); em.imul_rr(R::RDI, R::RDX);
-    em.call("__ac_alloc__");                  // rax = new block
-    // [new] = len+1
-    em.mov_rr(R::RCX, R::R13); em.inc_r(R::RCX);
-    em.mov_ptr_r(R::RAX, R::RCX);
-    // copy old[1..len] -> new[1..len]  (r14 = word index, 1..len)
-    em.mov_ri32(R::R14, 1);
+    em.mov_r_ptr(R::R13, R::RBX);             // r13 = len = ptr[0]
+    em.mov_rr(R::RAX, R::RBX); em.add_ri32(R::RAX, -8);
+    em.mov_r_ptr(R::R14, R::RAX);             // r14 = cap = ptr[-8]
+    em.cmp_rr(R::R13, R::R14);
+    em.jl("__ac_append_fast__");              // len < cap → room already available
+
+    // ---- slow path: capacity exhausted — double and copy, O(len) but amortized O(1) ----
+    em.add_rr(R::R14, R::R14);                // r14 = newcap = cap*2
+    em.mov_rr(R::RDI, R::R14); em.add_ri32(R::RDI, 2);
+    em.mov_ri32(R::RDX, 8); em.imul_rr(R::RDI, R::RDX);   // bytes = (newcap+2)*8
+    em.call("__ac_alloc__");                  // rax = new raw block
+    em.mov_ptr_r(R::RAX, R::R14);              // new_raw[0] = newcap
+    em.add_ri32(R::RAX, 8);                    // rax = new ptr (skip cap word)
+    em.mov_rr(R::RCX, R::R13); em.mov_ptr_r(R::RAX, R::RCX); // new_ptr[0] = len (for now)
+    // copy old_ptr[1..len] -> new_ptr[1..len]  (word index; word i holds element i-1)
+    em.mov_ri32(R::RCX, 1);
     em.label("__ac_append_copy__");
-    em.cmp_rr(R::R14, R::R13);                // if r14 > len done
-    em.jg("__ac_append_done__");
-    em.mov_rr(R::RCX, R::R14); em.mov_ri32(R::RDX, 8); em.imul_rr(R::RCX, R::RDX); // off = r14*8
-    em.mov_rr(R::R8, R::RBX); em.add_rr(R::R8, R::RCX); em.mov_r_ptr(R::R9, R::R8); // r9 = old[r14]
-    em.mov_rr(R::R8, R::RAX); em.add_rr(R::R8, R::RCX); em.mov_ptr_r(R::R8, R::R9); // new[r14] = r9
-    em.inc_r(R::R14);
+    em.cmp_rr(R::RCX, R::R13);
+    em.jg("__ac_append_copydone__");
+    em.mov_rr(R::RSI, R::RCX); em.mov_ri32(R::RDX, 8); em.imul_rr(R::RSI, R::RDX);
+    em.mov_rr(R::R8, R::RBX); em.add_rr(R::R8, R::RSI); em.mov_r_ptr(R::R9, R::R8); // r9 = old[i]
+    em.mov_rr(R::R8, R::RAX); em.add_rr(R::R8, R::RSI); em.mov_ptr_r(R::R8, R::R9); // new[i] = r9
+    em.inc_r(R::RCX);
     em.jmp("__ac_append_copy__");
-    em.label("__ac_append_done__");
-    // new[len+1] = value :  off = (len+1)*8
+    em.label("__ac_append_copydone__");
+    // new_ptr[len+1] = value ; new_ptr[0] = len+1
     em.mov_rr(R::RCX, R::R13); em.inc_r(R::RCX); em.mov_ri32(R::RDX, 8); em.imul_rr(R::RCX, R::RDX);
     em.mov_rr(R::R8, R::RAX); em.add_rr(R::R8, R::RCX); em.mov_ptr_r(R::R8, R::R12);
+    em.mov_rr(R::RCX, R::R13); em.inc_r(R::RCX);
+    em.mov_ptr_r(R::RAX, R::RCX);
+    em.jmp("__ac_append_done__");
+
+    // ---- fast path: len < cap — write in place, O(1), zero allocation/copy ----
+    em.label("__ac_append_fast__");
+    em.mov_rr(R::RCX, R::R13); em.inc_r(R::RCX); em.mov_ri32(R::RDX, 8); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::R8, R::RBX); em.add_rr(R::R8, R::RCX); em.mov_ptr_r(R::R8, R::R12); // ptr[len+1]=value
+    em.mov_rr(R::RCX, R::R13); em.inc_r(R::RCX);
+    em.mov_ptr_r(R::RBX, R::RCX);              // ptr[0] = len+1
+    em.mov_rr(R::RAX, R::RBX);                 // return same ptr — nothing moved
+
+    em.label("__ac_append_done__");
     em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
 }
@@ -3380,6 +4053,110 @@ static void emitStrEqLinux(X64Emitter& em) {
     em.ret();
 }
 
+// Event-listener bind/trigger table — same fixed 64-slot parallel-array design
+// AsmStrategy/CStrategy already use (see their emitEventBind/emitEventTrigger +
+// _ac_bind/_ac_trigger comments); ported here because BNY's opcode switch never had a case
+// for EVENT_BIND/EVENT_TRIGGER at all (silent no-op — the one backend this session's
+// event-listener fix left out). The two 64-entry arrays (keys, fns — 512 bytes each) are
+// lazily __ac_alloc__'d on first bind rather than living in a fixed .bss-style region: BNY's
+// gvar slots are individually-addressed 8-byte cells with no guaranteed contiguous layout
+// (the static-link path lays them out in NAME-SORTED order), so an "array" here has to be a
+// single heap block referenced by a pointer slot, same pattern as __save_buf_ptr/
+// __try_stack_ptr right above.
+//
+// __ac_bind__(rdi = key ptr, rsi = fn ptr) — appends (key, fn) at index __ev_n, n++.
+static void emitEventBindLinux(X64Emitter& em, int keysPtrSlot, int fnsPtrSlot, int nSlot) {
+    em.label("__ac_bind__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
+    em.mov_rr(R::R12, R::RDI);   // r12 = key ptr
+    em.mov_rr(R::R13, R::RSI);   // r13 = fn ptr
+
+    em.mov_ri64_gvar(R::RCX, keysPtrSlot);
+    em.mov_r_ptr(R::R14, R::RCX);         // r14 = keys_ptr
+    em.test_rr(R::R14, R::R14);
+    em.jne("__acb_havekeys__");
+    em.push_r(R::RCX); em.push_r(R::R12); em.push_r(R::R13);
+    em.mov_ri32(R::RDI, 512);
+    em.call("__ac_alloc__");
+    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RCX);
+    em.mov_ptr_r(R::RCX, R::RAX);
+    em.mov_rr(R::R14, R::RAX);
+    em.label("__acb_havekeys__");
+
+    em.mov_ri64_gvar(R::RCX, fnsPtrSlot);
+    em.mov_r_ptr(R::R15, R::RCX);         // r15 = fns_ptr
+    em.test_rr(R::R15, R::R15);
+    em.jne("__acb_havefns__");
+    em.push_r(R::RCX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14);
+    em.mov_ri32(R::RDI, 512);
+    em.call("__ac_alloc__");
+    em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RCX);
+    em.mov_ptr_r(R::RCX, R::RAX);
+    em.mov_rr(R::R15, R::RAX);
+    em.label("__acb_havefns__");
+
+    em.mov_ri64_gvar(R::RBX, nSlot);
+    em.mov_r_ptr(R::RAX, R::RBX);         // rax = n
+    em.mov_rr(R::RCX, R::RAX);
+    em.shl_r_i8(R::RCX, 3);
+    em.add_rr(R::RCX, R::R14);
+    em.mov_ptr_r(R::RCX, R::R12);         // keys[n] = key
+    em.mov_rr(R::RCX, R::RAX);
+    em.shl_r_i8(R::RCX, 3);
+    em.add_rr(R::RCX, R::R15);
+    em.mov_ptr_r(R::RCX, R::R13);         // fns[n] = fn
+    em.inc_r(R::RAX);
+    em.mov_ptr_r(R::RBX, R::RAX);         // n++
+
+    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+}
+
+// __ac_trigger__(rdi = key ptr) — linear __ac_streq__ scan; calls the first matching fn, 0-arg
+// (every EVENT_BIND callback is synthesized/referenced as a 0-arg function — see ir.cpp's
+// KeyBinding/BindStmt lowering, same convention CStrategy's `_ac_trigger` assumes).
+static void emitEventTriggerLinux(X64Emitter& em, int keysPtrSlot, int fnsPtrSlot, int nSlot) {
+    em.label("__ac_trigger__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
+    em.mov_rr(R::R12, R::RDI);            // r12 = key ptr to match
+
+    em.mov_ri64_gvar(R::RCX, keysPtrSlot);
+    em.mov_r_ptr(R::R13, R::RCX);         // r13 = keys_ptr
+    em.mov_ri64_gvar(R::RCX, fnsPtrSlot);
+    em.mov_r_ptr(R::R14, R::RCX);         // r14 = fns_ptr
+    em.mov_ri64_gvar(R::RCX, nSlot);
+    em.mov_r_ptr(R::R15, R::RCX);         // r15 = n
+
+    em.xor_rr(R::RBX, R::RBX);            // i = 0
+    em.label("__act_loop__");
+    em.cmp_rr(R::RBX, R::R15);
+    em.jge("__act_done__");
+    em.mov_rr(R::RAX, R::RBX);
+    em.shl_r_i8(R::RAX, 3);
+    em.add_rr(R::RAX, R::R13);
+    em.mov_r_ptr(R::RAX, R::RAX);         // rax = keys[i]
+    em.mov_rr(R::RDI, R::RAX);
+    em.mov_rr(R::RSI, R::R12);
+    em.call("__ac_streq__");
+    em.test_rr(R::RAX, R::RAX);
+    em.je("__act_next__");
+    em.mov_rr(R::RAX, R::RBX);
+    em.shl_r_i8(R::RAX, 3);
+    em.add_rr(R::RAX, R::R14);
+    em.mov_r_ptr(R::RAX, R::RAX);         // rax = fns[i]
+    em.call_r(R::RAX);
+    em.jmp("__act_done__");
+    em.label("__act_next__");
+    em.inc_r(R::RBX);
+    em.jmp("__act_loop__");
+    em.label("__act_done__");
+
+    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+}
+
 // widgets ilib callback trampolines (see widgetVarKind_'s comment for the ctor/method dispatch
 // these back — `btn(root, text, OnClick)` / `.on_click(OnClick)`). GTK's C callback signature is
 // `void (*)(void*)`; the AC user function being bridged to is either 0-arg or 1-arg (arity from
@@ -3434,23 +4211,28 @@ static void emitDictLinux(X64Emitter& em, StringPool& sp) {
         em.mov_ri32(R::RDI, 2);
         em.mov_ri32(R::RDX, (int32_t)msg.size());
         em.mov_ri32(R::RAX, 1); em.syscall();
-        em.mov_ri32(R::RAX, 60); em.mov_ri32(R::RDI, 1); em.syscall();
+        em.mov_ri32(R::RAX, 231); em.mov_ri32(R::RDI, 1); em.syscall();
     }
 }
 
-// __ac_dict_set__(rdi = block, rsi = key, rdx = val) -> rax = block (new block on growth).
+// __ac_dict_set__(rdi = ptr, rsi = key, rdx = val) -> rax = ptr (same pointer whenever
+// capacity allows — O(1) amortized on top of the existing O(n) linear-scan-for-match; only
+// allocates+copies once every doubling interval, mirroring __ac_append__'s design against
+// the [cap][n][k0][v0]... layout ptr[-8]=cap seeded by the ALLOC "dict" site. Previously
+// this allocated a fresh (2n+3)-word block and copied every existing pair on EVERY insert
+// past the first match-scan — O(n^2) total memory traffic for an N-insert loop.
 static void emitDictSetLinux(X64Emitter& em) {
     em.label("__ac_dict_set__");
     em.push_rbp(); em.mov_rbp_rsp();
-    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
-    em.mov_rr(R::RBX, R::RDI);                  // block
-    em.mov_rr(R::R12, R::RSI);                  // key
-    em.mov_rr(R::R13, R::RDX);                  // val
-    em.mov_ri32(R::R14, 0);                     // i
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14);
+    em.mov_rr(R::RBX, R::RDI);                  // rbx = ptr
+    em.mov_rr(R::R12, R::RSI);                  // r12 = key
+    em.mov_rr(R::R13, R::RDX);                  // r13 = val
+    em.mov_ri32(R::R14, 0);                     // r14 = i (scan index)
     em.label("__ac_ds_loop__");
-    em.mov_r_ptr(R::RAX, R::RBX);
+    em.mov_r_ptr(R::RAX, R::RBX);                // n
     em.cmp_rr(R::R14, R::RAX);
-    em.jge("__ac_ds_grow__");
+    em.jge("__ac_ds_grow__");                     // r14 == n → no match found, need to insert
     em.mov_rr(R::RCX, R::R14);
     em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
     em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
@@ -3468,41 +4250,58 @@ static void emitDictSetLinux(X64Emitter& em) {
     em.label("__ac_ds_next__");
     em.inc_r(R::R14);
     em.jmp("__ac_ds_loop__");
-    em.label("__ac_ds_grow__");                 // new block: (1 + 2(n+1)) words; copy; append
-    em.mov_r_ptr(R::R14, R::RBX);               // r14 = n
-    em.mov_rr(R::RDI, R::R14);
-    em.mov_ri32(R::RDX, 2); em.imul_rr(R::RDI, R::RDX);
-    em.add_ri32(R::RDI, 3);                     // 2n+3 words
-    em.mov_ri32(R::RDX, 8); em.imul_rr(R::RDI, R::RDX);
-    em.call("__ac_alloc__");
-    em.mov_rr(R::R15, R::RAX);                  // new block
-    em.mov_ri32(R::RCX, 0);                     // copy 1+2n words
+
+    em.label("__ac_ds_grow__");                  // r14 == n; decide fast (room) vs slow (full)
+    em.mov_rr(R::RCX, R::RBX); em.add_ri32(R::RCX, -8);
+    em.mov_r_ptr(R::RCX, R::RCX);                 // rcx = cap = ptr[-8]
+    em.cmp_rr(R::R14, R::RCX);
+    em.jl("__ac_ds_fast__");                       // n < cap → room already available
+
+    // ---- slow path: n == cap exactly (grow only ever triggers here, never n>cap) — r14
+    // doubles as oldcap for free, no separate read needed. Double capacity and copy. ----
+    em.mov_rr(R::RDI, R::R14); em.add_rr(R::RDI, R::RDI); em.inc_r(R::RDI);
+    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RDI, R::RDX);   // bytes = 16*(2*oldcap + 1)
+    em.call("__ac_alloc__");                                // rax = new raw block
+    em.mov_rr(R::RCX, R::R14); em.add_rr(R::RCX, R::RCX);    // rcx = newcap = 2*oldcap
+    em.mov_ptr_r(R::RAX, R::RCX);                             // new_raw[0] = newcap
+    em.add_ri32(R::RAX, 8);                                    // rax = new ptr
+    // copy old_ptr[0..2*oldcap] (word0=n plus 2*oldcap pair-words) -> new_ptr[same range];
+    // word0 gets overwritten with n+1 right after.
+    em.mov_ri32(R::RCX, 0);
     em.label("__ac_ds_copy__");
-    em.mov_rr(R::RAX, R::R14);
-    em.mov_ri32(R::RDX, 2); em.imul_rr(R::RAX, R::RDX);
-    em.inc_r(R::RAX);                           // words = 2n+1
-    em.cmp_rr(R::RCX, R::RAX);
+    em.mov_rr(R::RDX, R::R14); em.add_rr(R::RDX, R::RDX); em.inc_r(R::RDX); // bound = 2*oldcap+1
+    em.cmp_rr(R::RCX, R::RDX);
     em.jge("__ac_ds_copied__");
-    em.mov_rr(R::RDI, R::RCX);
-    em.mov_ri32(R::RDX, 8); em.imul_rr(R::RDI, R::RDX);
-    em.mov_rr(R::RSI, R::RBX); em.add_rr(R::RSI, R::RDI);
-    em.mov_r_ptr(R::RSI, R::RSI);               // word
-    em.mov_rr(R::RAX, R::R15); em.add_rr(R::RAX, R::RDI);
-    em.mov_ptr_r(R::RAX, R::RSI);
+    em.mov_rr(R::RSI, R::RCX); em.mov_ri32(R::RDI, 8); em.imul_rr(R::RSI, R::RDI);
+    em.mov_rr(R::R8, R::RBX); em.add_rr(R::R8, R::RSI); em.mov_r_ptr(R::R9, R::R8);
+    em.mov_rr(R::R8, R::RAX); em.add_rr(R::R8, R::RSI); em.mov_ptr_r(R::R8, R::R9);
     em.inc_r(R::RCX);
     em.jmp("__ac_ds_copy__");
     em.label("__ac_ds_copied__");
     em.mov_rr(R::RCX, R::R14); em.inc_r(R::RCX);
-    em.mov_ptr_r(R::R15, R::RCX);               // [new] = n+1
+    em.mov_ptr_r(R::RAX, R::RCX);                    // new_ptr[0] = n+1 (= oldcap+1)
     em.mov_rr(R::RCX, R::R14);
     em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
-    em.mov_rr(R::RDI, R::R15); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
-    em.mov_ptr_r(R::RDI, R::R12);               // key slot
+    em.mov_rr(R::RDI, R::RAX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
+    em.mov_ptr_r(R::RDI, R::R12);                    // new key slot
     em.add_ri32(R::RDI, 8);
-    em.mov_ptr_r(R::RDI, R::R13);               // value slot
-    em.mov_rr(R::RAX, R::R15);
+    em.mov_ptr_r(R::RDI, R::R13);                     // new value slot
+    em.jmp("__ac_ds_done__");
+
+    // ---- fast path: n < cap — write in place, O(1), zero allocation/copy ----
+    em.label("__ac_ds_fast__");
+    em.mov_rr(R::RCX, R::R14);
+    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
+    em.mov_ptr_r(R::RDI, R::R12);                    // key slot at ptr + 8 + 16n
+    em.add_ri32(R::RDI, 8);
+    em.mov_ptr_r(R::RDI, R::R13);                     // value slot
+    em.mov_rr(R::RCX, R::R14); em.inc_r(R::RCX);
+    em.mov_ptr_r(R::RBX, R::RCX);                       // ptr[0] = n+1
+    em.mov_rr(R::RAX, R::RBX);                           // return same ptr — nothing moved
+
     em.label("__ac_ds_done__");
-    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
 }
 
@@ -3811,38 +4610,183 @@ static void emitPrintCStrLinux(X64Emitter& em) {
 }
 
 // Inline ac_print_double — no libc, no libacmath.so.
-// Prints a double with up to 9 decimal places, trailing zeros stripped.
-// 2.0→"2"  2.5→"2.5"  10/3→"3.333333333"
-// Registers: xmm0=value in, r12=buf_ptr, r13=int_part, r14=counter, rbx=scratch_int
-// Buffer at rbp-64: 20 (int) + 1 (.) + 9 (frac) + 1 (\n) = 31 bytes max
+// Prints a double with up to 16 significant decimal digits, correctly rounded, trailing zeros
+// stripped. 2.0→"2"  2.5→"2.5"  10/3→"3.333333333333333"
+// Registers: xmm0=value in, r12=buf_ptr, r13=int_part→final int value, r14=scratch cursor
+//            (reused across phases), r15=scaled fraction, rbx=scratch. Sign lives in a
+//            dedicated stack byte (not a register) so it survives every later phase without
+//            fighting r14/rbx for space — see #28's fix below for why this rewrite needed one.
 static void emitPrintDoubleLinux(X64Emitter& em) {
     em.label("ac_print_double");
     em.push_rbp(); em.mov_rbp_rsp();
-    em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::RBX);
-    em.sub_rsp_i32(128);
-    // Stack layout (128-byte local area, safe below saved regs at rbp-8..rbp-32):
-    //   rbp-160..rbp-130 : main output buffer (30 bytes max)
-    //   rbp-129..rbp-110 : reverse integer digit buffer (20 bytes)
-    //   rbp-109..rbp-33  : spare
+    em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15); em.push_r(R::RBX);
+    em.sub_rsp_i32(200);
+    // Stack layout (200-byte local area, safe below saved regs at rbp-8..rbp-40):
+    //   rbp-192..rbp-163 : main output buffer (30 bytes max)
+    //   rbp-162..rbp-143 : reverse integer digit buffer (20 bytes)
+    //   rbp-142..rbp-125 : fractional digit buffer, raw 0-9 values, MSB-first (18 bytes: index 0
+    //                      at rbp-142 .. index 16 [guard] at rbp-126) — raw values, not ASCII,
+    //                      since rounding needs to compare/increment digit VALUES.
+    //   rbp-125          : sign flag byte (0 = non-negative, 1 = negative)
+    //   rbp-124..rbp-49  : spare
 
-    // r12 = write pointer into main output buffer at rbp-160
-    em.lea_r_rbp32(R::R12, -160);
+    // r12 = write pointer into main output buffer at rbp-192
+    em.lea_r_rbp32(R::R12, -192);
 
-    // ── Integer part ────────────────────────────────────────────────────────
-    em.cvttsd2si_r13_xmm0();            // r13 = trunc(value)
+    // ── Integer part + sign ─────────────────────────────────────────────────
+    em.cvttsd2si_r13_xmm0();            // r13 = trunc(value)   [xmm0 still = ORIGINAL value]
+
+    // Determine the sign from the ORIGINAL value, once, HERE — not from r13's own sign, which
+    // is unreliable whenever |value| < 1 (truncates to exactly integer 0, which has no sign
+    // bit at all: a value like -0.25 would silently lose its minus sign entirely). Verified
+    // real bug (two layers, both already fixed once): -2.5 printed "-2.+" (cvttsd2si on an
+    // un-negated fraction, -0.5*10=-5.0, truncates to digit -5; `-5+'0'` is ASCII '+', not
+    // '5'); -0.25 printed "0..+" (r13==0 has no sign of its own). Stash the flag in a stack
+    // byte (rbp-125) — a register can't survive the several phases (fraction-digit extraction,
+    // rounding/carry, integer-digit extraction) that all need scratch registers of their own.
+    em.mov_ri32(R::RAX, 0);
+    em.cvtsi2sd_xmm1_from_gpr(R::RAX); // xmm1 = 0.0 (temporary — repurposed for (double)r13 below)
+    em.ucomisd_xmm0_xmm1();            // compare ORIGINAL value against 0.0
+    em.mov_ri32(R::RAX, 0);
+    em.jcc(0x03, "__acd_notneg__");    // JAE/JNB (CF=0): value >= 0.0 → not negative
+    em.mov_ri32(R::RAX, 1);
+    em.label("__acd_notneg__");
+    em.lea_r_rbp32(R::RCX, -125);
+    em.mov_ptr_r8(R::RCX, R::RAX);     // [rbp-125] = sign flag
+
     em.cvtsi2sd_xmm1_from_gpr(R::R13); // xmm1 = (double)r13
-    em.subsd_xmm0_xmm1();              // xmm0 = fractional part
+    em.subsd_xmm0_xmm1();              // xmm0 = fractional part (NEGATIVE when value < 0,
+                                        // since e.g. -2.5 - (-2.0) = -0.5, not +0.5)
+
+    em.test_rr(R::RAX, R::RAX);        // rax still holds the sign flag from just above
+    em.je("__acd_fracpos__");
+    em.mov_ri64(R::RCX, (uint64_t)0xBFF0000000000000ULL); // -1.0
+    em.movq_xmm1_from_gpr(R::RCX);
+    em.mulsd_xmm0_xmm1();              // xmm0 = -fractional part (now positive)
+    em.label("__acd_fracpos__");
 
     em.mov_rr(R::RBX, R::R13);
-    em.test_rr(R::RBX, R::RBX);
-    em.jns("__acd_pos__");
+    em.test_rr(R::RAX, R::RAX);
+    em.je("__acd_absdone__");
+    em.neg_r(R::RBX);                  // rbx = |r13| (neg(0) is still 0 — fine)
+    em.label("__acd_absdone__");       // rbx = |integer part|; may still be bumped by rounding below
+
+    // ── Significant-digit budget: count |intpart|'s own decimal digits (min 1, even for 0),
+    // so the fractional part only gets 16-minus-that-many digits — matches %.16g's convention
+    // (significant digits are counted starting at the integer part's first digit, not the
+    // decimal point). Verified real bug in an earlier version of this fix: always keeping 16
+    // FRACTIONAL digits regardless of the integer part gave 17 total significant digits for
+    // 5.640000000000001 (int part "5" = 1 digit + 16 kept fractional = 17), printing
+    // "5.6400000000000006" instead of the correct "5.640000000000001" (15 fractional digits).
+    // Stored at [rbp-124] since later phases (guard-digit position, rounding-carry start,
+    // strip-loop's initial count) all need it and none of them have a spare register free.
+    { em.mov_rr(R::RAX, R::RBX);
+      em.mov_ri32(R::R14, 0);
+      em.label("__acd_cntloop__");
+      em.mov_ri32(R::RCX, 10);
+      em.cqo(); em.idiv_rcx();
+      em.inc_r(R::R14);
+      em.test_rr(R::RAX, R::RAX);
+      em.jne("__acd_cntloop__");        // r14 = digit count (>=1; 0 itself counts as 1 digit)
+      em.mov_ri32(R::RAX, 16);
+      em.sub_rr(R::RAX, R::R14);        // rax = 16 - digitcount
+      em.cmp_r_i32(R::RAX, 0);
+      em.jge("__acd_fkok__");
+      em.mov_ri32(R::RAX, 0);
+      em.label("__acd_fkok__");
+      em.lea_r_rbp32(R::RCX, -124);
+      em.mov_ptr_r(R::RCX, R::RAX);     // [rbp-124] = fracKeep (0-15)
+    }
+
+    // ── #28: fractional digits via EXACT 64-bit integer arithmetic, correctly rounded ──────
+    // The OLD algorithm repeatedly did `frac *= 10.0` in DOUBLE precision — each multiply/
+    // subtract step rounds, and by the ~13th-15th digit the accumulated error was large enough
+    // that `frac` prematurely computed as exactly 0.0, truncating real digits (verified: 3.14 +
+    // 2.5's true nearest double is 5.6400000000000005684...; PY's shortest round-trip repr is
+    // "5.640000000000001" — glibc's `%.16g`, ALREADY the convention CStrategy/CppStrategy use
+    // elsewhere in this codebase, agrees exactly — but the old BNY algorithm printed "5.64",
+    // stopping 13 digits early). Fix: `frac` has at most 52 significant mantissa bits, so
+    // `frac * 2^52` is an EXACT integer (no rounding — multiplying a double by a power of 2
+    // only shifts its exponent) representable in a 64-bit register. Extracting decimal digits
+    // from THAT via repeated `*10` / shift-52 / mask-52 is exact 64-bit integer arithmetic —
+    // no floating-point rounding anywhere in the loop, so no premature-zero termination.
+    em.mov_ri64(R::RAX, (uint64_t)0x4330000000000000ULL); // 2^52 as a double
+    em.movq_xmm1_from_gpr(R::RAX);
+    em.mulsd_xmm0_xmm1();               // xmm0 = frac * 2^52 (exact, still < 2^52)
+    em.cvttsd2si_rax_xmm0();            // rax = scaled fraction, exact 64-bit integer
+    em.mov_rr(R::R15, R::RAX);          // r15 = scaled
+
+    // Extract 17 raw digit values (16 to keep + 1 guard digit for rounding) into
+    // [rbp-142..rbp-126], MSB-first, via: scaled*=10; digit=scaled>>52; scaled&=(2^52-1).
+    em.lea_r_rbp32(R::R14, -142);       // r14 = write cursor into the fraction-digit buffer
+    { // rcx is the loop counter (pushed/popped each iteration — also needed as scratch inside)
+      em.mov_ri32(R::RCX, 17);
+      em.label("__acd_fdig__");
+      em.push_r(R::RCX);
+      em.mov_ri32(R::RCX, 10);
+      em.imul_rr(R::R15, R::RCX);       // r15 *= 10 (safe: <2^52 * 10 < 2^56, fits in 64 bits)
+      em.mov_rr(R::RAX, R::R15);
+      em.shr_r_i8(R::RAX, 52);          // rax = top digit (0-9)
+      em.mov_ptr_r8(R::R14, R::RAX); em.inc_r(R::R14);
+      em.mov_ri64(R::RCX, (uint64_t)0xFFFFFFFFFFFFFULL); // (1<<52)-1
+      em.and_rr(R::R15, R::RCX);        // r15 &= mask
+      em.pop_r(R::RCX);
+      em.dec_r(R::RCX); em.test_rr(R::RCX, R::RCX); em.jne("__acd_fdig__");
+    }
+
+    // ── Round-half-up using the guard digit at index fracKeep, carrying leftward through the
+    // fracKeep kept digits at [rbp-142..rbp-142+fracKeep-1]; a carry that escapes past digit 0
+    // (or fracKeep==0, meaning there's no fractional digit to carry through at all) bumps rbx
+    // (the integer part) by 1 BEFORE the integer-digit loop below runs, so e.g.
+    // 8.99999999999999996 → "9", not "8" with a wrong fractional tail.
+    em.lea_r_rbp32(R::RAX, -142);
+    em.lea_r_rbp32(R::RCX, -124); em.mov_r_ptr(R::RCX, R::RCX); // rcx = fracKeep
+    em.add_rr(R::RAX, R::RCX);          // rax = &fracbuf[fracKeep] (the guard digit)
+    em.movzx_r64_ptr8(R::RAX, R::RAX);
+    em.cmp_r_i32(R::RAX, 5);
+    em.jl("__acd_noround__");
+    em.lea_r_rbp32(R::RCX, -124); em.mov_r_ptr(R::RCX, R::RCX);
+    em.test_rr(R::RCX, R::RCX);
+    em.jne("__acd_havefrac__");
+    em.inc_r(R::RBX);                   // fracKeep==0: nothing to carry through, bump directly
+    em.jmp("__acd_noround__");
+    em.label("__acd_havefrac__");
+    em.lea_r_rbp32(R::R14, -142);
+    em.lea_r_rbp32(R::RCX, -124); em.mov_r_ptr(R::RCX, R::RCX);
+    em.add_rr(R::R14, R::RCX); em.dec_r(R::R14); // r14 = &fracbuf[fracKeep-1] (last kept digit)
+    em.label("__acd_carry__");
+    em.movzx_r64_ptr8(R::RAX, R::R14);
+    em.inc_r(R::RAX);
+    em.cmp_r_i32(R::RAX, 10);
+    em.jl("__acd_nooverflow__");
+    em.mov_ri32(R::RAX, 0);
+    em.mov_ptr_r8(R::R14, R::RAX);
+    em.dec_r(R::R14);
+    { // Carry escaped past digit 0 (index -1, address rbp-143) → bump the integer part.
+      std::string cont = "__acd_carrycont__";
+      em.lea_r_rbp32(R::RAX, -143);
+      em.cmp_rr(R::R14, R::RAX);
+      em.jne(cont);
+      em.inc_r(R::RBX);
+      em.jmp("__acd_noround__");
+      em.label(cont);
+    }
+    em.jmp("__acd_carry__");
+    em.label("__acd_nooverflow__");
+    em.mov_ptr_r8(R::R14, R::RAX);
+    em.label("__acd_noround__");
+
+    // ── Sign character (rbx now holds the FINAL, possibly rounding-bumped integer value) ──
+    em.lea_r_rbp32(R::RAX, -125);
+    em.movzx_r64_ptr8(R::RAX, R::RAX);
+    em.test_rr(R::RAX, R::RAX);
+    em.je("__acd_nosign__");
     em.mov_ri32(R::RAX, '-');
     em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
-    em.neg_r(R::RBX);
-    em.label("__acd_pos__");
+    em.label("__acd_nosign__");
 
-    // Reverse-order digits into [rbp-129..rbp-110] (20-byte safe area)
-    em.lea_r_rbp32(R::R14, -110);      // r14 = one past end of reverse area
+    // ── Integer digits: reverse-extract rbx into [rbp-162..rbp-143], copy forward ──────────
+    em.lea_r_rbp32(R::R14, -143);       // r14 = one past end of reverse area
     em.label("__acd_idig__");
     em.mov_rr(R::RAX, R::RBX);
     em.mov_ri32(R::RCX, 10);
@@ -3853,67 +4797,59 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.mov_rr(R::RBX, R::RAX);
     em.test_rr(R::RBX, R::RBX);
     em.jne("__acd_idig__");
-    // Copy forward into main output (r14 → boundary rbp-110)
-    em.lea_r_rbp32(R::RBX, -110);
+    em.lea_r_rbp32(R::RBX, -143);
     em.label("__acd_icpy__");
     em.movzx_r64_ptr8(R::RAX, R::R14);
     em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12); em.inc_r(R::R14);
     em.cmp_rr(R::R14, R::RBX);
     em.jl("__acd_icpy__");
 
-    // ── Check frac == 0 ────────────────────────────────────────────────────
-    em.mov_ri32(R::RAX, 0);
-    em.cvtsi2sd_xmm1_from_gpr(R::RAX); // xmm1 = 0.0
-    em.ucomisd_xmm0_xmm1();
-    em.je("__acd_dotzero__");          // whole-valued float still prints ".0" (12.0, not 12)
+    // ── Fractional digits: strip trailing zeros from the (rounded, fracKeep-digit) buffer ──
+    // rcx = count of digits still kept (starts at fracKeep, shrinks while the last is 0).
+    em.lea_r_rbp32(R::RCX, -124); em.mov_r_ptr(R::RCX, R::RCX);
+    em.label("__acd_striploop__");
+    em.test_rr(R::RCX, R::RCX);
+    em.je("__acd_stripdone__");         // stripped everything → whole-valued, print ".0"
+    em.lea_r_rbp32(R::RAX, -142);
+    em.add_rr(R::RAX, R::RCX);
+    em.dec_r(R::RAX);                   // rax = &fracbuf[rcx-1] (the last currently-kept digit)
+    em.movzx_r64_ptr8(R::RDX, R::RAX);
+    em.test_rr(R::RDX, R::RDX);
+    em.jne("__acd_stripdone__");        // nonzero digit found — rcx is the final kept count
+    em.dec_r(R::RCX);
+    em.jmp("__acd_striploop__");
+    em.label("__acd_stripdone__");
 
-    // ── Fractional digits ───────────────────────────────────────────────────
+    em.test_rr(R::RCX, R::RCX);
+    em.je("__acd_dotzero__");           // whole-valued float still prints ".0" (12.0, not 12)
+
+    // ── Print '.' + the rcx kept fractional digits (ASCII) ────────────────────────────────
     em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
-    em.mov_rr(R::R13, R::R12);         // r13 = start of frac digits (for strip)
+    em.lea_r_rbp32(R::R14, -142);        // r14 = cursor into fraction buffer, index 0 first
+    em.mov_rr(R::RBX, R::RCX);           // rbx free again (integer part already fully printed)
+    em.label("__acd_fcpy__");
+    em.movzx_r64_ptr8(R::RAX, R::R14);
+    em.add_ri32(R::RAX, '0');
+    em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12); em.inc_r(R::R14);
+    em.dec_r(R::RBX); em.test_rr(R::RBX, R::RBX); em.jne("__acd_fcpy__");
+    em.jmp("__acd_nl__");
 
-    em.mov_ri32(R::R14, 15);           // up to 15 digits (#28 — was 9; PY-repr parity would need Ryu)
-    em.label("__acd_fdig__");
-    // xmm0 = frac; xmm1 = 0.0 (from above or reloaded)
-    em.mov_ri64(R::RAX, (uint64_t)0x4024000000000000ULL); // 10.0
-    em.movq_xmm1_from_gpr(R::RAX);
-    em.mulsd_xmm0_xmm1();              // xmm0 = frac * 10
-    em.cvttsd2si_rax_xmm0();           // rax = digit  (0-9)
-    em.mov_rr(R::RBX, R::RAX);         // save digit
-    em.cvtsi2sd_xmm1_from_gpr(R::RAX);// xmm1 = (double)digit
-    em.subsd_xmm0_xmm1();             // xmm0 = new frac
-    em.add_ri32(R::RBX, '0');
-    em.mov_ptr_r8(R::R12, R::RBX); em.inc_r(R::R12);
-    em.dec_r(R::R14); em.test_rr(R::R14, R::R14); em.je("__acd_strip__");
-    // if frac == 0: done
-    em.mov_ri32(R::RAX, 0);
-    em.cvtsi2sd_xmm1_from_gpr(R::RAX);
-    em.ucomisd_xmm0_xmm1();
-    em.jne("__acd_fdig__");
-
-    // ── Strip trailing '0' ────────────────────────────────────────────────
-    em.label("__acd_strip__");
-    em.dec_r(R::R12);
-    em.movzx_r64_ptr8(R::RAX, R::R12);
-    em.cmp_r_i32(R::RAX, '0'); em.je("__acd_strip__");
-    em.inc_r(R::R12);
-    em.jmp("__acd_nl__");               // skip the ".0" block below (that path is for frac==0 only)
-
-    // ── Whole-valued float → append ".0" so a float never prints as a bare integer ──
+    // ── Whole-valued float (after rounding) → append ".0" ─────────────────────────────────
     em.label("__acd_dotzero__");
     em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
     em.mov_ri32(R::RAX, '0'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
     // fall through to newline + write
 
-    // ── Newline + write ───────────────────────────────────────────────────
+    // ── Newline + write ────────────────────────────────────────────────────────────────────
     em.label("__acd_nl__");
     em.mov_ri32(R::RAX, '\n'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
-    em.lea_r_rbp32(R::RSI, -160);      // buf start
+    em.lea_r_rbp32(R::RSI, -192);        // buf start
     em.sub_rr(R::R12, R::RSI);
     em.mov_rr(R::RDX, R::R12);
     em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RAX, 1); em.syscall();
 
-    em.add_rsp_i32(128);
-    em.pop_r(R::RBX); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12);
+    em.add_rsp_i32(200);
+    em.pop_r(R::RBX); em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12);
     em.pop_rbp(); em.ret();
 }
 
@@ -4005,13 +4941,33 @@ static void emitSaveAppendDoubleLinux(X64Emitter& em, int bufPtrSlot, int bufLen
 
     em.lea_r_rbp32(R::R12, -160);       // r12 = write pointer into local buffer
 
-    em.cvttsd2si_r13_xmm0();
+    em.cvttsd2si_r13_xmm0();            // r13 = trunc(value)  [xmm0 still = ORIGINAL value]
+
+    // Same fix as ac_print_double (see its own comment for the full walkthrough): the sign
+    // must come from the ORIGINAL value, checked once here, not from r13 (unreliable for
+    // |value| < 1, which truncates to integer 0 — no sign bit). Verified real bug here too:
+    // `save as` output for -2.5 wrote "-2.+"; for -0.25, "0..+".
+    em.mov_ri32(R::RAX, 0);
+    em.cvtsi2sd_xmm1_from_gpr(R::RAX); // xmm1 = 0.0 (temporary)
+    em.ucomisd_xmm0_xmm1();
+    em.mov_ri32(R::R14, 0);
+    em.jcc(0x03, "__acsd_notneg__");   // JAE/JNB (CF=0): value >= 0.0
+    em.mov_ri32(R::R14, 1);
+    em.label("__acsd_notneg__");
+
     em.cvtsi2sd_xmm1_from_gpr(R::R13);
     em.subsd_xmm0_xmm1();
 
+    em.test_rr(R::R14, R::R14);
+    em.je("__acsd_fracpos__");
+    em.mov_ri64(R::RAX, (uint64_t)0xBFF0000000000000ULL); // -1.0
+    em.movq_xmm1_from_gpr(R::RAX);
+    em.mulsd_xmm0_xmm1();
+    em.label("__acsd_fracpos__");
+
     em.mov_rr(R::RBX, R::R13);
-    em.test_rr(R::RBX, R::RBX);
-    em.jns("__acsd_pos__");
+    em.test_rr(R::R14, R::R14);
+    em.je("__acsd_pos__");
     em.mov_ri32(R::RAX, '-');
     em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
     em.neg_r(R::RBX);
@@ -4932,6 +5888,13 @@ static std::string normalizeExtSym(const std::string& irName) {
         {"sidebar.getinput",        "ac_sidebar_getinput"},
         {"screen.setmode",          "ac_screen_setmode"},
         {"screen.update",           "ac_screen_update"},
+        // ── aczip library ─────────────────────────────────────────────────────
+        // AC has no raw byte-buffer type, so these route through the file-to-file
+        // convenience functions in aczip_c.h/.cpp (shared with every other backend's
+        // FFI — see that file's own comment) instead of the raw ACZipByteArray API.
+        {"aczip.compress",          "ac_zip_compress_to_file"},
+        {"aczip.decompress",        "ac_zip_decompress_from_file"},
+        {"aczip.get_ratio",         "ac_get_compression_ratio"},
         // ── Web library ──────────────────────────────────────────────────────
         {"web.open",                "ac_web_open"},
         {"web.file_open",           "ac_web_file_open"},
@@ -4970,6 +5933,7 @@ static std::string normalizeExtSym(const std::string& irName) {
         {"ml.weights",               "ml_weights"},
         {"ml.take",                  "ml_take"},
         {"ml.grad",                  "ml_get_grad"},
+        {"ml.optimize",              "ml_optimize"},
         {"ml.add",                   "ml_add"},
         {"ml.multiply",              "ml_multiply"},
         {"ml.relu",                  "ml_relu"},
@@ -5047,6 +6011,14 @@ static std::string libForSym(const std::string& exportName) {
         exportName.rfind("pt_", 0) == 0 ||
         exportName.rfind("tf_", 0) == 0)
         return "libacml.so";
+
+    // aczip library (libaczip) — must precede the generic ac_ math fallback below, which
+    // would otherwise wrongly claim ac_zip_compress_to_file/ac_get_compression_ratio/etc
+    // too (they all start with "ac_" but aren't math functions).
+    if (exportName.rfind("ac_zip_", 0) == 0 ||
+        exportName == "ac_get_compression_ratio" ||
+        exportName == "ac_free_bytes")
+        return "libaczip.so";
 
     // Math library (libacmath)
     if (exportName.rfind("ac_", 0) == 0) return "libacmath.so";
@@ -5332,6 +6304,10 @@ class BinaryCompiler {
     // per-statement fact discovered while walking the program, same as ASM's own instanceClass_).
     std::map<std::string, std::vector<std::string>> classFields_;
     std::map<std::string, std::string> instanceClass_;
+    std::map<std::string, std::string> classReturnFuncs_;  // fn.name -> class name it always
+                                                             // constructs+returns; see the
+                                                             // prescan's own comment
+
     // widgets ilib: var name -> constructor kind, whole-program (populated during
     // collectExternalSymbols()'s scan, BEFORE any per-function FuncCompiler starts codegen) —
     // see FuncCompiler::widgetVarKind_'s comment for why this must be shared, not per-function.
@@ -5360,6 +6336,8 @@ class BinaryCompiler {
     bool                      usesAtomic_ = false; // program declares an `atomic` var
     bool                      usesSave_   = false; // program uses `save as`
     bool                      usesTry_    = false; // program uses try/catch
+    bool                      usesEvents_ = false; // program uses event-listener/bind
+    bool                      usesGenerators_ = false; // program has a `yield` generator
 
     struct FuncBounds { std::string name; uint64_t startOff, endOff; };
 
@@ -5389,10 +6367,20 @@ class BinaryCompiler {
                         promotedGlobals_.insert(n);
                 }
                 // `free x[, y…]` inside a fn binds those names to the free scope → promote.
+                // Unconditional — a FREE_DECL is itself the explicit "this is free-scoped"
+                // signal; requiring the same name to ALSO independently appear in the
+                // top-level mainloop/globalInit scan (freeVarSet) was backwards, and meant a
+                // var that's ONLY ever assigned via `free`/`<free>` inside a function (never
+                // also written at top level) never got promoted at all — its FREE_DECL was
+                // silently ignored, so it was never given a real global slot, and reading it
+                // from outside the function read uninitialized/zeroed memory instead
+                // (verified: `Make f func() { free x = 200; return x } ... Term.display x`
+                // printed 200 from inside f() but 0 from the top level, on BNY only — every
+                // other backend already promotes correctly here).
                 if (ins.opcode == IROpcode::FREE_DECL)
                     for (auto& op : ins.typedOperands) {
                         std::string n = nameOf(op);
-                        if (!n.empty() && !params.count(n) && freeVarSet.count(n))
+                        if (!n.empty() && !params.count(n))
                             promotedGlobals_.insert(n);
                     }
                 // arr.append(v) MUTATES arr without a result var (#13) — count it as a write.
@@ -5521,6 +6509,43 @@ class BinaryCompiler {
             gvarSlots_["__try_depth"] = slot++;
         }
 
+        // `yield`/generators: single shared "currently active generator" slot — same design as
+        // every other backend's fiber/thread implementation this session (see e.g. CStrategy's
+        // ac_gen_cur in ir_codegen.cpp): fiber switches are strictly nested/sequential, never
+        // concurrent, so one slot suffices. Holds the state-block pointer of whichever generator
+        // is currently executing, so its prologue (loading params) and its YIELD/RETURN can find
+        // their own state without threading an extra parameter through everything.
+        auto hasGen = [&](const IRFunction& fn) { return fn.isGenerator; };
+        usesGenerators_ = false;
+        for (auto& fn : prog.functions) if (hasGen(fn)) { usesGenerators_ = true; break; }
+        if (usesGenerators_) gvarSlots_["__ac_gen_cur"] = slot++;
+
+        // Event-listener (`configure event-listener`/`on value is X`/`bind KEY to FUNC`):
+        // EVENT_BIND/EVENT_TRIGGER were never handled anywhere in this file — a total no-op on
+        // BNY (silently swallowed by the opcode switch's default case, no error), the one backend
+        // left out of the fix that made this feature real everywhere else. Ported the same
+        // fixed-64-slot parallel-array design AsmStrategy/CStrategy already use (a linear
+        // strcmp/__ac_streq__ scan; 64 bindings is far past any realistic keybind count, so no
+        // need to hand-roll a hash map). BNY has no raw .bss array primitive though — gvar slots
+        // are individually-addressed 8-byte cells, not guaranteed contiguous in memory (the
+        // static-link path lays them out in NAME-SORTED order, not slot-index order) — so the
+        // array itself is a lazily __ac_alloc__'d 512-byte block (64 * 8 bytes) referenced by a
+        // pointer slot, same "cursor==0 means not yet allocated" pattern as __save_buf_ptr/
+        // __try_stack_ptr right above.
+        auto hasEvents = [&](const std::vector<IRInstruction>& code) {
+            for (auto& ins : code)
+                if (ins.opcode == IROpcode::EVENT_BIND || ins.opcode == IROpcode::EVENT_TRIGGER) return true;
+            return false;
+        };
+        usesEvents_ = hasEvents(prog.globalInit);
+        if (!usesEvents_)
+            for (auto& fn : prog.functions) if (hasEvents(fn.instructions)) { usesEvents_ = true; break; }
+        if (usesEvents_) {
+            gvarSlots_["__ev_keys_ptr"] = slot++;
+            gvarSlots_["__ev_fns_ptr"] = slot++;
+            gvarSlots_["__ev_n"] = slot++;
+        }
+
         // Bundle/class: field-order pre-scan. BNY had NO bundle/class codegen at all before this
         // (unlike ASM, which at least emitted plausible-looking method labels) — method labels
         // were just the bare method name (`greet`/`init`, no class prefix — a collision risk and,
@@ -5568,6 +6593,110 @@ class BinaryCompiler {
         // convention of still having a valid, empty entry) still gets a map entry.
         for (auto& fn : prog.functions)
             if (!fn.classOwner.empty()) classFields_[fn.classOwner];
+
+        // classReturnFuncs_: a free function whose every `return` traces to a var directly
+        // constructed via `SomeClass()` earlier in that SAME function body — lets `q = f()`
+        // be treated exactly like a direct `q = ClassName()` construct-call for
+        // resolveFieldAccess's own `instanceClass_` lookup (see its comment), even when the
+        // instance arrived across a function-return boundary. Real, verified bug (found+fixed
+        // for ir_codegen.cpp's 7 shared-driver backends this same session, same root cause):
+        // `Make f(): p = ClassName(); ...; return p` then `q = f(); q.x` printed 0 instead of
+        // the real field value — instanceClass_[q] was only ever set at a DIRECT construct-
+        // call site (the block just above/below this), never at an ordinary CALL whose callee
+        // merely forwards a constructed instance back out.
+        classReturnFuncs_.clear();
+        for (auto& fn : prog.functions) {
+            if (!fn.classOwner.empty() || fn.isGenerator) continue;
+            std::map<std::string, std::string> varClass;
+            for (auto& ins : fn.instructions) {
+                if (ins.opcode == IROpcode::CALL && ins.result.kind == IRRef::Kind::VAR
+                        && ins.result.id >= 0 && !ins.typedOperands.empty()
+                        && ins.typedOperands[0].kind == IRRef::Kind::VAR
+                        && ins.typedOperands[0].id >= 0) {
+                    std::string callee = prog.symbols.getName(ins.typedOperands[0].id);
+                    if (classFields_.count(callee))
+                        varClass[prog.symbols.getName(ins.result.id)] = callee;
+                }
+            }
+            std::string retClass; bool any = false, consistent = true;
+            for (auto& ins : fn.instructions) {
+                if (ins.opcode != IROpcode::RETURN || ins.typedOperands.empty()) continue;
+                const auto& rv = ins.typedOperands[0];
+                if (rv.kind != IRRef::Kind::VAR || rv.id < 0) { consistent = false; break; }
+                auto it = varClass.find(prog.symbols.getName(rv.id));
+                if (it == varClass.end()) { consistent = false; break; }
+                if (!any) { retClass = it->second; any = true; }
+                else if (retClass != it->second) { consistent = false; break; }
+            }
+            if (any && consistent) classReturnFuncs_[fn.name] = retClass;
+        }
+
+        // classParamTypes discovery (mirrors ir_codegen.cpp's UnifiedIRCodeGen driver fix — see
+        // its own comment for the full rationale; found+fixed there first this same session,
+        // same root cause, verified real: `Make show func(p): Term.display p.x` called as
+        // `show(pt)` printed GARBAGE — not a compile error, since BNY has no static parameter
+        // type to get wrong, but resolveFieldAccess's instanceClass_ lookup for "p" found
+        // nothing, so `p.x` silently read an unrelated, never-written flat slot literally named
+        // "p.x" instead of dereferencing p as a pointer into the real struct). Unlike
+        // ir_codegen.cpp's fix, this needs no two-pass trick — `prog` here is already the
+        // complete, fully-lowered program (ir.cpp finished long before this file runs), so one
+        // ordinary whole-program scan is enough, same as classReturnFuncs_ just above.
+        {
+            std::map<std::string, std::string> varClassGlobal;
+            auto scanConstructs = [&](const std::vector<IRInstruction>& instrs) {
+                for (auto& ins : instrs) {
+                    if (ins.opcode != IROpcode::CALL || ins.result.kind != IRRef::Kind::VAR
+                            || ins.result.id < 0 || ins.typedOperands.empty()
+                            || ins.typedOperands[0].kind != IRRef::Kind::VAR
+                            || ins.typedOperands[0].id < 0) continue;
+                    std::string callee = prog.symbols.getName(ins.typedOperands[0].id);
+                    if (classFields_.count(callee))
+                        varClassGlobal[prog.symbols.getName(ins.result.id)] = callee;
+                    else if (classReturnFuncs_.count(callee))
+                        varClassGlobal[prog.symbols.getName(ins.result.id)] = classReturnFuncs_[callee];
+                }
+            };
+            for (auto& fn : prog.functions) scanConstructs(fn.instructions);
+            scanConstructs(prog.globalInit);
+            scanConstructs(prog.dataSection);
+            scanConstructs(prog.mainSection);
+
+            std::map<std::string, std::map<int, std::string>> classParamTypes;
+            auto scanCalls = [&](const std::vector<IRInstruction>& instrs) {
+                for (auto& ins : instrs) {
+                    if ((ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL)
+                            || ins.typedOperands.empty()
+                            || ins.typedOperands[0].kind != IRRef::Kind::VAR) continue;
+                    std::string calleeName = prog.symbols.getName(ins.typedOperands[0].id);
+                    for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
+                        const IRRef& arg = ins.typedOperands[ai];
+                        if (arg.kind != IRRef::Kind::VAR) continue;
+                        auto vc = varClassGlobal.find(prog.symbols.getName(arg.id));
+                        if (vc != varClassGlobal.end())
+                            classParamTypes[calleeName][(int)(ai - 1)] = vc->second;
+                    }
+                }
+            };
+            for (auto& fn : prog.functions) scanCalls(fn.instructions);
+            scanCalls(prog.globalInit);
+            scanCalls(prog.dataSection);
+            scanCalls(prog.mainSection);
+
+            // Merge straight into instanceClass_ (a flat, unscoped var->class map, same
+            // convention as ir_codegen.cpp's classInstanceVars_/classInstanceVarNames_) using
+            // each matched function's REAL parameter names. Free functions only — fn.parameters
+            // for a method has an extra leading "self" the caller never writes, which would
+            // shift every index by one; out of scope for this fix, same as the shared driver's.
+            for (auto& fn : prog.functions) {
+                if (!fn.classOwner.empty()) continue;
+                auto cpIt = classParamTypes.find(fn.name);
+                if (cpIt == classParamTypes.end()) continue;
+                for (auto& [idx, cls] : cpIt->second) {
+                    if (idx < 0 || (size_t)idx >= fn.parameters.size()) continue;
+                    instanceClass_[fn.parameters[(size_t)idx]] = cls;
+                }
+            }
+        }
 
         // Builtin helper calls (ac_ipow from `^`/ptm/ptd, ac_length from `length`)
         // need their machine-code helpers emitted.
@@ -5878,7 +7007,18 @@ class BinaryCompiler {
                         irName.rfind("regex.", 0) == 0 ||
                         irName.rfind("stringm.", 0) == 0 ||
                         irName.rfind("ncpu.", 0) == 0 ||
-                        irName.rfind("maudio.", 0) == 0) {
+                        irName.rfind("maudio.", 0) == 0 ||
+                        // camera/sidebar/screen/aczip were missing from this allowlist
+                        // entirely — normalizeExtSym/libForSym both already had real
+                        // entries for them, but collectExternalSymbols (this pre-pass,
+                        // which decides which PLT stubs to allocate BEFORE codegen runs)
+                        // never called addSym() for them, so every call was an unresolved
+                        // label at link time regardless (verified: camera_demo.ac/
+                        // aczip_demo.ac both hard "undefined label" on every single call).
+                        irName.rfind("camera.", 0) == 0 ||
+                        irName.rfind("sidebar.", 0) == 0 ||
+                        irName.rfind("screen.", 0) == 0 ||
+                        irName.rfind("aczip.", 0) == 0) {
                         addSym(irName);
                     } else if (isNativeCpuPtrSym(irName)) {
                         // native-cpu's carried-over ptr_* functions are called bare (no dotted
@@ -5908,7 +7048,10 @@ class BinaryCompiler {
                     if (mname.rfind("ml.", 0) == 0 || mname.rfind("os.", 0) == 0 ||
                         mname.rfind("regex.", 0) == 0 || mname.rfind("stringm.", 0) == 0 ||
                         mname.rfind("web.", 0) == 0 || mname.rfind("server.", 0) == 0 ||
-                        mname.rfind("ncpu.", 0) == 0 || mname.rfind("maudio.", 0) == 0) {
+                        mname.rfind("ncpu.", 0) == 0 || mname.rfind("maudio.", 0) == 0 ||
+                        // Same missing-prefix gap as the CALL-opcode path above.
+                        mname.rfind("camera.", 0) == 0 || mname.rfind("sidebar.", 0) == 0 ||
+                        mname.rfind("screen.", 0) == 0 || mname.rfind("aczip.", 0) == 0) {
                         addSym(mname);
                         continue;
                     }
@@ -6061,6 +7204,10 @@ public:
             emitSaveFileLinux(em, gvarSlots_["__save_buf_ptr"], gvarSlots_["__save_buf_len"]);
         }
         if (usesIpow_) emitIpowLinux(em);
+        if (usesEvents_) {
+            emitEventBindLinux(em, gvarSlots_["__ev_keys_ptr"], gvarSlots_["__ev_fns_ptr"], gvarSlots_["__ev_n"]);
+            emitEventTriggerLinux(em, gvarSlots_["__ev_keys_ptr"], gvarSlots_["__ev_fns_ptr"], gvarSlots_["__ev_n"]);
+        }
         emitLengthLinux(em);  // always: ~30 bytes; __ac_strlen__ backs string-FOR/concat/indexing
         // Concat + streq emitted ALWAYS: the constant folder can fold away the only const-string
         // ADD (turning the usesConcat_ gate off) while a string-VAR ADD still emits a __ac_concat__
@@ -6099,11 +7246,14 @@ public:
             fc.gvarSlots_ = &gvarSlots_;
             fc.usesSave_ = usesSave_;
             fc.usesTry_ = usesTry_;
+            fc.usesGenerators_ = usesGenerators_;
             fc.classFields_ = &classFields_;
             fc.instanceClass_ = &instanceClass_;
             fc.classStringFields_ = &classStringFields_;
+            fc.classReturnFuncs_ = &classReturnFuncs_;
             fc.widgetVarKind_ = &widgetVarKindGlobal_;
-            fc.compileFn(fn);
+            if (fn.isGenerator) fc.compileGeneratorFn(fn);
+            else fc.compileFn(fn);
             funcBounds.push_back({fn.name, startOff, em.pos()});
         }
 
@@ -6118,9 +7268,11 @@ public:
             gc.gvarSlots_ = &gvarSlots_;
             gc.usesSave_ = usesSave_;
             gc.usesTry_ = usesTry_;
+            gc.usesGenerators_ = usesGenerators_;
             gc.classFields_ = &classFields_;
             gc.instanceClass_ = &instanceClass_;
             gc.classStringFields_ = &classStringFields_;
+            gc.classReturnFuncs_ = &classReturnFuncs_;
             gc.widgetVarKind_ = &widgetVarKindGlobal_;
             gc.compileGlobal(prog.globalInit);
             funcBounds.push_back({"_start", startOff, em.pos()});

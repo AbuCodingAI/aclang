@@ -2,6 +2,9 @@
 *.lir
 *.datac
 *.pyc
+*.o
+*.d
+*.backup
 __pycache__/
 .kiro/
 .vscode/

@@ -25,10 +25,11 @@ if _lib:
     def _s(b): return (b or b'').decode() if isinstance(b, bytes) else (b or '')
 
     _lib.ac_widgets_init.restype            = None; _lib.ac_widgets_init.argtypes            = []
-    _lib.ac_widgets_screen_new.restype      = _W;   _lib.ac_widgets_screen_new.argtypes      = [_CS, _CS]
+    _lib.ac_widgets_screen_new.restype      = _W;   _lib.ac_widgets_screen_new.argtypes      = [_CS]
     _lib.ac_widgets_screen_mainloop.restype = None; _lib.ac_widgets_screen_mainloop.argtypes = [_W]
     _lib.ac_widgets_screen_update.restype   = None; _lib.ac_widgets_screen_update.argtypes   = [_W]
     _lib.ac_widgets_screen_destroy.restype  = None; _lib.ac_widgets_screen_destroy.argtypes  = [_W]
+    _lib.ac_widgets_screen_dimensions.restype = None; _lib.ac_widgets_screen_dimensions.argtypes = [_W, _ct.c_int, _ct.c_int]
 
     _lib.ac_widgets_display_new.restype     = _W;   _lib.ac_widgets_display_new.argtypes     = [_W, _CS]
     _lib.ac_widgets_display_pack.restype    = None; _lib.ac_widgets_display_pack.argtypes    = [_W]
@@ -81,6 +82,12 @@ if _lib:
     _lib.ac_widgets_sketch_rect.restype     = None; _lib.ac_widgets_sketch_rect.argtypes     = [_W,_D,_D,_D,_D,_U8,_U8,_U8]
     _lib.ac_widgets_sketch_circle.restype   = None; _lib.ac_widgets_sketch_circle.argtypes   = [_W,_D,_D,_D,_U8,_U8,_U8]
     _lib.ac_widgets_sketch_text.restype     = None; _lib.ac_widgets_sketch_text.argtypes     = [_W,_D,_D,_CS,_U8,_U8,_U8]
+    _lib.ac_widgets_textbox_new.restype     = _W;   _lib.ac_widgets_textbox_new.argtypes     = [_W, _CS, _CS]
+    _lib.ac_widgets_textbox_pack.restype    = None; _lib.ac_widgets_textbox_pack.argtypes    = [_W]
+    _lib.ac_widgets_textbox_write.restype   = None; _lib.ac_widgets_textbox_write.argtypes   = [_W, _CS]
+    _lib.ac_widgets_textbox_get.restype     = _CS;  _lib.ac_widgets_textbox_get.argtypes     = [_W]
+    _lib.ac_widgets_textbox_find.restype    = _CS;  _lib.ac_widgets_textbox_find.argtypes    = [_W, _CS]
+    _lib.ac_widgets_textbox_fix.restype     = None; _lib.ac_widgets_textbox_fix.argtypes     = [_W, _CS]
 
     _lib.ac_widgets_set_lazy.restype        = None; _lib.ac_widgets_set_lazy.argtypes        = [_W]
     _lib.ac_widgets_pack_spaced.restype     = None; _lib.ac_widgets_pack_spaced.argtypes     = [_W, _I, _I]
@@ -104,10 +111,12 @@ if _lib:
 
     # ── Python wrapper classes ────────────────────────────────────────────────
     class Screen:
-        def __init__(self, title='AC App', geometry='800x600', **_):
-            self._h = _lib.ac_widgets_screen_new(_b(title), _b(geometry))
+        # title is mandatory — no geometry positional/default arg. Use .dimensions(w, h).
+        def __init__(self, title, **_):
+            self._h = _lib.ac_widgets_screen_new(_b(title))
         def mainloop(self): _lib.ac_widgets_screen_mainloop(self._h)
         def update(self):   _lib.ac_widgets_screen_update(self._h)
+        def dimensions(self, w, h): _lib.ac_widgets_screen_dimensions(self._h, int(w), int(h))
         def destroy(self):  _lib.ac_widgets_screen_destroy(self._h)
 
     class display:
@@ -243,6 +252,16 @@ if _lib:
         def circle(self,cx,cy,rad,r=0,g=0,b=0):   _lib.ac_widgets_sketch_circle(self._h,cx,cy,rad,r,g,b)
         def text(self,x,y,t,r=0,g=0,b=0):         _lib.ac_widgets_sketch_text(self._h,x,y,_b(t),r,g,b)
 
+    class textbox:
+        def __init__(self, master, color='black', font='monospace', _lz=None):
+            self._h = _lib.ac_widgets_textbox_new(master._h, _b(color), _b(font))
+            _auto_or_lazy(self._h, _lib.ac_widgets_textbox_pack, _lz)
+        def pack(self, space_x=0, space_y=0): _pack_or_spaced(self._h, _lib.ac_widgets_textbox_pack, space_x, space_y)
+        def write(self, s):      _lib.ac_widgets_textbox_write(self._h, _b(s))
+        def get(self):           return _s(_lib.ac_widgets_textbox_get(self._h))
+        def find(self, needle):  return _s(_lib.ac_widgets_textbox_find(self._h, _b(needle)))
+        def fix(self, s):        _lib.ac_widgets_textbox_fix(self._h, _b(s))
+
 else:
     import sys as _sys
     _sys.stderr.write("[widgets] WARNING: libacwidgets.so not found — stub mode\n")
@@ -318,3 +337,10 @@ else:
         def rect(self,x1,y1,x2,y2,r=0,g=0,b=0): pass
         def circle(self,cx,cy,rad,r=0,g=0,b=0): pass
         def text(self,x,y,t,r=0,g=0,b=0): pass
+    class textbox:
+        def __init__(self, master, color='black', font='monospace', **_): pass
+        def pack(self, **_): pass
+        def write(self, s): pass
+        def get(self): return ''
+        def find(self, needle): return ''
+        def fix(self, s): pass

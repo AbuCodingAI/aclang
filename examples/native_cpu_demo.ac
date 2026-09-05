@@ -1,0 +1,46 @@
+AC->PY
+
+/* native-cpu ilib — manual, low-level memory: raw pointers, heap allocation
+   (plain / zeroed / bitmap-backed), arenas, and cross-process broadcast
+   messaging. No garbage collector involved anywhere in this file. */
+
+use ilib native-cpu
+
+<mainloop>
+    header.display $Pointers$
+    p = ptr_new($hello$, 6, 0)
+    Term.display $ptr_new(...) = $ + to_string(p)
+    Term.display $ptr_is_null(ptr_null()) = $ + to_string(ptr_is_null(ptr_null()))
+    Term.display $ptr_is_null(p) = $ + to_string(ptr_is_null(p))
+
+    header.display $Heap allocation$
+    d = ncpu.dha(64, 0)
+    Term.display $ncpu.dha(64, 0) — plain heap alloc = $ + to_string(d)
+    z = ncpu.zdha(64, 0)
+    Term.display $ncpu.zdha(64, 0) — zeroed heap alloc = $ + to_string(z)
+    r = ncpu.realloc(d, 128)
+    Term.display $ncpu.realloc(d, 128) = $ + to_string(r)
+    bm = ncpu.bmdha(4096, 0)
+    Term.display $ncpu.bmdha(4096, 0) — bitmap-backed alloc = $ + to_string(bm)
+    bz = ncpu.bmzdha(4096, 0)
+    Term.display $ncpu.bmzdha(4096, 0) — zeroed bitmap-backed alloc = $ + to_string(bz)
+
+    header.display $Arenas$
+    arena = ncpu.arena_create(1024)
+    a1 = ncpu.arena_alloc(arena, 16)
+    a2 = ncpu.arena_alloc(arena, 16)
+    Term.display $two 16-byte arena allocations = $ + to_string(a1) + $, $ + to_string(a2)
+    ncpu.arena_dealloc(arena, a1)
+    Term.display $arena_dealloc(a1) — released one allocation back to the arena$
+    ncpu.arena_abort(arena)
+    Term.display $arena_abort(arena) — rolled the whole arena back$
+    ncpu.arena_destroy(arena)
+    Term.display $arena_destroy(arena) — arena freed$
+
+    header.display $Cross-process messaging$
+    got_before = ncpu.recieve($shutdown_request$)
+    Term.display $recieve() before any broadcast = $ + to_string(got_before)
+    ncpu.broadcast($shutdown_request$)
+    got_after = ncpu.recieve($shutdown_request$)
+    Term.display $recieve() after the matching broadcast = $ + to_string(got_after)
+<mainloop>

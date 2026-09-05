@@ -4,6 +4,7 @@ package main
 /*
 #cgo CFLAGS: -I${SRCDIR}/library/ilib/os
 #cgo LDFLAGS: -L${SRCDIR}/library/ilib/os -lacoos -Wl,-rpath,${SRCDIR}/library/ilib/os
+#include <stdlib.h>
 #include "os_c.h"
 */
 import "C"

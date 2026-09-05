@@ -96,14 +96,12 @@ function _finishPack(master, el, packedFlag, sx, sy) {
 }
 
 // ── Screen ───────────────────────────────────────────────────────────────────
-function Screen(title = 'AC App', geometry = '800x600') {
-    const parts = String(geometry).split('x');
-    const width = parseInt(parts[0]) || 800;
-    const height = parseInt(parts[1]) || 600;
+// title is mandatory — no geometry positional/default arg. Use .dimensions(w, h).
+function Screen(title) {
     const el = _makeEl('div');
     el.className = 'ac-screen';
     el.style.cssText =
-        `width:${width}px;min-height:${height}px;margin:20px auto;border:2px solid #333;` +
+        `width:800px;min-height:600px;margin:20px auto;border:2px solid #333;` +
         `padding:16px;background:#f5f5f5;font-family:Arial,sans-serif;box-sizing:border-box;`;
     if (_hasDOM) document.title = String(title);
 
@@ -114,6 +112,7 @@ function Screen(title = 'AC App', geometry = '800x600') {
     // No real blocking GTK-style loop makes sense on a JS event loop — the DOM already
     // reflects current widget state continuously, so update() is a deliberate no-op.
     o.update = () => {};
+    o.dimensions = (w, h) => { el.style.width = w + 'px'; el.style.minHeight = h + 'px'; };
     o.destroy = () => {
         if (_hasDOM && el.parentNode) el.parentNode.removeChild(el);
         o._mounted = false;
@@ -473,12 +472,29 @@ function sketch(master, width = 400, height = 300) {
     return o;
 }
 
+function textbox(master, color = 'black', font = 'monospace', lz = null) {
+    const el = _makeEl('textarea');
+    el.className = 'ac-textbox';
+    el.style.cssText = `width:100%;min-height:200px;box-sizing:border-box;color:${color};` +
+        `font-family:${font};white-space:pre;`;
+    const packed = { v: false };
+    if (lz !== 'lazy') { if (master && master._container) master._container.appendChild(el); packed.v = true; }
+
+    const o = { _el: el };
+    o.pack = (sx = 0, sy = 0) => _finishPack(master, el, packed, sx, sy);
+    o.write = (s) => { el.value = String(s); };
+    o.get = () => el.value;
+    o.find = (needle) => (el.value.indexOf(String(needle)) !== -1 ? String(needle) : '');
+    o.fix = (s) => { el.value = String(s); el.readOnly = true; };
+    return o;
+}
+
 // Export for use in a Node require()-based test harness. In a plain <script> (non-
 // module) browser context, the `function` declarations above are already global —
 // this block is additive, not required for that path.
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         lazy, Screen, display, ask, btn, ckbtn, radbtn, dropdown, advance, slider,
-        group, tabs, scroller, listbox, table, sketch,
+        group, tabs, scroller, listbox, table, sketch, textbox,
     };
 }

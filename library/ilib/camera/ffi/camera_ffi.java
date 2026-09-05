@@ -6,11 +6,32 @@ import java.nio.file.*;
 final class AcCamera {
     private static final Linker _L = Linker.nativeLinker();
     private static final SymbolLookup _SYM;
+    // AC_PATH-aware resolution — `Path.of(user.dir).resolve(...)` alone only found the
+    // library when `ac` was invoked from the project root itself; any other cwd (e.g.
+    // running a file from examples/) threw "Cannot open library" even though the .so
+    // was right there in the repo. Same AC_PATH/cwd/jar-relative order web-server's
+    // Java FFI already uses.
+    private static Path _resolveLib(String rel) {
+        Path relP = Path.of("library", "ilib", "camera", rel);
+        String acp = System.getenv("AC_PATH");
+        if (acp != null) {
+            Path cand = Path.of(acp).resolve(relP);
+            if (Files.exists(cand)) return cand.toAbsolutePath();
+        }
+        Path cwdCand = Path.of(".").resolve(relP);
+        if (Files.exists(cwdCand)) return cwdCand.toAbsolutePath();
+        try {
+            Path self = Path.of(AcCamera.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            Path base = Files.isDirectory(self) ? self : self.getParent();
+            Path fromClass = base.resolve("..").resolve(relP).normalize();
+            if (Files.exists(fromClass)) return fromClass.toAbsolutePath();
+        } catch (Exception ignored) {}
+        return cwdCand.toAbsolutePath();
+    }
     static {
         String _os = System.getProperty("os.name").toLowerCase();
         String _libFile = _os.contains("win") ? "libaccamera.dll" : "libaccamera.so";
-        Path _libPath = Path.of(System.getProperty("user.dir"))
-            .resolve("library/ilib/camera/" + _libFile).toAbsolutePath();
+        Path _libPath = _resolveLib(_libFile);
         _SYM = SymbolLookup.libraryLookup(_libPath, Arena.global());
     }
     private static MethodHandle _mh(String name, FunctionDescriptor fd) {

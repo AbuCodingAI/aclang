@@ -5,6 +5,7 @@ package main
 /*
 #cgo CFLAGS: -I${SRCDIR}/library/ilib/math
 #cgo LDFLAGS: -L${SRCDIR}/library/ilib/math -lacmath -Wl,-rpath,${SRCDIR}/library/ilib/math
+#include <stdlib.h>
 #include "math_c.h"
 */
 import "C"

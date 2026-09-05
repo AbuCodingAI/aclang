@@ -4,7 +4,7 @@ use ilib widgets
 
 <mainloop>
 
-    root = Screen($AC Widgets Test 2$, $600x600$)
+    root = Screen(title=$AC Widgets Test 2$, dimensions(600, 600))
 
     box = group(root, $Settings$)
     box.pack

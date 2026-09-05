@@ -1,0 +1,28 @@
+# AC ACZip Library — lowering rules (ilib:aczip)
+# Maps aczip:* IR calls to the ac_zip_* / ac_get_compression_ratio C API
+# exported by aczip_c.cpp's extern "C" shim over the aczip::ACZip C++ class.
+#
+# Default fallback: aczip:X -> ac_zip_X  (matches compress/decompress/
+# compress_hdd/compress_sata directly).
+# One explicit exception below: get_ratio doesn't follow the ac_zip_ prefix.
+
+# Core compression
+# aczip:compress          -> ac_zip_compress        (fallback)
+# aczip:decompress        -> ac_zip_decompress       (fallback)
+# aczip:compress_hdd      -> ac_zip_compress_hdd     (fallback)
+# aczip:compress_sata     -> ac_zip_compress_sata    (fallback)
+
+# Ratio — irregular name, no ac_zip_ prefix
+aczip:get_ratio           -> ac_get_compression_ratio
+
+# Buffer lifetime — every ac_zip_compress* call returns a heap-allocated
+# ACZipByteArray {data, size} that the caller MUST release with this:
+aczip:free_bytes          -> ac_free_bytes
+
+# NOTE (still open, out of scope for this pass): PY and JS do NOT call into
+# libaczip.so at all — aczip.py / aczip.js reimplement an older, incompatible
+# archive format (4-byte truncated tags instead of real paths, zstd-compress /
+# zlib-decompress mismatch, no filenames, div-by-zero on empty input; see the
+# format-mismatch comment at the top of aczip.cpp). Archives made by PY/JS are
+# NOT readable by the C++ v2 decompressor or vice versa. Migrating PY/JS onto
+# the v2 format is a separate, larger task.

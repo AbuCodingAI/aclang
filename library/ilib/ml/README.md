@@ -10,7 +10,8 @@ Rosetta-style API used by AC examples.
 | `ml.gradient_track(t, enabled)` | toggle gradient tracking |
 | `ml.backward(loss)` | run reverse-mode scalar autodiff |
 | `ml.grad_wipe(t)` | clear gradients |
-| `ml.weights(rate, t)` | SGD update for one tensor |
+| `ml.grad(t)` | read back the accumulated gradient (as a new tensor) |
+| `ml.weights(rate, t)` / `ml.optimize(rate, t)` | SGD update for one tensor (aliases) |
 | `ml.take(t)` | read the first scalar value |
 | `ml.add(a, b)`, `ml.multiply(a, b)`, `ml.relu(x)` | primitive ops |
 
@@ -56,11 +57,19 @@ ilib/ml/
 
 | Backend | Status |
 | --- | --- |
-| AC->C / AC->C++ | native `libacml.so` |
-| AC->BNY | dynamic `libacml.so` routing |
-| AC->PY / RS / GO / V | thin shims to `libacml.so` |
-| AC->JS / Java | scalar smoke-test shims only |
-| AI->VM / HTML | not implemented |
+| AC->C / AC->C++ | native `libacml.so` — verified numerically correct |
+| AC->BNY | dynamic `libacml.so` routing — verified numerically correct |
+| AC->PY / RS / GO / V | thin shims to `libacml.so` — verified numerically correct |
+| AC->JS / Java | independent pure-language autodiff engines (not FFI-bound — no native
+  binding is possible in a browser/plain-Node or a JVM without JNI) — verified numerically
+  correct against the native engine (matching gradients/SGD steps) for every operation
+  `ml.acl` exposes. `grid()`'s multi-element shape is collapsed to a single scalar
+  internally; this is behaviorally identical to native's real per-element storage for
+  everything AC's own `ml.acl` surface can express (no per-element read/write exists in the
+  language yet), but is not literally the same implementation — worth remembering if a
+  future per-element indexing feature gets added to `ml.acl`, since JS/Java would need real
+  arrays at that point, not a collapse. |
+| AI->VM / HTML | not implemented — a real, unstarted feature gap, not a stub |
 
 ## Build
 

@@ -1,0 +1,37 @@
+# AC web-server Library — lowering/import rules (ilib:web-server)
+# Server-side companion to ilib:web (which is client-only: open/popen/browser/page_get).
+# web-server is a SUB-library of web, not a standalone top-level ilib — the exclusive
+# import spelling is `from ilib web use web-server`. A bare `use ilib web-server` (or
+# `from ilib web-server use ...`) is a compile error (see ir.cpp's UseLibStmt lowering).
+# Importing web-server never pulls in web's own client-only namespace, and vice versa —
+# they stay independent namespaces at the AC-source level even though web-server can only
+# be reached THROUGH web's import spelling.
+#
+# AC has no kebab-case identifiers ('-' is the minus operator), so this ilib's
+# in-source call receiver is the hyphen-free `server` token (same rule
+# machine-audio -> maudio and string-cheese -> stringm already follow).
+#
+# One request in flight at a time (single blocking accept() loop, no threads/handles
+# passed into AC code — matches gl/camera's global-singleton-state model).
+
+server:listen         -> server.listen
+server:accept         -> server.accept
+server:req_method     -> server.req_method
+server:req_path       -> server.req_path
+server:req_query      -> server.req_query
+server:req_body       -> server.req_body
+server:req_header     -> server.req_header
+server:respond        -> server.respond
+server:respond_json   -> server.respond_json
+server:close          -> server.close
+
+# db_run: statement has no ?/:name placeholders — trusted/static text only.
+# db_run_p: statement uses ?/:name placeholders; params is a JSON array or object
+# string, bound server-side by JaSQL — never string-concatenated by AC or the ilib.
+server:db_run         -> server.db_run
+server:db_run_p       -> server.db_run_p
+server:db_import      -> server.db_import
+server:db_reset       -> server.db_reset
+server:db_stop        -> server.db_stop
+
+server:help           -> server.help

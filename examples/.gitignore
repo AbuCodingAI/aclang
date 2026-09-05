@@ -1,21 +1,10 @@
-*.py
-*.js
-*.cpp
-*.rs
-*.go
-*.java
-*.v
-*.s
-*.asm
-*.html
-*.s
-ac-cache/
-*.class
-*.acb
-*.h
-*.so
-*.o
-*_c
-*_cpp
-*_cxx
-*_lib
+# examples/ ships source only — every compiled-backend artifact (.py, .c, .cpp,
+# native binaries with no extension, etc.) is a local build byproduct, not
+# something to track. Allowlist instead of chasing extensions: a bare `*` deny
+# plus explicit `!` exceptions catches every backend's output naming
+# convention at once, including a same-stem extensionless binary (the C/CPP/RS
+# backends' own default `-o` behavior, `base` with no extension, right next to
+# the source) that no extension-based pattern would ever cover.
+*
+!*.ac
+!.gitignore

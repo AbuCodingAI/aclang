@@ -1,0 +1,37 @@
+AC->PY
+
+/* camera ilib — webcam capture plus its "sidebar" companion console (a small
+   text UI meant to sit beside a live capture) and "screen" display-mode
+   control. Runs fine with no webcam attached: init/capture/release still
+   return real status codes, they just report "no device". */
+
+use ilib camera
+
+<mainloop>
+    header.display $Camera lifecycle$
+    ok = camera.init()
+    Term.display $camera.init() = $ + to_string(ok)
+
+    header.display $Sidebar console$
+    sidebar.config($mode$, $manual$)
+    sidebar.setregion($0,0,320,240$)
+    sidebar.setinteractive(0)
+    sidebar.display($Ready to capture.$)
+    Term.display $configured a 320x240 sidebar region in manual, non-interactive mode$
+
+    header.display $Screen mode$
+    screen.setmode($fullscreen$)
+    screen.update()
+    Term.display $screen.setmode($ + $fullscreen$ + $) + screen.update() called$
+
+    header.display $Capture$
+    r1 = camera.capture($frame.jpg$)
+    Term.display $camera.capture($ + $frame.jpg$ + $) = $ + to_string(r1)
+    r2 = camera.capture_latest($latest.jpg$)
+    Term.display $camera.capture_latest($ + $latest.jpg$ + $) = $ + to_string(r2)
+    r3 = camera.capture_first($first.jpg$)
+    Term.display $camera.capture_first($ + $first.jpg$ + $) = $ + to_string(r3)
+
+    camera.release()
+    Term.display $camera.release() — device released$
+<mainloop>

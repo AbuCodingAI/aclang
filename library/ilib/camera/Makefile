@@ -20,7 +20,7 @@ TARGET_A  = libaccamera.a
 all: $(TARGET_SO) $(TARGET_A) motion_tracker_example
 
 # The shared/static libs AC's compiled backends actually link against — camera.cpp
-# owns the global Camera/SidebarConsole/Screen instances (WebCam/sidebar/etc.) that
+# owns the global Camera/SidebarConsole/Screen instances (camera/sidebar/screen) that
 # camera_c.cpp's extern "C" shim declares `extern` and wraps.
 $(TARGET_SO): camera.o camera_c.o
 	$(CXX) -shared -o $@ $^ $(LIBS)

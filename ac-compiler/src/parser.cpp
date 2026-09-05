@@ -64,6 +64,7 @@ private:
             if (t == TokenType::KW_IF     || t == TokenType::KW_FOR    ||
                 t == TokenType::KW_WHILST  || t == TokenType::KW_MAKE   ||
                 t == TokenType::KW_BUNDLE  || t == TokenType::KW_RETURN ||
+                t == TokenType::KW_YIELD   ||
                 t == TokenType::TAG_OPEN) return;
             advance();
         }
@@ -105,15 +106,20 @@ private:
     }
 
     // Pratt Parser for expressions
-    // Precedence table:
+    // Precedence table (see getPrecedence below for the authoritative source — this comment
+    // had drifted to describe an 8-level table that doesn't match the actual 10-level one):
     // 1: OR
-    // 2: XOR, XNOR  (|, #|)
-    // 3: AND  (&, keyword AND)
-    // 4: is, #=, <, >, #>(≤), #<(≥)
-    // 5: +, -
-    // 6: *, /, %, @
-    // 7: unary -, #(NOT)
-    // 8: function calls, indexing
+    // 2: XOR
+    // 3: AND
+    // 4: bor (bitwise OR)
+    // 5: bxor (bitwise XOR)
+    // 6: band (bitwise AND)
+    // 7: is, #=, <, >, #>(≤), #<(≥), overlap
+    // 8: +, -, xsub
+    // 9: *, /, //, ///, @, ptm, ptd
+    // 10: ^ (exponentiation, right-associative)
+    // unary -, not/#, ~/bnot parse their own operand at a hand-picked precedence per operator
+    // (see parsePrefix) rather than sitting at one fixed level in this table.
 
     int getPrecedence(TokenType op) {
         switch (op) {
@@ -134,18 +140,24 @@ private:
                 return 4;
 
             // Precedence 5: Bitwise XOR
-            // Symbols | / #| / & are RETIRED as operators (words only: bxor/band).
-            // They keep a precedence so expression parsing reaches the infix handler,
+            // #| is RETIRED as an operator (word only: use 'not (a xor b)' for XNOR).
+            // It keeps a precedence so expression parsing reaches the infix handler,
             // which throws a clear migration error instead of silently dropping tokens.
-            // (& and && still exist as raw tokens for method chaining, parsed separately.)
+            // PIPE (|) is NOT here anymore — it's the ternary trigger now (see
+            // parseExpression's post-loop check) and deliberately has NO precedence at
+            // all, so the Pratt loop never absorbs it at any nesting depth; it always
+            // surfaces as the first unconsumed token right after a fully-formed
+            // expression, whatever operators built that expression.
             case TokenType::KW_BXOR:     // Bitwise XOR
-            case TokenType::PIPE:        // retired → error with hint
             case TokenType::HASH_PIPE:   // retired → error with hint
                 return 5;
 
             // Precedence 6: Bitwise AND
+            // AMPERSAND (&) is NOT here — its "and"-operator duty is fully removed (no
+            // hint, just falls through to a plain parse error via the default case
+            // below). Its OTHER, real use — method chaining (&/&& ) — is a completely
+            // separate lookahead-based parse path elsewhere, untouched by this.
             case TokenType::KW_BAND:     // Bitwise AND
-            case TokenType::AMPERSAND:   // retired → error with hint
                 return 6;
 
             // Precedence 7: Comparisons (#> = ≤, #< = ≥) and overlap/is infix
@@ -209,19 +221,27 @@ private:
             return node;
         }
         
-        // Unary NOT (keyword)
+        // Unary NOT (keyword) — must bind LOOSER than comparisons (prec 7) so `not a is b`
+        // grabs the whole comparison as its operand, not just `a`. Precedence 3 (AND's own
+        // level) is the right threshold: the operand-parse consumes anything with prec > 3
+        // (comparisons at 7, all bitwise ops, arithmetic) but stops before AND(3)/XOR(2)/OR(1)
+        // — so `not a is b and c` comes out as `(not (a is b)) and c`, matching how every
+        // language with a real logical-not treats it (tighter than and/or, looser than
+        // comparisons). Was prec 9 (unary-minus's own tight-binding level) — verified real
+        // bug: `not a is b` (a=5,b=6) evaluated to False instead of True, since it parsed as
+        // `(not a) is b` → `(not 5) is 6` → `0 is 6` → False.
         if (at(TokenType::KW_NOT)) {
             advance();
-            auto operand = parseExpression(9); // unary binds tighter than +/-/* (grabs only its operand + ^)
+            auto operand = parseExpression(3);
             auto node = std::make_unique<ASTNode>(NodeType::UnaryExpr, "NOT");
             node->children.push_back(std::move(operand));
             return node;
         }
 
-        // Unary # (logical NOT — alias for 'not')
+        // Unary # (logical NOT — alias for 'not') — same fix as KW_NOT above.
         if (at(TokenType::HASH)) {
             advance();
-            auto operand = parseExpression(9); // unary binds tighter than +/-/* (grabs only its operand + ^)
+            auto operand = parseExpression(3);
             auto node = std::make_unique<ASTNode>(NodeType::UnaryExpr, "NOT");
             node->children.push_back(std::move(operand));
             return node;
@@ -255,10 +275,44 @@ private:
             return node;
         }
 
-        // Parenthesized expression
+        // Parenthesized expression, or a tuple literal: (a, b, ...)
+        // A lone (expr) with no comma stays plain grouping — zero behavior change there.
+        // Empty () is not handled here (no consumer for a 0-arity tuple in v1); it falls
+        // through to the plain-grouping expect() below exactly as it did before this change.
         if (at(TokenType::LPAREN)) {
             advance();
             auto expr = parseExpression(0);
+            if (at(TokenType::COMMA)) {
+                auto tup = std::make_unique<ASTNode>(NodeType::TupleLiteral, "");
+                if (expr) tup->children.push_back(std::move(expr));
+                while (at(TokenType::COMMA)) {
+                    advance();
+                    if (at(TokenType::RPAREN)) break; // trailing comma before )
+                    auto next = parseExpression(0);
+                    if (next) tup->children.push_back(std::move(next));
+                }
+                // Optional trailing type annotation: (a, b, ...; TYPE) or (a, b, ...; any).
+                // `; any` — an explicit heterogeneous tuple, allowed to mix element types
+                // (constant-indexed only; see ir.cpp's TupleLiteral lowering). `; TYPE` (int,
+                // dec, string, bool, short, mini, atomic) — a "colloid": every element is
+                // coerced to TYPE before IR is generated, erroring Preposterous on any element
+                // that can't convert. No annotation at all — the default — is a normal,
+                // homogeneous, inferred-type tuple (mixed int/float widens to float; any other
+                // mismatch is a Preposterous compile error).
+                if (at(TokenType::SEMICOLON)) {
+                    advance();
+                    static const std::unordered_set<std::string> tupleTypeNames = {
+                        "any", "int", "dec", "string", "bool", "short", "mini", "atomic"
+                    };
+                    if (at(TokenType::IDENTIFIER) && tupleTypeNames.count(peek().value)) {
+                        tup->value = advance().value;
+                    } else {
+                        throw SYNTAX_ERROR("Expected a type name (int/dec/string/bool/short/mini/atomic) or 'any' after ';' in tuple literal", peek().line, peek().col);
+                    }
+                }
+                expect(TokenType::RPAREN, "Expected ')' after tuple literal");
+                return tup;
+            }
             expect(TokenType::RPAREN, "Expected ')' after expression");
             return expr;
         }
@@ -322,8 +376,12 @@ private:
         }
         
         // Identifier (variable or function call)
-        // Also allow event-system keywords (value, on, rule, listener) as variable names
-        if (at(TokenType::IDENTIFIER) || at(TokenType::KW_VALUE) || at(TokenType::KW_RULE)) {
+        // Also allow event-system keywords (value, on, rule, listener) as variable names —
+        // and programLoop, which could be an ASSIGNMENT target (parseIdentifierStatement
+        // below already allowed it) but not READ as a value here, an asymmetry with its
+        // sibling soft keywords (`Term.display programLoop` was a hard parse error).
+        if (at(TokenType::IDENTIFIER) || at(TokenType::KW_VALUE) || at(TokenType::KW_RULE) ||
+            at(TokenType::KW_PROGRAM_LOOP)) {
             auto tok = advance();
 
             // Trailing wildcard: `p%` (starts-with pattern — `_wmatch` in the gl ilib's C++/JS/
@@ -492,7 +550,7 @@ private:
             return node;
         }
 
-        // iota N — lazy 0..N-1, displays concatenated (no list materialized)
+        // iota N — lazy 0..N-1, generates numbers on the spot (no list materialized upfront)
         if (at(TokenType::KW_IOTA)) {
             advance();
             auto boundExpr = parseExpression(0);
@@ -502,10 +560,32 @@ private:
             return node;
         }
 
-        // length expr — get array/string length (no parentheses required)
+        // xrange N — 1-indexed range (AC arrays are 1-indexed; range/sequence aren't).
+        // xiota N — 1-indexed iota. Both usable in expression position, e.g. FOR i in xrange 5.
+        if (at(TokenType::KW_XRANGE)) {
+            advance();
+            auto boundExpr = parseExpression(0);
+            auto node = std::make_unique<ASTNode>(NodeType::XRangeExpr, "");
+            if (boundExpr) node->children.push_back(std::move(boundExpr));
+            node->inferredType = std::make_shared<Type>(Type::makeList());
+            return node;
+        }
+        if (at(TokenType::KW_XIOTA)) {
+            advance();
+            auto boundExpr = parseExpression(0);
+            auto node = std::make_unique<ASTNode>(NodeType::XIotaExpr, "");
+            if (boundExpr) node->children.push_back(std::move(boundExpr));
+            node->inferredType = std::make_shared<Type>(Type::makeList());
+            return node;
+        }
+
+        // length expr — get array/string length (no parentheses required). Binds tight, same
+        // level as unary minus (prec 9 — grabs only its immediate operand + `^`), NOT prec 0
+        // (grab everything) — verified real bug: `length arr < 5` parsed as `length(arr < 5)`
+        // (comparing a list to an int, then taking ITS length) instead of `(length arr) < 5`.
         if (at(TokenType::KW_LENGTH)) {
             advance();
-            auto arg = parseExpression(0);
+            auto arg = parseExpression(9);
             auto node = std::make_unique<ASTNode>(NodeType::CallExpr, "length");
             if (arg) node->children.push_back(std::move(arg));
             return node;
@@ -603,14 +683,8 @@ private:
         } else if (op == TokenType::KW_BOR) {
             opStr = "bor";
             advance();
-        } else if (op == TokenType::PIPE) {
-            throw ACError::syntax("operator '|' was removed — use 'bor' (bitwise OR) or 'or' (logical)",
-                                  peek().line, peek().col);
         } else if (op == TokenType::HASH_PIPE) {
             throw ACError::syntax("operator '#|' was removed — use 'not (a xor b)' (XNOR)",
-                                  peek().line, peek().col);
-        } else if (op == TokenType::AMPERSAND) {
-            throw ACError::syntax("operator '&' was removed — use 'band' (bitwise AND) or 'and' (logical)",
                                   peek().line, peek().col);
         } else if (op == TokenType::KW_BAND) {
             opStr = "band";
@@ -678,6 +752,31 @@ private:
             }
 
             left = parseInfix(std::move(left), op);
+        }
+
+        // Ternary: `condition | true_expr, # false_expr` — read `|` as the math
+        // "such that" bar. Gated on `precedence == 0` (the default, used only by
+        // genuinely top-level callers — assignment RHS, return, a parenthesized
+        // sub-expression's own inner parse — never by a Pratt-recursive call binding
+        // some OTHER operator's right-hand operand, which always passes a nonzero
+        // precedence) so a bare `|` never gets misread as starting a ternary mid-way
+        // through some other expression's operand. PIPE deliberately has no
+        // precedence at all (see getPrecedence) so the while-loop above never
+        // consumes it — `left` here is always the FULL preceding expression,
+        // whatever operators built it. `#` is consumed as a literal else-marker
+        // here, not routed through parsePrefix's unary-NOT — no collision with that
+        // still-current meaning of `#` used everywhere else.
+        if (precedence == 0 && at(TokenType::PIPE)) {
+            advance(); // consume |
+            auto trueExpr = parseExpression();
+            expect(TokenType::COMMA, "Expected ',' after ternary true-branch");
+            expect(TokenType::HASH, "Expected '#' before ternary false-branch");
+            auto falseExpr = parseExpression();
+            auto node = std::make_unique<ASTNode>(NodeType::TernaryExpr);
+            node->children.push_back(std::move(left));
+            node->children.push_back(std::move(trueExpr));
+            node->children.push_back(std::move(falseExpr));
+            return node;
         }
 
         return left;
@@ -1013,6 +1112,21 @@ private:
             return node;
         }
 
+        // fetch math.sin — sugar for `from ilib math use sin`: imports ONLY that one
+        // dotted symbol (not the whole `math` namespace), callable bare afterward (`sin()`).
+        // Desugars to the exact same UseLibStmt shape `from ilib X use Y` produces, so
+        // selectiveImportAliases_ (ir.cpp) and every downstream mechanism built for that
+        // already handles it with zero extra work.
+        if (at(TokenType::KW_FETCH)) {
+            advance(); // consume 'fetch'
+            auto libTok = expect(TokenType::IDENTIFIER, "Expected library name after 'fetch'");
+            expect(TokenType::DOT, "Expected '.' after library name in 'fetch " + libTok.value + ".<symbol>'");
+            auto symTok = expect(TokenType::IDENTIFIER, "Expected symbol name after 'fetch " + libTok.value + ".'");
+            auto node = std::make_unique<ASTNode>(NodeType::UseLibStmt, "ilib:" + libTok.value);
+            node->attrs.push_back(symTok.value);
+            return node;
+        }
+
         // save as name
         if (at(TokenType::KW_SAVE)) {
             advance();
@@ -1038,8 +1152,16 @@ private:
             return parseTry();
         }
 
-        // cond x ...  (multi-branch dispatch sugar)
-        if (at(TokenType::IDENTIFIER) && peek().value == "cond") {
+        // cond x ...  (multi-branch dispatch sugar). "cond" is a soft keyword (plain IDENTIFIER
+        // text, not a real token type) — must NOT fire when "cond" is being used as an ordinary
+        // variable name (`cond = 5`, `cond += 1`, `cond[0] = 1`). Verified real bug: `cond = 5`
+        // unconditionally entered cond-dispatch parsing, which then choked on the bare `=`.
+        if (at(TokenType::IDENTIFIER) && peek().value == "cond" &&
+            peekAhead(1).type != TokenType::ASSIGN &&
+            peekAhead(1).type != TokenType::PLUS_EQUAL && peekAhead(1).type != TokenType::MINUS_EQUAL &&
+            peekAhead(1).type != TokenType::MULTIPLY_EQUAL && peekAhead(1).type != TokenType::DIVIDE_EQUAL &&
+            peekAhead(1).type != TokenType::AT_EQUAL &&
+            peekAhead(1).type != TokenType::LBRACKET && peekAhead(1).type != TokenType::DOT) {
             advance(); // consume 'cond'
             auto baseExpr = parseExpression(0);
             skipNewlines();
@@ -1280,29 +1402,16 @@ private:
             return node;
         }
 
-        // range N — Numeral Pos only
-        if (at(TokenType::KW_RANGE)) {
-            advance();
-            std::string n;
-            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE))
-                n += advance().value;
-            auto node = std::make_unique<ASTNode>(NodeType::RangeExpr, n);
-            node->inferredType = std::make_shared<Type>(Type::makeList());
-            return node;
-        }
-
-        // sequence(x, y)
-        if (at(TokenType::KW_SEQUENCE)) {
-            advance();
-            expect(TokenType::LPAREN, "Expected ( after sequence");
-            std::string x, y;
-            while (!at(TokenType::COMMA) && !at(TokenType::END_OF_FILE)) x += advance().value;
-            if (at(TokenType::COMMA)) advance();
-            while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) y += advance().value;
-            if (at(TokenType::RPAREN)) advance();
-            auto node = std::make_unique<ASTNode>(NodeType::SequenceExpr, x + "," + y);
-            node->inferredType = std::make_shared<Type>(Type::makeList());
-            return node;
+        // range N / sequence(x, y) / stream(x, y[, step]) as a bare statement (side-effect-free,
+        // but still valid syntax to parse, e.g. someone writes `range n + 1` alone on a line).
+        // Delegate to parsePrefix (via parseExpression) instead of duplicating its logic with
+        // raw manual token-concatenation — that duplicate had no separators between tokens at
+        // all (verified real bug: `range n + 1` collapsed to the text "n+1", losing the operator
+        // spacing and, worse, discarding real AST structure for a value-string blob), while
+        // parsePrefix's own KW_RANGE/KW_SEQUENCE/KW_STREAM handling (used for `x = range n + 1`
+        // and `FOR i in range n + 1`) already builds a proper child expression via parseExpression.
+        if (at(TokenType::KW_RANGE) || at(TokenType::KW_SEQUENCE) || at(TokenType::KW_STREAM)) {
+            return parseExpression(0);
         }
 
         // eval(expr) — evaluate string as AC expression, returns value
@@ -1340,7 +1449,9 @@ private:
             if (at(TokenType::ASSIGN)) {
                 advance();
                 valExpr = parseExpression();
-                if (valExpr && valExpr->type == NodeType::TupleLiteral) {
+                // {unscaled, scale} now parses as a (deduped) set literal, i.e. ListLiteral —
+                // see parseTupleLiteral's own comment for why the bare-{...} form changed.
+                if (valExpr && (valExpr->type == NodeType::TupleLiteral || valExpr->type == NodeType::ListLiteral)) {
                     auto t = peek();
                     throw SYNTAX_ERROR("math.GoodDec does not accept {unscaled, scale}; write decimals like 1.23 or expressions like 0.1 + 0.2", t.line, t.col);
                 }
@@ -1484,7 +1595,7 @@ private:
                 bool isAssign = (after == TokenType::ASSIGN
                               || after == TokenType::PLUS_EQUAL || after == TokenType::MINUS_EQUAL
                               || after == TokenType::MULTIPLY_EQUAL || after == TokenType::DIVIDE_EQUAL
-                              || after == TokenType::AT_EQUAL); // |= retired with the | operator
+                              || after == TokenType::AT_EQUAL);
                 if (isAssign) {
                     // Form 2: free var = expr  →  FreeDecl(var) carrying the assignment as child
                     advance(); // consume 'free'
@@ -1573,20 +1684,34 @@ private:
             auto node = std::make_unique<ASTNode>(NodeType::ReturnStmt, "");
 
             if (returnExpr) {
-                // return x, y  — collect comma-separated values into a list
+                // return x, y  — a real fixed-shape tuple (not a mutable list — see
+                // collectTupleTrackability/emitSyntheticTupleClass in ir.cpp: a returned
+                // tuple always escapes its function, so it always takes the fallback
+                // synthesized-bundle path, never the scalarized one).
                 if (at(TokenType::COMMA)) {
-                    auto list = std::make_unique<ASTNode>(NodeType::ListLiteral, "");
-                    list->children.push_back(std::move(returnExpr));
+                    auto tup = std::make_unique<ASTNode>(NodeType::TupleLiteral, "");
+                    tup->children.push_back(std::move(returnExpr));
                     while (at(TokenType::COMMA)) {
                         advance();
                         auto next = parseExpression(0);
-                        if (next) list->children.push_back(std::move(next));
+                        if (next) tup->children.push_back(std::move(next));
                     }
-                    node->children.push_back(std::move(list));
+                    node->children.push_back(std::move(tup));
                 } else {
                     node->children.push_back(std::move(returnExpr));
                 }
             }
+            return node;
+        }
+
+        // yield expr — any Make func containing this anywhere becomes a generator
+        // (auto-detected, matches Python's own "presence of yield" rule; see
+        // collectGeneratorFunctions in ir.cpp for the detection prepass).
+        if (at(TokenType::KW_YIELD)) {
+            advance();
+            auto yieldExpr = parseExpression(0);
+            auto node = std::make_unique<ASTNode>(NodeType::YieldStmt, "");
+            if (yieldExpr) node->children.push_back(std::move(yieldExpr));
             return node;
         }
 
@@ -2065,14 +2190,43 @@ private:
             auto node = std::make_unique<ASTNode>(NodeType::DictLiteral, contents);
             return node;
         } else {
-            // Parse as tuple: {$item1, item2$}
-            std::string contents;
+            // Parse as a SET: {item1, item2, ...} — Python's set() literal: dedupes elements,
+            // otherwise identical to a list. Produces a genuine NodeType::ListLiteral (not a
+            // separate type) so it rides the exact same ALLOC/.append/.kick/.swap/indexing
+            // machinery a plain `[...]` list already gets on every backend — "takes all list
+            // functions" is then true for free, nothing backend-specific to add. Dedup is
+            // TEXT-based, at parse time (`{1, 2, 2, 3}` -> `{1, 2, 3}`; a computed duplicate
+            // like `{2, 1+1}` isn't caught — that would need a runtime membership check, out of
+            // scope here). Replaces the old bare "tuple" literal — verified dead weight: only
+            // 2 of 12 backends (PY/JS) had ANY "tuple" ALLOC codegen at all, and even the parser
+            // itself never finished it (its string-element branch never actually applied the
+            // $..$ wrapping the sibling list-literal parser does, verified by direct diff).
+            std::vector<std::string> elems;
+            std::string cur;
+            int depth = 0;
             while (!at(TokenType::RBRACE) && !at(TokenType::END_OF_FILE)) {
-                if (at(TokenType::STRING)) contents += advance().value;
-                else contents += advance().value;
+                if (at(TokenType::LBRACKET))            { depth++; cur += advance().value; continue; }
+                if (at(TokenType::RBRACKET))            { depth--; cur += advance().value; continue; }
+                if (at(TokenType::STRING))              { cur += "$" + advance().value + "$"; continue; }
+                if (at(TokenType::COMMA) && depth == 0) { elems.push_back(cur); cur.clear(); advance(); continue; }
+                cur += advance().value;
             }
+            if (!cur.empty() || !elems.empty()) elems.push_back(cur);
             if (at(TokenType::RBRACE)) advance();
-            auto node = std::make_unique<ASTNode>(NodeType::TupleLiteral, contents);
+            auto trimS = [](const std::string& s) {
+                size_t a = s.find_first_not_of(' '), b = s.find_last_not_of(' ');
+                return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+            };
+            std::vector<std::string> uniq;
+            for (auto& e : elems) {
+                std::string te = trimS(e);
+                bool dup = false;
+                for (auto& u : uniq) if (u == te) { dup = true; break; }
+                if (!dup) uniq.push_back(te);
+            }
+            std::string contents;
+            for (size_t k = 0; k < uniq.size(); k++) { if (k) contents += ","; contents += uniq[k]; }
+            auto node = std::make_unique<ASTNode>(NodeType::ListLiteral, contents);
             return node;
         }
     }
@@ -2204,10 +2358,23 @@ private:
             advance();
             expect(TokenType::LPAREN, "Expected ( after func");
             // collect all args: func(a, b, c)
+            // Verified real bug this closes: "value"/"rule" are soft keywords (KW_VALUE/
+            // KW_RULE, not IDENTIFIER — see the `const value = 2` comment above) but this loop
+            // only ever advanced past IDENTIFIER or COMMA. `func(value)` (an entirely ordinary
+            // parameter name) hit neither branch, never advanced `pos`, and spun at 100% CPU
+            // forever — a real infinite-loop hang, not just a rejected/misparsed parameter.
+            // Accept the same soft keywords Make's own name parsing already does (line ~2354),
+            // and hard-error instead of spinning on anything else unexpected, so a future
+            // unhandled token type fails loudly instead of hanging again.
             std::vector<std::string> args;
             while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
-                if (at(TokenType::IDENTIFIER)) args.push_back(advance().value);
-                if (at(TokenType::COMMA)) advance();
+                if (at(TokenType::IDENTIFIER) || at(TokenType::KW_VALUE) || at(TokenType::KW_RULE)) {
+                    args.push_back(advance().value);
+                } else if (at(TokenType::COMMA)) {
+                    advance();
+                } else {
+                    throw SYNTAX_ERROR("Expected parameter name in function argument list", peek().line, peek().col);
+                }
             }
             expect(TokenType::RPAREN, "Expected )");
             auto node = std::make_unique<ASTNode>(NodeType::FuncDef, name);
@@ -2451,7 +2618,24 @@ private:
                 advance();
                 std::string val;
                 while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                    val += advance().value + " ";
+                    if (at(TokenType::STRING)) { val += "$" + advance().value + "$"; continue; }
+                    std::string tv = advance().value;
+                    // Tight-glue punctuation that must stay adjacent to its neighbor for
+                    // lowerExpr()'s own downstream text-based indexing/dotted-name detection
+                    // to recognize it at all — same established pattern as ConfigCall's own
+                    // text-builder just above (see its comment on the identical problem for
+                    // '.'). Verified real bug this closes: `h.val = arr[2]` reconstructed as
+                    // "arr [ 2 ] " — the space before '[' broke lowerExpr()'s
+                    // is-this-an-index-expression check, silently falling through to some
+                    // other (wrong) interpretation instead of a real indexed read.
+                    if (tv == "." || tv == "[" || tv == "]" || tv == "(" || tv == ")" || tv == ",") {
+                        val += tv;
+                        continue;
+                    }
+                    if (!val.empty() && val.back() != '.' && val.back() != '[' && val.back() != '('
+                                       && val.back() != ',')
+                        val += " ";
+                    val += tv;
                 }
                 auto node = std::make_unique<ASTNode>(NodeType::PropAssign, name + "." + prop);
                 node->attrs.push_back(val);
@@ -2484,6 +2668,47 @@ private:
                     tail += " ";
             }
             if (!tail.empty()) node->attrs.push_back(tail);
+            return node;
+        }
+
+        // Destructuring assignment: a, b[, c...] = expr
+        // A bare COMMA right after a plain identifier is unclaimed by every branch above
+        // (DOT/LPAREN went to their own returns already) and by the ASSIGN-based simple
+        // assignment below (which never sees a leading COMMA) — this is the one new grammar
+        // slot tuples need. Only plain-identifier LHS targets are supported (a.x, b = ... or
+        // a[0], b = ... are not handled here — they fall through to the DOT/LBRACKET branches
+        // above instead, unchanged).
+        if (at(TokenType::COMMA)) {
+            std::vector<std::string> targets;
+            targets.push_back(name);
+            while (at(TokenType::COMMA)) {
+                advance();
+                targets.push_back(advance().value);
+            }
+            if (!at(TokenType::ASSIGN)) {
+                throw SYNTAX_ERROR("Expected '=' after comma-separated destructuring targets", peek().line, peek().col);
+            }
+            advance(); // consume =
+            auto rhsExpr = parseExpression(0);
+            if (!rhsExpr) {
+                throw SYNTAX_ERROR("Expected expression after destructuring '='", peek().line, peek().col);
+            }
+            // a, b = x, y  — bare comma-separated RHS (mirrors `return x, y`'s own sugar):
+            // collect into a real TupleLiteral so the RHS shape is uniform whether written
+            // a, b = (x, y) or a, b = x, y.
+            if (at(TokenType::COMMA)) {
+                auto tup = std::make_unique<ASTNode>(NodeType::TupleLiteral, "");
+                tup->children.push_back(std::move(rhsExpr));
+                while (at(TokenType::COMMA)) {
+                    advance();
+                    auto next = parseExpression(0);
+                    if (next) tup->children.push_back(std::move(next));
+                }
+                rhsExpr = std::move(tup);
+            }
+            auto node = std::make_unique<ASTNode>(NodeType::DestructureAssignStmt, "");
+            node->attrs = std::move(targets);
+            node->children.push_back(std::move(rhsExpr));
             return node;
         }
 
@@ -2586,14 +2811,16 @@ private:
                 node->attrs.push_back("__list__" + listNode->value);
                 return node;
             }
-            // tuple or dict literal
+            // set or dict literal — parseTupleLiteral's bare-{...} branch now returns a
+            // (deduped) ListLiteral, not a TupleLiteral (see its own comment); route it through
+            // the same "__list__" attrs marker a plain `[...]` assignment already uses.
             if (at(TokenType::LBRACE)) {
                 auto literalNode = parseTupleLiteral();
                 auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
                 if (literalNode->type == NodeType::DictLiteral) {
                     node->attrs.push_back("__dict__" + literalNode->value);
                 } else {
-                    node->attrs.push_back("__tuple__" + literalNode->value);
+                    node->attrs.push_back("__list__" + literalNode->value);
                 }
                 return node;
             }
@@ -2604,38 +2831,20 @@ private:
                 node->attrs.push_back("__fn__" + fnNode->value);
                 return node;
             }
-            // range N
-            if (at(TokenType::KW_RANGE)) {
-                advance();
-                auto rangeExpr = parseExpression(0);
-                if (!rangeExpr) {
-                    throw SYNTAX_ERROR("Expected expression after range", peek().line, peek().col);
-                }
-                auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
-                node->attrs.push_back("__range__");
-                node->children.push_back(std::move(rangeExpr));
-                return node;
-            }
-            // sequence(x, y)
-            if (at(TokenType::KW_SEQUENCE)) {
-                advance();
-                expect(TokenType::LPAREN, "Expected ( after sequence");
-                auto xExpr = parseExpression(0);
-                if (!xExpr) {
-                    throw SYNTAX_ERROR("Expected first argument in sequence", peek().line, peek().col);
-                }
-                expect(TokenType::COMMA, "Expected comma in sequence");
-                auto yExpr = parseExpression(0);
-                if (!yExpr) {
-                    throw SYNTAX_ERROR("Expected second argument in sequence", peek().line, peek().col);
-                }
-                expect(TokenType::RPAREN, "Expected ) after sequence");
-                auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
-                node->attrs.push_back("__sequence__");
-                node->children.push_back(std::move(xExpr));
-                node->children.push_back(std::move(yExpr));
-                return node;
-            }
+            // range N / sequence(x,y[,step]) as an assignment RHS: these used to have their
+            // own special-cased "__range__"/"__sequence__" attrs-marker handling here, but
+            // ir.cpp's AssignStmt lowering checks attrs BEFORE children, and the marker case it
+            // actually looks for was in the "children empty" legacy-string branch — dead, since
+            // this code always pushed a real child. Every use of that marker silently fell
+            // through to the fully generic "structured expression" path instead, which just
+            // lowered the RAW BOUND as a plain scalar and threw the range/sequence-ness away
+            // entirely (verified real bug: `y = range 5` printed the bare `5`, not `[0,1,2,3,4]`
+            // — matches a previously-documented-but-unfixed "range/sequence-as-value collapses
+            // to bound" limitation). `stream`/`iota` never had this special-casing and fell
+            // through to the generic Pratt-parser path below — which already builds a correct
+            // RangeExpr/SequenceExpr node (with real children, including the 3-arg step form
+            // sequence's OWN version above never supported) — so removing this dead-weight
+            // special case fixes both range and sequence for free, no ir.cpp change needed.
             // function call with keyword args: name = func(key=val, key=val) or func(arg1, arg2)
             if (at(TokenType::IDENTIFIER) && peekAhead(1).type == TokenType::LPAREN) {
                 std::string funcName = advance().value;
@@ -2718,12 +2927,6 @@ private:
             auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
             node->children.push_back(std::move(rhsExpr));
             return node;
-        }
-
-        // "Name at <rate>" — animation rate/direction hint, skip as no-op
-        if (at(TokenType::KW_AT)) {
-            while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) advance();
-            return nullptr;
         }
 
         // Bare identifier - unidentified syntax, throw error

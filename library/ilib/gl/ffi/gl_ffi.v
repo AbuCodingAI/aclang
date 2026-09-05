@@ -126,75 +126,75 @@ fn gl_delta_time() f32      { return C.ac_gl_delta_time() }
 
 // ── Namespace struct — AC-generated V uses gl.screen.create(...) etc. ──
 
-struct _AcGlScreen {}
-fn (_AcGlScreen) create(w int, h int, title string) bool { return gl_screen_create(w, h, title) }
-fn (_AcGlScreen) set_bg(r u8, g u8, b u8)                { gl_screen_set_bg(r, g, b) }
-fn (_AcGlScreen) set_fps(fps int)                          { gl_screen_set_fps(fps) }
-fn (_AcGlScreen) w() int                                   { return gl_screen_w() }
-fn (_AcGlScreen) h() int                                   { return gl_screen_h() }
+struct AcGlScreen {}
+fn (o AcGlScreen) create(w int, h int, title string) bool { return gl_screen_create(w, h, title) }
+fn (o AcGlScreen) set_bg(r u8, g u8, b u8)                { gl_screen_set_bg(r, g, b) }
+fn (o AcGlScreen) set_fps(fps int)                          { gl_screen_set_fps(fps) }
+fn (o AcGlScreen) w() int                                   { return gl_screen_w() }
+fn (o AcGlScreen) h() int                                   { return gl_screen_h() }
 
-struct _AcGlObj {}
-fn (_AcGlObj) create(name string)                    { gl_obj_create(name) }
-fn (_AcGlObj) geometry(name string, w int, h int)    { gl_obj_geometry(name, w, h) }
-fn (_AcGlObj) square(name string, size int)           { gl_obj_square(name, size) }
-fn (_AcGlObj) pos(name string, x int, y int)          { gl_obj_pos(name, x, y) }
-fn (_AcGlObj) color(name string, r u8, g u8, b u8)   { gl_obj_color(name, r, g, b) }
-fn (_AcGlObj) velocity(name string, vx f32, vy f32)  { gl_obj_velocity(name, vx, vy) }
-fn (_AcGlObj) set_speed(name string, s f32)           { gl_obj_set_speed(name, s) }
-fn (_AcGlObj) set_direction(name string, d f32)       { gl_obj_set_direction(name, d) }
-fn (_AcGlObj) speed_mult(name string, m f32)          { gl_obj_speed_mult(name, m) }
-fn (_AcGlObj) move_x(name string, dx int)            { gl_obj_move_x(name, dx) }
-fn (_AcGlObj) move_y(name string, dy int)            { gl_obj_move_y(name, dy) }
-fn (_AcGlObj) x(name string) int                     { return gl_obj_x(name) }
-fn (_AcGlObj) y(name string) int                     { return gl_obj_y(name) }
-fn (_AcGlObj) w(name string) int                     { return gl_obj_w(name) }
-fn (_AcGlObj) h(name string) int                     { return gl_obj_h(name) }
-fn (_AcGlObj) curveshape(name string, expr string)   { gl_obj_curveshape(name, expr) }
-fn (_AcGlObj) vertex(name string, vx f32, vy f32)   { gl_obj_vertex(name, vx, vy) }
-fn (_AcGlObj) to_draw(name string)                            { gl_obj_to_draw(name) }
-fn (_AcGlObj) circle_fall(name string, frac f32, dir string)  { gl_obj_circle_fall(name, frac, dir) }
-fn (_AcGlObj) circle_fell(name string) bool                   { return gl_obj_circle_fell(name) }
-fn (_AcGlObj) set_spawn(name string)                          { gl_obj_set_spawn(name) }
-fn (_AcGlObj) regen(name string)                              { gl_obj_regen(name) }
-fn (_AcGlObj) animate(name string, dir string, speed f32)     { gl_obj_animate(name, dir, speed) }
+struct AcGlObj {}
+fn (o AcGlObj) create(name string)                    { gl_obj_create(name) }
+fn (o AcGlObj) geometry(name string, w int, h int)    { gl_obj_geometry(name, w, h) }
+fn (o AcGlObj) square(name string, size int)           { gl_obj_square(name, size) }
+fn (o AcGlObj) pos(name string, x int, y int)          { gl_obj_pos(name, x, y) }
+fn (o AcGlObj) color(name string, r u8, g u8, b u8)   { gl_obj_color(name, r, g, b) }
+fn (o AcGlObj) velocity(name string, vx f32, vy f32)  { gl_obj_velocity(name, vx, vy) }
+fn (o AcGlObj) set_speed(name string, s f32)           { gl_obj_set_speed(name, s) }
+fn (o AcGlObj) set_direction(name string, d f32)       { gl_obj_set_direction(name, d) }
+fn (o AcGlObj) speed_mult(name string, m f32)          { gl_obj_speed_mult(name, m) }
+fn (o AcGlObj) move_x(name string, dx int)            { gl_obj_move_x(name, dx) }
+fn (o AcGlObj) move_y(name string, dy int)            { gl_obj_move_y(name, dy) }
+fn (o AcGlObj) x(name string) int                     { return gl_obj_x(name) }
+fn (o AcGlObj) y(name string) int                     { return gl_obj_y(name) }
+fn (o AcGlObj) w(name string) int                     { return gl_obj_w(name) }
+fn (o AcGlObj) h(name string) int                     { return gl_obj_h(name) }
+fn (o AcGlObj) curveshape(name string, expr string)   { gl_obj_curveshape(name, expr) }
+fn (o AcGlObj) vertex(name string, vx f32, vy f32)   { gl_obj_vertex(name, vx, vy) }
+fn (o AcGlObj) to_draw(name string)                            { gl_obj_to_draw(name) }
+fn (o AcGlObj) circle_fall(name string, frac f32, dir string)  { gl_obj_circle_fall(name, frac, dir) }
+fn (o AcGlObj) circle_fell(name string) bool                   { return gl_obj_circle_fell(name) }
+fn (o AcGlObj) set_spawn(name string)                          { gl_obj_set_spawn(name) }
+fn (o AcGlObj) regen(name string)                              { gl_obj_regen(name) }
+fn (o AcGlObj) animate(name string, dir string, speed f32)     { gl_obj_animate(name, dir, speed) }
 
-struct _AcGlDraw {}
-fn (_AcGlDraw) create(name string)                                                    { gl_draw_create(name) }
-fn (_AcGlDraw) curveshape(name string, expr string)                                   { gl_draw_curveshape(name, expr) }
-fn (_AcGlDraw) vertex(name string, vx f32, vy f32)                                   { gl_draw_vertex(name, vx, vy) }
-fn (_AcGlDraw) line(name string, x1 f32, y1 f32, x2 f32, y2 f32, r u8, g u8, b u8) { gl_draw_line(name, x1, y1, x2, y2, r, g, b) }
-fn (_AcGlDraw) circle(name string, cx f32, cy f32, rad f32, r u8, g u8, b u8)       { gl_draw_circle(name, cx, cy, rad, r, g, b) }
-fn (_AcGlDraw) clear(name string)                                                     { gl_draw_clear(name) }
-fn (_AcGlDraw) to_obj(name string)                                                    { gl_draw_to_obj(name) }
+struct AcGlDraw {}
+fn (o AcGlDraw) create(name string)                                                    { gl_draw_create(name) }
+fn (o AcGlDraw) curveshape(name string, expr string)                                   { gl_draw_curveshape(name, expr) }
+fn (o AcGlDraw) vertex(name string, vx f32, vy f32)                                   { gl_draw_vertex(name, vx, vy) }
+fn (o AcGlDraw) line(name string, x1 f32, y1 f32, x2 f32, y2 f32, r u8, g u8, b u8) { gl_draw_line(name, x1, y1, x2, y2, r, g, b) }
+fn (o AcGlDraw) circle(name string, cx f32, cy f32, rad f32, r u8, g u8, b u8)       { gl_draw_circle(name, cx, cy, rad, r, g, b) }
+fn (o AcGlDraw) clear(name string)                                                     { gl_draw_clear(name) }
+fn (o AcGlDraw) to_obj(name string)                                                    { gl_draw_to_obj(name) }
 
-struct _AcGlHitbox {}
-fn (_AcGlHitbox) overlap(a string, b string) bool            { return gl_hitbox_overlap(a, b) }
-fn (_AcGlHitbox) boundary(name string) bool                  { return gl_hitbox_boundary(name) }
-fn (_AcGlHitbox) overlap_pattern(n string, pat string) bool  { return gl_hitbox_overlap_pattern(n, pat) }
-fn (_AcGlHitbox) many_overlap() bool                         { return gl_hitbox_many_overlap() }
+struct AcGlHitbox {}
+fn (o AcGlHitbox) overlap(a string, b string) bool            { return gl_hitbox_overlap(a, b) }
+fn (o AcGlHitbox) boundary(name string) bool                  { return gl_hitbox_boundary(name) }
+fn (o AcGlHitbox) overlap_pattern(n string, pat string) bool  { return gl_hitbox_overlap_pattern(n, pat) }
+fn (o AcGlHitbox) many_overlap() bool                         { return gl_hitbox_many_overlap() }
 
-struct _AcGlKey {}
-fn (_AcGlKey) pressed(k string) bool      { return gl_key_pressed(k) }
-fn (_AcGlKey) just_pressed(k string) bool { return gl_key_just_pressed(k) }
+struct AcGlKey {}
+fn (o AcGlKey) pressed(k string) bool      { return gl_key_pressed(k) }
+fn (o AcGlKey) just_pressed(k string) bool { return gl_key_just_pressed(k) }
 
-struct _AcGlFrame {}
-fn (_AcGlFrame) begin() bool    { return gl_frame_begin() }
-fn (_AcGlFrame) update(dt f32)  { gl_frame_update(dt) }
-fn (_AcGlFrame) render()        { gl_frame_render() }
-fn (_AcGlFrame) end()           { gl_frame_end() }
-fn (_AcGlFrame) delta() f32     { return gl_delta_time() }
+struct AcGlFrame {}
+fn (o AcGlFrame) begin() bool    { return gl_frame_begin() }
+fn (o AcGlFrame) update(dt f32)  { gl_frame_update(dt) }
+fn (o AcGlFrame) render()        { gl_frame_render() }
+fn (o AcGlFrame) end()           { gl_frame_end() }
+fn (o AcGlFrame) delta() f32     { return gl_delta_time() }
 
-struct _AcGlNS {
-    screen _AcGlScreen
-    obj    _AcGlObj
-    draw   _AcGlDraw
-    hitbox _AcGlHitbox
-    key    _AcGlKey
-    frame  _AcGlFrame
+struct AcGlNS {
+    screen AcGlScreen
+    obj    AcGlObj
+    draw   AcGlDraw
+    hitbox AcGlHitbox
+    key    AcGlKey
+    frame  AcGlFrame
 }
-fn (_AcGlNS) init() bool               { return gl_init() }
-fn (_AcGlNS) quit()                    { gl_quit() }
-fn (_AcGlNS) is_draw(name string) bool { return gl_is_draw(name) }
-fn (_AcGlNS) is_obj(name string) bool  { return gl_is_obj(name) }
+fn (o AcGlNS) init() bool               { return gl_init() }
+fn (o AcGlNS) quit()                    { gl_quit() }
+fn (o AcGlNS) is_draw(name string) bool { return gl_is_draw(name) }
+fn (o AcGlNS) is_obj(name string) bool  { return gl_is_obj(name) }
 
-const gl = _AcGlNS{}
+const gl = AcGlNS{}

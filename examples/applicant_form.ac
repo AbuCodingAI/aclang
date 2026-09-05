@@ -17,7 +17,8 @@ Make OnSubmit func()
     status_lbl.set($Saved! Entry appended to applicants.ndjson$)
 
 <mainloop>
-    root = Screen($Job Application Form$, $500x560$)
+    root = Screen(title=$Job Application Form$)
+    root.dimensions(500, 560)
 
     _h = display(root, $=== Job Application Form ===$)
 

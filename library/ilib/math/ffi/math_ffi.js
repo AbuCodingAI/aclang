@@ -1,5 +1,5 @@
 const _ffi=require('ffi-napi'),_ref=require('ref-napi'),_path=require('path');
-const _lib=_path.join(process.cwd(),'library','math',process.platform==='win32'?'acmath':'libacmath');
+const _lib=_path.join(process.cwd(),'library','ilib','math',process.platform==='win32'?'acmath':'libacmath');
 const _D='double',_I='int64',_INT='int',_V='void';
 const _m=_ffi.Library(_lib,{
 // Constants

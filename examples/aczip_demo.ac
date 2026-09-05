@@ -1,0 +1,43 @@
+AC->PY
+
+/* aczip ilib — real file compression, round-tripped through the actual on-disk
+   ACZip v2 format. AC has no raw byte-buffer type, so aczip.compress/.decompress
+   work file-to-file: compress writes straight to an output archive and returns the
+   byte count, decompress reads an archive off disk and extracts it. */
+
+use ilib os
+use ilib aczip
+
+<mainloop>
+    header.display $Preparing sample files$
+    os.mkdir($aczip_demo_src$)
+    os.write_to($aczip_demo_src/hello.txt$, $Hello from the aczip ilib demo!$)
+    os.write_to($aczip_demo_src/poem.txt$, $Roses are red, compression is neat, ACZip v2 makes the archive complete.$)
+    Term.display $wrote aczip_demo_src/hello.txt and aczip_demo_src/poem.txt$
+
+    header.display $Compressing$
+    written = aczip.compress($aczip_demo_src$, 1, $aczip_demo.aczip$)
+    Term.display $aczip.compress(...) wrote $ + to_string(written) + $ bytes to aczip_demo.aczip$
+
+    ratio = aczip.get_ratio(200, written)
+    Term.display $aczip.get_ratio(200, written) = $ + to_string(ratio) + $ percent$
+
+    header.display $Decompressing$
+    status = aczip.decompress($aczip_demo.aczip$, $aczip_demo_out$)
+    Term.display $aczip.decompress(...) status = $ + to_string(status) + $ (0 = success)$
+
+    header.display $Verifying the round trip$
+    restored = os.read($aczip_demo_out/aczip_demo_src/hello.txt$)
+    Term.display $restored hello.txt = $ + restored
+
+    header.display $Cleaning up$
+    os.rmfile($aczip_demo_src/hello.txt$)
+    os.rmfile($aczip_demo_src/poem.txt$)
+    os.rmdir($aczip_demo_src$)
+    os.rmfile($aczip_demo_out/aczip_demo_src/hello.txt$)
+    os.rmfile($aczip_demo_out/aczip_demo_src/poem.txt$)
+    os.rmdir($aczip_demo_out/aczip_demo_src$)
+    os.rmdir($aczip_demo_out$)
+    os.rmfile($aczip_demo.aczip$)
+    Term.display $removed all demo files and directories$
+<mainloop>

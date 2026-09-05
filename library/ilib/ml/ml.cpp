@@ -210,6 +210,15 @@ int ml_sgd_step(double learning_rate, tensor_id_t tensor_id) {
     return ml_weights(learning_rate, tensor_id);
 }
 
+// ml.acl maps ml:grad -> ml.grad and ml:optimize -> ml.optimize, but this file only ever
+// exported ml_get_grad/ml_sgd_step — a name mismatch every non-C++ binding hit as a real,
+// silent gap (ml.hpp's C++ wrapper happened to rename `grad` on its own end, but nothing
+// bound `ml.optimize` anywhere, and no non-C++ binding bound `ml.grad` either). These two
+// exports are pure aliases under the EXACT names the .acl table (and every language binding
+// generated from it) actually expects.
+tensor_id_t ml_grad(tensor_id_t id) { return ml_get_grad(id); }
+int ml_optimize(double learning_rate, tensor_id_t tensor_id) { return ml_sgd_step(learning_rate, tensor_id); }
+
 int ml_adam_step(double learning_rate, double, double, double, tensor_id_t tensor_id) {
     return ml_weights(learning_rate, tensor_id);
 }

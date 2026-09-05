@@ -9,7 +9,8 @@ AC->PY
 use ilib widgets
 
 <mainloop>
-    root = Screen(title=$My App$, geometry=$400x300$)
+    root = Screen(title=$My App$)
+    root.dimensions(400, 300)
     label = display(master=root, text=$Hello World$)
     label.pack
     button = btn(master=root, text=$Click Me$, cmd=null)
@@ -21,10 +22,12 @@ use ilib widgets
 ## Widget Classes
 
 ### Screen
-Main application window.
+Main application window. `title=` is mandatory — there is no geometry argument on the
+constructor; size the window explicitly with `.dimensions(w, h)`.
 
 ```ac
-root = Screen(title=$My App$, geometry=$400x300$)
+root = Screen(title=$My App$)
+root.dimensions(400, 300)
 root.mainloop
 ```
 

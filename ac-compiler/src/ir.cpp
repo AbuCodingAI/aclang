@@ -10,6 +10,7 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 
 // Declared in main.cpp; set by --allow-foreign CLI flag
 extern bool g_allow_foreign;
@@ -162,6 +163,10 @@ static std::string opcodeStr(IROpcode op) {
         case IROpcode::TRY_END:       return "try_end";
         case IROpcode::TAG_BEGIN:     return "tag_begin";
         case IROpcode::TAG_END:       return "tag_end";
+        case IROpcode::YIELD:         return "yield";
+        case IROpcode::GEN_CREATE:    return "gen_create";
+        case IROpcode::GEN_NEXT:      return "gen_next";
+        case IROpcode::GEN_DONE:      return "gen_done";
         default:                      return "???";
     }
 }
@@ -176,6 +181,8 @@ class IRGenerator {
     bool             inMainSection = false; // true once we enter <mainloop>
     bool             inFreeScope   = false; // true inside a <free> block
     std::set<int>    freeDeclaredIds;       // var IDs already FREE_DECL'd in current free scope
+    bool             inBoundScope  = false; // true inside a <bound> block
+    std::set<int>    boundDeclaredIds;      // var IDs already FREE_DECL'd(bound) in current bound scope
     std::string      currentClass_;         // non-empty while inside a bundle body
     std::string      currentCustomTag_;     // non-empty while inside a def tag body
     std::vector<std::string> currentTagObjects_; // ObjDecl names declared inside current custom tag
@@ -209,6 +216,21 @@ class IRGenerator {
         return names;
     }
     std::set<std::string>    widgetCtorVars_;
+    // Every `Make func` (qualified "Class.method" for bundle methods, matching funcId's own
+    // interning convention above) whose body contains a `yield` anywhere — populated by a
+    // dedicated AST-only prepass (collectGeneratorFunctions, run once before gen(ast) in
+    // generate()) BECAUSE generate() lowers in a single forward pass: a FOR loop calling a
+    // generator defined LATER in the file would otherwise still be unresolved when the FOR
+    // loop itself is lowered, and would silently fall through to the ordinary array-collection
+    // path instead of the generator one.
+    std::set<std::string>    generatorFuncNames_;
+    // Vars assigned a DIRECT generator call (`g = twovals()`) BEFORE being used in a FOR loop —
+    // `FOR x in g:` needs to know `g` already holds a live handle (reuse it directly) rather
+    // than a fresh one (GEN_CREATE a NEW generator each time, which is what the `FOR x in
+    // twovals():` direct-call shape correctly does instead). Populated by a second prepass,
+    // collectGeneratorHandleVars, run right after collectGeneratorFunctions (needs
+    // generatorFuncNames_ already complete to recognize the call as generator-producing).
+    std::set<std::string>    generatorHandleVars_;
     // Every `on value is <key>` binding registered via `configure event-listener`, tracked so
     // the auto-generated `<StartHere>` game loop can poll+trigger them for real every frame —
     // see that case's own comment for why this was previously entirely dead (EVENT_BIND/
@@ -218,12 +240,692 @@ class IRGenerator {
     // body, meaning poll via key_pressed/held every frame rather than key_just_pressed once).
     std::vector<std::tuple<std::string,std::string,bool>> polledKeyBindings_;
 
+    // ── tuples ───────────────────────────────────────────────────────────────
+    // Memoized per-shape synthesized fallback bundle classes for escaping tuples (a tuple
+    // that's bound to a var and used later, returned, passed as an argument, or otherwise
+    // not immediately consumed in the same statement it's built in). Shape key ("2:i:s") →
+    // synthesized class name ("_AcTuple2_i_s"), so structurally identical tuple shapes
+    // anywhere in the program share exactly one class — see emitSyntheticTupleClass.
+    std::map<std::string, std::string> tupleShapeClasses_;
+    int tupleTempCounter_ = 0;
+    // className -> its slots' IRTypes, and the set of classes built from an `; any` tuple
+    // literal — both populated in emitSyntheticTupleClass, consulted by IndexExpr's tuple
+    // lowering to decide constant-only vs. bounded-dynamic-dispatch indexing (see its comment).
+    std::map<std::string, std::vector<IRType>> tupleClassSlotTypes_;
+    std::set<std::string> tupleAnyClasses_;
+
+    static std::string tupleTypeCode(IRType t) {
+        switch (t) {
+            case IRType::FLOAT:  return "f";
+            case IRType::STRING: return "s";
+            case IRType::BOOL:   return "b";
+            default:             return "i"; // INT and anything else default to int slot
+        }
+    }
+
+    // Build (once per distinct shape, memoized in tupleShapeClasses_) a compiler-synthesized
+    // bundle class `_AcTupleN_...` with fields `_0.._N-1`, all defaulted to a type-appropriate
+    // zero value — mirrors BundleDef's own synthetic-init emission shape exactly (the
+    // `!hasUserInit && !fieldDefaults.empty()` branch above) so every backend's existing class
+    // codegen, including BNY's whole-program classOwner/self.field scan (which never looks at
+    // the AST at all), picks it up with zero backend-specific code. Fields are written
+    // AFTERWARD by the caller via plain `t._0 = value` STORE_VARs — the exact same IR shape
+    // PropAssign lowering produces for `p.x = 5` (Phase 0's own fix target) — rather than
+    // passing values as constructor args, so tuple construction reuses the freshly-verified
+    // "construct then field-assign" pattern instead of a novel one. Returns the class name.
+    //
+    // `isAny` (from an `; any` tuple literal) is part of the memoization key — an `; any`
+    // tuple and a plain inferred/colloid tuple that HAPPEN to share the same slot types must
+    // still get separate classes, since only the `; any` one is barred from dynamic indexing
+    // (see IndexExpr's own tuple-lowering comment) — sharing a class would silently let a
+    // dynamic index through on `(1, 2; any)` just because it's structurally identical to a
+    // plain `(1, 2)`.
+    std::string emitSyntheticTupleClass(const std::vector<IRType>& slotTypes, bool isAny = false) {
+        std::string key = std::to_string(slotTypes.size());
+        for (auto t : slotTypes) key += ":" + tupleTypeCode(t);
+        if (isAny) key += ":any";
+        auto it = tupleShapeClasses_.find(key);
+        if (it != tupleShapeClasses_.end()) return it->second;
+
+        // "AcTupleN_..." not "_AcTupleN_..." — class names pass through every backend's own
+        // naming transform UNCHANGED (e.g. VStrategy::emitClassBegin emits `name` raw, no
+        // vName()), and V specifically hard-errors on a struct name starting with anything but
+        // an uppercase letter ("struct name `_AcTuple2_i_i` must begin with capital letter").
+        std::string className = "AcTuple" + std::to_string(slotTypes.size());
+        for (auto t : slotTypes) className += "_" + tupleTypeCode(t);
+        if (isAny) className += "_any";
+        tupleShapeClasses_[key] = className;
+        tupleClassSlotTypes_[className] = slotTypes;
+        if (isAny) tupleAnyClasses_.insert(className);
+
+        // A tuple literal can be lowered from anywhere — inside a function body, inside
+        // mainloop, at top level — but its class DEFINITION must land wherever BundleDef's
+        // own definitions do (a standalone IRFunction entry + dataSection/globalInit markers),
+        // never spliced into whatever section is currently active. Save/restore around it.
+        //
+        // `cur` is a raw IRFunction* into prog.functions (a std::vector) — saving it as a bare
+        // pointer here is a real use-after-free hazard: this function's OWN prog.functions.
+        // push_back() below (for the synthetic init) can reallocate the vector's backing
+        // storage, silently invalidating any pointer into it, INCLUDING the caller's `cur` if
+        // this ran while lowering was already inside another function body (e.g. `return x, y`
+        // inside `Make makePair`). Verified real crash: Bus error, `return 3, 4` alone (no
+        // caller-side destructure even needed to trigger it) — save/restore by INDEX instead,
+        // recomputed against the vector's current (possibly moved) buffer afterward.
+        IRFunction* savedCur = cur;
+        size_t savedCurIdx = savedCur ? (size_t)(savedCur - prog.functions.data()) : (size_t)-1;
+        bool savedInMain = inMainSection;
+        cur = nullptr;
+        inMainSection = false;
+
+        IRInstruction cb(IROpcode::CLASS_BEGIN);
+        cb.typedOperands = {mkConst(className)};
+        rawEmit(cb);
+
+        int funcId = prog.symbols.intern(className + ".init", IRType::FUNCTION);
+        IRFunction fn("init", className);
+        fn.returnType = IRType::VOID;
+        prog.symbols.intern("self");
+        fn.parameters.push_back("self");
+        prog.functions.push_back(std::move(fn));
+        cur = &prog.functions.back();
+        IRInstruction entry(IROpcode::FUNC_BEGIN);
+        entry.typedOperands = {IRRef::func(funcId)};
+        emit(std::move(entry));
+
+        for (size_t i = 0; i < slotTypes.size(); i++) {
+            // "f0"/"f1"/... not "_0"/"_1" — a leading-underscore-plus-digit field name hits
+            // VStrategy::vName's leading-'_'-becomes-'a' identifier sanitization at the field
+            // DECLARATION site (emitFieldDecl, called with the bare field name) but NOT at any
+            // USE site (`t._0`, embedded in a dotted string where vName only ever touches
+            // index 0 of the WHOLE string, i.e. the receiver's first character) — verified
+            // real bug: V declared `a0 i64` in the struct but every read/write still said
+            // `t._0`, a genuinely undeclared field. Plain "f0" passes through every backend's
+            // naming transform completely unchanged, sidestepping the mismatch entirely.
+            IRRef dst = mkVar("self.f" + std::to_string(i));
+            setRefType(dst, slotTypes[i]);
+            IRRef zero = slotTypes[i] == IRType::FLOAT  ? IRRef::constant(IRValue(0.0)) :
+                         slotTypes[i] == IRType::STRING ? mkConst("") :
+                         mkConstInt(0);
+            IRInstruction st(IROpcode::STORE_VAR, dst, {zero});
+            st.resultType = slotTypes[i];
+            emit(std::move(st));
+        }
+        IRInstruction ret(IROpcode::RETURN); ret.typedOperands = {}; emit(std::move(ret));
+        IRInstruction end(IROpcode::FUNC_END); end.typedOperands = {IRRef::func(funcId)}; emit(std::move(end));
+        cur = nullptr;
+
+        IRInstruction ce(IROpcode::CLASS_END);
+        ce.typedOperands = {mkConst(className)};
+        rawEmit(ce);
+
+        cur = (savedCurIdx != (size_t)-1) ? &prog.functions[savedCurIdx] : savedCur;
+        inMainSection = savedInMain;
+        return className;
+    }
+
+    // var name -> synthesized tuple class name, for every named var known to hold a tuple
+    // instance (populated by lowerTupleEscaping below). Lets a later `t[i]` (constant i)
+    // redirect straight to the field `t._{i-1}` instead of a real LOAD_INDEX.
+    std::map<std::string, std::string> tupleInstanceVars_;
+
+    // qualifiedFuncName -> {paramIndex (0-based, matches call-argument position, i.e. n.attrs'
+    // own index — NOT fn.parameters', which has an extra leading "self" for methods) ->
+    // synthesized tuple class name}. A tuple crosses a call boundary as a real fallback-bundle
+    // instance (verified: `show(t)` passes the actual `AcTuple2_i_i` object, never a native
+    // multi-return on any backend for the callee side) — but the callee's OWN parameter is just
+    // a plain Identifier with no static type annotation, so `p[i]` inside `show`'s body has no
+    // way to know `p` is a tuple unless told. Two-pass discovery (see discoverTupleParamShapes
+    // and generateIR's driver) fixes this: pass 1 lowers the whole program once to see which
+    // vars ever get passed as tuple-typed call arguments (impossible to know up front — a
+    // tuple's class name is only known once its OWN binding site is actually lowered, and
+    // FuncDefs are lowered in written order, almost always BEFORE the call sites that invoke
+    // them), pass 2 re-lowers for real with this map pre-seeded so FuncDef's own case can treat
+    // a matched parameter exactly like an already-known tupleInstanceVars_ entry from the very
+    // first statement of the function body — zero changes needed to IndexExpr's tuple lookup.
+    std::map<std::string, std::map<int, std::string>> tupleParamClasses_;
+
+    // Populated by discoverTupleParamShapes() at the end of a lowering pass: a shallow,
+    // single-hop scan of every already-emitted CALL/LIB_CALL instruction's arguments against
+    // THIS pass's own tupleInstanceVars_. Only sees what pass 1 already knew — a tuple
+    // forwarded through TWO hops (`show(p)` itself passing `p` on to a third function) needs a
+    // third pass to resolve, which this does not attempt; a real (if narrower) fix for the
+    // direct case beats none.
+    //
+    // A bare statement-level call with no assignment (`show(t)`, as opposed to `x = show(t)`)
+    // does NOT go through the plain-CALL path used elsewhere — MethodCall's generic fallback
+    // (verified: ir.cpp's own `case NodeType::MethodCall`, its LAST branch before FunctionCall)
+    // emits it as a LIB_CALL instead, with the exact same {mkVar(calleeName), args...} operand
+    // shape (confirmed via --stop-after-ir: `show(t)` lowered to `lib_call show, t`, not `call`).
+    // LIB_CALL is also used for real library/widget/gl calls whose operand[0] is a mkConst
+    // string, not a VAR — the Kind::VAR guard below already excludes those for free, so this
+    // scan only ever matches a genuine user-defined function/method name.
+    void discoverTupleParamShapes() {
+        auto scanList = [&](const std::vector<IRInstruction>& instrs) {
+            for (const auto& ins : instrs) {
+                if ((ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL)
+                        || ins.typedOperands.empty()) continue;
+                const IRRef& callee = ins.typedOperands[0];
+                if (callee.kind != IRRef::Kind::VAR) continue;
+                std::string calleeName = prog.symbols.getName(callee.id);
+                for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
+                    const IRRef& arg = ins.typedOperands[ai];
+                    if (arg.kind != IRRef::Kind::VAR) continue;
+                    auto tv = tupleInstanceVars_.find(prog.symbols.getName(arg.id));
+                    if (tv != tupleInstanceVars_.end())
+                        tupleParamClasses_[calleeName][(int)(ai - 1)] = tv->second;
+                }
+            }
+        };
+        for (auto& fn : prog.functions) scanList(fn.instructions);
+        scanList(prog.globalInit);
+        scanList(prog.dataSection);
+        scanList(prog.mainSection);
+    }
+
+    // ── tuple scalarization (SROA) ──────────────────────────────────────────
+    // "qualifiedFn::varName" -> {arity, isAny}, populated ONCE by collectTupleTrackability
+    // (an AST-only prepass, run before gen(ast) — see its own comment) for every
+    // `var = (tuple literal)` binding proven to never escape its enclosing function body (or
+    // the top-level/mainloop scope, qualifiedFn=""). Consulted at REAL lowering time by the
+    // AssignStmt/IndexExpr/DestructureAssignStmt cases to route through flat shadow vars
+    // instead of ever constructing a synthesized bundle instance — the actual "optimize it
+    // away completely" case for a tuple that's bound now and read later, as opposed to
+    // DestructureAssignStmt's own separate same-statement fast path.
+    struct TupleScalarCandidate { size_t arity; bool isAny; };
+    std::map<std::string, TupleScalarCandidate> scalarizableTupleVars_;
+    // "qualifiedFn::varName" -> the REAL per-slot IRTypes, filled in when the (already proven
+    // scalarizable) binding is actually lowered — a prepass over the AST alone can't know an
+    // element's type (it may depend on other vars' inferred types), only real lowering can.
+    // Consulted by later index/destructure reads of the same var within the SAME forward pass
+    // (this compiler's established single-forward-pass assumption — see e.g.
+    // selectiveImportAliases_'s own comment for the identical pattern elsewhere).
+    std::map<std::string, std::vector<IRType>> tupleScalarShadowTypes_;
+    // Qualified name of the function currently being lowered ("" = top-level/mainloop scope) —
+    // matches collectGeneratorFunctions'/collectTupleTrackability's own qualification
+    // convention exactly, so a lookup key built the same way at both prepass and real-lowering
+    // time always agrees. Set/restored around FuncDef's own case.
+    std::string currentFunc_;
+
+    static std::string sanitizeForVarName(const std::string& s) {
+        std::string r = s;
+        for (char& c : r) if (c == '.') c = '_';
+        return r;
+    }
+    // Deterministic — both the binding lowering (which creates these) and any later index/
+    // destructure read (which just needs to KNOW the name, not store it anywhere) compute the
+    // exact same name independently; no separate "where do this var's shadows live" table
+    // needed beyond scalarizableTupleVars_ answering "is it scalarized at all".
+    std::string tupleScalarShadowName(const std::string& varName, size_t i) const {
+        return "_ac_tup_scal_" + sanitizeForVarName(currentFunc_) + "_" + varName + "_f" + std::to_string(i);
+    }
+
+    // Whole-word substring search — `text` contains `word` bounded by non-identifier
+    // characters (or the string's own edges) on both sides, so matching "t" doesn't fire on
+    // "total" or "at". Used to scan legacy TEXT-based `attrs` fields for a reference to the
+    // tracked var (see scanTupleEscaping's own comment on why this exists at all).
+    static bool containsWholeWord(const std::string& text, const std::string& word) {
+        if (word.empty()) return false;
+        size_t pos = 0;
+        while ((pos = text.find(word, pos)) != std::string::npos) {
+            bool leftOk = (pos == 0) || !(std::isalnum((unsigned char)text[pos - 1]) || text[pos - 1] == '_');
+            size_t endPos = pos + word.size();
+            bool rightOk = (endPos >= text.size()) || !(std::isalnum((unsigned char)text[endPos]) || text[endPos] == '_');
+            if (leftOk && rightOk) return true;
+            pos = endPos;
+        }
+        return false;
+    }
+
+    // Escape-detection walker for ONE candidate var within ONE scope (see
+    // collectTupleTrackabilityScope). Stops at FuncDef/BundleDef boundaries (this language has
+    // no closures, so nothing outside the var's own enclosing scope could reference it anyway).
+    // Two contexts are exempted from flagging the var's OWN reference as escaping (though their
+    // OTHER parts are still recursed into normally): the base of a t[i] index read (constant or
+    // dynamic — both are supported directly against shadow vars, see lowerTupleScalarIndex),
+    // and a bare `a, b = t` whole-tuple destructure. Anything else — a call argument, a return
+    // value, stored into a list/dict/field, compared, copied to another var, printed as a
+    // whole value — has no representation once scalarized, so it forces the fallback bundle
+    // path instead.
+    void scanTupleEscaping(const ASTNode& node, const std::string& varName, bool& escaped) {
+        if (escaped) return;
+        if (node.type == NodeType::FuncDef || node.type == NodeType::BundleDef) return;
+        if (node.type == NodeType::IndexExpr && node.children.size() >= 2 && node.children[0]
+                && node.children[1]
+                && node.children[0]->type == NodeType::Identifier && node.children[0]->value == varName) {
+            scanTupleEscaping(*node.children[1], varName, escaped);
+            return;
+        }
+        if (node.type == NodeType::DestructureAssignStmt && !node.children.empty() && node.children[0]
+                && node.children[0]->type == NodeType::Identifier && node.children[0]->value == varName) {
+            return;
+        }
+        if (node.type == NodeType::AssignStmt && node.value == varName) {
+            // The var's own (single, per assignCount) binding statement — assigning TO it
+            // isn't a read of a prior value. Still recurse into the RHS for OTHER references.
+            for (auto& c : node.children) { if (escaped) return; if (c) scanTupleEscaping(*c, varName, escaped); }
+            return;
+        }
+        if (node.type == NodeType::Identifier && node.value == varName) {
+            escaped = true;
+            return;
+        }
+        // A LOT of this parser's grammar (MethodCall's various forms, plain FunctionCall,
+        // ConfigCall, ObjDecl, ...) represents its argument/operand list as legacy TEXT in
+        // `attrs`, not as child AST nodes at all — a var referenced ONLY that way (verified
+        // real bug: `useIt(t)` — a bare call, parsed as MethodCall with attrs=["t"] — was
+        // completely invisible to the Identifier-node check above, so `t` got scalarized
+        // despite being passed to a function that expects a real value; the generated code
+        // referenced a `t` that was never declared, since only its shadow vars existed).
+        // Conservative by construction: ANY node with a matching word in ANY attrs string is
+        // escaping, whatever the node type — there's no "safe" attrs-text context in this
+        // design (every genuinely safe context above is a STRUCTURED node with empty attrs).
+        for (auto& a : node.attrs) {
+            if (containsWholeWord(a, varName)) { escaped = true; return; }
+        }
+        for (auto& c : node.children) {
+            if (escaped) return;
+            if (c) scanTupleEscaping(*c, varName, escaped);
+        }
+    }
+
+    // Binding+escape analysis for ONE scope (a function body, or the top-level/mainloop
+    // content) — see scalarizableTupleVars_'s own comment for the overall design. A var
+    // qualifies only with EXACTLY ONE assignment anywhere in scope (AssignStmt OR
+    // DestructureAssignStmt target) — a conservative "single static binding only" rule that
+    // sidesteps reasoning about whether a later reassignment is a compatible re-binding: a var
+    // reassigned even once more, to anything, falls back to the ordinary bundle path.
+    void collectTupleTrackabilityScope(const ASTNode& scopeRoot, const std::string& qualifiedFn) {
+        std::map<std::string, int> assignCount;
+        std::map<std::string, const ASTNode*> bindingLiteral;
+        std::function<void(const ASTNode&)> collectAssigns = [&](const ASTNode& node) {
+            if (node.type == NodeType::FuncDef || node.type == NodeType::BundleDef) return;
+            if (node.type == NodeType::AssignStmt && !node.value.empty()
+                    && node.value.find('.') == std::string::npos) {
+                assignCount[node.value]++;
+                if (!node.children.empty() && node.children[0]
+                        && node.children[0]->type == NodeType::TupleLiteral)
+                    bindingLiteral[node.value] = node.children[0].get();
+            } else if (node.type == NodeType::DestructureAssignStmt) {
+                for (auto& t : node.attrs) assignCount[t]++;
+            }
+            for (auto& c : node.children) if (c) collectAssigns(*c);
+        };
+        collectAssigns(scopeRoot);
+
+        for (auto& [varName, litNode] : bindingLiteral) {
+            if (assignCount[varName] != 1) continue;
+            bool escaped = false;
+            scanTupleEscaping(scopeRoot, varName, escaped);
+            if (!escaped)
+                scalarizableTupleVars_[qualifiedFn + "::" + varName] =
+                    { litNode->children.size(), litNode->value == "any" };
+        }
+    }
+
+    // Top-level prepass entry: the whole program's top-level/mainloop content is one flat
+    // scope (qualifiedFn=""), and each FuncDef body is its own separate scope — matches
+    // collectGeneratorFunctions' own qualification convention (classCtx + "." + name) exactly,
+    // so lookups built the same way at real-lowering time always agree.
+    void collectTupleTrackability(const ASTNode& ast) {
+        collectTupleTrackabilityScope(ast, "");
+        std::function<void(const ASTNode&, const std::string&)> findFuncs =
+            [&](const ASTNode& node, const std::string& classCtx) {
+                if (node.type == NodeType::FuncDef) {
+                    std::string qualified = classCtx.empty() ? node.value : classCtx + "." + node.value;
+                    if (!node.children.empty() && node.children[0])
+                        collectTupleTrackabilityScope(*node.children[0], qualified);
+                    for (auto& c : node.children) if (c) findFuncs(*c, classCtx);
+                    return;
+                }
+                if (node.type == NodeType::BundleDef) {
+                    for (auto& c : node.children) if (c) findFuncs(*c, node.value);
+                    return;
+                }
+                for (auto& c : node.children) if (c) findFuncs(*c, classCtx);
+            };
+        findFuncs(ast, "");
+    }
+
+    static IRType tupleTypeNameToIRType(const std::string& name) {
+        if (name == "dec")    return IRType::FLOAT;
+        if (name == "string") return IRType::STRING;
+        if (name == "bool")   return IRType::BOOL;
+        if (name == "short")  return IRType::SHORT;
+        if (name == "mini")   return IRType::MINI;
+        if (name == "atomic") return IRType::ATOMIC;
+        return IRType::INT;   // "int" and any unrecognized name (parser already validated it)
+    }
+    static const char* irTypeName(IRType t) {
+        switch (t) {
+            case IRType::FLOAT:  return "dec";
+            case IRType::STRING: return "string";
+            case IRType::BOOL:   return "bool";
+            case IRType::SHORT:  return "short";
+            case IRType::MINI:   return "mini";
+            case IRType::ATOMIC: return "atomic";
+            default:             return "int";
+        }
+    }
+    // `(elems; TYPE)` colloid coercion for a single LITERAL element — resolved entirely at
+    // compile time (the literal's own text is reparsed/reformatted for the target type), per
+    // Abu's own spec: "tries to convert each item to that type before IR(And throws a
+    // Preposterous if it can[not])". Throws ACError::tupleColloidConversionFailed on any
+    // literal that provably can't convert (e.g. a non-numeric string to int/dec).
+    IRRef coerceLiteralToType(const ASTNode& lit, IRType target) {
+        const std::string& kind = lit.attrs.empty() ? std::string() : lit.attrs[0];
+        auto asDisplay = [&]{ return kind == "STRING" ? ("$" + lit.value + "$") : lit.value; };
+        switch (target) {
+            case IRType::SHORT: case IRType::MINI: case IRType::ATOMIC: case IRType::INT: {
+                if (kind == "INT") return mkConstInt(std::stoll(lit.value));
+                if (kind == "FLOAT") { try { return mkConstInt((int64_t)std::stod(lit.value)); } catch (...) {} }
+                if (kind == "BOOL") return mkConstInt(lit.value == "true" ? 1 : 0);
+                if (kind == "STRING") {
+                    try {
+                        size_t idx = 0;
+                        long long v = std::stoll(lit.value, &idx);
+                        if (idx == lit.value.size()) return mkConstInt(v);
+                    } catch (...) {}
+                }
+                throw ACError::tupleColloidConversionFailed(asDisplay(), irTypeName(target));
+            }
+            case IRType::FLOAT: {
+                if (kind == "INT" || kind == "FLOAT") { try { return IRRef::constant(IRValue(std::stod(lit.value))); } catch (...) {} }
+                if (kind == "BOOL") return IRRef::constant(IRValue(lit.value == "true" ? 1.0 : 0.0));
+                if (kind == "STRING") {
+                    try {
+                        size_t idx = 0;
+                        double v = std::stod(lit.value, &idx);
+                        if (idx == lit.value.size()) return IRRef::constant(IRValue(v));
+                    } catch (...) {}
+                }
+                throw ACError::tupleColloidConversionFailed(asDisplay(), irTypeName(target));
+            }
+            case IRType::BOOL: {
+                if (kind == "BOOL") return IRRef::constant(IRValue(lit.value == "true"));
+                if (kind == "INT") { try { return IRRef::constant(IRValue(std::stoll(lit.value) != 0)); } catch (...) {} }
+                if (kind == "FLOAT") { try { return IRRef::constant(IRValue(std::stod(lit.value) != 0.0)); } catch (...) {} }
+                if (kind == "STRING") return IRRef::constant(IRValue(lit.value == "true"));
+                throw ACError::tupleColloidConversionFailed(asDisplay(), irTypeName(target));
+            }
+            case IRType::STRING:
+                // Every literal kind has a natural string form — always succeeds.
+                if (kind == "BOOL") return mkConst(lit.value == "true" ? std::string("true") : std::string("false"));
+                return mkConst(lit.value);
+            default:
+                throw ACError::tupleColloidConversionFailed(asDisplay(), irTypeName(target));
+        }
+    }
+
+    // Shared by every TupleLiteral consumer — BOTH the escaping/fallback-bundle path
+    // (lowerTupleEscaping, below) AND the same-statement destructure fast path
+    // (DestructureAssignStmt's own case in gen(), which deliberately never calls
+    // lowerTupleEscaping at all, since its whole point is to avoid ever building a bundle) —
+    // the type-unification RULE applies to a tuple regardless of whether it ends up allocated.
+    // `n.value` carries the tuple's optional annotation (parser.cpp's paren-expr-or-tuple
+    // branch): "" = normal/inferred (must end up homogeneous — mixed int/dec widens to dec,
+    // anything else is a Preposterous compile error), "any" = explicit heterogeneous (no
+    // coercion at all), or a coercion type name (int/dec/string/bool/short/mini/atomic) = a
+    // "colloid" — every element is converted to that one type before IR is generated.
+    void lowerTupleElements(const ASTNode& n, std::vector<IRRef>& elems, std::vector<IRType>& slotTypes) {
+        if (n.value == "any") {
+            for (auto& c : n.children) {
+                if (!c) continue;
+                IRRef er = lowerExprNode(*c);
+                elems.push_back(er);
+                slotTypes.push_back(typeOfRef(er));
+            }
+        } else if (!n.value.empty()) {
+            // Colloid: coerce every element to the annotated type.
+            IRType target = tupleTypeNameToIRType(n.value);
+            for (auto& c : n.children) {
+                if (!c) continue;
+                IRRef er = (c->type == NodeType::LiteralExpr)
+                    ? coerceLiteralToType(*c, target)
+                    : lowerExprNode(*c);
+                if (er.kind != IRRef::Kind::CONST && typeOfRef(er) != target) {
+                    IRRef cast = mkTemp();
+                    IRInstruction ci(IROpcode::TYPE_CAST);
+                    ci.typedOperands = {er};
+                    ci.result = cast;
+                    ci.resultType = target;
+                    emit(std::move(ci));
+                    er = cast;
+                }
+                elems.push_back(er);
+                slotTypes.push_back(target);
+            }
+        } else {
+            // Normal/inferred: lower every element, then require a single common type — mixed
+            // int/dec widens to dec (matches every other numeric-mixing context in this
+            // compiler); any other mismatch is a hard compile-time error.
+            for (auto& c : n.children) {
+                if (!c) continue;
+                IRRef er = lowerExprNode(*c);
+                elems.push_back(er);
+                slotTypes.push_back(typeOfRef(er));
+            }
+            bool anyFloat = false, mismatch = false;
+            IRType first = IRType::VOID;
+            IRType other = IRType::VOID;
+            for (IRType t : slotTypes) {
+                // VOID means "not known yet at this point in lowering" (e.g. a plain function
+                // call's result — return types aren't inferred until codegen, see
+                // lowerExprNode's CallExpr case, a bare mkTemp() with no setRefType at all) —
+                // NOT a real type, and never conflicts with anything. Verified real bug:
+                // `(getNum(), 100)` — both genuinely int at runtime — was rejected as
+                // "mismatched types (int and int)" (irTypeName's own VOID-defaults-to-"int"
+                // fallback made the message doubly misleading) purely because getNum()'s
+                // result type wasn't resolved yet.
+                if (t == IRType::VOID) continue;
+                if (t == IRType::FLOAT) anyFloat = true;
+                if (first == IRType::VOID) { first = t; continue; }
+                if (t != first && !(t == IRType::INT && first == IRType::FLOAT)
+                               && !(first == IRType::INT && t == IRType::FLOAT)) {
+                    mismatch = true; other = t;
+                }
+            }
+            if (mismatch)
+                throw ACError::tupleNotHomogeneous(irTypeName(first), irTypeName(other));
+            if (anyFloat) {
+                for (size_t i = 0; i < elems.size(); i++) {
+                    if (slotTypes[i] == IRType::FLOAT) continue;
+                    if (elems[i].kind == IRRef::Kind::CONST && elems[i].value.type == IRType::INT) {
+                        elems[i] = IRRef::constant(IRValue((double)std::get<int64_t>(elems[i].value.data)));
+                    } else {
+                        IRRef cast = mkTemp();
+                        IRInstruction ci(IROpcode::TYPE_CAST);
+                        ci.typedOperands = {elems[i]};
+                        ci.result = cast;
+                        ci.resultType = IRType::FLOAT;
+                        emit(std::move(ci));
+                        elems[i] = cast;
+                    }
+                    slotTypes[i] = IRType::FLOAT;
+                }
+            }
+        }
+    }
+
+    // Escaping-path lowering: construct a synthesized bundle instance and field-assign each
+    // element (via lowerTupleElements, above). Returns the instance var's IRRef. `explicitDst`,
+    // when given, constructs DIRECTLY into that (already-named) var — matching the verified
+    // `t = Point()` construct-call shape exactly — rather than a synthesized temp name; used by
+    // AssignStmt's `t = (x, y)` binding case so `t` itself becomes a real, trackable
+    // class-instance var (a plain STORE_VAR copying a synthetic var's value into `t` would NOT
+    // make codegen's own instanceVarClass_/classInstanceVars_ tracking recognize `t` as a class
+    // instance — those are populated only at construct-call sites and via noteInstanceClass,
+    // never by a generic value copy).
+    IRRef lowerTupleEscaping(const ASTNode& n, const std::string& hint = "tup", const IRRef* explicitDst = nullptr) {
+        std::vector<IRRef> elems;
+        std::vector<IRType> slotTypes;
+        lowerTupleElements(n, elems, slotTypes);
+        std::string className = emitSyntheticTupleClass(slotTypes, n.value == "any");
+        IRRef instVar;
+        std::string varName;
+        if (explicitDst && explicitDst->kind == IRRef::Kind::VAR) {
+            instVar = *explicitDst;
+            varName = prog.symbols.getName(instVar.id);
+        } else {
+            varName = "_ac_tup_" + hint + "_" + std::to_string(tupleTempCounter_++);
+            instVar = mkVar(varName);
+        }
+        std::vector<IRRef> ctorOps = {mkVar(className)};
+        IRInstruction ctor(IROpcode::CALL, instVar, ctorOps);
+        emit(std::move(ctor));
+        for (size_t i = 0; i < elems.size(); i++) {
+            IRRef fdst = mkVar(varName + ".f" + std::to_string(i));
+            IRInstruction st(IROpcode::STORE_VAR, fdst, {elems[i]});
+            emit(std::move(st));
+        }
+        tupleInstanceVars_[varName] = className;
+        return instVar;
+    }
+
+    // Shared bounded-dispatch/constant-index core for BOTH representations a tuple var can be
+    // in: escaping (a synthesized bundle instance, fields `t.fN`) or scalarized (flat shadow
+    // vars, see scalarizableTupleVars_). `hintName` is only for error messages; `fieldRef(i)`
+    // returns the IRRef for slot i in whichever representation the caller is using.
+    //
+    // `idxRef` is the ALREADY-LOWERED index value, still 1-based per AC convention — callers
+    // lower it themselves (via lowerExprNode for the structured-AST path, lowerExpr for the
+    // legacy string-expression path — see lowerTupleIndex's/lowerTupleScalarIndex's own call
+    // sites) BEFORE calling in here, so this core has no dependency on which lowering path
+    // produced it. A CONSTANT index (idxRef is a genuine IRRef CONST int, not merely written
+    // as a literal in the source — the two paths fold identically) redirects straight to the
+    // matching field — zero cost, works for every tuple including `; any`. A non-constant
+    // index needs a bounded runtime dispatch (one arm per known slot, EQ-tested against the
+    // index, first match wins) — safe ONLY when every slot shares one type, since IRType has
+    // no tagged-union/Any variant this compiler's whole per-var static-type-inference
+    // machinery could route a dynamically-selected read through. An `; any` tuple is therefore
+    // constant-index-only ("t[i] should be dynamic except for 'any' tuples" — Abu's own spec):
+    // rejected here as a compile-time error, not deferred to a runtime failure, since the type
+    // mismatch is already knowable at compile time.
+    IRRef lowerTupleIndexCore(const std::string& hintName, const std::vector<IRType>& slotTypes,
+                              bool isAny, const IRRef& idxRef,
+                              const std::function<IRRef(size_t)>& fieldRef) {
+        size_t arity = slotTypes.size();
+
+        if (idxRef.kind == IRRef::Kind::CONST && idxRef.value.type == IRType::INT) {
+            long long idx1 = std::get<int64_t>(idxRef.value.data);
+            if (idx1 < 1 || (size_t)idx1 > arity)
+                throw ACError::semantic("tuple index " + std::to_string(idx1) +
+                    " is out of range for a " + std::to_string(arity) + "-element tuple");
+            return fieldRef((size_t)(idx1 - 1));
+        }
+
+        if (isAny)
+            throw ACError::semantic("`" + hintName + "` is an `; any` tuple — only a constant "
+                "index is allowed on it (a dynamic index has no single type to give the result)");
+        if (arity == 0) return mkConstInt(0);
+
+        // Bounded dispatch — same IF_BEGIN/IF_ELSE/IF_END (high-level IR) / label+jump
+        // (low-level, ASM/BNY) shape TernaryExpr's own lowering already establishes, so no
+        // backend-specific codegen is needed here either. An index that matches no arm at
+        // runtime (out of range) leaves the result at its placeholder zero value — a safe,
+        // silent fallback rather than a crash, matching this compiler's general lenient-
+        // runtime-conversion style (e.g. ac_atoi's own silent-0-on-failure convention).
+        // "_ac_tupidx_" — LEADING underscore, matching every other synthetic name in this
+        // pass (_ac_tup_*, _ac_swap_*). A bare "ac_"-prefixed name (no leading underscore)
+        // collides with an unrelated, pre-existing convention: CStrategy's isKnownFloatName
+        // (and its siblings) treats ANY "ac_"-prefixed identifier as a known runtime float
+        // constant/helper (ac_pi, etc.) — verified real bug: an all-int tuple's dynamic-index
+        // read printed "10.0" instead of "10" purely because its var happened to start with
+        // "ac_", nothing to do with setRefType (which was already correct).
+        thread_local int tupIdxC = 0;
+        std::string rn = "_ac_tupidx_" + std::to_string(tupIdxC++);
+        IRRef resV = mkVar(rn);
+        IRRef rawIdx = idxRef;
+        IRType elemType = slotTypes[0];   // homogeneous, guaranteed — `isAny` already handled above
+        setRefType(resV, elemType);       // real type on record for anything that consults
+                                           // prog.symbols directly (TYPE_CAST decisions, etc.)
+        IRRef zeroVal = elemType == IRType::FLOAT  ? IRRef::constant(IRValue(0.0))
+                      : elemType == IRType::STRING ? mkConst("")
+                      : mkConstInt(0);
+        emit(IRInstruction(IROpcode::STORE_VAR, resV, {zeroVal}));
+
+        if (prog.useHighLevelIR) {
+            for (size_t i = 0; i < arity; i++) {
+                IRRef eq = mkTemp();
+                emit(IRInstruction(IROpcode::EQ, eq, {rawIdx, mkConstInt((int64_t)(i + 1))}));
+                IRInstruction ib(IROpcode::IF_BEGIN); ib.typedOperands = {eq}; emit(std::move(ib));
+                emit(IRInstruction(IROpcode::STORE_VAR, resV, {fieldRef(i)}));
+                if (i + 1 < arity) emit(IRInstruction(IROpcode::IF_ELSE));
+            }
+            for (size_t i = 0; i < arity; i++) emit(IRInstruction(IROpcode::IF_END));
+        } else {
+            IRRef endL = mkLabel();
+            for (size_t i = 0; i < arity; i++) {
+                IRRef eq = mkTemp();
+                emit(IRInstruction(IROpcode::EQ, eq, {rawIdx, mkConstInt((int64_t)(i + 1))}));
+                IRRef nextL = (i + 1 < arity) ? mkLabel() : endL;
+                emitJF(eq, nextL);
+                emit(IRInstruction(IROpcode::STORE_VAR, resV, {fieldRef(i)}));
+                emitJump(endL);
+                if (i + 1 < arity) emitLabel(nextL);
+            }
+            emitLabel(endL);
+        }
+        return resV;
+    }
+
+    // `t[i]` on a known ESCAPING tuple instance var (a real synthesized bundle). `idxRef` must
+    // already be lowered by the caller (see lowerTupleIndexCore's own comment).
+    IRRef lowerTupleIndex(const std::string& varName, const std::string& className, const IRRef& idxRef) {
+        auto stIt = tupleClassSlotTypes_.find(className);
+        static const std::vector<IRType> emptySlots;
+        const std::vector<IRType>& slotTypes = stIt != tupleClassSlotTypes_.end() ? stIt->second : emptySlots;
+        bool isAny = tupleAnyClasses_.count(className) > 0;
+        return lowerTupleIndexCore(varName, slotTypes, isAny, idxRef,
+            [&](size_t i) { return mkVar(varName + ".f" + std::to_string(i)); });
+    }
+
+    // `t[i]` on a known SCALARIZED tuple var (flat shadow vars, no bundle at all). `idxRef`
+    // must already be lowered by the caller (see lowerTupleIndexCore's own comment).
+    IRRef lowerTupleScalarIndex(const std::string& varName, const std::string& scalKey,
+                                bool isAny, const IRRef& idxRef) {
+        auto tyIt = tupleScalarShadowTypes_.find(scalKey);
+        static const std::vector<IRType> emptySlots;
+        const std::vector<IRType>& slotTypes = tyIt != tupleScalarShadowTypes_.end() ? tyIt->second : emptySlots;
+        return lowerTupleIndexCore(varName, slotTypes, isAny, idxRef,
+            [&](size_t i) { return mkVar(tupleScalarShadowName(varName, i)); });
+    }
+
+    // `from ilib math use sin` (selective import): maps the bare alias name ("sin") to its
+    // fully-qualified ilib call name ("math.sin"). Populated when the UseLibStmt is lowered
+    // (imports are always written before use, single forward pass — same assumption every
+    // other incrementally-built lowering table in this class already makes). Consulted by
+    // every CallExpr/FunctionCall lowering site so a bare `sin(x)` after a selective import
+    // is treated EXACTLY like `math.sin(x)` from that point on — every backend's existing
+    // float-return-type inference, calling-convention marshaling, and symbol-name tables
+    // already handle the qualified form correctly, so rewriting here (once, backend-agnostic)
+    // avoids needing N separate per-backend "recognize this bare alias" mechanisms. Before
+    // this fix, only PythonStrategy (`sin = math.sin` alias) and CppStrategy (an incomplete
+    // `using ac_math::sym;` with a cmath-collision skip-list) had ANY handling at all, and
+    // both were still wrong — Python was actually fine, but Rust/Go/V/Java hard-failed
+    // ("sin not found in this scope") and C/C++ silently called the WRONG function's return
+    // type (libc's real `::sin` exists too, so it link-resolved, but the destination var's
+    // type was inferred as int instead of float since no float-return check recognized the
+    // bare name — verified: `ac_int y = sin(t_1)` printed `0` instead of `0.0`).
+    std::unordered_map<std::string,std::string> selectiveImportAliases_;
+
     // loop label stacks for break/continue
     std::stack<IRRef> loopStart;
     std::stack<IRRef> loopEnd;
 
     // type tracking: temp id → IRType (propagated from literals and operations)
     std::unordered_map<int,IRType> tempTypes_;
+
+    // Which VAR symbol ids have EVER been the destination of a plain assignment — separate from
+    // "what type is it currently tracked as" (prog.symbols.getType). A var's first-ever
+    // assignment must stay a plain STORE_VAR even when its RHS type is unknown (VOID), but a
+    // LATER reassignment whose RHS type doesn't match the CURRENT one must still get a TYPE_CAST
+    // even when the var's tracked type is ALSO VOID (a function-call result: `typeOfRef` returns
+    // VOID until backend-specific return-type inference runs, well after ir.cpp's lowering).
+    // Without this set, `x = getNum(); x = $hello$` silently stayed a plain STORE_VAR (no TYPE_CAST at
+    // all — verified via --stop-after-ir) since oldType read VOID either way, indistinguishable
+    // from a genuine first assignment — the retype was never even detected, let alone lowered
+    // correctly; every backend's emitTypeCast had nothing to react to.
+    std::set<int> everAssignedVarIds_;
 
     // Infer IRType from any ref (CONST → embedded type, VAR/TEMP → tracked type)
     IRType typeOfRef(const IRRef& r) const {
@@ -240,6 +942,15 @@ class IRGenerator {
     void setRefType(const IRRef& r, IRType t) {
         if (r.kind == IRRef::Kind::TEMP) tempTypes_[r.id] = t;
         if (r.kind == IRRef::Kind::VAR)  prog.symbols.setType(r.id, t);
+    }
+
+    // `atomic x = e`'s declaration lowering (TypeCoerceStmt, ATOMIC case) already calls
+    // setRefType(varRef, IRType::ATOMIC), which records it via prog.symbols.setType —
+    // queryable here for any LATER reassignment to the same var, since prog.symbols is
+    // shared program-wide state, not per-statement. Used to close the atomic
+    // read-modify-write race: see the compound-assignment cases below.
+    bool isAtomicRef(const IRRef& r) const {
+        return r.kind == IRRef::Kind::VAR && prog.symbols.getType(r.id) == IRType::ATOMIC;
     }
 
     // ── allocation helpers ──────────────────────────────────────────────────
@@ -331,6 +1042,23 @@ class IRGenerator {
                 freeDeclaredIds.insert(id);
                 IRInstruction fd(IROpcode::FREE_DECL);
                 fd.typedOperands = {i.result};
+                rawEmit(std::move(fd));
+            }
+        }
+        // Inside a <bound> block: same mechanism as <free> above, but the FREE_DECL carries
+        // the "bound" attr — exempts the var from loop save/restore (so it survives the
+        // enclosing loop, matching <free>) WITHOUT promoting it to a true program global
+        // (mirrors the `bound var = expr` statement form's own FreeDecl lowering, see its
+        // comment). <bound> was previously a pure no-op (TAG_BEGIN/TAG_END with zero
+        // scoping effect) despite tags.hpp documenting real "cannot leak out" semantics.
+        if (inBoundScope && i.opcode == IROpcode::STORE_VAR
+                         && i.result.kind == IRRef::Kind::VAR) {
+            int id = i.result.id;
+            if (!boundDeclaredIds.count(id)) {
+                boundDeclaredIds.insert(id);
+                IRInstruction fd(IROpcode::FREE_DECL);
+                fd.typedOperands = {i.result};
+                fd.attrs.push_back("bound");
                 rawEmit(std::move(fd));
             }
         }
@@ -428,19 +1156,25 @@ class IRGenerator {
             case NodeType::BinaryExpr: {
                 // Binary operation: left op right
                 if (expr.children.size() >= 2 && expr.children[0] && expr.children[1]) {
-                    // LIST REPETITION: [elem] @ n → list of n copies (alloc + fill loop —
-                    // rides existing ALLOC/append machinery, so it works on EVERY backend).
+                    // LIST REPETITION: [elem, ...] @ n → list of n copies of the whole element
+                    // sequence (alloc + fill loop — rides existing ALLOC/append machinery, so
+                    // it works on EVERY backend). A multi-element list literal in this position
+                    // has empty .children and a raw comma-joined .value ("1,2") — split it so
+                    // each repeat appends every element instead of feeding the whole "1,2" text
+                    // to a single append() call (see splitTopLevelCommas's own comment).
                     if ((expr.value == "@" || expr.value == "*") &&
                         expr.children[0]->type == NodeType::ListLiteral &&
-                        (expr.children[0]->children.size() == 1 ||
-                         (expr.children[0]->children.empty() && !expr.children[0]->value.empty()))) {
+                        (!expr.children[0]->children.empty() || !expr.children[0]->value.empty())) {
                         thread_local int repC = 0;
                         std::string dstName = "ac_rep_" + std::to_string(repC);
                         std::string idxName = "ac_repi_" + std::to_string(repC); repC++;
                         IRRef dstV = mkVar(dstName), idxV = mkVar(idxName);
-                        IRRef elem  = expr.children[0]->children.empty()
-                            ? lowerExpr(expr.children[0]->value)
-                            : lowerExprNode(*expr.children[0]->children[0]);
+                        std::vector<IRRef> elems;
+                        if (!expr.children[0]->children.empty()) {
+                            for (auto& c : expr.children[0]->children) elems.push_back(lowerExprNode(*c));
+                        } else {
+                            for (auto& piece : splitTopLevelCommas(expr.children[0]->value)) elems.push_back(lowerExpr(piece));
+                        }
                         IRRef count = lowerExprNode(*expr.children[1]);
                         emit(IRInstruction(IROpcode::ALLOC, dstV, {mkConst("list"), mkConst("")}));
                         emit(IRInstruction(IROpcode::STORE_VAR, idxV, {mkConstInt(0)}));
@@ -451,8 +1185,10 @@ class IRGenerator {
                             IRRef c = mkTemp();
                             emit(IRInstruction(IROpcode::LT, c, {idxV, count}));
                             { IRInstruction jf(IROpcode::JUMP_IF_FALSE); jf.typedOperands = {c, brk}; emit(std::move(jf)); }
-                            { IRInstruction ap(IROpcode::LIB_CALL);
-                              ap.typedOperands = {mkConst(dstName + ".append"), elem}; emit(std::move(ap)); }
+                            for (auto& elem : elems) {
+                                IRInstruction ap(IROpcode::LIB_CALL);
+                                ap.typedOperands = {mkConst(dstName + ".append"), elem}; emit(std::move(ap));
+                            }
                             IRRef inc = mkTemp();
                             emit(IRInstruction(IROpcode::ADD, inc, {idxV, mkConstInt(1)}));
                             emit(IRInstruction(IROpcode::STORE_VAR, idxV, {inc}));
@@ -464,8 +1200,10 @@ class IRGenerator {
                             IRRef c = mkTemp();
                             emit(IRInstruction(IROpcode::LT, c, {idxV, count}));
                             emitJF(c, endL);
-                            { IRInstruction ap(IROpcode::LIB_CALL);
-                              ap.typedOperands = {mkConst(dstName + ".append"), elem}; emit(std::move(ap)); }
+                            for (auto& elem : elems) {
+                                IRInstruction ap(IROpcode::LIB_CALL);
+                                ap.typedOperands = {mkConst(dstName + ".append"), elem}; emit(std::move(ap));
+                            }
                             IRRef inc = mkTemp();
                             emit(IRInstruction(IROpcode::ADD, inc, {idxV, mkConstInt(1)}));
                             emit(IRInstruction(IROpcode::STORE_VAR, idxV, {inc}));
@@ -646,9 +1384,26 @@ class IRGenerator {
                                 return mkConstInt(op == "ptm" ? (int64_t)((uint64_t)a << b) : (a >> b));
                             // out-of-range shift → leave as a runtime PTM/PTD op (don't fold to UB)
                         }
+                        // A non-constant (or constant-but-out-of-range) shift amount reaches
+                        // every backend's own `<<`/`>>` codegen UNMASKED — every one of those
+                        // is a REAL 64-bit shift in the target language too, so a runtime
+                        // amount >= 64 is genuine UB there as well, not just a folding
+                        // shortcut this compiler skips. Verified real bug: `1 ptm 65` printed
+                        // "0" on C (with a "shift count >= width of type" gcc warning) — no
+                        // per-backend fix needed, since masking the amount to 0-63 HERE, once,
+                        // in the IR, matches real x86 hardware shift semantics anyway (`shl`/
+                        // `shr` already mask their count by 63 in silicon), so every backend's
+                        // shift becomes well-defined for free.
+                        IRRef bMasked = rRef;
+                        if (!(rRef.kind == IRRef::Kind::CONST && rRef.value.type == IRType::INT
+                                && std::get<int64_t>(rRef.value.data) >= 0
+                                && std::get<int64_t>(rRef.value.data) < 64)) {
+                            bMasked = mkTemp();
+                            emit(IRInstruction(IROpcode::BAND, bMasked, {rRef, mkConstInt(63)}));
+                        }
                         IRRef dst = mkTemp();
                         emit(IRInstruction(op == "ptm" ? IROpcode::PTM : IROpcode::PTD,
-                                           dst, {lRef, rRef}));
+                                           dst, {lRef, bMasked}));
                         return dst;
                     }
 
@@ -840,6 +1595,49 @@ class IRGenerator {
                 return lowerExpr(expr.value);
             }
             
+            case NodeType::TernaryExpr: {
+                // `condition | true_expr, # false_expr` (parser.cpp's post-loop check).
+                // Desugars to a synthetic result var + a real if/else, the exact same
+                // shape as the short-circuit and/or case above (branch, store into a
+                // synthetic var, continue) just with BOTH branches populated instead of
+                // one guarded branch. Reuses IF_BEGIN/IF_ELSE/IF_END (high-level IR) or
+                // emitJF+labels (low-level IR, e.g. BNY) — opcodes every backend already
+                // implements — so no backend-specific codegen is needed anywhere.
+                thread_local int ternC = 0;
+                std::string rn = "ac_tern_" + std::to_string(ternC++);
+                IRRef resV = mkVar(rn);
+                IRRef condRef = lowerExprNode(*expr.children[0]);
+                IRRef condT = mkTemp();
+                emit(IRInstruction(IROpcode::NEQ, condT, {condRef, mkConstInt(0)}));
+                // Unconditional placeholder write BEFORE the branch — same reason
+                // short-circuit and/or's resV above does this: `ac_tern_` is in
+                // isSyntheticVar()'s exemption list (needed to protect it from loop
+                // save/restore corruption), but that SAME exemption also excludes it
+                // from the cross-block hoist scan that block-scoped backends (C/C++/
+                // Java/Rust) need for any var whose ONLY writes are inside if/else arms
+                // — without this, those backends emit "ac_tern_0 undeclared" (verified
+                // regression via a --all sweep). Writing it once, unconditionally, first
+                // means it's always genuinely declared in the enclosing scope before
+                // either branch touches it, so hoisting is never needed.
+                emit(IRInstruction(IROpcode::STORE_VAR, resV, {mkConstInt(0)}));
+                if (prog.useHighLevelIR) {
+                    { IRInstruction ib(IROpcode::IF_BEGIN); ib.typedOperands = {condT}; emit(std::move(ib)); }
+                    emit(IRInstruction(IROpcode::STORE_VAR, resV, {lowerExprNode(*expr.children[1])}));
+                    emit(IRInstruction(IROpcode::IF_ELSE));
+                    emit(IRInstruction(IROpcode::STORE_VAR, resV, {lowerExprNode(*expr.children[2])}));
+                    emit(IRInstruction(IROpcode::IF_END));
+                } else {
+                    IRRef elseL = mkLabel(), endL = mkLabel();
+                    emitJF(condT, elseL);
+                    emit(IRInstruction(IROpcode::STORE_VAR, resV, {lowerExprNode(*expr.children[1])}));
+                    emitJump(endL);
+                    emitLabel(elseL);
+                    emit(IRInstruction(IROpcode::STORE_VAR, resV, {lowerExprNode(*expr.children[2])}));
+                    emitLabel(endL);
+                }
+                return resV;
+            }
+
             case NodeType::UnaryExpr: {
                 // Unary operation: op operand
                 if (!expr.children.empty() && expr.children[0]) {
@@ -886,6 +1684,10 @@ class IRGenerator {
             case NodeType::CallExpr:
             case NodeType::FunctionCall: {
                 std::string fname = expr.value;
+                {
+                    auto ait = selectiveImportAliases_.find(fname);
+                    if (ait != selectiveImportAliases_.end()) fname = ait->second;
+                }
 
                 // INDIRECT call: empty name + callee expression as first child
                 // (e.g. funcs[i](x)). Lower the callee to a temp; CALL's operand[0]
@@ -948,6 +1750,21 @@ class IRGenerator {
             case NodeType::IndexExpr: {
                 // Array indexing: array[index]  (AC uses 1-based, targets use 0-based)
                 if (expr.children.size() >= 2 && expr.children[0] && expr.children[1]) {
+                    // t[i] on a known tuple var — see lowerTupleIndexCore's own comment for the
+                    // constant/dynamic/`; any` rules. Scalarized (flat shadow vars) checked
+                    // first, then the escaping/bundle representation.
+                    if (expr.children[0]->type == NodeType::Identifier) {
+                        const std::string& idName = expr.children[0]->value;
+                        std::string scalKey = currentFunc_ + "::" + idName;
+                        auto scalIt = scalarizableTupleVars_.find(scalKey);
+                        auto tv = tupleInstanceVars_.find(idName);
+                        if (scalIt != scalarizableTupleVars_.end() || tv != tupleInstanceVars_.end()) {
+                            IRRef idxRef = lowerExprNode(*expr.children[1]);
+                            if (scalIt != scalarizableTupleVars_.end())
+                                return lowerTupleScalarIndex(idName, scalKey, scalIt->second.isAny, idxRef);
+                            return lowerTupleIndex(tv->first, tv->second, idxRef);
+                        }
+                    }
                     IRRef arr = lowerExprNode(*expr.children[0]);
                     IRRef rawIdx = lowerExprNode(*expr.children[1]);
                     IRRef idx = adjustIndex(rawIdx);
@@ -963,15 +1780,20 @@ class IRGenerator {
             case NodeType::MethodCall: {
                 // Handle Term.ask as an expression (input with prompt)
                 const std::string& mname = expr.value;
-                auto endsWith = [](const std::string& s, const std::string& suf) {
-                    return s.size() >= suf.size() && s.substr(s.size()-suf.size()) == suf;
-                };
-                if (endsWith(mname, "ask")) {
-                    IRRef dst = mkTemp();
-                    IRRef prompt = expr.children.empty() ? mkConst("$$") : lowerExprNode(*expr.children[0]);
-                    IRInstruction i(IROpcode::INPUT, dst, {prompt});
-                    emit(std::move(i));
-                    return dst;
+                // Only Term.ask (or a bare "ask") means generic input — "endsWith(mname,\"ask\")"
+                // used to also swallow OTHER receivers' .ask methods (e.g. camera's sidebar.ask),
+                // silently shadowing them with input() and making them unreachable from AC source.
+                {
+                    auto askDot = mname.rfind('.');
+                    std::string askRecv = askDot == std::string::npos ? "" : mname.substr(0, askDot);
+                    std::string askMeth = askDot == std::string::npos ? mname : mname.substr(askDot + 1);
+                    if (askMeth == "ask" && (askRecv.empty() || askRecv == "Term")) {
+                        IRRef dst = mkTemp();
+                        IRRef prompt = expr.children.empty() ? mkConst("$$") : lowerExprNode(*expr.children[0]);
+                        IRInstruction i(IROpcode::INPUT, dst, {prompt});
+                        emit(std::move(i));
+                        return dst;
+                    }
                 }
                 // sure $msg$ as expression: result = sure $Delete?$  → confirm("Delete?")
                 if (mname == "sure") {
@@ -1105,24 +1927,39 @@ class IRGenerator {
             }
 
             case NodeType::EvalExpr: {
+                // eval(x) dispatches per-backend on x's STATIC type (see emitEval in
+                // ir_codegen.cpp): a STRING argument is interpreted as code (the arithmetic-
+                // string evaluator); anything else is evaluated directly, wrapped in try/catch
+                // (this used to be lazy_eval's job — see LazyEvalExpr below for why it moved).
                 IRRef dst = mkTemp();
                 IRRef arg = expr.children.empty()
                     ? mkConst("")
                     : lowerExprNode(*expr.children[0]);
                 IRInstruction i(IROpcode::EVAL, dst, {arg});
+                // The string branch always yields a FLOAT (the arithmetic evaluator); the
+                // expression branch yields whatever the expression's own known type is. Without
+                // this, dst stays VOID-typed — verified real bug on Go/Java: `d = eval(f())`
+                // where f() returns an int compiled to an untyped interface{}/Object assignment,
+                // a hard compile error ("cannot use ... as int64 value", "incompatible types").
+                IRType argType = typeOfRef(arg);
+                i.resultType = (argType == IRType::STRING) ? IRType::FLOAT : argType;
+                if (i.resultType != IRType::VOID) setRefType(dst, i.resultType);
                 emit(std::move(i));
                 return dst;
             }
 
             case NodeType::LazyEvalExpr: {
-                // lazy_eval(expr) — evaluate expr in a safe try/catch wrapper
-                IRRef dst = mkTemp();
-                IRRef arg = expr.children.empty()
-                    ? mkConst("")
-                    : lowerExprNode(*expr.children[0]);
-                IRInstruction i(IROpcode::LAZY_EVAL, dst, {arg});
-                emit(std::move(i));
-                return dst;
+                // lazy_eval(expr) — Abu's spec: a pure IDENTITY passthrough, zero runtime cost.
+                // Its entire purpose is documentation/intent ("this value is meant to be
+                // sanitized before being eval'd") — it holds the value off, unchanged, for the
+                // CALLER to sanitize with ordinary operations (e.g. stringm.* on a string) before
+                // passing it to eval(). Since it's identity, sanitizing via string ops naturally
+                // preserves the STRING type eval() dispatches on — no wrapper object or
+                // provenance tracking needed. (This used to build IROpcode::LAZY_EVAL — that
+                // opcode's codegen, the try/catch-wrapped-expr-eval, is still used, just now as
+                // eval()'s own "argument isn't a string" branch — see emitEval.)
+                if (expr.children.empty()) return mkConst("");
+                return lowerExprNode(*expr.children[0]);
             }
 
             case NodeType::RangeExpr: {
@@ -1156,20 +1993,55 @@ class IRGenerator {
                 return dst;
             }
 
-            // iota/stream used as a VALUE (not a FOR collection) → concatenated string via
-            // a backend builtin (ac_iota / ac_stream), like the `length`→ac_length pattern.
+            // iota/stream used as a VALUE (not a FOR collection): iota generates NUMBERS, one
+            // at a time, on the spot — it is NEVER a string. It used to route through a
+            // ac_iota/ac_stream backend builtin that built a concatenated STRING of digits
+            // ("iota 5" -> "01234") — flatly wrong (Abu, directly, repeatedly: "iota is not a
+            // string, never a string, it is a lazy generator" / "IOTA IS NOT A CONCATENATED
+            // STRING ... IT GENERATES A NUMBER ON THE SPOT"). Route through the exact same
+            // ALLOC("range"/"sequence") mechanism RangeExpr/SequenceExpr use, so a bare `x =
+            // iota 5` materializes real numbers [0,1,2,3,4], matching every other numeric
+            // context instead of a digit-string. The FOR-loop path (ir.cpp's ForLoop case) was
+            // never affected by this bug — it already generates one number per iteration lazily,
+            // with nothing materialized upfront; that's iota's real, primary use and stays as-is.
             case NodeType::IotaExpr: {
-                IRRef bound = !expr.children.empty() ? lowerExprNode(*expr.children[0]) : mkConstInt(0);
                 IRRef dst = mkTemp();
-                emit(IRInstruction(IROpcode::CALL, dst, {mkVar("ac_iota"), bound}));
+                IRRef bound = !expr.children.empty() ? lowerExprNode(*expr.children[0]) : mkConstInt(0);
+                IRInstruction i(IROpcode::ALLOC, dst, {mkConst("range"), bound});
+                emit(std::move(i));
                 return dst;
             }
             case NodeType::StreamExpr: {
+                IRRef dst = mkTemp();
                 IRRef a = expr.children.size() >= 1 ? lowerExprNode(*expr.children[0]) : mkConstInt(0);
                 IRRef b = expr.children.size() >= 2 ? lowerExprNode(*expr.children[1]) : mkConstInt(0);
-                IRRef step = expr.children.size() >= 3 ? lowerExprNode(*expr.children[2]) : mkConstInt(1);
+                std::vector<IRRef> sops = {mkConst("sequence"), a, b};
+                if (expr.children.size() >= 3) sops.push_back(lowerExprNode(*expr.children[2]));
+                IRInstruction i(IROpcode::ALLOC, dst, sops);
+                emit(std::move(i));
+                return dst;
+            }
+
+            // xrange N / xiota N — 1-indexed range/iota (AC arrays are 1-indexed; range/
+            // sequence/iota/stream aren't). Pure desugaring to sequence(1, N+1)/stream(1, N+1):
+            // reuses the exact same "sequence" ALLOC machinery every backend already handles
+            // correctly, computing the +1 with a real IR ADD instead of AST manipulation.
+            case NodeType::XRangeExpr: {
                 IRRef dst = mkTemp();
-                emit(IRInstruction(IROpcode::CALL, dst, {mkVar("ac_stream"), a, b, step}));
+                IRRef bound = !expr.children.empty() ? lowerExprNode(*expr.children[0]) : mkConstInt(0);
+                IRRef bPlus1 = mkTemp();
+                emit(IRInstruction(IROpcode::ADD, bPlus1, {bound, mkConstInt(1)}));
+                IRInstruction i(IROpcode::ALLOC, dst, {mkConst("sequence"), mkConstInt(1), bPlus1});
+                emit(std::move(i));
+                return dst;
+            }
+            case NodeType::XIotaExpr: {
+                IRRef dst = mkTemp();
+                IRRef bound = !expr.children.empty() ? lowerExprNode(*expr.children[0]) : mkConstInt(0);
+                IRRef bPlus1 = mkTemp();
+                emit(IRInstruction(IROpcode::ADD, bPlus1, {bound, mkConstInt(1)}));
+                IRInstruction i(IROpcode::ALLOC, dst, {mkConst("sequence"), mkConstInt(1), bPlus1});
+                emit(std::move(i));
                 return dst;
             }
 
@@ -1207,6 +2079,14 @@ class IRGenerator {
                 setRefType(dst, IRType::LIST);   // so `nums = [..]` types nums LIST (arg cloning, #22)
                 return dst;
             }
+
+            // A tuple literal reached AS AN EXPRESSION (return x,y; a function-call argument;
+            // an element of a list/dict/another tuple; etc — anything that isn't the direct,
+            // same-statement RHS of a DestructureAssignStmt, which has its own zero-cost fast
+            // path in gen()'s DestructureAssignStmt case). This is always the escaping/fallback
+            // path — a synthesized bundle instance, per the tuple design's Design section.
+            case NodeType::TupleLiteral:
+                return lowerTupleEscaping(expr, "expr");
 
             default:
                 // Fallback: treat as variable or constant
@@ -1792,6 +2672,43 @@ class IRGenerator {
     // Call attrs are comma-split by the parser, which shreds list literals:
     // f([5, 2, 9]) arrives as attrs ["[5","2","9]"]. Re-join bracket groups so a
     // list literal is one argument again ("[5,2,9]").
+    // Splits a raw ListLiteral's flattened `.value` text ("1,2" for `[1, 2]`) back into its
+    // individual element expressions — needed by the `[elem1, elem2, ...] @ n` repeat lowering
+    // below, which otherwise only ever saw ONE element (children is empty for a multi-element
+    // list literal in THIS position; see that lowering's own comment) and fed the whole raw
+    // "1,2" text to a SINGLE append() call — a real crash on every backend whose append() takes
+    // exactly one argument (verified: Python — "TypeError: list.append() takes exactly one
+    // argument (2 given)"). Tracks bracket/paren/brace depth and `$...$` string spans so a
+    // comma inside a nested list/call/string doesn't split early.
+    static std::vector<std::string> splitTopLevelCommas(const std::string& s) {
+        std::vector<std::string> out;
+        std::string cur;
+        int depth = 0;
+        bool inStr = false;
+        for (size_t i = 0; i < s.size(); i++) {
+            char c = s[i];
+            if (c == '$' && (i == 0 || s[i-1] != '\\')) inStr = !inStr;
+            if (!inStr) {
+                if (c == '[' || c == '(' || c == '{') depth++;
+                else if (c == ']' || c == ')' || c == '}') depth--;
+            }
+            if (c == ',' && depth == 0 && !inStr) {
+                out.push_back(cur);
+                cur.clear();
+            } else {
+                cur += c;
+            }
+        }
+        if (!cur.empty() || !out.empty()) out.push_back(cur);
+        // Trim surrounding whitespace off each piece (list literals are written "1, 2", not "1,2").
+        for (auto& p : out) {
+            size_t a = p.find_first_not_of(" \t");
+            size_t b = p.find_last_not_of(" \t");
+            p = (a == std::string::npos) ? "" : p.substr(a, b - a + 1);
+        }
+        return out;
+    }
+
     static std::vector<std::string> mergeBracketAttrs(const std::vector<std::string>& attrs) {
         std::vector<std::string> out;
         std::string pending;
@@ -1890,6 +2807,23 @@ class IRGenerator {
                 for (char c : recv)
                     if (!std::isalnum((unsigned char)c) && c != '_') { identRecv = false; break; }
                 if (identRecv && !inner.empty()) {
+                    // t[i] on a known tuple var — see lowerTupleIndexCore's own comment for
+                    // the rules. This legacy string-expression path (PropAssign's RHS, among
+                    // others — anywhere text gets re-lowered rather than the structured AST
+                    // going through lowerExprNode) needs the exact same redirect lowerExprNode's
+                    // own IndexExpr case has, or it falls straight through to a real LOAD_INDEX
+                    // against a bundle instance — verified real bug: `h.val = t[1]` crashed at
+                    // runtime ("'AcTuple2_i_i' object is not subscriptable") since t is not
+                    // actually a list.
+                    std::string scalKey = currentFunc_ + "::" + recv;
+                    auto scalIt = scalarizableTupleVars_.find(scalKey);
+                    auto tv = tupleInstanceVars_.find(recv);
+                    if (scalIt != scalarizableTupleVars_.end() || tv != tupleInstanceVars_.end()) {
+                        IRRef idxRef = lowerExpr(inner);
+                        if (scalIt != scalarizableTupleVars_.end())
+                            return lowerTupleScalarIndex(recv, scalKey, scalIt->second.isAny, idxRef);
+                        return lowerTupleIndex(tv->first, tv->second, idxRef);
+                    }
                     IRRef idx = lowerExpr(inner);
                     IRRef adj = adjustIndex(idx);   // string dict keys pass through; ints -1
                     IRRef dst = mkTemp();
@@ -2087,14 +3021,28 @@ class IRGenerator {
 
     // ── compound assignment helper ──────────────────────────────────────────
 
-    void emitCompound(IROpcode op, const std::string& varName, const std::string& rhs) {
+    // `x += rRef` etc (already-lowered rhs): if x is `atomic`, LOCK_BEGIN goes before the
+    // READ of x's current value (the ADD/SUB/etc below), not just around the final
+    // STORE_VAR — closing the real TOCTOU race every backend's atomic codegen used to
+    // have (the lock previously only ever wrapped the write; the read that computed the
+    // new value happened earlier, unlocked, as a separate instruction — see
+    // ac_atomic_rmw_race_fixed memory for the full trace). LOCK_BEGIN/LOCK_END are
+    // real opcodes now (include/ir.hpp) that every backend implements by holding its
+    // already-existing atomic lock object across the whole bracketed span instead of
+    // just a single statement.
+    void emitCompoundRef(IROpcode op, const std::string& varName, IRRef rRef) {
         IRRef lRef = mkVar(varName);
-        IRRef rRef = lowerExpr(rhs);
-        IRRef tmp  = mkTemp();
+        bool atomic = isAtomicRef(lRef);
+        if (atomic) emit(IRInstruction(IROpcode::LOCK_BEGIN));
+        IRRef tmp = mkTemp();
         emit(IRInstruction(op, tmp, {lRef, rRef}));
         IRInstruction st(IROpcode::STORE_VAR);
         st.typedOperands = {mkVar(varName), tmp};
         emit(std::move(st));
+        if (atomic) emit(IRInstruction(IROpcode::LOCK_END));
+    }
+    void emitCompound(IROpcode op, const std::string& varName, const std::string& rhs) {
+        emitCompoundRef(op, varName, lowerExpr(rhs));
     }
 
     // ── else-chain helper (high-level IR only) ──────────────────────────────
@@ -2394,6 +3342,8 @@ class IRGenerator {
 
             IRFunction fn(n.value, currentClass_);
             fn.returnType = IRType::VOID;
+            fn.isGenerator = generatorFuncNames_.count(
+                currentClass_.empty() ? n.value : currentClass_ + "." + n.value) > 0;
 
             // Scope guard: guarantees exitScope even if gen() throws
             ScopeGuard scope(prog.symbols);
@@ -2422,6 +3372,38 @@ class IRGenerator {
             entry.typedOperands = {IRRef::func(funcId)};
             emit(std::move(entry));
 
+            // Matches collectTupleTrackability's own qualification exactly, so a
+            // scalarizableTupleVars_ lookup built here always agrees with what the prepass
+            // computed. Saved/restored (not just cleared) in case this ever nests — this
+            // language has no closures, so it shouldn't in practice, but restoring costs
+            // nothing and avoids leaking a wrong context into whatever called into this one.
+            std::string savedFunc = currentFunc_;
+            currentFunc_ = currentClass_.empty() ? n.value : currentClass_ + "." + n.value;
+
+            // Tuple-parameter pre-seeding (see tupleParamClasses_'s own comment and
+            // discoverTupleParamShapes): on the real (2nd) generation pass, a parameter
+            // discovery proved receives a tuple argument at some call site is treated exactly
+            // like an already-bound tupleInstanceVars_ entry from the very first statement of
+            // this body, so IndexExpr's existing t[i] lookup picks it up with zero changes of
+            // its own — fixes `Make show func(p): Term.display p[1]` crashing when called as
+            // `show(t)` (p[1] used to fall through to plain list-index codegen since nothing
+            // ever told this function's body that p is a tuple). tupleInstanceVars_ is a flat,
+            // unscoped map (matches lowerTupleEscaping's own convention), so save/restore by
+            // name around this one function body only — leaving a stale entry after returning
+            // would incorrectly leak into any later, unrelated var of the same name.
+            std::vector<std::pair<std::string, std::string>> savedTupleParamEntries;
+            auto tpcIt = tupleParamClasses_.find(currentFunc_);
+            if (tpcIt != tupleParamClasses_.end()) {
+                for (auto& [idx, className] : tpcIt->second) {
+                    if (idx < 0 || (size_t)idx >= n.attrs.size()) continue;
+                    const std::string& pname = n.attrs[(size_t)idx];
+                    auto prior = tupleInstanceVars_.find(pname);
+                    savedTupleParamEntries.push_back(
+                        {pname, prior != tupleInstanceVars_.end() ? prior->second : std::string()});
+                    tupleInstanceVars_[pname] = className;
+                }
+            }
+
             if (!n.children.empty()) gen(*n.children[0]);
 
             // implicit void return if no explicit return
@@ -2433,6 +3415,11 @@ class IRGenerator {
             end.typedOperands = {IRRef::func(funcId)};
             emit(std::move(end));
 
+            currentFunc_ = savedFunc;
+            for (auto& [pname, priorClass] : savedTupleParamEntries) {
+                if (priorClass.empty()) tupleInstanceVars_.erase(pname);
+                else tupleInstanceVars_[pname] = priorClass;
+            }
             cur = nullptr;
             break;
         }
@@ -2608,20 +3595,37 @@ class IRGenerator {
                 if (raw.substr(0, 11) == "__funcall__") {
                     if (!n.children.empty() && n.children[0]->type == NodeType::FunctionCall) {
                         auto& fc = *n.children[0];
-                        std::vector<IRRef> ops = {mkVar(fc.value)};
+                        std::string fcFname = fc.value;
+                        {
+                            auto ait = selectiveImportAliases_.find(fcFname);
+                            if (ait != selectiveImportAliases_.end()) fcFname = ait->second;
+                        }
+                        std::vector<IRRef> ops = {mkVar(fcFname)};
+                        // Screen's title is mandatory and must use the title= keyword — there is
+                        // no positional form and no geometry argument at all anymore (size the
+                        // window with .dimensions(w, h) instead). Checked against the RAW attrs
+                        // (before the keyword-stripping loop below runs) so a bare positional
+                        // `Screen($X$)` is rejected just as clearly as `Screen()`.
+                        if (fc.value == "Screen") {
+                            auto rawAttrs = mergeBracketAttrs(fc.attrs);
+                            bool hasTitleKw = !rawAttrs.empty() && rawAttrs[0].rfind("title=", 0) == 0;
+                            if (!hasTitleKw) {
+                                throw ACError::semantic(
+                                    "Screen(...) requires an explicit title= argument, e.g. "
+                                    "Screen(title=$My Window$) — there is no positional form and "
+                                    "no geometry argument; use .dimensions(w, h) to size the window.");
+                            }
+                        }
                         for (auto& a0 : mergeBracketAttrs(fc.attrs)) {
                             std::string a = a0;
                             // Keyword-arg sugar for widget ctors: `Screen(title=$X$)` — strip a
                             // recognized "paramName=" prefix so the value flows through the
                             // SAME literal/ident/expr handling below as a plain positional arg
                             // would. A small, targeted table (not a general language keyword-arg
-                            // feature) — only correctly positions a SINGLE kwarg matching the
-                            // Nth param when the first N-1 positional args are also omitted
-                            // (exactly Abu's `Screen(title=$X$)`, no geometry, case); it does NOT
-                            // reorder multiple out-of-sequence kwargs.
+                            // feature).
                             {
                                 static const std::unordered_map<std::string, std::vector<std::string>> ctorParamNames = {
-                                    {"Screen", {"title", "geometry"}},
+                                    {"Screen", {"title"}},
                                 };
                                 auto pit = ctorParamNames.find(fc.value);
                                 if (pit != ctorParamNames.end()) {
@@ -2666,8 +3670,31 @@ class IRGenerator {
                                     ops.push_back(lowerExpr(a));   // expression argument
                             }
                         }
+                        // `g = twovals()` on a family-C backend (Java/C/CPP/LIB — no native
+                        // generator/channel construct): must produce a real handle via
+                        // GEN_CREATE, not a plain CALL — matches the same opcode a direct
+                        // `FOR x in twovals():` already uses (ir.cpp's ForLoop case) so a LATER
+                        // `FOR x in g:` (see generatorHandleVars_'s own comment/prepass) finds a
+                        // real, family-C-shaped handle to reuse. Family A/B need no special
+                        // case here at all — their generator-ness lives entirely in the
+                        // callee's own signature/codegen, so the plain CALL below already
+                        // produces the right kind of value (a real Python/JS generator object,
+                        // or a Go/Rust/V channel).
+                        static const std::set<std::string> genFamilyCA = {"Java", "C", "CPP", "C++", "LIB", "BNY", "ASM"};
+                        if (generatorFuncNames_.count(fc.value) && genFamilyCA.count(prog.backend)) {
+                            IRInstruction gc(IROpcode::GEN_CREATE, dst, ops);
+                            emit(std::move(gc));
+                            break;
+                        }
                         IRInstruction i(IROpcode::CALL, dst, ops);
                         emit(std::move(i));
+                        // Mark dst assigned even though its type stays VOID here (a call
+                        // result's real type isn't known until backend-specific inference,
+                        // well after this lowering pass) — otherwise a LATER retype of this
+                        // same var (`x = someFunc(); x = $hello$`) can't tell "first assignment,
+                        // no cast needed" apart from "reassignment of unknown-typed prior value,
+                        // genuinely needs a TYPE_CAST" — see everAssignedVarIds_'s own comment.
+                        everAssignedVarIds_.insert(dst.id);
                         if (widgetCtorNames().count(fc.value)) widgetCtorVars_.insert(n.value);
                         break;
                     }
@@ -2676,21 +3703,25 @@ class IRGenerator {
 
             // Check if we have a structured expression as child
             if (!n.children.empty()) {
-                // a = [elem] @ n  → ALLOC directly into `a` + fill loop (typed backends
-                // declare `a` as a list via emitAlloc; a temp var would type it as int).
+                // a = [elem, ...] @ n  → ALLOC directly into `a` + fill loop (typed backends
+                // declare `a` as a list via emitAlloc; a temp var would type it as int). See
+                // splitTopLevelCommas's comment for why a multi-element list literal here needs
+                // splitting instead of a single append() call per repeat.
                 ASTNode* rep = n.children[0].get();
                 if (rep && rep->type == NodeType::BinaryExpr &&
                     (rep->value == "@" || rep->value == "*") &&
                     rep->children.size() >= 2 &&
                     rep->children[0]->type == NodeType::ListLiteral &&
-                    (rep->children[0]->children.size() == 1 ||
-                     (rep->children[0]->children.empty() && !rep->children[0]->value.empty()))) {
+                    (!rep->children[0]->children.empty() || !rep->children[0]->value.empty())) {
                     thread_local int repiC = 0;
                     std::string idxName = "_ac_repi_" + std::to_string(repiC++);
                     IRRef idxV = mkVar(idxName);
-                    IRRef elem  = rep->children[0]->children.empty()
-                        ? lowerExpr(rep->children[0]->value)
-                        : lowerExprNode(*rep->children[0]->children[0]);
+                    std::vector<IRRef> elems;
+                    if (!rep->children[0]->children.empty()) {
+                        for (auto& c : rep->children[0]->children) elems.push_back(lowerExprNode(*c));
+                    } else {
+                        for (auto& piece : splitTopLevelCommas(rep->children[0]->value)) elems.push_back(lowerExpr(piece));
+                    }
                     IRRef count = lowerExprNode(*rep->children[1]);
                     emit(IRInstruction(IROpcode::ALLOC, dst, {mkConst("list"), mkConst("")}));
                     emit(IRInstruction(IROpcode::STORE_VAR, idxV, {mkConstInt(0)}));
@@ -2702,7 +3733,10 @@ class IRGenerator {
                         IRRef c = mkTemp();
                         emit(IRInstruction(IROpcode::LT, c, {idxV, count}));
                         { IRInstruction jf(IROpcode::JUMP_IF_FALSE); jf.typedOperands = {c, brk}; emit(std::move(jf)); }
-                        { IRInstruction ap(IROpcode::LIB_CALL); ap.typedOperands = {mkConst(apName), elem}; emit(std::move(ap)); }
+                        for (auto& elem : elems) {
+                            IRInstruction ap(IROpcode::LIB_CALL);
+                            ap.typedOperands = {mkConst(apName), elem}; emit(std::move(ap));
+                        }
                         IRRef inc = mkTemp();
                         emit(IRInstruction(IROpcode::ADD, inc, {idxV, mkConstInt(1)}));
                         emit(IRInstruction(IROpcode::STORE_VAR, idxV, {inc}));
@@ -2714,7 +3748,10 @@ class IRGenerator {
                         IRRef c = mkTemp();
                         emit(IRInstruction(IROpcode::LT, c, {idxV, count}));
                         emitJF(c, endL);
-                        { IRInstruction ap(IROpcode::LIB_CALL); ap.typedOperands = {mkConst(apName), elem}; emit(std::move(ap)); }
+                        for (auto& elem : elems) {
+                            IRInstruction ap(IROpcode::LIB_CALL);
+                            ap.typedOperands = {mkConst(apName), elem}; emit(std::move(ap));
+                        }
                         IRRef inc = mkTemp();
                         emit(IRInstruction(IROpcode::ADD, inc, {idxV, mkConstInt(1)}));
                         emit(IRInstruction(IROpcode::STORE_VAR, idxV, {inc}));
@@ -2723,15 +3760,102 @@ class IRGenerator {
                     }
                     break;
                 }
+                // t = (x, y) — bind a tuple literal to a var.
+                if (rep && rep->type == NodeType::TupleLiteral) {
+                    // Proven by collectTupleTrackability to never escape this scope: store
+                    // each element straight into flat shadow vars — no bundle, no class, no
+                    // allocation at all. This is the "bind now, use later" half of the
+                    // "optimize it away completely" ask; DestructureAssignStmt's own
+                    // same-statement fast path already covers the other half.
+                    auto scalIt = scalarizableTupleVars_.find(currentFunc_ + "::" + n.value);
+                    if (scalIt != scalarizableTupleVars_.end()) {
+                        std::vector<IRRef> elems;
+                        std::vector<IRType> slotTypes;
+                        lowerTupleElements(*rep, elems, slotTypes);
+                        for (size_t i = 0; i < elems.size(); i++) {
+                            IRRef shadow = mkVar(tupleScalarShadowName(n.value, i));
+                            setRefType(shadow, slotTypes[i]);
+                            IRInstruction st(IROpcode::STORE_VAR, shadow, {elems[i]});
+                            st.resultType = slotTypes[i];
+                            emit(std::move(st));
+                        }
+                        tupleScalarShadowTypes_[currentFunc_ + "::" + n.value] = slotTypes;
+                        break;
+                    }
+                    // Otherwise: construct the synthesized bundle DIRECTLY into `dst` (see
+                    // lowerTupleEscaping's own comment on why a plain value-copy from a
+                    // separately-named instance wouldn't make `dst` trackable as a class
+                    // instance for later field access).
+                    lowerTupleEscaping(*rep, "bind", &dst);
+                    break;
+                }
                 IRRef src = lowerExprNode(*n.children[0]);
                 IRType t  = typeOfRef(src);
-                setRefType(dst, t);          // propagate type to destination var
-                IRInstruction i(IROpcode::STORE_VAR, dst, {src});
-                i.resultType = t;
-                emit(std::move(i));
+                // Automatic retype: when a plain reassignment's value is a DIFFERENT type
+                // than what this var was last known to hold, insert a real TYPE_CAST (the
+                // same mechanism `dec x = 5`/`atomic x = 5` already use) at exactly this
+                // point instead of silently keeping the var's old static type — Abu's own
+                // words: "IN THE IR, WHEN TYPE CHANGES WE INSERT A TYPE CHANGE ... IS WHAT
+                // HAPPENS WITHOUT THE USER HAVING TO WRITE IT." Verified real bug this
+                // closes: `x = 5; x = $String$; x = 5.0` — C had been declaring `x` with
+                // ONE static type picked from a whole-lifetime scan (here: `double`, since
+                // a float assignment appears later), so the STRING assignment spliced in as
+                // a bare, unquoted identifier; JS's compile-time `_acp` vs `_acpf` print-
+                // site choice silently lost the float's `.0` formatting once `x` had also
+                // been used as a string in between. This is the ACTIVE structured-AST path
+                // (the sibling "Legacy string-based handling" below shares the same fix for
+                // whatever narrower cases still reach it without a children[0] expression).
+                IRType oldType = prog.symbols.getType(dst.id);
+                bool wasAssignedBefore = everAssignedVarIds_.count(dst.id) > 0;
+                everAssignedVarIds_.insert(dst.id);
+                // SHORT/MINI/ATOMIC are "sticky" qualifiers, not just the most recent
+                // snapshot type: once a var is declared with one, a later plain-INT
+                // reassignment (the ordinary way to use `short`/`mini`/`atomic` itself,
+                // e.g. `atomic counter = 10; counter = 100`) must NOT silently downgrade it
+                // back to bare INT here — that corrupts prog.symbols' own type for this
+                // var, which every LATER reference consults too. Verified real bug this
+                // closes: `atomic counter = 10; counter = 100; counter -= 3` silently
+                // dropped LOCK_BEGIN/LOCK_END on that trailing `-=` entirely (emitCompoundRef's
+                // isAtomicRef check saw the corrupted INT type) — a genuine cross-backend
+                // thread-safety regression, not a display/formatting issue.
+                //
+                // ATOMIC specifically is sticky against EVERY later type, not just INT:
+                // it's documented as always an int variable ("atomic x [= expr] — int
+                // variable; any op touching it is a global critical section", token.hpp),
+                // so `atomic x = 5; x = 5.5` should coerce 5.5 into the atomic int (like
+                // any other int coercion), not silently turn x into a genuine float var.
+                // Verified real bug the narrower INT-only version still had: several
+                // backends' emitTypedStoreVar gate their special atomic-store branch on
+                // "is this var's CURRENT type ATOMIC" — once a later FLOAT type_cast won
+                // that check, the var's OWN initial `atomic x = 5` declaration stopped
+                // being recognized as atomic (varCastTypes only holds the FINAL type),
+                // so its declaration was silently skipped — undeclared-variable compile
+                // errors on some backends, silently-zero-initialized on others.
+                bool stickyKeep = (oldType == IRType::ATOMIC)
+                                  || ((oldType == IRType::SHORT || oldType == IRType::MINI)
+                                      && t == IRType::INT);
+                IRType effType = stickyKeep ? oldType : t;
+                setRefType(dst, effType);          // propagate type to destination var
+                // A genuine retype needs a TYPE_CAST even when oldType itself is VOID — that
+                // happens whenever the PRIOR assignment's value came from something whose type
+                // isn't known until backend-specific inference (a function call result), not
+                // just "this is x's true first assignment" (wasAssignedBefore tells them apart).
+                bool priorTypeIsAmbiguous = (oldType == IRType::VOID) && wasAssignedBefore;
+                if (effType != IRType::VOID && (oldType != IRType::VOID || priorTypeIsAmbiguous)
+                    && oldType != effType) {
+                    IRInstruction ci(IROpcode::TYPE_CAST);
+                    ci.typedOperands = {src};
+                    ci.result = dst;
+                    ci.resultType = effType;
+                    emit(std::move(ci));
+                } else {
+                    IRInstruction i(IROpcode::STORE_VAR, dst, {src});
+                    i.resultType = effType;
+                    emit(std::move(i));
+                }
                 break;
             }
-            
+
             // Legacy string-based handling (fallback)
             if (n.attrs.empty()) break;
             const std::string& raw = n.attrs[0];
@@ -2741,14 +3865,48 @@ class IRGenerator {
                 // get a 0 placeholder + STORE_INDEX with the lowered value (depth-aware split).
                 std::string inner = raw.substr(8);
                 std::vector<std::string> elems;
-                { std::string cur; int depth = 0;
-                  for (char c : inner) {
-                      if (c=='['||c=='('||c=='{') depth++;
-                      else if (c==']'||c==')'||c=='}') depth--;
-                      if (c==',' && depth==0) { elems.push_back(cur); cur.clear(); }
-                      else cur += c;
-                  }
-                  if (!cur.empty()) elems.push_back(cur); }
+                {
+                    auto trimS = [](std::string s) {
+                        size_t a = s.find_first_not_of(' '), b = s.find_last_not_of(' ');
+                        return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+                    };
+                    std::string t = trimS(inner);
+                    // Single-span form: the WHOLE content is one `$..$` block with no other
+                    // '$' inside (`[$a, b, c$]` — one STRING token whose raw text already
+                    // contains the commas, ast.hpp's documented canonical list-of-strings
+                    // form) — its OWN internal commas are the element separators, each
+                    // re-wrapped so isLiteral() below still recognizes them as complete
+                    // strings. This loop used to only track bracket depth, never `$`-span
+                    // state, so it split "$a, b, c$" into the three UNBALANCED fragments
+                    // "$a"/" b"/" c$" instead — none recognized as a complete string by
+                    // isLiteral(), so each was sent through lowerExpr as garbage (verified
+                    // real bug: printed literally "$a" instead of "a").
+                    if (t.size() >= 2 && t.front() == '$' && t.back() == '$'
+                        && t.find('$', 1) == t.size() - 1) {
+                        std::string innerSpan = t.substr(1, t.size() - 2);
+                        std::string cur;
+                        for (char c : innerSpan) {
+                            if (c == ',') { elems.push_back("$" + trimS(cur) + "$"); cur.clear(); }
+                            else cur += c;
+                        }
+                        elems.push_back("$" + trimS(cur) + "$");
+                    } else {
+                        // General (multi-span) form: `[$a$, $b$, $c$]` — each element
+                        // individually `$`-delimited, joined by commas genuinely OUTSIDE any
+                        // span. Track `inDollar` so a string element's own text (unlikely to
+                        // contain a bracket, but never a bare comma either, by construction)
+                        // is never split mid-span.
+                        std::string cur; int depth = 0; bool inDollar = false;
+                        for (char c : inner) {
+                            if (c == '$') { inDollar = !inDollar; cur += c; continue; }
+                            if (!inDollar && (c=='['||c=='('||c=='{')) depth++;
+                            else if (!inDollar && (c==']'||c==')'||c=='}')) depth--;
+                            if (c==',' && depth==0 && !inDollar) { elems.push_back(cur); cur.clear(); }
+                            else cur += c;
+                        }
+                        if (!cur.empty()) elems.push_back(cur);
+                    }
+                }
                 auto isLiteral = [this](std::string e) {
                     size_t a=e.find_first_not_of(' '), b=e.find_last_not_of(' ');
                     if (a==std::string::npos) return false;
@@ -2822,88 +3980,87 @@ class IRGenerator {
                 IRInstruction i(IROpcode::STORE_VAR, dst, {src});
                 emit(std::move(i));
             } else {
+                // Plain `x = <expr>` (e.g. `x = x + 1`, the un-sugared form of `x += 1`,
+                // already handled via emitCompoundRef above). If `x` is atomic, bracket
+                // the WHOLE expression evaluation + store in the lock, not just the
+                // store — unconditionally, whether or not `expr` textually references
+                // `x` itself: harmless extra scope when it doesn't (matches what the
+                // old single-store auto-wrap already did for a non-self-referential
+                // atomic reassignment), and closes the real TOCTOU race when it does
+                // (see emitCompoundRef's comment for the full story). Detecting
+                // self-reference precisely isn't possible here anyway — `raw` is a
+                // legacy free-text expression string, not a structured AST child.
+                bool atomic = isAtomicRef(dst);
+                if (atomic) emit(IRInstruction(IROpcode::LOCK_BEGIN));
                 IRRef src = lowerExpr(raw);
-                IRInstruction i(IROpcode::STORE_VAR, dst, {src});
-                emit(std::move(i));
+                // Automatic retype: when a plain reassignment's literal value is a
+                // DIFFERENT type than what this var was last known to hold, insert a real
+                // TYPE_CAST (the same mechanism `dec x = 5`/`atomic x = 5` already use) at
+                // exactly this point instead of silently keeping the var's old static type
+                // — Abu's own words: "IN THE IR, WHEN TYPE CHANGES WE INSERT A TYPE CHANGE
+                // ... IS WHAT HAPPENS WITHOUT THE USER HAVING TO WRITE IT." Verified real
+                // bug this closes: `x = 5; x = $String$; x = 5.0` — C had been declaring
+                // `x` with ONE static type picked from a whole-lifetime scan (here:
+                // `double`, since a float assignment appears later), so the STRING
+                // assignment spliced in as a bare, unquoted identifier; JS's compile-time
+                // `_acp` vs `_acpf` print-site choice silently lost the float's `.0`
+                // formatting once `x` had also been used as a string in between. Scoped to
+                // literal CONST sources only (`src.kind == CONST`) — inferring the type of
+                // an arbitrary expression RHS is the much larger general problem every
+                // float/string/list type-inference fix elsewhere in this file already
+                // grapples with; this targets exactly the case Abu specified.
+                IRType castType = IRType::VOID;
+                if (dst.kind == IRRef::Kind::VAR && src.kind == IRRef::Kind::CONST) {
+                    IRType newType = src.value.type;
+                    if (newType != IRType::VOID) {
+                        IRType oldType = prog.symbols.getType(dst.id);
+                        // Same ATOMIC/SHORT/MINI stickiness as the structured-AST path
+                        // above (see its comment, including why ATOMIC is sticky against
+                        // EVERY type, not just INT) — a plain literal reassignment must
+                        // not downgrade a qualifier type back here either.
+                        bool stickyKeep = (oldType == IRType::ATOMIC)
+                                          || ((oldType == IRType::SHORT || oldType == IRType::MINI)
+                                              && newType == IRType::INT);
+                        IRType effType = stickyKeep ? oldType : newType;
+                        if (oldType != IRType::VOID && oldType != effType) castType = effType;
+                        setRefType(dst, effType);
+                    }
+                }
+                if (castType != IRType::VOID) {
+                    IRInstruction ci(IROpcode::TYPE_CAST);
+                    ci.typedOperands = {src};
+                    ci.result = dst;
+                    ci.resultType = castType;
+                    emit(std::move(ci));
+                } else {
+                    IRInstruction i(IROpcode::STORE_VAR, dst, {src});
+                    emit(std::move(i));
+                }
+                if (atomic) emit(IRInstruction(IROpcode::LOCK_END));
             }
             break;
         }
 
         case NodeType::PlusEqualStmt:
-            if (!n.children.empty()) {
-                // Structured expression as child
-                IRRef lRef = mkVar(n.value);
-                IRRef rRef = lowerExprNode(*n.children[0]);
-                IRRef tmp = mkTemp();
-                emit(IRInstruction(IROpcode::ADD, tmp, {lRef, rRef}));
-                IRInstruction st(IROpcode::STORE_VAR);
-                st.typedOperands = {mkVar(n.value), tmp};
-                emit(std::move(st));
-            } else if (!n.attrs.empty()) {
-                // Legacy string-based (fallback)
-                emitCompound(IROpcode::ADD, n.value, n.attrs[0]);
-            }
+            if (!n.children.empty()) emitCompoundRef(IROpcode::ADD, n.value, lowerExprNode(*n.children[0]));
+            else if (!n.attrs.empty()) emitCompound(IROpcode::ADD, n.value, n.attrs[0]);
             break;
         case NodeType::MinusEqualStmt:
-            if (!n.children.empty()) {
-                // Structured expression as child
-                IRRef lRef = mkVar(n.value);
-                IRRef rRef = lowerExprNode(*n.children[0]);
-                IRRef tmp = mkTemp();
-                emit(IRInstruction(IROpcode::SUB, tmp, {lRef, rRef}));
-                IRInstruction st(IROpcode::STORE_VAR);
-                st.typedOperands = {mkVar(n.value), tmp};
-                emit(std::move(st));
-            } else if (!n.attrs.empty()) {
-                // Legacy string-based (fallback)
-                emitCompound(IROpcode::SUB, n.value, n.attrs[0]);
-            }
+            if (!n.children.empty()) emitCompoundRef(IROpcode::SUB, n.value, lowerExprNode(*n.children[0]));
+            else if (!n.attrs.empty()) emitCompound(IROpcode::SUB, n.value, n.attrs[0]);
             break;
         case NodeType::MultiplyEqualStmt:
         case NodeType::AtEqualStmt:
-            if (!n.children.empty()) {
-                // Structured expression as child
-                IRRef lRef = mkVar(n.value);
-                IRRef rRef = lowerExprNode(*n.children[0]);
-                IRRef tmp = mkTemp();
-                emit(IRInstruction(IROpcode::MUL, tmp, {lRef, rRef}));
-                IRInstruction st(IROpcode::STORE_VAR);
-                st.typedOperands = {mkVar(n.value), tmp};
-                emit(std::move(st));
-            } else if (!n.attrs.empty()) {
-                // Legacy string-based (fallback)
-                emitCompound(IROpcode::MUL, n.value, n.attrs[0]);
-            }
+            if (!n.children.empty()) emitCompoundRef(IROpcode::MUL, n.value, lowerExprNode(*n.children[0]));
+            else if (!n.attrs.empty()) emitCompound(IROpcode::MUL, n.value, n.attrs[0]);
             break;
         case NodeType::DivideEqualStmt:
-            if (!n.children.empty()) {
-                // Structured expression as child
-                IRRef lRef = mkVar(n.value);
-                IRRef rRef = lowerExprNode(*n.children[0]);
-                IRRef tmp = mkTemp();
-                emit(IRInstruction(IROpcode::DIV, tmp, {lRef, rRef}));
-                IRInstruction st(IROpcode::STORE_VAR);
-                st.typedOperands = {mkVar(n.value), tmp};
-                emit(std::move(st));
-            } else if (!n.attrs.empty()) {
-                // Legacy string-based (fallback)
-                emitCompound(IROpcode::DIV, n.value, n.attrs[0]);
-            }
+            if (!n.children.empty()) emitCompoundRef(IROpcode::DIV, n.value, lowerExprNode(*n.children[0]));
+            else if (!n.attrs.empty()) emitCompound(IROpcode::DIV, n.value, n.attrs[0]);
             break;
         case NodeType::XorEqualStmt:
-            if (!n.children.empty()) {
-                // Structured expression as child
-                IRRef lRef = mkVar(n.value);
-                IRRef rRef = lowerExprNode(*n.children[0]);
-                IRRef tmp = mkTemp();
-                emit(IRInstruction(IROpcode::XOR, tmp, {lRef, rRef}));
-                IRInstruction st(IROpcode::STORE_VAR);
-                st.typedOperands = {mkVar(n.value), tmp};
-                emit(std::move(st));
-            } else if (!n.attrs.empty()) {
-                // Legacy string-based (fallback)
-                emitCompound(IROpcode::XOR, n.value, n.attrs[0]);
-            }
+            if (!n.children.empty()) emitCompoundRef(IROpcode::XOR, n.value, lowerExprNode(*n.children[0]));
+            else if (!n.attrs.empty()) emitCompound(IROpcode::XOR, n.value, n.attrs[0]);
             break;
 
         // ── display / print ─────────────────────────────────────────────────
@@ -3170,8 +4327,17 @@ class IRGenerator {
                     // the un-evaluated text "$+path+$..." instead of falling through to
                     // lowerExpr below to actually parse the concatenation.
                     ops.push_back(mkConst(trimmed.substr(1, trimmed.size() - 2)));
-                } else if (!trimmed.empty() && std::isdigit((unsigned char)trimmed.front())) {
-                    // Mixed digit-alpha token like "60fps" — treat as string constant
+                } else if (!trimmed.empty() && std::isdigit((unsigned char)trimmed.front())
+                           && [&]{ for (char c : trimmed) if (!std::isalnum((unsigned char)c) && c != '_') return false; return true; }()) {
+                    // Mixed digit-alpha token like "60fps" — treat as string constant. The
+                    // ORIGINAL check here was just "starts with a digit and isn't pure
+                    // numeric" — far broader than "60fps"-style unit suffixes, so it ALSO
+                    // swallowed any digit-led ARITHMETIC EXPRESSION (`7/2`, `3+4`, `5*x`) as a
+                    // literal string constant instead of evaluating it. Verified real bug:
+                    // `foo(7/2)` printed the literal text "7/2", not 3.5. Now requires the
+                    // WHOLE token to be alnum/underscore (matching the isIdent check just
+                    // below for the non-digit-starting case) — anything with an operator
+                    // character falls through to the expression-lowering branch instead.
                     ops.push_back(mkConst(trimmed));
                 } else if (!trimmed.empty() && lowerListLiteralArg(trimmed, ops)) {
                     // list literal argument — lowered to an ALLOC temp
@@ -3189,6 +4355,92 @@ class IRGenerator {
                         ops.push_back(lowerExpr(trimmed));
                 } else {
                     // Empty - skip
+                }
+            }
+            // .kick()/.kick(i) — unifies pop (no arg, drops the last element) and remove-by-
+            // index (one arg, 1-based like every other AC index); .swap(i, j) — swaps two
+            // elements in place. Arrays only ever exposed .append() as a real mutator, and a
+            // true in-place shrink/grow needs backend-specific runtime support none of the 12
+            // targets share — so both are pure front-end desugaring (rebuild-and-reassign for
+            // kick, load/store/load/store for swap) built entirely from LOAD_INDEX/STORE_INDEX/
+            // ALLOC/.append, the same primitives [elem]@n list-repeat and the ternary already
+            // ride, so it works on every backend for free with zero codegen changes.
+            {
+                auto dotPosM = mname.rfind('.');
+                if (dotPosM != std::string::npos && dotPosM > 0) {
+                    std::string recvM = mname.substr(0, dotPosM);
+                    std::string methM = mname.substr(dotPosM + 1);
+                    if (methM == "swap" && ops.size() == 3) {
+                        IRRef arrV = mkVar(recvM);
+                        IRRef i1 = adjustIndex(ops[1]);
+                        IRRef j1 = adjustIndex(ops[2]);
+                        IRRef tmp = mkTemp();
+                        emit(IRInstruction(IROpcode::LOAD_INDEX, tmp, {arrV, i1}));
+                        IRRef vj = mkTemp();
+                        emit(IRInstruction(IROpcode::LOAD_INDEX, vj, {arrV, j1}));
+                        { IRInstruction st(IROpcode::STORE_INDEX); st.typedOperands = {arrV, i1, vj}; emit(std::move(st)); }
+                        { IRInstruction st(IROpcode::STORE_INDEX); st.typedOperands = {arrV, j1, tmp}; emit(std::move(st)); }
+                        break;
+                    }
+                    if (methM == "kick" && ops.size() <= 2) {
+                        thread_local int kickC = 0;
+                        std::string tag = std::to_string(kickC++);
+                        IRRef arrV = mkVar(recvM);
+                        IRRef lenT = mkTemp();
+                        emit(IRInstruction(IROpcode::CALL, lenT, {mkVar("ac_length"), arrV}));
+                        IRRef target = ops.size() == 2 ? ops[1] : lenT;
+                        std::string newName = "_ac_kick_new_" + tag;
+                        std::string idxName = "_ac_kick_i_" + tag;
+                        IRRef newV = mkVar(newName), idxV = mkVar(idxName);
+                        emit(IRInstruction(IROpcode::ALLOC, newV, {mkConst("list"), mkConst("")}));
+                        emit(IRInstruction(IROpcode::STORE_VAR, idxV, {mkConstInt(1)}));
+                        auto emitBody = [&]() {
+                            IRRef keep = mkTemp();
+                            emit(IRInstruction(IROpcode::NEQ, keep, {idxV, target}));
+                            if (prog.useHighLevelIR) {
+                                IRInstruction ib(IROpcode::IF_BEGIN); ib.typedOperands = {keep}; emit(std::move(ib));
+                                IRRef elem = mkTemp();
+                                emit(IRInstruction(IROpcode::LOAD_INDEX, elem, {arrV, adjustIndex(idxV)}));
+                                { IRInstruction ap(IROpcode::LIB_CALL); ap.typedOperands = {mkConst(newName + ".append"), elem}; emit(std::move(ap)); }
+                                emit(IRInstruction(IROpcode::IF_END));
+                            } else {
+                                IRRef skipL = mkLabel();
+                                emitJF(keep, skipL);
+                                IRRef elem = mkTemp();
+                                emit(IRInstruction(IROpcode::LOAD_INDEX, elem, {arrV, adjustIndex(idxV)}));
+                                { IRInstruction ap(IROpcode::LIB_CALL); ap.typedOperands = {mkConst(newName + ".append"), elem}; emit(std::move(ap)); }
+                                emitLabel(skipL);
+                            }
+                        };
+                        if (prog.useHighLevelIR) {
+                            IRRef brk = mkConst("__break__");
+                            loopEnd.push(brk); loopStart.push(mkConst("__continue__"));
+                            emit(IRInstruction(IROpcode::WHILE_BEGIN));
+                            IRRef c = mkTemp();
+                            emit(IRInstruction(IROpcode::LTE, c, {idxV, lenT}));
+                            { IRInstruction jf(IROpcode::JUMP_IF_FALSE); jf.typedOperands = {c, brk}; emit(std::move(jf)); }
+                            emitBody();
+                            IRRef inc = mkTemp();
+                            emit(IRInstruction(IROpcode::ADD, inc, {idxV, mkConstInt(1)}));
+                            emit(IRInstruction(IROpcode::STORE_VAR, idxV, {inc}));
+                            emit(IRInstruction(IROpcode::WHILE_END));
+                            loopEnd.pop(); loopStart.pop();
+                        } else {
+                            IRRef startL = mkLabel(), endL = mkLabel();
+                            emitLabel(startL);
+                            IRRef c = mkTemp();
+                            emit(IRInstruction(IROpcode::LTE, c, {idxV, lenT}));
+                            emitJF(c, endL);
+                            emitBody();
+                            IRRef inc = mkTemp();
+                            emit(IRInstruction(IROpcode::ADD, inc, {idxV, mkConstInt(1)}));
+                            emit(IRInstruction(IROpcode::STORE_VAR, idxV, {inc}));
+                            emitJump(startL);
+                            emitLabel(endL);
+                        }
+                        emit(IRInstruction(IROpcode::STORE_VAR, arrV, {newV}));
+                        break;
+                    }
                 }
             }
             // Sugar: `widget.add($a$, $b$, $c$)` — every widget "add" method (dropdown/listbox/
@@ -3231,6 +4483,10 @@ class IRGenerator {
             {
                 auto fit = glFuncMap.find(fname);
                 if (fit != glFuncMap.end()) fname = fit->second;
+                else {
+                    auto ait = selectiveImportAliases_.find(fname);
+                    if (ait != selectiveImportAliases_.end()) fname = ait->second;
+                }
             }
             std::vector<IRRef> ops = {mkVar(fname)};
             for (auto& a : mergeBracketAttrs(n.attrs)) {
@@ -3280,6 +4536,128 @@ class IRGenerator {
             break;
         }
 
+        case NodeType::DestructureAssignStmt: {
+            // a, b[, c...] = expr — n.attrs = ordered target names, n.children[0] = RHS.
+            if (n.children.empty() || !n.children[0]) break;
+            const ASTNode& rhs = *n.children[0];
+
+            if (rhs.type == NodeType::TupleLiteral) {
+                // Same-statement destructure: a, b = (x, y) or a, b = x, y — the headline
+                // zero-cost case (no bundle, no class, nothing to allocate). Only aliased RHS
+                // elements (an RHS var that's ALSO one of the LHS targets — e.g. a swap,
+                // a, b = b, a) need to be snapshotted into a temp BEFORE any target is
+                // overwritten; every other element stores straight into its target with no
+                // intermediate var at all. A temp for every element regardless (the original,
+                // simpler version) was ALSO correct, but left an unconditionally-declared,
+                // never-read scratch var behind whenever constant-folding later resolved the
+                // store to a literal (`x, y = (10, 20)`) — harmless on most backends, but a
+                // real compile error on Go, which hard-rejects an unused local (`t_0 declared
+                // and not used`).
+                std::set<std::string> targetNames(n.attrs.begin(), n.attrs.end());
+                bool needsSnapshot = false;
+                for (auto& c : rhs.children)
+                    if (c && c->type == NodeType::Identifier && targetNames.count(c->value)) { needsSnapshot = true; break; }
+                // lowerTupleElements applies the SAME homogeneity/coercion rule (inferred
+                // widening, colloid, or `; any`) this fast path would otherwise skip entirely —
+                // the type rule applies to a tuple regardless of whether it's ever allocated.
+                std::vector<IRRef> elems;
+                std::vector<IRType> slotTypes;
+                lowerTupleElements(rhs, elems, slotTypes);
+                std::vector<IRRef> vals;
+                for (size_t ei = 0; ei < elems.size(); ei++) {
+                    IRRef er = elems[ei];
+                    if (!needsSnapshot) { vals.push_back(er); continue; }
+                    // A named `_ac_`-prefixed var, not mkTemp() — the dead-CONST-store
+                    // elimination pass (ir.cpp's own "Dead-const-store elimination" section)
+                    // only prunes STORE_VAR targets of Kind::VAR; runDCE's TEMP-cleanup never
+                    // applies here either, since it unconditionally keeps every STORE_VAR
+                    // (side-effecting by default) regardless of what kind its target is.
+                    // A genuine mkTemp() snapshot was therefore NEVER reclaimed once a later
+                    // constant-fold pass replaced its only consumer with a literal — verified
+                    // real bug: Go hard-errors ("t_0 declared and not used") on the swap case
+                    // (a, b = b, a) once a, b's values are both compile-time-known constants.
+                    IRRef t = mkVar("_ac_swap_" + std::to_string(tupleTempCounter_++));
+                    IRInstruction mv(IROpcode::STORE_VAR, t, {er});
+                    mv.resultType = slotTypes[ei];
+                    setRefType(t, slotTypes[ei]);
+                    emit(std::move(mv));
+                    vals.push_back(t);
+                }
+                size_t count = std::min(n.attrs.size(), vals.size());
+                for (size_t i = 0; i < count; i++) {
+                    IRRef dst = mkVar(n.attrs[i]);
+                    IRInstruction st(IROpcode::STORE_VAR, dst, {vals[i]});
+                    st.resultType = slotTypes[i];
+                    emit(std::move(st));
+                }
+                break;
+            }
+
+            // A bare var previously bound via `t = (x, y)` and proven scalarizable — read
+            // straight off its flat shadow vars, no bundle involved at all.
+            if (rhs.type == NodeType::Identifier) {
+                std::string scalKey = currentFunc_ + "::" + rhs.value;
+                auto scalIt = scalarizableTupleVars_.find(scalKey);
+                if (scalIt != scalarizableTupleVars_.end()) {
+                    for (size_t i = 0; i < n.attrs.size(); i++) {
+                        IRRef dst = mkVar(n.attrs[i]);
+                        IRRef fld = mkVar(tupleScalarShadowName(rhs.value, i));
+                        IRInstruction st(IROpcode::STORE_VAR, dst, {fld});
+                        emit(std::move(st));
+                    }
+                    break;
+                }
+            }
+
+            // Otherwise: RHS is a single expression that resolves to an escaping tuple
+            // instance — a direct call (`a, b = f()`, f always tuple-returning), or a bare var
+            // previously bound via `t = (x, y)` that DIDN'T qualify for scalarization above
+            // (always the fallback-bundle path — see TupleLiteral's own lowerExprNode case).
+            // Field-read `_0.._N-1` off it: the exact "construct in one place, field-access
+            // across a boundary" shape Phase 0's bundle-in-free-function fix already made work
+            // end-to-end on every backend.
+            std::string srcName;
+            IRRef srcVar;
+            if (rhs.type == NodeType::CallExpr || rhs.type == NodeType::FunctionCall) {
+                // Mirrors the verified `__funcall__` AssignStmt pattern (mkVar(fname) as
+                // ops[0], CALL's result a NAMED var, not a temp) — a CALL result routed
+                // through a plain TEMP first isn't the shape Phase 0's instance tracking was
+                // verified against, so this is built directly rather than via lowerExprNode's
+                // generic CallExpr case (which returns a bare mkTemp()).
+                std::string fname = rhs.value;
+                auto ait = selectiveImportAliases_.find(fname);
+                if (ait != selectiveImportAliases_.end()) fname = ait->second;
+                srcName = "_ac_tup_dst_" + std::to_string(tupleTempCounter_++);
+                srcVar = mkVar(srcName);
+                std::vector<IRRef> ops = {mkVar(fname)};
+                for (auto& a : rhs.children) if (a) ops.push_back(lowerExprNode(*a));
+                IRInstruction call(IROpcode::CALL, srcVar, ops);
+                emit(std::move(call));
+            } else if (rhs.type == NodeType::Identifier) {
+                srcName = rhs.value;
+                srcVar = mkVar(srcName);
+            } else {
+                IRRef er = lowerExprNode(rhs);
+                if (er.kind == IRRef::Kind::VAR) {
+                    srcName = prog.symbols.getName(er.id);
+                    srcVar = er;
+                } else {
+                    srcName = "_ac_tup_dst_" + std::to_string(tupleTempCounter_++);
+                    srcVar = mkVar(srcName);
+                    IRInstruction mv(IROpcode::STORE_VAR, srcVar, {er});
+                    emit(std::move(mv));
+                }
+            }
+            (void)srcVar;
+            for (size_t i = 0; i < n.attrs.size(); i++) {
+                IRRef dst = mkVar(n.attrs[i]);
+                IRRef fld = mkVar(srcName + ".f" + std::to_string(i));
+                IRInstruction st(IROpcode::STORE_VAR, dst, {fld});
+                emit(std::move(st));
+            }
+            break;
+        }
+
         case NodeType::PropAssign: {
             // name.prop = value  OR  name.prop /= value (compound, attrs[0] = "/=")
             IRRef dst = mkVar(n.value);
@@ -3310,26 +4688,49 @@ class IRGenerator {
             if (!n.attrs.empty() && !n.children.empty() &&
                 (n.attrs[0] == "/=" || n.attrs[0] == "*=" || n.attrs[0] == "+=" || n.attrs[0] == "-=" ||
                  n.attrs[0] == "@=")) {
-                // Skip compound assigns on function-attribute style (e.g. jump.vertex /= 2)
-                // where the receiver is not a GL object — such "closure attributes" have no
-                // cross-backend representation and would produce undeclared-variable errors.
-                auto dotPos = n.value.find('.');
-                if (dotPos != std::string::npos) {
-                    std::string receiver = n.value.substr(0, dotPos);
-                    if (glObjects_.count(receiver) == 0) break; // skip
-                }
+                // This used to unconditionally skip (silently drop the whole statement, no
+                // error) any compound assign whose receiver wasn't a known GL object — meant
+                // to guard a narrow "function-attribute style" case (e.g. jump.vertex /= 2,
+                // a closure-attribute pseudo-property with no real backing storage), but the
+                // condition was far broader than that: it skipped compound assignment on
+                // EVERY ordinary bundle field in the language, GL or not. Verified real bug:
+                // `h.val += 5` (h a plain bundle instance) silently vanished — no IR emitted
+                // for it at all, not even a wrong value, just gone — since dst below (a plain
+                // VAR ref to the dotted name, same self.field/namedVar.field convention as
+                // every other bundle field access) already reaches the SAME
+                // "__compound_assign__" LIB_CALL mechanism a GL object's compound assign uses,
+                // there was never a real reason to special-case GL objects here at all.
                 IRRef rhs = lowerExprNode(*n.children[0]);
                 // "@=" isn't a real operator in ANY target language outside this one (Python's
                 // `@=` means matrix-multiply, not this) — only reachable here for a fallthrough
                 // `@=` the gl:obj.speed_mult special-case above didn't claim (a non-GL-object
                 // receiver, or a GL property other than "speed"). `@` is AC's general multiply
-                // operator everywhere else, so translate the op text to the already-fully-
-                // supported "*=" rather than ever emitting raw "@=" into generated code.
-                std::string op = (n.attrs[0] == "@=") ? "*=" : n.attrs[0];
-                // emit as LIB_CALL("__compound_assign__", dst, op, rhs) so codegen can render X op= Y
-                IRInstruction i(IROpcode::LIB_CALL);
-                i.typedOperands = {mkConst("__compound_assign__"), dst, mkConst(op), rhs};
-                emit(std::move(i));
+                // operator everywhere else, so treat it as MUL below like every other `@`.
+                //
+                // emitCompoundRef — the SAME established helper a plain (non-dotted) `x += y`
+                // already goes through (PlusEqualStmt et al., just below this case) — instead
+                // of the single opaque LIB_CALL("__compound_assign__", ...) this used to emit.
+                // That LIB_CALL was handled by ONE generic text-substitution block in the
+                // shared driver (`lhs + " " + op + " " + rhs + ";"`) that assumed every backend
+                // could accept raw "h.val += 5;"-shaped text. Fine for every text-emitting
+                // backend, but BNY (a wholly separate hand-rolled compiler) never implemented
+                // this LIB_CALL name AT ALL — unreachable before the GL-object restriction
+                // above was removed, so the gap was never exposed — and ASM (shared driver, but
+                // real x86-64, not text) took the SAME generic branch and got literal C-syntax
+                // spliced into a .asm file (verified: "h.val += 5;" — a hard nasm parse error).
+                // A hand-rolled read+ADD/SUB/MUL/DIV+STORE_VAR replacement (tried first) turned
+                // out to have its OWN gap — a fresh mkTemp() result has no established type-
+                // inference tie back to the field's already-declared type, so C++/Java/Rust/Go/V
+                // variously mis-declared or rejected it (verified: DIV producing a genuinely
+                // float-typed temp against an int field — "incompatible types", "cannot use
+                // float64 as int64"). emitCompoundRef is the proven-working mechanism plain
+                // compound-assign already relies on; reusing it directly needs no new backend
+                // code either, since dotted-name field reads/writes already work everywhere.
+                emitCompoundRef(n.attrs[0] == "@=" ? IROpcode::MUL
+                              : n.attrs[0] == "+=" ? IROpcode::ADD
+                              : n.attrs[0] == "-=" ? IROpcode::SUB
+                              : n.attrs[0] == "/=" ? IROpcode::DIV
+                              : IROpcode::MUL, n.value, rhs);
             } else {
                 // DEG/RAD prefix sugar (`DEG x.prop=45` / `RAD x.prop=0.785`) — set by the
                 // parser's statement-prefix handling (see its comment). DEG is a no-op (AC's
@@ -3338,6 +4739,26 @@ class IRGenerator {
                 // — reuses the exact same textual call-lowering path every other `name(args)`
                 // expression already goes through just below, not a duplicated formula.
                 std::string valText = n.attrs.empty() ? "" : n.attrs[0];
+                // The parser builds this text token-by-token, each with a TRAILING space
+                // (`val += advance().value + " ";`, parser.cpp's "assignment: Name.prop =
+                // value" branch) — so a single-token RHS like `p.x = 5` arrives here as "5 "
+                // (trailing space), not "5". A genuine, real, PRE-EXISTING bug found while
+                // debugging an unrelated BNY issue, not BNY-specific: `lowerExpr("5 ")`
+                // doesn't recognize the untrimmed text as a numeric literal at all, so it
+                // falls through to treating it as an unknown VARIABLE NAME (literally named
+                // "5 ") — a var that's never legitimately assigned anywhere, so it reads back
+                // as whatever uninitialized memory/register happens to be there. Every TEXT-
+                // EMITTING backend (Python/JS/C/...) masked this by accident: `ref()`'s
+                // fallback for an unresolvable symbol just prints the symbol's own NAME as
+                // literal text, and "5" is *also* valid literal syntax in every one of those
+                // target languages, so the generated source came out looking right by pure
+                // coincidence. BNY (real machine code, not text) has no such accidental
+                // safety net — it allocates a genuine, real, uninitialized stack slot for a
+                // symbol named "5 " and reads garbage/zero from it, which is what actually
+                // surfaced this (verified: `p = Point(); p.x = 5; Term.display p.x` printed 0
+                // instead of 5 — bare, no free function boundary involved at all).
+                { size_t a = valText.find_first_not_of(' '), b = valText.find_last_not_of(' ');
+                  valText = (a == std::string::npos) ? std::string() : valText.substr(a, b - a + 1); }
                 if (n.angleUnit == 2 && !valText.empty())
                     valText = "math.rad2deg(" + valText + ")";
                 IRRef src = valText.empty() ? mkConst("") : lowerExpr(valText);
@@ -3636,9 +5057,12 @@ class IRGenerator {
 
             // Low-level (BNY/ASM): range/sequence/iota/stream → compact counted WHILST loop.
             // iota iterates like range; stream like sequence. Optional step (3rd arg).
+            // xrange/xiota are the 1-indexed cousins — same shape as range, just a=1 and
+            // b=bound+1 instead of a=0 and b=bound.
             bool isRangeLike = collNode.type == NodeType::RangeExpr || collNode.type == NodeType::IotaExpr;
+            bool isXLike     = collNode.type == NodeType::XRangeExpr || collNode.type == NodeType::XIotaExpr;
             bool isSeqLike   = collNode.type == NodeType::SequenceExpr || collNode.type == NodeType::StreamExpr;
-            if (!prog.useHighLevelIR && (isRangeLike || isSeqLike)) {
+            if (!prog.useHighLevelIR && (isRangeLike || isXLike || isSeqLike)) {
 
                 IRRef startL = mkLabel();
                 IRRef contL  = mkLabel();  // continue → the INCREMENT, not the top (#2: skipping
@@ -3654,6 +5078,13 @@ class IRGenerator {
                     bRef = !collNode.children.empty()
                         ? lowerExprNode(*collNode.children[0])
                         : lowerExpr(collNode.value);
+                } else if (isXLike) {
+                    aRef = mkConstInt(1);
+                    IRRef bound = !collNode.children.empty()
+                        ? lowerExprNode(*collNode.children[0])
+                        : lowerExpr(collNode.value);
+                    bRef = mkTemp();
+                    emit(IRInstruction(IROpcode::ADD, bRef, {bound, mkConstInt(1)}));
                 } else {
                     if (collNode.children.size() >= 2) {
                         aRef = lowerExprNode(*collNode.children[0]);
@@ -3734,6 +5165,113 @@ class IRGenerator {
                 loopEnd.pop();
                 loopStart.pop();
                 break;
+            }
+
+            // `FOR x in gen(args):` where gen is a known generator function, on a family-C
+            // backend (Java/C/CPP/LIB — no native generator/channel construct, unlike family
+            // A's real `yield`/`for` or family B's channel+range) — expand into the WHILE-shape
+            // this exact function already uses for sequence-with-explicit-step just above (same
+            // idiom, not a new one): GEN_CREATE once, then GEN_NEXT/GEN_DONE each iteration.
+            // Family A/B backends fall through to the unchanged generic path below instead —
+            // their generator-ness is handled entirely by the callee's OWN signature/codegen,
+            // never visible at this call site.
+            {
+                static const std::set<std::string> genFamilyC = {"Java", "C", "CPP", "C++", "LIB"};
+                bool isGenCall = (collNode.type == NodeType::CallExpr || collNode.type == NodeType::FunctionCall);
+                std::string calleeName = isGenCall ? collNode.value : "";
+                // `FOR x in g:` where `g = twovals()` ran earlier — reuse g's EXISTING handle
+                // directly (no GEN_CREATE: that would spin up a whole SECOND, independent
+                // generator, and the correct behavior — matching every other family — is that
+                // iterating an already-partially-or-fully-consumed handle a second time picks
+                // up where it left off, e.g. yielding nothing further once exhausted).
+                bool isGenVar = (collNode.type == NodeType::Identifier)
+                                && generatorHandleVars_.count(collNode.value);
+                if ((isGenCall && generatorFuncNames_.count(calleeName)
+                        && genFamilyC.count(prog.backend))
+                    || (isGenVar && genFamilyC.count(prog.backend))) {
+                    IRRef genHandle;
+                    if (isGenVar) {
+                        genHandle = mkVar(collNode.value);
+                    } else {
+                        genHandle = mkTemp();
+                        std::vector<IRRef> ops = {mkVar(calleeName)};
+                        for (auto& c : collNode.children) if (c) ops.push_back(lowerExprNode(*c));
+                        IRInstruction gc(IROpcode::GEN_CREATE, genHandle, ops);
+                        emit(std::move(gc));
+                    }
+                    IRRef breakSentinel = mkConst("__break__");
+                    IRRef contSentinel  = mkConst("__continue__");
+                    loopEnd.push(breakSentinel);
+                    loopStart.push(contSentinel);
+                    emit(IRInstruction(IROpcode::WHILE_BEGIN));
+                    IRRef tmpVal = mkTemp();
+                    emit(IRInstruction(IROpcode::GEN_NEXT, tmpVal, {genHandle}));
+                    IRRef tmpDone = mkTemp();
+                    emit(IRInstruction(IROpcode::GEN_DONE, tmpDone, {genHandle}));
+                    // JUMP_IF_TRUE has no real implementation on several backends (Java among
+                    // them — the base BackendStrategy default is a silent no-op) — negate and
+                    // use JUMP_IF_FALSE instead, the exact same proven idiom the sequence-
+                    // with-explicit-step WHILE loop just above already relies on.
+                    IRRef tmpNotDone = mkTemp();
+                    emit(IRInstruction(IROpcode::NOT, tmpNotDone, {tmpDone}));
+                    {
+                        IRInstruction jf(IROpcode::JUMP_IF_FALSE);
+                        jf.typedOperands = {tmpNotDone, breakSentinel};
+                        emit(std::move(jf));
+                    }
+                    emit(IRInstruction(IROpcode::STORE_VAR, mkVar(iterVar), {tmpVal}));
+                    if (bodyIndex < n.children.size()) gen(*n.children[bodyIndex]);
+                    for (size_t i = bodyIndex + 1; i < n.children.size(); i++) gen(*n.children[i]);
+                    emit(IRInstruction(IROpcode::WHILE_END));
+                    loopEnd.pop();
+                    loopStart.pop();
+                    break;
+                }
+            }
+
+            // `FOR x in gen(args):` on the low-level (!useHighLevelIR) family-C backends — BNY and
+            // ASM, neither of which has structured-loop IR opcodes at all (see prog.useHighLevelIR's
+            // own comment). Same GEN_CREATE/GEN_NEXT/GEN_DONE opcodes as the high-level family-C
+            // branch above, just expanded into the label/jump loop shape this function's own
+            // low-level range/seq branch (just above, `isRangeLike`/`isSeqLike`) already
+            // establishes for these backends, instead of WHILE_BEGIN/WHILE_END.
+            if (!prog.useHighLevelIR && (prog.backend == "BNY" || prog.backend == "ASM")) {
+                bool isGenCall = (collNode.type == NodeType::CallExpr || collNode.type == NodeType::FunctionCall);
+                std::string calleeName = isGenCall ? collNode.value : "";
+                bool isGenVar = (collNode.type == NodeType::Identifier)
+                                && generatorHandleVars_.count(collNode.value);
+                if ((isGenCall && generatorFuncNames_.count(calleeName)) || isGenVar) {
+                    IRRef genHandle;
+                    if (isGenVar) {
+                        genHandle = mkVar(collNode.value);
+                    } else {
+                        genHandle = mkTemp();
+                        std::vector<IRRef> ops = {mkVar(calleeName)};
+                        for (auto& c : collNode.children) if (c) ops.push_back(lowerExprNode(*c));
+                        IRInstruction gc(IROpcode::GEN_CREATE, genHandle, ops);
+                        emit(std::move(gc));
+                    }
+                    IRRef startL = mkLabel();
+                    IRRef endL   = mkLabel();
+                    loopStart.push(startL);   // no separate continue-target: nothing to increment
+                    loopEnd.push(endL);
+                    emitLabel(startL);
+                    IRRef tmpVal = mkTemp();
+                    emit(IRInstruction(IROpcode::GEN_NEXT, tmpVal, {genHandle}));
+                    IRRef tmpDone = mkTemp();
+                    emit(IRInstruction(IROpcode::GEN_DONE, tmpDone, {genHandle}));
+                    IRRef tmpNotDone = mkTemp();
+                    emit(IRInstruction(IROpcode::NOT, tmpNotDone, {tmpDone}));
+                    emitJF(tmpNotDone, endL);
+                    emit(IRInstruction(IROpcode::STORE_VAR, mkVar(iterVar), {tmpVal}));
+                    if (bodyIndex < n.children.size()) gen(*n.children[bodyIndex]);
+                    for (size_t i = bodyIndex + 1; i < n.children.size(); i++) gen(*n.children[i]);
+                    emitJump(startL);
+                    emitLabel(endL);
+                    loopStart.pop();
+                    loopEnd.pop();
+                    break;
+                }
             }
 
             // For iteration, iota/stream behave as range/sequence (LAZY, one-value-per-iteration
@@ -3841,6 +5379,14 @@ class IRGenerator {
             }
             
             IRInstruction i(IROpcode::RETURN);
+            i.typedOperands = {val};
+            emit(std::move(i));
+            break;
+        }
+
+        case NodeType::YieldStmt: {
+            IRRef val = !n.children.empty() ? lowerExprNode(*n.children[0]) : mkConst("");
+            IRInstruction i(IROpcode::YIELD);
             i.typedOperands = {val};
             emit(std::move(i));
             break;
@@ -4258,6 +5804,20 @@ class IRGenerator {
                 auto colon = effValue.find(':');
                 if (colon != std::string::npos) { libType = effValue.substr(0, colon); libName = effValue.substr(colon + 1); }
 
+                // web-server is a sub-ilib of web, never a standalone top-level import —
+                // `from ilib web use web-server` (rewritten to this same ilib:web-server
+                // form just below) is the ONLY valid spelling. A direct `use ilib
+                // web-server` / `from ilib web-server use ...` used to also silently work
+                // (an earlier session treated the two forms as interchangeable aliases) —
+                // Abu's explicit correction: only the `from ilib web use` spelling should be
+                // accepted, since it's the one that actually reads as "web-server is a
+                // sub-thing of web."
+                if (libType == "ilib" && libName == "web-server") {
+                    throw ACError::semantic(
+                        "'web-server' is a sub-library of 'web', not a standalone ilib — use "
+                        "'from ilib web use web-server' instead of 'use ilib web-server'.");
+                }
+
                 // `from ilib web use web-server` — web-server is a sub-ilib of web, not
                 // a restricted symbol list of web's own functions. Rewrite to a plain
                 // import of web-server (and ONLY web-server — `use ilib web` on its own
@@ -4276,6 +5836,15 @@ class IRGenerator {
                     trackedName = (c2 != std::string::npos) ? effValue.substr(c2 + 1) : effValue;
                 }
                 prog.importedLibs.insert(trackedName);
+
+                // Selective import (`from ilib math use sin, cos`): register each requested
+                // symbol as an alias for its qualified ilib call — see
+                // selectiveImportAliases_'s own comment for why this is done here instead of
+                // per-backend. Only real ilib namespace calls have a qualified dotted form to
+                // alias to (elib/clib/flib symbols aren't namespaced the same way).
+                if (libType == "ilib")
+                    for (auto& sym : effAttrs)
+                        selectiveImportAliases_[sym] = libName + "." + sym;
             }
             IRInstruction i(IROpcode::LIB_CALL);
             // operands: "import", "ilib:math"[, "sin,cos,sqrt" if selective]
@@ -4394,13 +5963,101 @@ class IRGenerator {
             break;
         }
 
+        // eval(...)/lazy_eval(...) as a BARE statement (result never assigned) — the generic
+        // `default:` fallback below only recurses into children, which for these nodes means
+        // "recurse into the string/expr argument," never actually lowering the EvalExpr/
+        // LazyEvalExpr node itself. Verified real bug: `eval($sideEffectFn()$)` alone on a line
+        // emitted NO instruction at all (not even reaching runDCE — this is a lowering gap, not
+        // a dead-code-elimination one), silently dropping the entire evaluated side effect.
+        case NodeType::EvalExpr:
+        case NodeType::LazyEvalExpr:
+            lowerExprNode(n);
+            break;
+
         default:
             for (auto& c : n.children) gen(*c);
             break;
         }
     }
 
+    // True if `node` (or anything under it) is a YieldStmt, WITHOUT descending into a
+    // nested FuncDef — a yield inside a nested `Make` belongs to that inner function, not
+    // whichever outer one we're currently scanning (matches Python's own scoping rule).
+    static bool containsYield(const ASTNode& node) {
+        if (node.type == NodeType::YieldStmt) return true;
+        if (node.type == NodeType::FuncDef) return false;
+        for (auto& c : node.children)
+            if (c && containsYield(*c)) return true;
+        return false;
+    }
+
+    // AST-only prepass (see generatorFuncNames_'s own comment for why this must run BEFORE
+    // gen(ast), not be discovered incidentally during it). Walks the whole tree once,
+    // recording every `Make func` (qualified "Class.method" inside a bundle, matching
+    // FuncDef's own funcId interning convention) whose body contains a yield anywhere.
+    void collectGeneratorFunctions(const ASTNode& node, const std::string& classCtx = "") {
+        if (node.type == NodeType::FuncDef) {
+            std::string qualified = classCtx.empty() ? node.value : classCtx + "." + node.value;
+            if (!node.children.empty() && node.children[0] && containsYield(*node.children[0]))
+                generatorFuncNames_.insert(qualified);
+            for (auto& c : node.children)
+                if (c) collectGeneratorFunctions(*c, classCtx);
+            return;
+        }
+        if (node.type == NodeType::BundleDef) {
+            for (auto& c : node.children)
+                if (c) collectGeneratorFunctions(*c, node.value);
+            return;
+        }
+        for (auto& c : node.children)
+            if (c) collectGeneratorFunctions(*c, classCtx);
+    }
+
+    // Second prepass (run after collectGeneratorFunctions — needs generatorFuncNames_ already
+    // complete). `g = twovals()` reaches ir.cpp's AssignStmt case through one of two AST
+    // shapes depending on parser context: the dedicated "__funcall__"-tagged fast path
+    // (attrs[0], children[0] = FunctionCall), or the generic structured-expression path
+    // (children[0] = CallExpr/FunctionCall directly, no attrs tag) — check both.
+    void collectGeneratorHandleVars(const ASTNode& node) {
+        if (node.type == NodeType::AssignStmt && !node.children.empty() && node.children[0]) {
+            const ASTNode& val = *node.children[0];
+            if (val.type == NodeType::CallExpr || val.type == NodeType::FunctionCall) {
+                if (generatorFuncNames_.count(val.value))
+                    generatorHandleVars_.insert(node.value);
+            }
+        }
+        for (auto& c : node.children)
+            if (c) collectGeneratorHandleVars(*c);
+    }
+
 public:
+    // Two-pass tuple-parameter-shape driver (see tupleParamClasses_'s own comment): the free
+    // function generateIR() reads this back after a discovery pass and feeds it into a second,
+    // real pass via setTupleParamClasses before calling generate() again.
+    const std::map<std::string, std::map<int, std::string>>& getTupleParamClasses() const {
+        return tupleParamClasses_;
+    }
+    void setTupleParamClasses(std::map<std::string, std::map<int, std::string>> m) {
+        tupleParamClasses_ = std::move(m);
+    }
+    // A discovered className (e.g. "AcTuple2_i_i") is meaningless on its own in a fresh pass —
+    // lowerTupleIndex needs its slotTypes/isAny-ness too (tupleClassSlotTypes_/tupleAnyClasses_,
+    // both populated only once the class's own defining tuple literal is actually lowered,
+    // which for a tuple passed as a parameter happens LATER in program order than the callee
+    // whose body needs to index it). Merge — not replace — into the real pass's own registry;
+    // the real pass's later emitSyntheticTupleClass call for that exact shape still fires
+    // normally and re-derives the identical entry, so this only fills the gap for code that
+    // runs BEFORE that point. Deliberately does NOT touch tupleShapeClasses_ (the memoization
+    // key map) — pre-seeding THAT would make emitSyntheticTupleClass's own dedup check think
+    // the class was already defined and skip emitting its CLASS_BEGIN/definition entirely.
+    void mergeTupleClassRegistry(const std::map<std::string, std::vector<IRType>>& slotTypes,
+                                 const std::set<std::string>& anyClasses) {
+        for (auto& [cls, st] : slotTypes) tupleClassSlotTypes_[cls] = st;
+        for (auto& cls : anyClasses) tupleAnyClasses_.insert(cls);
+    }
+    const std::map<std::string, std::vector<IRType>>& getTupleClassSlotTypes() const { return tupleClassSlotTypes_; }
+    const std::set<std::string>& getTupleAnyClasses() const { return tupleAnyClasses_; }
+
     IRProgram generate(const ASTNode& ast, const std::string& backend) {
         prog         = IRProgram();
         prog.backend = backend;
@@ -4416,6 +6073,14 @@ public:
         // so every if/loop became C++ `goto` → "jump crosses initialization" build errors.
         tc = lc = 0;
         inMainSection = false;
+        generatorFuncNames_.clear();
+        generatorHandleVars_.clear();
+        collectGeneratorFunctions(ast);
+        collectGeneratorHandleVars(ast);
+        scalarizableTupleVars_.clear();
+        tupleScalarShadowTypes_.clear();
+        currentFunc_.clear();
+        collectTupleTrackability(ast);
         gen(ast);
 
         // If no explicit <mainloop> tag was encountered, all non-import instructions
@@ -4439,6 +6104,8 @@ public:
                 return std::get<std::string>(ins.typedOperands[0].value.data) != "import";
             }), ds.end());
         }
+
+        discoverTupleParamShapes();
 
         prog.globalTempCount  = tc;
         prog.globalLabelCount = lc;
@@ -4542,6 +6209,24 @@ static void runDCE(std::vector<IRInstruction>& instrs) {
             case IROpcode::TRY_END:
             case IROpcode::TAG_BEGIN:
             case IROpcode::TAG_END:
+            // Mirrors isSideEffect() below (used for constexpr-eval purity checks) — verified
+            // real bug: `eval($sideEffectFn()$)` with its result never assigned/used got fully
+            // deleted by this pass (the compiler even warned the callee "defined but never
+            // called"), silently dropping eval's entire side effect. SOFT_HALT/SLEEP/EVENT_*/
+            // RESTART_PROGRAM produce no TEMP result in practice so were never actually at risk,
+            // but are listed here too so this switch can't silently drift from isSideEffect's
+            // again if that ever changes.
+            case IROpcode::EVAL:
+            case IROpcode::LAZY_EVAL:
+            case IROpcode::SOFT_HALT:
+            case IROpcode::SLEEP:
+            case IROpcode::EVENT_BIND:
+            case IROpcode::EVENT_TRIGGER:
+            case IROpcode::RESTART_PROGRAM:
+            case IROpcode::ALIAS_DECL:
+            case IROpcode::SAVE_FILE:
+            case IROpcode::RAISE_CLAUSE:
+            case IROpcode::FREE_DECL:
                 return true;
             default:
                 return false;
@@ -4709,6 +6394,12 @@ static IRValue applyBinOp(IROpcode op, const IRValue& L, const IRValue& R) {
                 return IRValue((int64_t)v);
             }
         case IROpcode::DIV:  {
+            // `/` is intentionally the "smart" division: int result for speed when the
+            // quotient is exactly whole, float only when precision actually needs it
+            // (Abu: "we store ints for speed but floats for precision" — `//` is
+            // dedicated int division, `///` dedicated float division; plain `/` isn't
+            // either of those, it auto-picks). NOT a bug — reverting my own earlier
+            // "always float" change here, which wrongly treated this as broken.
             double d = asDbl(R);
             if (d == 0.0) return IRValue();   // VOID → don't fold; keep runtime div-by-zero error
             double q = asDbl(L) / d;
@@ -4722,12 +6413,29 @@ static IRValue applyBinOp(IROpcode op, const IRValue& L, const IRValue& R) {
         case IROpcode::MOD:  { int64_t b = asInt(R); if (b==0) return IRValue(); int64_t r = asInt(L)%b; if (r!=0 && ((r<0)!=(b<0))) r+=b; return IRValue(r); }
         // Comparisons/logicals return int64 0/1 (AC's canonical truth) — a BOOL here breaks
         // typed backends (Go/Java/Rust can't put `true` in an int64) and diverges from BNY/C.
-        case IROpcode::EQ:   return IRValue((int64_t)((anyFloat ? (asDbl(L)==asDbl(R)) : (asInt(L)==asInt(R))) ? 1 : 0));
-        case IROpcode::NEQ:  return IRValue((int64_t)((anyFloat ? (asDbl(L)!=asDbl(R)) : (asInt(L)!=asInt(R))) ? 1 : 0));
-        case IROpcode::LT:   return IRValue((int64_t)((anyFloat ? (asDbl(L)< asDbl(R)) : (asInt(L)< asInt(R))) ? 1 : 0));
-        case IROpcode::GT:   return IRValue((int64_t)((anyFloat ? (asDbl(L)> asDbl(R)) : (asInt(L)> asInt(R))) ? 1 : 0));
-        case IROpcode::LTE:  return IRValue((int64_t)((anyFloat ? (asDbl(L)<=asDbl(R)) : (asInt(L)<=asInt(R))) ? 1 : 0));
-        case IROpcode::GTE:  return IRValue((int64_t)((anyFloat ? (asDbl(L)>=asDbl(R)) : (asInt(L)>=asInt(R))) ? 1 : 0));
+        // STRING operands must compare as strings, not via asInt() (which returns 0 for any
+        // string — verified real bug reachable via `--target BNY -O4`'s whole-function
+        // constexpr-eval loop: a user fn doing `IF a is b` called with two DIFFERENT constant
+        // strings folded to 1/true, since asInt("cat")==asInt("dog")==0==0. Mirrors the fix
+        // already applied to the OTHER, more commonly-hit fold path in this file — see its
+        // "STRING operands must compare as strings" comment).
+        case IROpcode::EQ: case IROpcode::NEQ: case IROpcode::LT:
+        case IROpcode::GT: case IROpcode::LTE: case IROpcode::GTE:
+            if (L.type == IRType::STRING && R.type == IRType::STRING) {
+                int c = std::get<std::string>(L.data).compare(std::get<std::string>(R.data));
+                bool r = (op==IROpcode::EQ) ? (c==0) : (op==IROpcode::NEQ) ? (c!=0)
+                       : (op==IROpcode::LT) ? (c<0)  : (op==IROpcode::GT)  ? (c>0)
+                       : (op==IROpcode::LTE)? (c<=0) : (c>=0);
+                return IRValue((int64_t)(r ? 1 : 0));
+            }
+            switch (op) {
+                case IROpcode::EQ:  return IRValue((int64_t)((anyFloat ? (asDbl(L)==asDbl(R)) : (asInt(L)==asInt(R))) ? 1 : 0));
+                case IROpcode::NEQ: return IRValue((int64_t)((anyFloat ? (asDbl(L)!=asDbl(R)) : (asInt(L)!=asInt(R))) ? 1 : 0));
+                case IROpcode::LT:  return IRValue((int64_t)((anyFloat ? (asDbl(L)< asDbl(R)) : (asInt(L)< asInt(R))) ? 1 : 0));
+                case IROpcode::GT:  return IRValue((int64_t)((anyFloat ? (asDbl(L)> asDbl(R)) : (asInt(L)> asInt(R))) ? 1 : 0));
+                case IROpcode::LTE: return IRValue((int64_t)((anyFloat ? (asDbl(L)<=asDbl(R)) : (asInt(L)<=asInt(R))) ? 1 : 0));
+                default:             return IRValue((int64_t)((anyFloat ? (asDbl(L)>=asDbl(R)) : (asInt(L)>=asInt(R))) ? 1 : 0));
+            }
         case IROpcode::AND:  return IRValue((int64_t)((asInt(L) && asInt(R)) ? 1 : 0));
         case IROpcode::OR:   return IRValue((int64_t)((asInt(L) || asInt(R)) ? 1 : 0));
         case IROpcode::XOR:  return IRValue((int64_t)(((bool)(asInt(L)) != (bool)(asInt(R))) ? 1 : 0));
@@ -4832,28 +6540,6 @@ static IRValue tryConstexprMathEval(const std::string& rawName,
                                     const std::vector<IRValue>& args,
                                     const IRProgram& prog)
 {
-    // iota/stream with constant args fold to their concatenated string at compile time
-    // (BNY has no runtime helper for them — and constants shouldn't need one anywhere).
-    auto IV = [&](size_t k) -> int64_t {
-        const IRValue& v = args[k];
-        if (v.type == IRType::INT)   return std::get<int64_t>(v.data);
-        if (v.type == IRType::FLOAT) return (int64_t)std::get<double>(v.data);
-        return 0;
-    };
-    if (rawName == "ac_iota" && args.size() == 1) {
-        std::string r; int64_t n = IV(0);
-        if (n < 0 || n > 100000) return IRValue();   // keep huge ones runtime
-        for (int64_t i = 0; i < n; i++) r += std::to_string(i);
-        return IRValue(r);
-    }
-    if (rawName == "ac_stream" && (args.size() == 2 || args.size() == 3)) {
-        int64_t a = IV(0), b = IV(1), st = args.size() == 3 ? IV(2) : 1;
-        if (st == 0) st = 1;
-        if ((st > 0 ? (b - a) : (a - b)) > 100000) return IRValue();
-        std::string r;
-        for (int64_t i = a; (st > 0) ? (i < b) : (i > b); i += st) r += std::to_string(i);
-        return IRValue(r);
-    }
     std::string name = normalizeMathName(rawName, prog.importedLibs.count("math") > 0);
     if (name.rfind("math.", 0) != 0) return IRValue();
 
@@ -4939,7 +6625,7 @@ static bool isSideEffect(IROpcode op) {
         case IROpcode::PRINT: case IROpcode::INPUT: case IROpcode::LIB_CALL:
         case IROpcode::HALT: case IROpcode::SOFT_HALT: case IROpcode::SLEEP:
         case IROpcode::EVENT_BIND: case IROpcode::EVENT_TRIGGER:
-        case IROpcode::EVAL: case IROpcode::RESTART_PROGRAM:
+        case IROpcode::EVAL: case IROpcode::LAZY_EVAL: case IROpcode::RESTART_PROGRAM:
         case IROpcode::ALIAS_DECL: case IROpcode::SAVE_FILE:
             return true;
         default: return false;
@@ -5324,6 +7010,32 @@ static void runLocalConstFolding(std::vector<IRInstruction>& instrs, const IRPro
                 if (known(ins.typedOperands[0], L) && known(ins.typedOperands[1], R)) {
                     IRValue folded = applyBinOp(ins.opcode, L, R);
                     if (folded.type == IRType::VOID) { forget(ins.result); break; } // e.g. div by 0 — keep runtime error
+                    // A short/mini-typed result must wrap to its real width BEFORE it gets
+                    // baked into a literal — applyBinOp computes in plain int64, unaware of
+                    // the destination's declared width (ins.resultType, set during
+                    // lowering, still intact here — only overwritten a few lines down).
+                    // Skipping this let a folded out-of-range literal reach the target
+                    // language verbatim: `short x=2147483647; x=x+1` folded straight to
+                    // the literal 2147483648, which Go/Java reject outright at compile
+                    // time ("constant overflows int32" / "lossy conversion") since it
+                    // never fits a 32-bit type — not merely a wrong VALUE bug, a compile
+                    // failure. Preserving the narrow type on `folded` (not widening to
+                    // INT) — NOT retyped to SHORT/MINI: commonRef's CONST-value rendering
+                    // (ir_codegen.cpp) only special-cases IRType::INT/FLOAT/BOOL/STRING;
+                    // handing it a CONST literally typed SHORT falls through every branch
+                    // to its final `return "0"` default, discarding the correctly-wrapped
+                    // number entirely (caught by this exact test). `x`'s own declared
+                    // width is already tracked separately from its TYPE_CAST declaration —
+                    // this fold only needs the NUMBER wrapped, not the const's type changed.
+                    int w = irIntWidth(ins.resultType);
+                    if (w && folded.type == IRType::INT) {
+                        uint64_t v = (uint64_t)std::get<int64_t>(folded.data);
+                        uint64_t mask = (w >= 64) ? ~0ULL : ((1ULL << w) - 1);
+                        uint64_t u = v & mask;
+                        uint64_t signBit = 1ULL << (w - 1);
+                        if (u & signBit) u -= (mask + 1);
+                        folded.data = (int64_t)u;
+                    }
                     ins.opcode = IROpcode::LOAD_CONST;
                     ins.typedOperands = {IRRef::constant(folded)};
                     ins.resultType = folded.type;
@@ -5494,7 +7206,8 @@ static void runOptPasses(IRProgram& prog) {
     if (prog.backend != "LIB") {
         auto scanPre = [&](const std::vector<IRInstruction>& instrs) {
             for (const auto& ins : instrs) {
-                if ((ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL)
+                if ((ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL
+                        || ins.opcode == IROpcode::GEN_CREATE)
                         && !ins.typedOperands.empty()) {
                     const auto& r = ins.typedOperands[0];
                     if (r.kind == IRRef::Kind::VAR && r.id >= 0) {
@@ -5634,8 +7347,19 @@ static void runOptPasses(IRProgram& prog) {
                     // "self.*" stores as dead here silently dropped every bundle field
                     // initializer (found via `bundle X / x = default` producing an instance
                     // with unset fields). Never eliminate them.
+                    //
+                    // The SAME aliasing problem applies to ANY dotted field write on a NAMED
+                    // instance, not just literally "self." — `p.x = 5` (from OUTSIDE a method,
+                    // on any bundle-holding var) is read back as `q.x` once assigned to a
+                    // DIFFERENT variable (`q = f()` where f constructs+returns p) or even just
+                    // read back through `p.x` itself if nothing textually happens to reuse that
+                    // exact string elsewhere — this pass has no way to know. Was scoped to only
+                    // "self." before — verified real bug found on BNY (the one backend that
+                    // actually acts on this DCE, not just warns): `p.x = 5; ...; return p` then
+                    // `q = f(); Term.display q.x` silently dropped the `p.x = 5` store entirely,
+                    // printing 0. Any dotted VAR name is a field write; exempt all of them.
                     const std::string& tgtName = prog.symbols.getName(tgt->id);
-                    if (tgtName.rfind("self.", 0) == 0) return false;
+                    if (tgtName.find('.') != std::string::npos) return false;
                     return readNames.count(tgtName) == 0;
                 }), code.end());
             };
@@ -5800,8 +7524,34 @@ static void wrapWithRestartLoop(IRProgram& prog) {
     prog.globalInit = std::move(out);
 }
 
+// Cheap gate for the two-pass tuple-parameter-shape discovery below (see
+// IRGenerator::tupleParamClasses_'s own comment) — a full discovery pass costs a whole extra
+// lowering of the program, so skip it entirely for the overwhelming majority of programs that
+// never construct a tuple at all. A false positive (TupleLiteral present but no tuple ever
+// actually crosses a call boundary as a parameter) just costs one wasted discovery pass, not
+// incorrectness — discoverTupleParamShapes() naturally produces an empty map in that case.
+static bool astHasTupleLiteral(const ASTNode& n) {
+    if (n.type == NodeType::TupleLiteral) return true;
+    for (auto& c : n.children) if (c && astHasTupleLiteral(*c)) return true;
+    return false;
+}
+
 IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtimeMode, int optLevel) {
     IRGenerator g;
+    if (astHasTupleLiteral(ast)) {
+        // Discovery pass: lower once (throwaway output) purely to learn which functions'
+        // parameters ever receive a tuple argument — impossible to know up front, since a
+        // tuple's synthesized class name is only known once its own binding site is lowered,
+        // and FuncDefs are lowered in written order, almost always before the call sites that
+        // invoke them. See tupleParamClasses_'s own comment for the full rationale.
+        IRGenerator discover;
+        discover.generate(ast, backend);
+        auto tupleParams = discover.getTupleParamClasses();
+        if (!tupleParams.empty()) {
+            g.setTupleParamClasses(std::move(tupleParams));
+            g.mergeTupleClassRegistry(discover.getTupleClassSlotTypes(), discover.getTupleAnyClasses());
+        }
+    }
     auto prog = g.generate(ast, backend);
     prog.optLevel = optLevel;
     if (!runtimeMode) runOptPasses(prog);
@@ -5813,7 +7563,8 @@ IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtim
             std::set<std::string> writtenVarsPre, readVarsPre;
             auto scan = [&](const std::vector<IRInstruction>& instrs) {
                 for (const auto& ins : instrs) {
-                    if ((ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL)
+                    if ((ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL
+                            || ins.opcode == IROpcode::GEN_CREATE)
                             && !ins.typedOperands.empty()) {
                         const auto& r = ins.typedOperands[0];
                         if (r.kind == IRRef::Kind::VAR && r.id >= 0) {

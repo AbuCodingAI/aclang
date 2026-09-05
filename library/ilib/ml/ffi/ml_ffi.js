@@ -34,5 +34,11 @@ const ml = (() => {
     multiply(a, b) { return put(take(a) * take(b), 'mul', Number(a), Number(b)); },
     relu(x) { return put(Math.max(0, take(x)), 'relu', Number(x), 0); },
     backward(loss) { if (!node(loss)) return 0; back(Number(loss), 1); return 1; },
+    // ml.acl maps ml:grad -> ml.grad / ml:optimize -> ml.optimize — both were entirely
+    // missing here (matches ml_get_grad/ml_sgd_step's own naming gap fixed in ml.cpp/every
+    // other binding). grad() mirrors native's ml_get_grad: a NEW tensor node holding a copy
+    // of the accumulated gradient, not a live view. optimize() is a plain alias of weights().
+    grad(tensorId) { const n = node(tensorId); return put(n ? n.grad : 0); },
+    optimize(learningRate, tensorId) { const n = node(tensorId); if (!n) return 0; n.value -= Number(learningRate) * n.grad; return 1; },
   };
 })();

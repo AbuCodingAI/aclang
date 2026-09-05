@@ -10,6 +10,8 @@ extern "C" {
     fn ml_multiply(a: i64, b: i64) -> i64;
     fn ml_relu(x: i64) -> i64;
     fn ml_backward(loss: i64) -> i32;
+    fn ml_grad(tensor_id: i64) -> i64;
+    fn ml_optimize(learning_rate: f64, tensor_id: i64) -> i32;
 }
 
 pub struct Ml;
@@ -30,4 +32,6 @@ impl Ml {
     pub fn multiply(&self, a: i64, b: i64) -> i64 { unsafe { ml_multiply(a, b) } }
     pub fn relu(&self, x: i64) -> i64 { unsafe { ml_relu(x) } }
     pub fn backward(&self, loss: i64) -> i64 { unsafe { ml_backward(loss) as i64 } }
+    pub fn grad(&self, tensor_id: i64) -> i64 { unsafe { ml_grad(tensor_id) } }
+    pub fn optimize(&self, learning_rate: f64, tensor_id: i64) -> i64 { unsafe { ml_optimize(learning_rate, tensor_id) as i64 } }
 }

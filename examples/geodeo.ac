@@ -51,7 +51,6 @@ use ilib gl
                         Cactus.CircleFall(1/4 RightDir)
 
                     Terrain.ANIMATE
-                    RightDir at 60fps
 
                     IF Cactus.CircleFell(1/4 RightDir) is True
                         Cactus.regen()

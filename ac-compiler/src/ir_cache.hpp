@@ -10,7 +10,7 @@
 #include <memory>
 
 static const char IRC_MAGIC[4] = {'A','C','I','R'};
-static const uint8_t IRC_VERSION = 17; // bumped: resultType serialized per instruction (#9)
+static const uint8_t IRC_VERSION = 18; // bumped: IRFunction::isGenerator serialized (`yield`)
 
 // ── FNV-1a 64-bit hash ────────────────────────────────────────────────────────
 inline uint64_t fnv64(const std::string& data) {
@@ -153,6 +153,7 @@ inline void saveIRCache(const std::string& ircFile, uint64_t hash,
         wU8(f, (uint8_t)fn.returnType);
         wI32(f, fn.tempCount);
         wI32(f, fn.labelCount);
+        wU8(f, fn.isGenerator ? 1 : 0);
         uint8_t np = (uint8_t)std::min((size_t)255, fn.parameters.size());
         wU8(f, np);
         for (size_t i = 0; i < np; i++) wStr(f, fn.parameters[i]);
@@ -220,6 +221,7 @@ inline std::unique_ptr<AC_IR::IRProgram> loadIRCache(const std::string& ircFile,
                 fn.returnType  = (AC_IR::IRType)rU8(f);
                 fn.tempCount   = rI32(f);
                 fn.labelCount  = rI32(f);
+                fn.isGenerator = rU8(f) != 0;
                 uint8_t np = rU8(f);
                 for (int i = 0; i < np; i++) fn.parameters.push_back(rStr(f));
                 uint32_t ic = rU32(f);

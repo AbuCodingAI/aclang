@@ -14,6 +14,9 @@
 // that whole class of "type-mangled" bugs instead of patching each backend's private guesswork.)
 inline bool acCallReturnsFloat(const std::string& irName) {
     if (irName == "ml.take" || irName == "ml_take") return true;
+    // aczip's compression-ratio percentage — same "known float-returning ilib call"
+    // pattern as ml.take above.
+    if (irName == "aczip.get_ratio" || irName == "aczip_get_ratio") return true;
     bool isMath = irName.rfind("math.", 0) == 0 || irName.rfind("math_", 0) == 0;
     if (!isMath) return false;
     // math.* return a double EXCEPT this small set of genuinely integer-valued ones.

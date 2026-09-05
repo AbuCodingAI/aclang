@@ -70,6 +70,27 @@ void BackendRegistry::initializeStandardBackends() {
     registerBackend("BNY", ".acb", dummyGenerator,
         [](const std::string& outFile) { return outFile; });  // Direct execution of binary
 
+    // ARM (AArch64) raw ELF64 — see exp_arm.cpp. Host is x86-64 during development, so the
+    // default run step goes through qemu-aarch64 (user-mode emulation); on real ARM64
+    // hardware this would just be `outFile` directly, same as BNY above. main.cpp's actual
+    // dispatch (runArmBinary) also auto-detects the host at compile time and routes "BNY"
+    // itself here when running on ARM, so BNY isn't hardcoded to x86-64 either.
+    registerBackend("ARM", ".acb", dummyGenerator,
+        [](const std::string& outFile) { return "qemu-aarch64 " + outFile; });
+
+    // RISC (AArch64 GNU-assembler text) — see exp_arm_asm.cpp, Phase 2 built on exp_arm.cpp's
+    // proven design; ARM's assembly-text counterpart to BNY's x86 "ASM" backend, named for the
+    // RISC instruction set family (vs. x86's CISC) rather than reusing "ARMASM". Assemble+link
+    // with the real cross toolchain, then run under qemu-aarch64 (same cross-host caveat as ARM
+    // above). main.cpp's dispatch (runArmAsm) also auto-detects the host and routes plain "ASM"
+    // here when running on ARM, instead of emitting x86 NASM syntax that wouldn't assemble there.
+    registerBackend("RISC", ".s", dummyGenerator,
+        [](const std::string& outFile) {
+            return "aarch64-linux-gnu-as " + outFile + " -o /tmp/ac_arm_out.o && "
+                   "aarch64-linux-gnu-ld /tmp/ac_arm_out.o -o /tmp/ac_arm_out && "
+                   "qemu-aarch64 /tmp/ac_arm_out";
+        });
+
     registerBackend("LIB", ".cpp", dummyGenerator,
         [](const std::string& outFile) { return ""; });  // No run step; compiled to .so/.dll
 }

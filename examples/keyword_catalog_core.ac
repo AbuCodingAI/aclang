@@ -154,7 +154,6 @@ bundle Critter
     /* --- misc statement-only keywords --- */
     eval($1 + 1$)
     lazy_eval($1 + 1$)
-    label at 60
 
     /* --- bundle usage --- */
     c = Critter()

@@ -1,0 +1,17 @@
+AC->BNY
+
+<mainloop>
+    Term.display $Hello!$
+    FOR x in range 5
+        Term.display x
+    FOR x in xrange 5
+        Term.display x
+    FOR x in iota 5
+        Term.display x
+    FOR x in xiota 5
+        Term.display x
+    FOR x in sequence(1, 100, 4)
+        Term.display x
+    FOR x in stream(1, 100, 4)
+        Term.display x
+<mainloop>

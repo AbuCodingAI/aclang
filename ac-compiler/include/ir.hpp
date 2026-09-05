@@ -138,7 +138,30 @@ enum class IROpcode {
     // Tag structure
     TAG_BEGIN,      // start of a named tag block; operand[0] = string name of tag
     TAG_END,        // end of a named tag block; operand[0] = string name of tag
-    FDIV            // /// always-float division (perf knob: no divisibility check)
+    FDIV,           // /// always-float division (perf knob: no divisibility check)
+
+    // `atomic` compound read-modify-write (`x = x + 1` where x is atomic): brackets
+    // the WHOLE span from the first read of x through the final write in one
+    // critical section, so the read-modify-write is a genuine atomic RMW instead of
+    // an unlocked read followed by a separately-locked write (a real TOCTOU race —
+    // see ac_atomic_rmw_race_fixed memory). Every backend already has a global
+    // atomic-lock object (built for the single-instruction-wrap case); these just
+    // call its existing lock()/unlock() at the START/END of the whole span instead
+    // of only around the final STORE_VAR.
+    LOCK_BEGIN,
+    LOCK_END,
+
+    // Generators (`yield`). YIELD only ever appears inside a function whose
+    // IRFunction::isGenerator is true. GEN_CREATE/GEN_NEXT/GEN_DONE are emitted only
+    // for backends without a native generator/channel construct (family C: Java, C,
+    // CPP, LIB, BNY, ASM) — see the yield plan for the family A/B/C split.
+    YIELD,          // operand[0] = value to hand back to the consumer
+    GEN_CREATE,     // operand[0] = generator function ref, operand[1..] = args;
+                    // result = opaque generator handle
+    GEN_NEXT,       // operand[0] = handle; result = the value produced by the next
+                    // resume (undefined if the generator is already done)
+    GEN_DONE        // operand[0] = handle; result = bool — was the most recent
+                    // GEN_NEXT the terminal no-value resume?
 };
 
 enum class IRType {
@@ -379,7 +402,35 @@ public:
         
         return -1;  // Not found
     }
-    
+
+    // Scope-blind lookup: returns the LAST-interned id for `name`, regardless of scope depth or
+    // the table's current scope. `lookup()` above is scope-aware by design (correct for name
+    // resolution during real lowering, where "currentScope" tracks where we actually are in the
+    // AST walk) — but a whole-program backend compile phase (BNY's exp_bny.cpp, run long after
+    // ir.cpp's lowering finished and every scope it ever entered has since been exited) has no
+    // "current scope" that still matches where a given name was originally interned, so
+    // lookup() spuriously returns -1 for a real, valid symbol (verified real bug: a function
+    // parameter referenced in its own body ONLY via dotted field access, e.g. `p.x`/`p.y`,
+    // never as a bare `p` — the bare name "p" itself was interned fine at FuncDef time, but by
+    // the time BNY's codegen looks it up by name post-lowering, "p"'s interning scope had long
+    // since closed).
+    //
+    // MUST scan `symbols` directly, not `nameToIds`: exitScope() (below) doesn't just make an
+    // exited scope's names invisible, it actively ERASES their nameToIds entries outright (real
+    // shadowing semantics, correct for the AST-walking pass that owns `currentScope`) — so by
+    // the time this runs, `nameToIds["p"]` is already empty, permanently, even though
+    // `symbols[5]` (the actual Symbol struct `intern()` created) is still sitting right there
+    // untouched (exitScope only ever prunes the name INDEX, never the append-only backing
+    // vector). Verified: an index-based fix here returned -1 on the exact same input a linear
+    // scan below finds immediately. O(n) in total symbol count — fine for this table's size,
+    // and only reached from a post-lowering, once-per-parameter, whole-program compile pass,
+    // not any hot path.
+    int lookupAnyScope(const std::string& name) const {
+        for (int id = (int)symbols.size() - 1; id >= 0; --id)
+            if (symbols[id].name == name) return id;
+        return -1;
+    }
+
     // Get symbol name by index
     const std::string& getName(int id) const {
         if (id >= 0 && id < static_cast<int>(symbols.size())) {
@@ -547,6 +598,7 @@ struct IRFunction {
     std::vector<std::string> parameters;
     std::vector<IRInstruction> instructions;
     IRType returnType;
+    bool isGenerator = false;   // true if this function's body contains a `yield` anywhere
 
     // NEW: Counters for generating unique IDs
     int tempCount = 0;

@@ -1,59 +1,19 @@
-; ACZip FFI for x86-64 Assembly (NASM)
-; Bindings to libaczip.so
+; AC ilib: aczip — x86-64 NASM extern declarations (libaczip.so)
+; AC has no raw byte-buffer type, so this binding calls the file-to-file convenience
+; functions in aczip_c.h/.cpp (shared with every other backend's FFI — see that file's
+; own comment) instead of marshaling ACZipByteArray by hand. AsmStrategy's
+; asmIlibSymbolMap translates AC's `aczip.compress(...)` etc directly to these real
+; symbols (ir_codegen.cpp) — no bare-name wrapper functions needed here, just the
+; extern declarations every call site needs at link time.
 
-extern ac_zip_compress
-extern ac_zip_decompress
-extern ac_zip_compress_hdd
-extern ac_zip_compress_sata
+; long long ac_zip_compress_to_file(const char* path, int parallel, const char* output_path)
+; Signature: (rdi: path, esi: parallel, rdx: output_path) -> rax: bytes written (-1 on failure)
+extern ac_zip_compress_to_file
+
+; int ac_zip_decompress_from_file(const char* archive_path, const char* output_path)
+; Signature: (rdi: archive_path, rsi: output_path) -> eax: status (0 = success)
+extern ac_zip_decompress_from_file
+
+; double ac_get_compression_ratio(size_t original, size_t compressed)
+; Signature: (rdi: original, rsi: compressed) -> xmm0: ratio percentage
 extern ac_get_compression_ratio
-extern ac_free_bytes
-
-section .text
-
-; ac_zip_compress(path: rdi, parallel: rsi) -> ByteArray {rax, rdx}
-global aczip_compress
-aczip_compress:
-    mov rax, rdi        ; path pointer
-    mov rcx, rsi        ; parallel flag
-    call ac_zip_compress
-    ; Returns: rax = data pointer, rdx = size
-    ret
-
-; ac_zip_decompress(data: rdi, size: rsi, output_path: rdx) -> status: rax
-global aczip_decompress
-aczip_decompress:
-    mov rax, rdi        ; data pointer
-    mov rcx, rsi        ; size
-    mov rdx, rdx        ; output_path (already in rdx)
-    call ac_zip_decompress
-    ret
-
-; ac_zip_compress_hdd(path: rdi) -> ByteArray {rax, rdx}
-global aczip_compress_hdd
-aczip_compress_hdd:
-    mov rax, rdi        ; path pointer
-    call ac_zip_compress_hdd
-    ret
-
-; ac_zip_compress_sata(path: rdi) -> ByteArray {rax, rdx}
-global aczip_compress_sata
-aczip_compress_sata:
-    mov rax, rdi        ; path pointer
-    call ac_zip_compress_sata
-    ret
-
-; ac_get_compression_ratio(original: rdi, compressed: rsi) -> ratio: xmm0
-global aczip_get_ratio
-aczip_get_ratio:
-    mov rax, rdi        ; original size
-    mov rcx, rsi        ; compressed size
-    call ac_get_compression_ratio
-    ; Returns: xmm0 (double)
-    ret
-
-; ac_free_bytes(arr: rdi)
-global aczip_free
-aczip_free:
-    mov rax, rdi        ; ByteArray pointer
-    call ac_free_bytes
-    ret

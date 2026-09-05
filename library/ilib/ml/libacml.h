@@ -233,6 +233,13 @@ tensor_id_t ml_get_grad(tensor_id_t tensor_id);
 */
 int ml_sgd_step(double learning_rate, tensor_id_t tensor_id);
 
+/* Aliases matching the AC-facing ml.acl names (ml:grad -> ml.grad, ml:optimize ->
+   ml.optimize) — every language binding should call these two, not ml_get_grad/
+   ml_sgd_step directly, so the exported symbol name always matches what AC source
+   actually calls. */
+tensor_id_t ml_grad(tensor_id_t tensor_id);
+int ml_optimize(double learning_rate, tensor_id_t tensor_id);
+
 /* Adam optimizer step
    Args:
      learning_rate: step size

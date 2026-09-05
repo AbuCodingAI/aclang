@@ -24,6 +24,10 @@ _lib.ml_relu.argtypes = [ctypes.c_int64]
 _lib.ml_relu.restype = ctypes.c_int64
 _lib.ml_backward.argtypes = [ctypes.c_int64]
 _lib.ml_backward.restype = ctypes.c_int
+_lib.ml_grad.argtypes = [ctypes.c_int64]
+_lib.ml_grad.restype = ctypes.c_int64
+_lib.ml_optimize.argtypes = [ctypes.c_double, ctypes.c_int64]
+_lib.ml_optimize.restype = ctypes.c_int
 
 class ml:
     @staticmethod
@@ -46,3 +50,7 @@ class ml:
     def relu(x): return int(_lib.ml_relu(int(x)))
     @staticmethod
     def backward(loss): return int(_lib.ml_backward(int(loss)))
+    @staticmethod
+    def grad(tensor_id): return int(_lib.ml_grad(int(tensor_id)))
+    @staticmethod
+    def optimize(learning_rate, tensor_id): return int(_lib.ml_optimize(float(learning_rate), int(tensor_id)))

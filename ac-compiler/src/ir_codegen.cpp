@@ -1,4 +1,5 @@
 #include "../include/ac.hpp"
+#include "../include/wasm_blobs.hpp"
 #include <sstream>
 #include <fstream>
 #include <map>
@@ -8,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -21,6 +23,15 @@
 #endif
 
 using namespace AC_IR;
+
+// sequence(a,b[,step])/stream(a,b[,step]) ALLOC's optional step rides inside content2 as
+// "b\x1fstep" (see the ALLOC dispatch's own comment for why — emitAlloc's signature only
+// carries two content strings). Splits it back into (b, step); step is "" when absent.
+static std::pair<std::string, std::string> splitSeqStep(const std::string& content2) {
+    size_t sep = content2.find('\x1f');
+    if (sep == std::string::npos) return {content2, ""};
+    return {content2.substr(0, sep), content2.substr(sep + 1)};
+}
 
 // ─── FFI file reader ─────────────────────────────────────────────────────────
 // Reads library/<libName>/ffi/<libName>_ffi.<ext>.
@@ -349,6 +360,21 @@ static bool isIntReturningMathFunc(const char* s) {
         || strcmp(name, "is_prime") == 0;
 }
 
+// Shared "is this ilib call float-returning" check for backends whose type-inference is a
+// simple per-call-name lookup (currently only VStrategy needs it as a free function — the
+// other typed backends each keep their own near-identical isFloatReturningFunc member
+// checking the same math./math_/stat_ prefixes, just not factored out into one place).
+// isIntReturningMathFunc (just above) already handles both the dot ("math.gcd") and
+// underscore ("math_gcd") call-name forms — see its own comment for why both exist
+// (different backends flatten dotted ilib calls differently, and a selective-import alias
+// rewrite can surface either form depending on which codegen path handles a given statement
+// shape).
+static bool isMathFloatReturningFunc(const std::string &fn)
+{
+    if (isIntReturningMathFunc(fn.c_str())) return false;
+    return fn.rfind("math.", 0) == 0 || fn.rfind("math_", 0) == 0 || fn.rfind("stat_", 0) == 0;
+}
+
 // Reformat "p1, p2" → "TYPE p1, TYPE p2"
 static std::string typedParams(const std::string &params, const std::string &typeName)
 {
@@ -435,6 +461,78 @@ static std::string rustMutTypedParams(const std::string &params, const std::stri
 
 // Common ref formatter (all backends except ASM share this)
 // Escape a raw string for embedding in a double-quoted literal.
+// Splits a list-literal's raw content text into elements, recognizing AC's `$..$` string
+// delimiter. Handles the two shapes AC source can actually produce (see parser.cpp's
+// parseListLiteral): multiple individually `$..$`-wrapped STRING tokens joined by real
+// commas (`[$a$, $b$, $c$]` -> "$a$,$b$,$c$" — writing each element like any other AC
+// string literal), and a single `$..$` span whose own text already contains the commas
+// (`[$a, b, c$]` -> "$a, b, c$" — ast.hpp's documented canonical form, one STRING token).
+// Each returned element is EITHER still `$..$`-wrapped (a string element — caller converts
+// to its own target language's real string literal) or passed through unchanged (a
+// numeric/expression element, e.g. "1", "i@i", a nested "[...]").
+static std::vector<std::string> splitListElements(const std::string& content) {
+    std::vector<std::string> out;
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(' '), b = s.find_last_not_of(' ');
+        return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+    };
+    std::string c = trim(content);
+    if (c.empty()) return out;
+    // Single-span form: the WHOLE content is one `$..$` block with no other '$' inside —
+    // its own commas are the element separators.
+    if (c.size() >= 2 && c.front() == '$' && c.back() == '$'
+        && c.find('$', 1) == c.size() - 1) {
+        std::string inner = c.substr(1, c.size() - 2);
+        std::string cur;
+        for (char ch : inner) {
+            if (ch == ',') { out.push_back("$" + trim(cur) + "$"); cur.clear(); }
+            else cur += ch;
+        }
+        out.push_back("$" + trim(cur) + "$");
+        return out;
+    }
+    // General form: split on commas OUTSIDE any `$..$` span and outside bracket nesting.
+    std::string cur;
+    int depth = 0;
+    bool inDollar = false;
+    for (char ch : c) {
+        if (ch == '$') { inDollar = !inDollar; cur += ch; continue; }
+        if (!inDollar && (ch == '[' || ch == '(')) depth++;
+        if (!inDollar && (ch == ']' || ch == ')')) depth--;
+        if (ch == ',' && depth == 0 && !inDollar) { out.push_back(trim(cur)); cur.clear(); continue; }
+        cur += ch;
+    }
+    if (!trim(cur).empty() || !out.empty()) out.push_back(trim(cur));
+    return out;
+}
+// Rejoins splitListElements' output, converting each `$..$`-wrapped element via `quoteFn`
+// (target-language string-literal syntax) and passing everything else through unchanged.
+static std::string convertListContent(const std::string& content,
+        const std::function<std::string(const std::string&)>& quoteFn) {
+    auto elems = splitListElements(content);
+    std::string out;
+    for (size_t k = 0; k < elems.size(); k++) {
+        if (k) out += ", ";
+        const std::string& e = elems[k];
+        if (e.size() >= 2 && e.front() == '$' && e.back() == '$')
+            out += quoteFn(e.substr(1, e.size() - 2));
+        else
+            out += e;
+    }
+    return out;
+}
+// True when every element of a list literal's raw content is a `$..$`-delimited string —
+// the ONLY case typed backends' plain-list emitAlloc branch needs to special-case (a real
+// string-container type instead of their int64-array default). Empty content (`[]`) is not
+// treated as an all-string list — falls through to the existing numeric/empty-array path
+// unchanged, zero behavior change for what already worked.
+static bool isAllStringListContent(const std::string& content) {
+    auto elems = splitListElements(content);
+    if (elems.empty()) return false;
+    for (auto& e : elems)
+        if (!(e.size() >= 2 && e.front() == '$' && e.back() == '$')) return false;
+    return true;
+}
 static std::string escapeStr(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -526,7 +624,7 @@ public:
         // operator '<'" comparing a String against a long literal).
         static const std::set<std::string> tails = {
             "upper", "lower", "trim", "strip", "replace", "b", "format", "getline",
-            "cwd", "env", "read_from", "search", "escape", "join",
+            "cwd", "env", "read", "read_from", "search", "escape", "join",
         };
         for (const char* ns : {"stringm", "os", "regex"}) {
             std::string d = std::string(ns) + ".", u = std::string(ns) + "_";
@@ -544,6 +642,11 @@ public:
             if (f.rfind(d, 0) == 0 && wsTails.count(f.substr(d.size()))) return true;
             if (f.rfind(u, 0) == 0 && wsTails.count(f.substr(u.size()))) return true;
         }
+        // camera ilib: sidebar.ask/getinput return the text typed at the prompt (camera.acl /
+        // camera_c.h's `const char* ac_sidebar_ask(...)`), not a number — same pattern as the
+        // string-tail tables above.
+        if (f == "sidebar.ask" || f == "sidebar_ask" ||
+            f == "sidebar.getinput" || f == "sidebar_getinput") return true;
         return false;
     }
 
@@ -656,8 +759,15 @@ public:
     virtual void emitSoftHalt(std::ostringstream &out, int &indent) { emitHalt(out, indent); }
     // Pause execution for `secs` seconds (decimal OK).
     virtual void emitSleep(std::ostringstream &out, int &indent, const std::string &secs) {}
+    // eval(x): argIsString is true when x's static type is STRING — interpret it as code (the
+    // arithmetic evaluator). Otherwise x is a real AC expression — evaluate it directly, wrapped
+    // in try/catch (delegate to emitLazyEval, unchanged; see NodeType::LazyEvalExpr in ir.cpp).
+    // resultType is x's known IRType (VOID if not statically known) — needed by any backend
+    // whose "evaluate directly, catching errors" path can't just declare a dynamic/interface{}-
+    // style result (Go/Java: a statically-typed destination var can't accept that).
     virtual void emitEval(std::ostringstream &out, int &indent,
-                          const std::string &res, const std::string &expr) = 0;
+                          const std::string &res, const std::string &expr, bool argIsString,
+                          IRType resultType) = 0;
     // quickthread f(args) — lightweight thread. Default: plain synchronous call
     // (only Go has native goroutines; others degrade gracefully).
     virtual void emitQuickThread(std::ostringstream &out, int &indent,
@@ -753,6 +863,17 @@ public:
     // native string type and iterate them as characters. Set by genFunction before emitFunctionBegin.
     std::set<std::string> stringVars_;
     virtual void setStringVars(const std::set<std::string>& s) { stringVars_ = s; }
+
+    // Vars that need a genuine boxed/tagged runtime value instead of one fixed declared type
+    // (Abu's real retype spec — see ac_true_flow_sensitive_retype_spec memory): detected when a
+    // var stays classified "string" by the existing last-assignment-wins stringVars_ heuristic
+    // (see detectNumericRetype) BUT also has a non-string, non-literal-foldable assignment (a
+    // function CALL result) somewhere — the case that whole-lifetime unification can't declare
+    // correctly (`std::string x = getNum();` doesn't compile) and that crashed BNY's codegen
+    // outright. Default no-op; only backends that implement boxing (currently CppStrategy) act
+    // on it — everyone else keeps today's behavior unchanged.
+    std::set<std::string> boxedVars_;
+    virtual void setBoxedVars(const std::set<std::string>& s) { boxedVars_ = s; }
 
     // Dict variables (string-keyed maps) — set at emitAlloc("dict"), consulted by index emission.
     std::set<std::string> dictVars_;      // all dicts
@@ -891,6 +1012,15 @@ public:
         else                { emit(out, indent, "// <" + tag + ">"); }
     }
 
+    // `atomic` read-modify-write lock brackets — every backend overrides these to hold
+    // its OWN already-existing global atomic-lock object (built for the single-store
+    // case) across the whole span ir.cpp now brackets (read-of-current-value through
+    // final write), not just the store. No base-class default: every backend that
+    // supports `atomic` at all must override both, since a no-op default would silently
+    // reopen the exact race this exists to close.
+    virtual void emitLockBegin(std::ostringstream &out, int &indent) = 0;
+    virtual void emitLockEnd(std::ostringstream &out, int &indent) = 0;
+
     // Exception handling (try/catch/after)
     // Default no-ops: backends without native exceptions emit body sequentially
     virtual void emitTryBegin(std::ostringstream &out, int &indent)
@@ -957,6 +1087,47 @@ public:
                                  const std::string &cond, const std::string &label) = 0;
     virtual void emitJumpIfTrue(std::ostringstream &out, int indent,
                                 const std::string &cond, const std::string &label) {}
+
+    // `yield` / generators. setIsGenerator is called before emitFunctionBegin, same idiom
+    // as setReturnIsFloat/setFreeVars/setListParams. emitYield only ever appears inside a
+    // generator function. emitGenCreate/emitGenNext/emitGenDone are only emitted for
+    // backends without a native generator/channel construct (family C — Java, C, CPP, LIB,
+    // BNY, ASM); family A (PY/JS/HTML) and B (GO/RS/V) only need setIsGenerator+emitYield —
+    // see the yield plan for the full family split.
+    virtual void setIsGenerator(bool) {}
+    virtual void emitYield(std::ostringstream &, int &, const std::string & /*val*/) {}
+    virtual void emitGenCreate(std::ostringstream &, int &, const std::string & /*res*/,
+                               const std::string & /*func*/, const std::string & /*args*/) {}
+    virtual void emitGenNext(std::ostringstream &, int &, const std::string & /*res*/,
+                             const std::string & /*handle*/) {}
+    virtual void emitGenDone(std::ostringstream &, int &, const std::string & /*res*/,
+                             const std::string & /*handle*/) {}
+    // Family B (GO/RS/V) only: called right after a CALL whose callee is a known generator
+    // function, so emitForBegin can tell "this collection is really a channel/receiver, use
+    // the single-value range form" apart from a plain array — the shared driver knows the
+    // callee's generator-ness (a whole-program prescan), the strategy doesn't otherwise.
+    virtual void noteGeneratorCallResult(const std::string & /*resultVar*/) {}
+
+    // Called right after ANY call site (direct construct-call `q = ClassName()`, OR `q = f()`
+    // where f is known — via classFuncs_'s whole-program prescan — to always construct+return
+    // one bundle class) resolves `resultVar`'s class. Lets a backend's OWN dotted-field-access
+    // translation (`q.x` read/write) recognize `q` as a real bundle instance — not just the
+    // hardcoded `self` receiver every backend already special-cased — even when `q`'s value
+    // arrived across a function-return boundary, not just a construct-call in the same
+    // function. Default no-op; PY/JS need nothing here (dynamically typed, `q.x = 5` is
+    // already valid text regardless). See classFuncs_'s own comment for the full story.
+    virtual void noteInstanceClass(const std::string & /*var*/, const std::string & /*className*/) {}
+    // fn.name -> class name, for every free function whose every `return` traces to one
+    // directly-constructed bundle instance (classFuncs_'s prescan). Consulted by a backend's
+    // OWN emitFunctionPrototype/emitFunctionBegin to declare the REAL return type (`Point
+    // makePoint(...)`) instead of the int/float/list/string/void default every other
+    // return-type inference here assumes — none of which know about bundle classes at all.
+    virtual void setClassReturnFuncs(const std::map<std::string,std::string> &) {}
+    // funcName -> {paramIndex -> class name} — see classParamTypes_'s own comment in
+    // UnifiedIRCodeGen. Default no-op; overridden per static backend to fix the parameter's
+    // declared TYPE and to pre-seed classInstanceVars_/classInstanceVarNames_ so the body's own
+    // `p.field` accesses format as real struct field reads instead of a flattened `p_field`.
+    virtual void setClassParamTypes(const std::map<std::string, std::map<int, std::string>> &) {}
 
     virtual void setReturnIsFloat(bool) {}  // called before emitFunctionBegin
     virtual void setFloatReturnFuncs(const std::set<std::string>&) {}  // funcs that return float
@@ -1103,6 +1274,12 @@ class PythonStrategy : public BackendStrategy
     bool needsEvents_ = false;
     bool needsSave_ = false;
     void setNeedsSave(bool v) override { needsSave_ = v; }
+    // Needed only to route Term.display through _ac_dblprint for the cross-backend %.16g float
+    // convention (see emitHeader) — Python itself never needed float-vs-other type tracking
+    // before this (print() alone handled every type identically).
+    std::set<std::string> floatVars_;
+    void setFloatVarsFull(const std::set<std::string>& s) override { floatVars_ = s; }
+    bool isFloatVal(const std::string& v) const { return looksFloat(v) || floatVars_.count(v); }
     bool hasDivOp_ = false, hasIpowOp_ = false, hasLengthOp_ = false, hasAddOp_ = false, hasRandomOp_ = false;
     void setUsedBuiltinOps(bool d, bool ip, bool l, bool a, bool r, bool /*idiv*/, bool /*eval*/, bool /*etry*/) override {
         hasDivOp_ = d; hasIpowOp_ = ip; hasLengthOp_ = l; hasAddOp_ = a; hasRandomOp_ = r;
@@ -1110,7 +1287,11 @@ class PythonStrategy : public BackendStrategy
     void emitCapture(std::ostringstream &out, int &indent, const std::string &val) override
     {
         if (!needsSave_) return;
-        emit(out, indent, "_ac_saved.append(str(" + val + ") + \"\\n\")");
+        // Float-typed capture must match `Term.display`'s %.16g convention (`_ac_fmtg`), not
+        // Python's default str()/repr() (shortest round-trip) — otherwise the two could
+        // disagree on the identical value (same class of gap already fixed for Rust/Go).
+        std::string fmt = isFloatVal(val) ? ("_ac_fmtg(" + val + ")") : ("str(" + val + ")");
+        emit(out, indent, "_ac_saved.append(" + fmt + " + \"\\n\")");
     }
     void emitSaveFile(std::ostringstream &out, int &indent, const std::string &filename) override
     {
@@ -1158,6 +1339,18 @@ class PythonStrategy : public BackendStrategy
         emitRaw(out, "# Generated by AC Compiler (AC->PY)");
         emitRaw(out, "import sys, os, time");
         emitRaw(out, "from typing import Final");
+        // Cross-backend float-display convention: Abu's call — every backend prints floats via
+        // the SAME `%.16g`-equivalent (16 significant digits, trailing zeros stripped, ".0"
+        // appended for a whole-valued result) instead of each language's own native "shortest
+        // round-trip" formatter (Python's repr/JS's toString/etc). Python has this natively via
+        // `%` — see CStrategy's `_ac_dblprint` for the canonical algorithm every other backend's
+        // copy of this function matches.
+        emitRaw(out, "def _ac_fmtg(d):");
+        emitRaw(out, "    s = '%.16g' % d");
+        emitRaw(out, "    if not any(c in s for c in '.eEnN'): s += '.0'");
+        emitRaw(out, "    return s");
+        emitRaw(out, "def _ac_dblprint(d):");
+        emitRaw(out, "    print(_ac_fmtg(d))");
         if (needsSave_) emitRaw(out, "_ac_saved = []  # `save as`: accumulates everything printed so far");
         if (anyAtomicVars()) {
             emitRaw(out, "import threading");
@@ -1298,10 +1491,30 @@ class PythonStrategy : public BackendStrategy
     }
     void emitStoreVar(std::ostringstream &out, int &indent, const std::string &var, const std::string &val) override
     {
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in the
-        // global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible RMW.
-        if (isAtomicVar(var)) emit(out, indent, "with _ac_atomic_lock: " + var + " = " + val);
-        else emit(out, indent, var + " = " + val);
+        // No more atomic special-case here — ir.cpp now brackets the WHOLE
+        // read-modify-write span (not just this single store) with real
+        // LOCK_BEGIN/LOCK_END instructions (see emitLockBegin/emitLockEnd below) for any
+        // reassignment to an atomic var, closing the TOCTOU race the old
+        // store-only wrap here could never actually close (the read that computed `val`
+        // already happened in a separate, earlier, unlocked instruction by the time this
+        // runs). Leaving the old wrap here too would double-acquire Python's non-reentrant
+        // Lock and deadlock.
+        //
+        // `atomic` is always an int variable (its own doc comment, token.hpp) — a float
+        // value needs a real int() truncation here, same coercion every other backend's
+        // atomic store applies. Every OTHER backend needed an explicit cast to even
+        // compile (Go/Java/Rust reject an implicit narrowing store outright); Python
+        // would happily let x silently become a float otherwise, which is why this was
+        // the one backend where the bug was invisible without a matching fix.
+        std::string rhs = (isAtomicVar(var) && looksFloat(val)) ? "int(" + val + ")" : val;
+        emit(out, indent, var + " = " + rhs);
+    }
+    void emitLockBegin(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "with _ac_atomic_lock:");
+        indent++;
+    }
+    void emitLockEnd(std::ostringstream &out, int &indent) override {
+        indent--;
     }
     void emitConstDecl(std::ostringstream &out, int &indent,
                        const std::string &var, const std::string &val, IRType) override
@@ -1361,9 +1574,16 @@ class PythonStrategy : public BackendStrategy
     {
         emit(out, indent, val.empty() ? "return" : "return " + val);
     }
+    // Real Python `yield` — the presence of this inside a `def` is what makes CPython
+    // treat it as a generator; no signature/decl change needed (unlike JS's `function*`).
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, val.empty() ? "yield" : "yield " + val);
+    }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        emit(out, indent, "print(" + val + ")");
+        if (isFloatVal(val)) emit(out, indent, "_ac_dblprint(" + val + ")");
+        else emit(out, indent, "print(" + val + ")");
     }
     // `sure $msg$` (browser confirm()) has no Python UI to ask through — the base
     // BackendStrategy::emitConfirm default is a pure no-op that never assigns `res` at all,
@@ -1390,9 +1610,10 @@ class PythonStrategy : public BackendStrategy
         emit(out, indent, "time.sleep(" + secs + ")");
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
-        emit(out, indent, res + " = float(eval(" + expr + "))");
+        if (argIsString) emit(out, indent, res + " = float(eval(" + expr + "))");
+        else emitLazyEval(out, indent, res, expr);
     }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
@@ -1433,10 +1654,17 @@ class PythonStrategy : public BackendStrategy
                    const std::string &content, const std::string &content2 = "") override
     {
         if (type == "range") {
-            emit(out, indent, var + " = range(" + content + ")");
+            // AC's `range` is documented to generate a real LIST first, then iterate over it
+            // (unlike `iota`, its lazy/concatenated-string cousin) — a bare `range(...)` is
+            // Python's own lazy range OBJECT, which every other backend's materialized-array
+            // equivalent doesn't match: `Term.display range 5` showed "range(0, 5)" instead of
+            // "[0, 1, 2, 3, 4]", the only backend not showing a real list.
+            emit(out, indent, var + " = list(range(" + content + "))");
         } else if (type == "sequence") {
-            std::string b = content2.empty() ? content : content2;
-            emit(out, indent, var + " = range(" + content + ", " + b + ")");
+            auto [b0, step] = splitSeqStep(content2);
+            std::string b = b0.empty() ? content : b0;
+            std::string st = step.empty() ? "1" : step;
+            emit(out, indent, var + " = list(range(" + content + ", " + b + ", " + st + "))");
         } else if (type == "dict") {
             std::string d = "{";
             bool first = true;
@@ -1461,7 +1689,8 @@ class PythonStrategy : public BackendStrategy
             // doesn't exist yet at that point; the source clearly meant `Ball = "Ball"`).
             emit(out, indent, var + " = \"" + content + "\"");
         } else {
-            emit(out, indent, var + " = [" + content + "]");
+            emit(out, indent, var + " = [" + convertListContent(content,
+                [](const std::string& s) { return "\"" + escapeStr(s) + "\""; }) + "]");
         }
     }
     void emitLoadIndex(std::ostringstream &out, int &indent,
@@ -1639,6 +1868,7 @@ class JavaScriptStrategy : public BackendStrategy
 {
 protected:
     std::set<std::string> declared;   // protected so HTMLStrategy shares ONE set (was shadowed → let x twice)
+    bool isGenerator_ = false;   // protected so HTMLStrategy's own emitFunctionBegin sees it too
     // protected so HTMLStrategy's own emitHeader can see what was imported — HTML never had
     // its own way to know, which is exactly why AC->HTML loaded ZERO ilib content for ANY
     // library (every `use ilib X` threw ReferenceError in a real browser). Fixed below.
@@ -1650,6 +1880,84 @@ protected:
     // whole numbers) instead of the default `_acp` — a real value-vs-display bug, not cosmetic
     // (silently makes a float look like an int in the program's actual output).
     std::set<std::string> floatVars_;
+
+    // `short`/`mini` (fixed-width 32/16-bit int) and `atomic` var support: real inlined
+    // WASM instead of either silently doing nothing (short/mini — JS numbers never wrap)
+    // or relying only on JS's single-threaded run-to-completion execution (atomic — still
+    // correct, see emitLockBegin/End's comment, but not literal atomic *memory access* the
+    // way WASM's i32.atomic.load/store genuinely is). See wasm/*.wat + wasm_blobs.hpp.
+    std::map<std::string, IRType> varCastTypes_;
+    void setVarCastTypes(const std::map<std::string, IRType>& m) override { varCastTypes_ = m; }
+    std::map<std::string, int> atomicOffsets_;
+    int nextAtomicOffset_ = 0;
+    int atomicOffset(const std::string& var) {
+        auto it = atomicOffsets_.find(var);
+        if (it != atomicOffsets_.end()) return it->second;
+        int off = nextAtomicOffset_;
+        nextAtomicOffset_ += 4;
+        atomicOffsets_[var] = off;
+        return off;
+    }
+    bool anyAtomicVars() const {
+        for (auto& [k, v] : varCastTypes_) if (v == IRType::ATOMIC) return true;
+        return false;
+    }
+    bool anyShortMiniVars() const {
+        for (auto& [k, v] : varCastTypes_) if (irIntWidth(v)) return true;
+        return false;
+    }
+    // Emits the WASM instantiation bootstrap — only when the program actually uses
+    // short/mini or atomic (matches the existing "only inline what's used" convention for
+    // range/bxor/etc. runtime helpers). `atob`/Uint8Array are available identically in
+    // Node 16+ and every browser, so ONE snippet serves both JS and HTML output.
+    void emitWasmBootstrap(std::ostringstream &out) {
+        bool sm = anyShortMiniVars(), at = anyAtomicVars();
+        if (!sm && !at) return;
+        emitRaw(out, "function _ac_wasm_bytes(b64) { return Uint8Array.from(atob(b64), c => c.charCodeAt(0)); }");
+        if (sm) {
+            emitRaw(out, "const _ac_wasm_sm = new WebAssembly.Instance(new WebAssembly.Module(_ac_wasm_bytes(\"" + std::string(AcWasm::SHORT_MINI_B64) + "\"))).exports;");
+            emitRaw(out, "const _ac_wrap32 = _ac_wasm_sm.wrap32, _ac_wrap16 = _ac_wasm_sm.wrap16;");
+        }
+        if (at) {
+            emitRaw(out, "const _ac_wasm_at = new WebAssembly.Instance(new WebAssembly.Module(_ac_wasm_bytes(\"" + std::string(AcWasm::ATOMICS_B64) + "\"))).exports;");
+            emitRaw(out, "const _ac_atomic_store = _ac_wasm_at.store;");
+        }
+    }
+    void emitTypedStoreVar(std::ostringstream &out, int &indent,
+                           const std::string &var, const std::string &val, IRType t) override
+    {
+        IRType effT = t;
+        auto it = varCastTypes_.find(var);
+        if (it != varCastTypes_.end()) effT = it->second;
+        if (effT == IRType::ATOMIC) {
+            // `formatRef`/`ref()` resolves BOTH a read value AND a write-target's plain
+            // name — there is no way to tell those two uses apart from inside formatRef,
+            // so routing atomic READS through WASM there (an earlier version of this)
+            // silently corrupted the STORE TARGET's own name too (`ref(i.result)` for
+            // this very STORE_VAR uses the exact same call). Instead: the plain JS
+            // variable stays the single source of truth for READS (always correct — kept
+            // in sync on every write, and nothing can interleave mid-statement in JS's
+            // single-threaded, run-to-completion model), while the WRITE itself is a
+            // genuine WASM i32.atomic.store (not a JS approximation) whose return value
+            // (the stored value) becomes the mirror variable's new value in one expression.
+            emit(out, indent, decl(var, "_ac_atomic_store(" + std::to_string(atomicOffset(var)) + ", " + val + ")"));
+            return;
+        }
+        if (irIntWidth(effT)) {
+            const char* fn = effT == IRType::SHORT ? "_ac_wrap32" : "_ac_wrap16";
+            emit(out, indent, decl(var, std::string(fn) + "(" + val + ")"));
+            return;
+        }
+        // JS numbers have no int/float distinction at runtime, so Term.display's _acpf
+        // vs _acp choice (see JavaScriptStrategy::emitHeader's own comment) depends
+        // ENTIRELY on floatVars_ being correctly marked here — a plain store never
+        // checked this at all (verified real, pre-existing gap: `x = 24; x /= 2` folds
+        // to a genuine 12.0 at compile time — see ir.cpp's applyBinOp DIV fix — but
+        // printed as "12", not "12.0", since nothing ever marked x float for a plain
+        // STORE_VAR/compound-assignment result, only for an explicit TYPE_CAST).
+        if (looksFloat(val) || floatVars_.count(val)) floatVars_.insert(var);
+        emit(out, indent, decl(var, val));
+    }
 private:
     bool needsEvents_ = false;
     bool needsSave_ = false;
@@ -1661,7 +1969,7 @@ private:
     void emitCapture(std::ostringstream &out, int &indent, const std::string &val) override
     {
         if (!needsSave_) return;
-        emit(out, indent, "_acCap(" + val + ");");
+        emit(out, indent, (floatVars_.count(val) ? "_acCapF(" : "_acCap(") + val + ");");
     }
     void emitSaveFile(std::ostringstream &out, int &indent, const std::string &filename) override
     {
@@ -1694,6 +2002,7 @@ private:
     {
         emitRaw(out, "// Generated by AC Compiler (AC->JS)");
         emitRaw(out, "'use strict';");
+        emitWasmBootstrap(out);
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
         emitRaw(out, "function ac_iota(n) {");
         emitRaw(out, "    let r = '';");
@@ -1732,12 +2041,38 @@ private:
         emitRaw(out, "function _acp(x) {");
         emitRaw(out, "    console.log(Array.isArray(x) ? '[' + x.join(', ') + ']' : x);");
         emitRaw(out, "}");
-        // JS has no int/float distinction at runtime (9 === 9.0), so a whole-number value from a
-        // FLOAT type-cast (`to_dec(9)`) would print as "9" via plain console.log, losing the
-        // decimal point AC's Python reference always shows. Only used at call sites the compiler
-        // knows are float-typed (see JavaScriptStrategy::floatVars_) — never applied to genuine ints.
+        // Cross-backend float-display convention: Abu's call — every backend prints floats via
+        // the SAME `%.16g`-equivalent (16 significant digits, trailing zeros stripped, ".0"
+        // appended for a whole-valued result) instead of each language's own native "shortest
+        // round-trip" formatter. JS has no native %g; `toPrecision` doesn't strip trailing
+        // zeros and switches to exponential notation at a DIFFERENT threshold than C's %g
+        // (verified: toPrecision(16) keeps 0.00001 in fixed notation, %.16g switches to "1e-05"
+        // at that same exponent) — ac_fmtg reimplements %g's actual rule (exponent < -4 or >=16
+        // -> scientific) directly on top of toExponential(15), which gives exact digits with no
+        // native-rounding surprises. Verified byte-for-byte against real `%.16g` output across a
+        // spread including whole/negative/tiny/huge/scientific-boundary values.
+        emitRaw(out, "function ac_fmtg(d) {");
+        emitRaw(out, "    if (d === 0) return Object.is(d, -0) ? '-0' : '0';");
+        emitRaw(out, "    const neg = d < 0, ad = Math.abs(d);");
+        emitRaw(out, "    const m = ad.toExponential(15).match(/^(\\d)\\.(\\d+)e([+-]\\d+)$/);");
+        emitRaw(out, "    let digits = (m[1] + m[2]).replace(/0+$/, '') || '0';");
+        emitRaw(out, "    const exp = parseInt(m[3], 10);");
+        emitRaw(out, "    let result;");
+        emitRaw(out, "    if (exp < -4 || exp >= 16) {");
+        emitRaw(out, "        const mant = digits.length > 1 ? digits[0] + '.' + digits.slice(1) : digits;");
+        emitRaw(out, "        result = mant + 'e' + (exp < 0 ? '-' : '+') + String(Math.abs(exp)).padStart(2, '0');");
+        emitRaw(out, "    } else if (exp >= 0) {");
+        emitRaw(out, "        result = digits.length <= exp + 1 ? digits + '0'.repeat(exp + 1 - digits.length)");
+        emitRaw(out, "                                          : digits.slice(0, exp + 1) + '.' + digits.slice(exp + 1);");
+        emitRaw(out, "    } else {");
+        emitRaw(out, "        result = '0.' + '0'.repeat(-exp - 1) + digits;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    return (neg ? '-' : '') + result;");
+        emitRaw(out, "}");
         emitRaw(out, "function _acpf(x) {");
-        emitRaw(out, "    console.log((typeof x === 'number' && Number.isInteger(x)) ? x.toFixed(1) : x);");
+        emitRaw(out, "    let s = ac_fmtg(x);");
+        emitRaw(out, "    if (!/[.eEnN]/.test(s)) s += '.0';");
+        emitRaw(out, "    console.log(s);");
         emitRaw(out, "}");
         // `//` truncating integer division
         if (hasIdivOp_) {
@@ -1751,6 +2086,15 @@ private:
             emitRaw(out, "const _ac_saved = [];");
             emitRaw(out, "function _acCap(x) {");
             emitRaw(out, "    _ac_saved.push((Array.isArray(x) ? '[' + x.join(', ') + ']' : x) + '\\n');");
+            emitRaw(out, "}");
+            // Float-typed capture must match _acpf's %.16g convention, not JS's default
+            // number-to-string (shortest round-trip) — otherwise `Term.display`/`save as`
+            // of the identical value could disagree (same class of gap already fixed for
+            // Rust/Go's emitCapture this session).
+            emitRaw(out, "function _acCapF(x) {");
+            emitRaw(out, "    let s = ac_fmtg(x);");
+            emitRaw(out, "    if (!/[.eEnN]/.test(s)) s += '.0';");
+            emitRaw(out, "    _ac_saved.push(s + '\\n');");
             emitRaw(out, "}");
         }
         for (auto& [lt, ln] : pendingImports_) {
@@ -1813,6 +2157,15 @@ private:
         emit(out, indent, "_acTrigger(" + translateJsKeyConstant(key) + ");");
     }
 
+    // Real no-ops, not a skipped fix: generated JS/Node code is single-threaded
+    // (run-to-completion — `quickthread` degrades to a plain synchronous call on this
+    // backend, never a real OS thread), so no OTHER JS code can ever interleave mid-
+    // statement here. There was never a lock mechanism for `atomic` on this backend at
+    // all (confirmed: no `_ac_atomic_lock` anywhere in this class) because there's
+    // nothing for it to protect against.
+    void emitLockBegin(std::ostringstream &, int &) override {}
+    void emitLockEnd(std::ostringstream &, int &) override {}
+
     bool dotCallSyntax() const override { return true; }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
@@ -1830,6 +2183,15 @@ private:
         // already translated ("this.field", from formatRef() on the READ side) — handle both.
         if (var.rfind("self.", 0) == 0) return "this." + var.substr(5) + " = " + val + ";";
         if (var.rfind("this.", 0) == 0) return var + " = " + val + ";";
+        // Any OTHER dotted name — a bundle instance field write on a named, non-self var
+        // (`q.x = 5`), or a synthesized tuple's `_N` field (`t._0 = 5`) — is already valid JS
+        // as a plain assignment: no `let` (a syntax error on a member expression — `let` only
+        // binds a fresh identifier) and no pre-declaration (JS objects accept a property
+        // assignment regardless of whether that property was set before, as long as the
+        // object itself already exists). Verified real bug: fell through to the `declared`/
+        // `let` path below, which emitted `let _ac_tup_expr_0._0 = 3;` — a SyntaxError at
+        // parse time (`return x, y` / `t = (x, y)` tuple binding).
+        if (var.find('.') != std::string::npos) return var + " = " + val + ";";
         if (declared.insert(var).second)
             return "let " + var + " = " + val + ";";
         return var + " = " + val + ";";
@@ -1837,6 +2199,9 @@ private:
 
     void emitStoreVar(std::ostringstream &out, int &indent, const std::string &var, const std::string &val) override
     {
+        // Same floatVars_ marking as emitTypedStoreVar's fallback (see its comment) —
+        // this is the OTHER real call site the driver uses for a plain STORE_VAR.
+        if (looksFloat(val) || floatVars_.count(val)) floatVars_.insert(var);
         emit(out, indent, decl(var, val));
     }
     void emitConstDecl(std::ostringstream &out, int &indent,
@@ -1888,11 +2253,22 @@ private:
           if (ap != std::string::npos && ap == func.size() - 7) {
               emit(out, indent, func.substr(0, ap) + ".push(" + args + ");"); return; } }
         std::string call = func + "(" + args + ")";
+        // aczip's compression-ratio percentage — a whole-number result (e.g. 25.0) prints
+        // as "25" with no way to tell it apart from a real int on JS/HTML (no declared
+        // types), unless floatVars_ says otherwise — Term.display then picks the plain
+        // `_acp` formatter instead of `_acpf`'s forced ".0".
+        if (!res.empty() && (func == "aczip.get_ratio" || func == "aczip_get_ratio"))
+            floatVars_.insert(res);
         emit(out, indent, res.empty() ? call + ";" : decl(res, call));
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
         emit(out, indent, val.empty() ? "return;" : "return " + val + ";");
+    }
+    void setIsGenerator(bool v) override { isGenerator_ = v; }
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, val.empty() ? "yield;" : "yield " + val + ";");
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
@@ -1915,9 +2291,10 @@ private:
         emit(out, indent, "{ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,Math.max(0,Math.floor(("+secs+")*1000))); }");
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
-        emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')()')()"));
+        if (argIsString) emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')()')()"));
+        else emitLazyEval(out, indent, res, expr);
     }
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
     {
@@ -2017,11 +2394,19 @@ private:
                    const std::string &var, const std::string &type,
                    const std::string &content, const std::string &content2 = "") override
     {
+        // `declared` was never updated here (every prior call site handed ALLOC a brand-new
+        // var, so the omission was invisible) — a plain reassignment of an ALLOC'd var further
+        // down (`arr = rebuiltList`, e.g. .kick()'s rebuild-and-reassign) went through decl(),
+        // which saw the name as never-declared and re-emitted `let`, a hard "already been
+        // declared" SyntaxError. Route through decl()'s own insert so the tracking matches.
+        std::string kw = declared.insert(var).second ? "let " : "";
         if (type == "range") {
-            emit(out, indent, "let " + var + " = [...Array(Number(" + content + ")).keys()];");
+            emit(out, indent, kw + var + " = [...Array(Number(" + content + ")).keys()];");
         } else if (type == "sequence") {
-            std::string b = content2.empty() ? content : content2;
-            emit(out, indent, "let " + var + " = Array.from({length:Number(" + b + ")-Number(" + content + ")},(_, _k)=>_k+Number(" + content + "));");
+            auto [b0, step] = splitSeqStep(content2);
+            std::string b = b0.empty() ? content : b0;
+            std::string st = step.empty() ? "1" : step;
+            emit(out, indent, kw + var + " = Array.from({length:Math.ceil((Number(" + b + ")-Number(" + content + "))/Number(" + st + "))},(_, _k)=>_k*Number(" + st + ")+Number(" + content + "));");
         } else if (type == "dict") {
             std::string d = "{";
             bool first = true;
@@ -2030,17 +2415,18 @@ private:
                 d += fmtDictKey(k) + ": " + fmtDictVal(v);
                 first = false;
             }
-            emit(out, indent, "let " + var + " = " + d + "};");
+            emit(out, indent, kw + var + " = " + d + "};");
         } else if (type == "tuple") {
-            emit(out, indent, "let " + var + " = [" + content + "];");
+            emit(out, indent, kw + var + " = [" + content + "];");
         } else if (type == "string") {
             // Same bug/fix as PythonStrategy's emitAlloc (see its comment) — a genuinely
             // string-typed ALLOC fell through to the generic list-literal branch, splicing the
             // bare unquoted content directly into a `[...]` literal — JS then parsed it as a
             // variable reference, not a string.
-            emit(out, indent, "let " + var + " = \"" + content + "\";");
+            emit(out, indent, kw + var + " = \"" + content + "\";");
         } else {
-            emit(out, indent, "let " + var + " = [" + content + "];");
+            emit(out, indent, kw + var + " = [" + convertListContent(content,
+                [](const std::string& s) { return "\"" + escapeStr(s) + "\""; }) + "];");
         }
     }
     void emitLoadIndex(std::ostringstream &out, int &indent,
@@ -2118,10 +2504,13 @@ private:
             else if (jsParams == "self") jsParams = "";
         }
         std::string jsName = (!classOwner.empty() && name == "init") ? "constructor" : name;
+        // `function*` for a free function, `*name(...)` for a class method (JS's own two
+        // generator-method spellings — no "function" keyword on a method either way).
+        std::string genMark = isGenerator_ ? "*" : "";
         if (classOwner.empty())
-            emit(out, indent, "function " + jsName + "(" + jsParams + ") {");
+            emit(out, indent, "function" + genMark + " " + jsName + "(" + jsParams + ") {");
         else
-            emit(out, indent, jsName + "(" + jsParams + ") {");
+            emit(out, indent, genMark + jsName + "(" + jsParams + ") {");
         indent++;
         // Register parameters as declared so reassigning one (`n = n // 2`) emits `n = ...`,
         // not `let n = ...` (which shadows the param and triggers a TDZ ReferenceError).
@@ -2224,7 +2613,7 @@ class HTMLStrategy : public JavaScriptStrategy
     void emitCapture(std::ostringstream &out, int &indent, const std::string &val) override
     {
         if (!needsSave_) return;
-        emit(out, indent, "_acCap(" + val + ");");
+        emit(out, indent, (floatVars_.count(val) ? "_acCapF(" : "_acCap(") + val + ");");
     }
     // No filesystem in a browser — trigger a real download via a Blob + synthetic anchor click
     // (the standard client-side "Save As" idiom), not a stub.
@@ -2255,35 +2644,60 @@ class HTMLStrategy : public JavaScriptStrategy
 
     void emitHeader(std::ostringstream &out) override
     {
+        // HTML is inlined JS with a document to host it in — not a themed page. No imposed
+        // dark theme, no viewport/responsive assumptions, no custom per-tag colors: `<b>`/
+        // `<i>`/`<h2>`/`<a>`/`<code>`/`<u>`/`<mark>`/`<hr>` (emitted by the rich-text
+        // Term.display forms, see #boldPrint etc. below) are already visually distinct under
+        // every browser's own default stylesheet with zero CSS — a plain `Term.display
+        // $Hello World$` gets a plain, minimal page, not a designed site nobody asked for.
         emitRaw(out, "<!DOCTYPE html>");
         emitRaw(out, "<html lang=\"en\">");
         emitRaw(out, "<head>");
         emitRaw(out, "  <meta charset=\"UTF-8\">");
-        emitRaw(out, "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
         emitRaw(out, "  <title>AC Program</title>");
-        emitRaw(out, "  <style>");
-        emitRaw(out, "    body { font-family: monospace; background: #1e1e2e; color: #cdd6f4; margin: 0; padding: 1rem; }");
-        emitRaw(out, "    #_out { white-space: pre-wrap; line-height: 1.6; }");
-        emitRaw(out, "    #_out b  { color: #f38ba8; }");
-        emitRaw(out, "    #_out i  { color: #a6e3a1; font-style: italic; }");
-        emitRaw(out, "    #_out h2 { color: #89b4fa; margin: 0.4em 0; }");
-        emitRaw(out, "    #_out a  { color: #cba6f7; }");
-        emitRaw(out, "    #_out code { background: #313244; padding: 0 4px; border-radius: 3px; color: #f9e2af; }");
-        emitRaw(out, "    #_out p  { margin: 0.2em 0; }");
-        emitRaw(out, "    #_out u  { color: #89dceb; text-decoration: underline; }");
-        emitRaw(out, "    #_out mark { background: #f9e2af; color: #1e1e2e; padding: 0 2px; }");
-        emitRaw(out, "    #_out hr { border: none; border-top: 1px solid #45475a; margin: 0.6em 0; }");
-        emitRaw(out, "  </style>");
+        // The one functionally-necessary rule, not a design choice: each Term.display call
+        // appends a real '\n' text node, but a browser's default `white-space: normal`
+        // COLLAPSES that to a single space — without this, every line of output would run
+        // together on one visual line regardless of how many times Term.display was called.
+        emitRaw(out, "  <style>#_out { white-space: pre-wrap; }</style>");
         emitRaw(out, "</head>");
         emitRaw(out, "<body>");
         emitRaw(out, "<div id=\"_out\"></div>");
         emitRaw(out, "<script>");
         emitRaw(out, "'use strict';");
+        emitWasmBootstrap(out);
         emitRaw(out, "const _el = document.getElementById('_out');");
-        emitRaw(out, "function _print(v) { _el.appendChild(document.createTextNode(String(v) + '\\n')); }");
-        // Same whole-number-float fix as JS's `_acpf` (see JavaScriptStrategy::emitHeader) — only
-        // used at call sites the compiler knows are float-typed (JavaScriptStrategy::floatVars_).
-        emitRaw(out, "function _printf(v) { _el.appendChild(document.createTextNode(((typeof v === 'number' && Number.isInteger(v)) ? v.toFixed(1) : v) + '\\n')); }");
+        // Array formatting must match JS's `_acp` exactly (`[1, 2, 3]`, not JS's own bare
+        // `String(arr)` which silently drops the brackets/spacing to `1,2,3`) — the same
+        // AC source produced visibly different Term.display output across the two backends
+        // (verified: `Term.display [1,2,3]` printed "[1, 2, 3]" on JS, "1,2,3" on HTML).
+        emitRaw(out, "function _print(v) { _el.appendChild(document.createTextNode((Array.isArray(v) ? '[' + v.join(', ') + ']' : String(v)) + '\\n')); }");
+        // Cross-backend float-display convention (see JavaScriptStrategy::emitHeader's matching
+        // `ac_fmtg` for the full rationale/verification — same function, duplicated here since
+        // HTMLStrategy has its own separate emitHeader/print path, not JS's `_acpf`).
+        emitRaw(out, "function ac_fmtg(d) {");
+        emitRaw(out, "    if (d === 0) return Object.is(d, -0) ? '-0' : '0';");
+        emitRaw(out, "    const neg = d < 0, ad = Math.abs(d);");
+        emitRaw(out, "    const m = ad.toExponential(15).match(/^(\\d)\\.(\\d+)e([+-]\\d+)$/);");
+        emitRaw(out, "    let digits = (m[1] + m[2]).replace(/0+$/, '') || '0';");
+        emitRaw(out, "    const exp = parseInt(m[3], 10);");
+        emitRaw(out, "    let result;");
+        emitRaw(out, "    if (exp < -4 || exp >= 16) {");
+        emitRaw(out, "        const mant = digits.length > 1 ? digits[0] + '.' + digits.slice(1) : digits;");
+        emitRaw(out, "        result = mant + 'e' + (exp < 0 ? '-' : '+') + String(Math.abs(exp)).padStart(2, '0');");
+        emitRaw(out, "    } else if (exp >= 0) {");
+        emitRaw(out, "        result = digits.length <= exp + 1 ? digits + '0'.repeat(exp + 1 - digits.length)");
+        emitRaw(out, "                                          : digits.slice(0, exp + 1) + '.' + digits.slice(exp + 1);");
+        emitRaw(out, "    } else {");
+        emitRaw(out, "        result = '0.' + '0'.repeat(-exp - 1) + digits;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    return (neg ? '-' : '') + result;");
+        emitRaw(out, "}");
+        emitRaw(out, "function _printf(v) {");
+        emitRaw(out, "    let s = ac_fmtg(v);");
+        emitRaw(out, "    if (!/[.eEnN]/.test(s)) s += '.0';");
+        emitRaw(out, "    _el.appendChild(document.createTextNode(s + '\\n'));");
+        emitRaw(out, "}");
         emitRaw(out, "function _printHTML(h) { const d = document.createElement('div'); d.innerHTML = h; _el.appendChild(d); }");
         // HTML-escape any value before it goes into innerHTML/attributes — a displayed value
         // containing <script>…</script> or `\"` used to inject markup/JS into the page (XSS).
@@ -2331,14 +2745,17 @@ class HTMLStrategy : public JavaScriptStrategy
             emitRaw(out, "    return Math.trunc(a / b);");
             emitRaw(out, "}");
         }
-        emitRaw(out, "function _acp(x) {");
-        emitRaw(out, "    console.log(Array.isArray(x) ? '[' + x.join(', ') + ']' : x);");
-        emitRaw(out, "}");
         if (needsSave_) {
             emitRaw(out, "// `save as`: accumulates everything printed so far");
             emitRaw(out, "const _ac_saved = [];");
             emitRaw(out, "function _acCap(x) {");
             emitRaw(out, "    _ac_saved.push((Array.isArray(x) ? '[' + x.join(', ') + ']' : x) + '\\n');");
+            emitRaw(out, "}");
+            // Same _printf-vs-_acCap convention gap as JS's emitCapture (see its comment).
+            emitRaw(out, "function _acCapF(x) {");
+            emitRaw(out, "    let s = ac_fmtg(x);");
+            emitRaw(out, "    if (!/[.eEnN]/.test(s)) s += '.0';");
+            emitRaw(out, "    _ac_saved.push(s + '\\n');");
             emitRaw(out, "}");
         }
         // AC->HTML used to load ZERO ilib content for ANY library — inheriting JS's `pendingImports_`
@@ -2420,6 +2837,15 @@ class HTMLStrategy : public JavaScriptStrategy
         emit(out, indent, "_acTrigger(" + translateJsKeyConstant(key) + ");");
     }
 
+    // Real no-ops, not a skipped fix: generated JS/Node code is single-threaded
+    // (run-to-completion — `quickthread` degrades to a plain synchronous call on this
+    // backend, never a real OS thread), so no OTHER JS code can ever interleave mid-
+    // statement here. There was never a lock mechanism for `atomic` on this backend at
+    // all (confirmed: no `_ac_atomic_lock` anywhere in this class) because there's
+    // nothing for it to protect against.
+    void emitLockBegin(std::ostringstream &, int &) override {}
+    void emitLockEnd(std::ostringstream &, int &) override {}
+
     bool dotCallSyntax() const override { return true; }
 
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
@@ -2437,6 +2863,11 @@ class HTMLStrategy : public JavaScriptStrategy
         // already translated ("this.field", from formatRef() on the READ side) — handle both.
         if (var.rfind("self.", 0) == 0) return "this." + var.substr(5) + " = " + val + ";";
         if (var.rfind("this.", 0) == 0) return var + " = " + val + ";";
+        // Any OTHER dotted name — a bundle instance field write on a named, non-self var, or a
+        // synthesized tuple's `_N` field — is already valid JS as a plain assignment: no `let`
+        // (a syntax error on a member expression) and no pre-declaration needed. See
+        // JavaScriptStrategy::decl's matching comment for the verified bug this closes.
+        if (var.find('.') != std::string::npos) return var + " = " + val + ";";
         if (declared.insert(var).second)
             return "let " + var + " = " + val + ";";
         return var + " = " + val + ";";
@@ -2444,6 +2875,9 @@ class HTMLStrategy : public JavaScriptStrategy
 
     void emitStoreVar(std::ostringstream &out, int &indent, const std::string &var, const std::string &val) override
     {
+        // Same floatVars_ marking as JS's emitStoreVar/emitTypedStoreVar (see its
+        // comment) — HTML keeps its own copy of this method, same gap independently.
+        if (looksFloat(val) || floatVars_.count(val)) floatVars_.insert(var);
         emit(out, indent, decl(var, val));
     }
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
@@ -2540,9 +2974,10 @@ class HTMLStrategy : public JavaScriptStrategy
             emit(out, indent, decl(res, "confirm(" + val + ")"));
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
-        emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')()')()"));
+        if (argIsString) emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')()')()"));
+        else emitLazyEval(out, indent, res, expr);
     }
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
     {
@@ -2649,16 +3084,22 @@ class HTMLStrategy : public JavaScriptStrategy
                    const std::string &var, const std::string &type,
                    const std::string &content, const std::string &content2 = "") override
     {
+        // See JavaScriptStrategy::emitAlloc's comment — `declared` must be updated here too,
+        // or a later plain reassignment of an ALLOC'd var double-`let`s and hard-errors.
+        std::string kw = declared.insert(var).second ? "let " : "";
         if (type == "range") {
-            emit(out, indent, "let " + var + " = [...Array(Number(" + content + ")).keys()];");
+            emit(out, indent, kw + var + " = [...Array(Number(" + content + ")).keys()];");
         } else if (type == "sequence") {
-            std::string b = content2.empty() ? content : content2;
-            emit(out, indent, "let " + var + " = Array.from({length:Number(" + b + ")-Number(" + content + ")},(_, _k)=>_k+Number(" + content + "));");
+            auto [b0, step] = splitSeqStep(content2);
+            std::string b = b0.empty() ? content : b0;
+            std::string st = step.empty() ? "1" : step;
+            emit(out, indent, kw + var + " = Array.from({length:Math.ceil((Number(" + b + ")-Number(" + content + "))/Number(" + st + "))},(_, _k)=>_k*Number(" + st + ")+Number(" + content + "));");
         } else if (type == "string") {
             // Same bug/fix as PythonStrategy/JavaScriptStrategy's emitAlloc (see their comment).
-            emit(out, indent, "let " + var + " = \"" + content + "\";");
+            emit(out, indent, kw + var + " = \"" + content + "\";");
         } else {
-            emit(out, indent, "let " + var + " = [" + content + "];");
+            emit(out, indent, kw + var + " = [" + convertListContent(content,
+                [](const std::string& s) { return "\"" + escapeStr(s) + "\""; }) + "];");
         }
     }
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -2700,10 +3141,13 @@ class HTMLStrategy : public JavaScriptStrategy
             else if (jsParams == "self") jsParams = "";
         }
         std::string jsName = (!classOwner.empty() && name == "init") ? "constructor" : name;
+        // `function*` for a free function, `*name(...)` for a class method (JS's own two
+        // generator-method spellings — no "function" keyword on a method either way).
+        std::string genMark = isGenerator_ ? "*" : "";
         if (classOwner.empty())
-            emit(out, indent, "function " + jsName + "(" + jsParams + ") {");
+            emit(out, indent, "function" + genMark + " " + jsName + "(" + jsParams + ") {");
         else
-            emit(out, indent, jsName + "(" + jsParams + ") {");
+            emit(out, indent, genMark + jsName + "(" + jsParams + ") {");
         indent++;
         // Register parameters as declared so reassigning one (`n = n // 2`) emits `n = ...`,
         // not `let n = ...` (which shadows the param and triggers a TDZ ReferenceError).
@@ -2786,6 +3230,11 @@ class CStrategy : public BackendStrategy
     std::set<std::string> declared;
     std::set<std::string> floatVars;
     std::set<std::string> classInstanceVars_;   // vars holding a bundle instance (see emitConstructCall)
+    std::map<std::string,std::string> classInstanceVarNames_;  // var -> class name (decl() needs the
+                                                                 // real type, not just "is an instance")
+    std::map<std::string,std::string> classReturnFuncs_;   // fn.name -> class name (see setClassReturnFuncs)
+    std::map<std::string, std::map<int, std::string>> classParamTypes_;  // see setClassParamTypes
+    void setClassParamTypes(const std::map<std::string, std::map<int, std::string>> &m) override { classParamTypes_ = m; }
     std::set<std::string> bundleStringFields_;  // FIELD names (not full paths) known to be string-typed
     // Shadows (not overrides — the base isn't virtual) BackendStrategy::isStringVar for every
     // call within CStrategy's own methods. C never populates the base `stringVars_` set at all
@@ -2811,6 +3260,40 @@ class CStrategy : public BackendStrategy
     }
     std::set<std::string> listVars;
     std::set<std::string> strVars;   // vars holding char* (e.g. iota/stream results)
+    bool curFuncIsGenerator_ = false;
+    bool isGenerator_ = false;
+    std::string genStructName_, genFuncCName_;
+    std::vector<std::pair<std::string,std::string>> genParams_;
+    void setIsGenerator(bool v) override { isGenerator_ = v; }
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "g->value = " + val + ";");
+        emit(out, indent, "swapcontext(&g->genCtx, &g->callerCtx);");
+    }
+    // emitFunctionEnd already emits a real "creator" function (allocates state, copies args
+    // in, arms the fiber via makecontext, returns the handle) for every generator function —
+    // this just needs to CALL it, exactly like an ordinary function call.
+    void emitGenCreate(std::ostringstream &out, int &indent, const std::string &res,
+                       const std::string &func, const std::string &args) override
+    {
+        emit(out, indent, "AcGen_" + func + "* " + res + " = " + func + "(" + args + ");");
+        declared.insert(res);
+    }
+    void emitGenNext(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &handle) override
+    {
+        // Never resume an already-finished fiber (undefined behavior) — same guard C/CPP's
+        // design note calls out explicitly.
+        emit(out, indent, "if (!" + handle + "->done) { ac_gen_cur = " + handle + "; swapcontext(&" + handle + "->callerCtx, &" + handle + "->genCtx); }");
+        emit(out, indent, "ac_int " + res + " = " + handle + "->value;");
+        declared.insert(res);
+    }
+    void emitGenDone(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &handle) override
+    {
+        emit(out, indent, "ac_int " + res + " = " + handle + "->done;");
+        declared.insert(res);
+    }
     std::set<std::string> userFloatFuncs_;
     std::map<std::string, std::string> widgetVars_; // C widget handles: var -> constructor kind
     std::map<std::string, int> userFuncArity_;
@@ -2929,6 +3412,50 @@ private:
         emitRaw(out, "#include <string.h>");
         emitRaw(out, "#include <stdint.h>");
         emitRaw(out, "#include <unistd.h>");
+        // `yield`/generators: POSIX ucontext.h fiber (getcontext/makecontext/swapcontext) —
+        // verified real on this build's glibc; a fiber (not an OS thread) since a generator's
+        // body runs on its own separate stack that just naturally persists locals across each
+        // yield/resume switch, no thread or struct-of-locals needed at all. Unconditional
+        // (harmless if the program has no generators — a standard, always-available header).
+        emitRaw(out, "#include <ucontext.h>");
+        emitRaw(out, "static void* ac_gen_cur; /* single shared slot: fiber switches are strictly nested/sequential, never concurrent */");
+        // AcDynVal: a genuine tagged runtime value for the small set of variables (setBoxedVars)
+        // that Abu's retype spec requires to hold different types at different points in their
+        // own scope (`x=5; x=getSomething(); x=$hello$`) — one fixed C declared type per var
+        // name can't do that, so for exactly these vars (never ordinary ones) the declared type
+        // IS AcDynVal. C has no operator overloading, so unlike the C++ port every consumer
+        // (emitBinaryOp/emitComparison/emitPrint/emitCall/emitTypedStoreVar/emitTypeCast) calls
+        // these helpers explicitly instead of relying on `x + 3` just working. Emitted
+        // unconditionally (cheap; boxedVars_ itself is computed per-function, after emitHeader
+        // has already run, so there's no cheap whole-program precheck to gate this on).
+        emitRaw(out, "typedef struct { int tag; long long i; double d; const char* s; } AcDynVal;");
+        emitRaw(out, "static AcDynVal ac_dyn_i(long long v) { AcDynVal r; r.tag=0; r.i=v; r.d=0; r.s=0; return r; }");
+        emitRaw(out, "static AcDynVal ac_dyn_f(double v) { AcDynVal r; r.tag=1; r.i=0; r.d=v; r.s=0; return r; }");
+        emitRaw(out, "static AcDynVal ac_dyn_s(const char* v) { AcDynVal r; r.tag=2; r.i=0; r.d=0; r.s=v?v:\"\"; return r; }");
+        emitRaw(out, "static AcDynVal ac_dyn_b(long long v) { AcDynVal r; r.tag=3; r.i=v?1:0; r.d=0; r.s=0; return r; }");
+        emitRaw(out, "static double ac_dyn_asd(AcDynVal v) { return v.tag==1?v.d : (double)v.i; }");
+        emitRaw(out, "static long long ac_dyn_asi(AcDynVal v) { return v.tag==1?(long long)v.d : v.i; }");
+        emitRaw(out, "static char* ac_dyn_str(AcDynVal v) {");
+        emitRaw(out, "    char* r;");
+        emitRaw(out, "    if (v.tag==2) { r = malloc(strlen(v.s)+1); strcpy(r, v.s); return r; }");
+        emitRaw(out, "    if (v.tag==3) { r = malloc(6); strcpy(r, v.i ? \"true\" : \"false\"); return r; }");
+        emitRaw(out, "    r = malloc(32);");
+        emitRaw(out, "    if (v.tag==0) { snprintf(r, 32, \"%lld\", v.i); return r; }");
+        emitRaw(out, "    { long long xi=(long long)v.d; if ((double)xi==v.d) snprintf(r,32,\"%lld\",xi); else snprintf(r,32,\"%.17g\",v.d); }");
+        emitRaw(out, "    return r;");
+        emitRaw(out, "}");
+        emitRaw(out, "static void ac_dyn_print(AcDynVal v) { char* s = ac_dyn_str(v); printf(\"%s\\n\", s); free(s); }");
+        emitRaw(out, "static AcDynVal ac_dyn_add(AcDynVal a, AcDynVal b) {");
+        emitRaw(out, "    if (a.tag==2 || b.tag==2) { char* as=ac_dyn_str(a); char* bs=ac_dyn_str(b); char* r=malloc(strlen(as)+strlen(bs)+1); strcpy(r,as); strcat(r,bs); free(as); free(bs); return ac_dyn_s(r); }");
+        emitRaw(out, "    if (a.tag==1 || b.tag==1) return ac_dyn_f(ac_dyn_asd(a)+ac_dyn_asd(b));");
+        emitRaw(out, "    return ac_dyn_i(ac_dyn_asi(a)+ac_dyn_asi(b));");
+        emitRaw(out, "}");
+        emitRaw(out, "static AcDynVal ac_dyn_sub(AcDynVal a, AcDynVal b) { return (a.tag==1||b.tag==1) ? ac_dyn_f(ac_dyn_asd(a)-ac_dyn_asd(b)) : ac_dyn_i(ac_dyn_asi(a)-ac_dyn_asi(b)); }");
+        emitRaw(out, "static AcDynVal ac_dyn_mul(AcDynVal a, AcDynVal b) { return (a.tag==1||b.tag==1) ? ac_dyn_f(ac_dyn_asd(a)*ac_dyn_asd(b)) : ac_dyn_i(ac_dyn_asi(a)*ac_dyn_asi(b)); }");
+        emitRaw(out, "static AcDynVal ac_dyn_div(AcDynVal a, AcDynVal b) { return ac_dyn_f(ac_dyn_asd(a)/ac_dyn_asd(b)); }");
+        emitRaw(out, "static long long ac_dyn_eq(AcDynVal a, AcDynVal b) { return (a.tag==2||b.tag==2) ? (strcmp(ac_dyn_str(a),ac_dyn_str(b))==0) : (ac_dyn_asd(a)==ac_dyn_asd(b)); }");
+        emitRaw(out, "static long long ac_dyn_lt(AcDynVal a, AcDynVal b) { return (a.tag==2||b.tag==2) ? (strcmp(ac_dyn_str(a),ac_dyn_str(b))<0) : (ac_dyn_asd(a)<ac_dyn_asd(b)); }");
+        emitRaw(out, "static long long ac_dyn_gt(AcDynVal a, AcDynVal b) { return (a.tag==2||b.tag==2) ? (strcmp(ac_dyn_str(a),ac_dyn_str(b))>0) : (ac_dyn_asd(a)>ac_dyn_asd(b)); }");
         if (anyAtomicVars()) {
             emitRaw(out, "#include <pthread.h>");
             emitRaw(out, "static pthread_mutex_t _ac_atomic_lock = PTHREAD_MUTEX_INITIALIZER; /* `atomic` vars: any op touching one is a global critical section */");
@@ -2955,6 +3482,10 @@ private:
                     else if (ln == "web-server") _lnk = "acserver";
                     else if (ln == "native-cpu") _lnk = "acncpu";
                     else if (ln == "os")       _lnk = "acoos";   // libacoos.so (sic)
+                    // aczip's name already reads as "AC Zip" — the real file is libaczip.so,
+                    // NOT libacaczip.so (the generic "ac"+ln fallback below double-prefixes it,
+                    // "cannot find -lacaczip").
+                    else if (ln == "aczip")    _lnk = "aczip";
                     else { _lnk = "ac"; for (char c : ln) if (c != '-') _lnk += c; }
                     emitRaw(out, "// Link: gcc output.c -L\"" + absDir + "\" -l" + _lnk
                                  + " -Wl,-rpath,\"" + absDir + "\"");
@@ -3305,6 +3836,18 @@ private:
         // here may arrive raw as "self.field" OR already as "self->field" from formatRef).
         if (var.rfind("self.", 0) == 0) return "self->" + var.substr(5) + " = " + val + ";";
         if (var.rfind("self->", 0) == 0) return var + " = " + val + ";";
+        // Bundle field WRITE on a NAMED instance, not just `self` — `p.x = 5` where `p` holds
+        // a real bundle value (see classInstanceVars_'s comment; formatRef already handles the
+        // READ side of this same dotted convention, `c.hp`, via `.` not `->` since C bundle
+        // instances are stack VALUES, not pointers — this was the missing WRITE-side half,
+        // verified real bug: fell through to the generic branch below and declared a bogus
+        // fresh `ac_int p.x = 5;`, invalid C syntax). A field on a genuine struct value is
+        // never independently "declared" — always a plain assignment.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot)))
+                return var + " = " + val + ";";
+        }
         // Re-typing coercion (#retype): a variable that's EVER assigned a string is a string
         // everywhere (inference promoted it). Non-string values assigned to it get to_string'd,
         // so `x = 5; x = $hi$` becomes `ac_str x = ac_to_str(5); x = "hi";` instead of punning a
@@ -3329,6 +3872,28 @@ private:
             if (declared.insert(var).second) return ty + var + " = " + val + ";";
             return var + " = " + val + ";";
         }
+        // Same gap as the dictVars_ check above, for a plain-variable copy of a list-typed
+        // value (`y = t_0` after `t_0 := ALLOC(range ...)`, e.g. `y = range 5` used as a plain
+        // value rather than a FOR-loop collection) — this never checked listVars at all, so it
+        // fell to the generic `ac_int` default below and punned a genuine `ac_int*` list
+        // pointer through a scalar (verified: "initialization of 'ac_int' from 'ac_int *'
+        // makes integer from pointer without a cast", then a garbage printed value).
+        if (listVars.count(val) || listGlobals_.count(val)) {
+            listVars.insert(var);
+            if (declared.insert(var).second) return "ac_int* " + var + " = " + val + ";";
+            return var + " = " + val + ";";
+        }
+        // `q = f()` where f is known to always construct+return one bundle class — declare
+        // `q` with its REAL type (`Point q = makePoint();`), not the `ac_int` default below.
+        // noteInstanceClass populated classInstanceVarNames_ before this call ran (see the
+        // shared driver's own ordering comment on why that hook fires before emitCall/decl).
+        {
+            auto civ = classInstanceVarNames_.find(var);
+            if (civ != classInstanceVarNames_.end()) {
+                if (declared.insert(var).second) return civ->second + " " + var + " = " + val + ";";
+                return var + " = " + val + ";";
+            }
+        }
         if (declared.insert(var).second)
         {
             IRType ct = castDeclType(var, floatVars.count(var) ? IRType::FLOAT : IRType::VOID);
@@ -3345,15 +3910,21 @@ private:
 
     void emitStoreVar(std::ostringstream &out, int &indent, const std::string &var, const std::string &val) override
     {
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in the
-        // global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible RMW.
-        if (castDeclType(var, IRType::VOID) == IRType::ATOMIC) {
-            emit(out, indent, "pthread_mutex_lock(&_ac_atomic_lock);");
-            emit(out, indent, decl(var, val));
-            emit(out, indent, "pthread_mutex_unlock(&_ac_atomic_lock);");
-        } else {
-            emit(out, indent, decl(var, val));
-        }
+        // No more atomic special-case here — ir.cpp now brackets the WHOLE
+        // read-modify-write span (not just this single store) with real
+        // LOCK_BEGIN/LOCK_END instructions (see emitLockBegin/emitLockEnd below) for
+        // any reassignment to an atomic var, closing the TOCTOU race the old
+        // store-only wrap here could never actually close (the read that computed `val`
+        // already happened in a separate, earlier, unlocked instruction by the time this
+        // runs). Leaving the old wrap here too would double-lock a non-reentrant
+        // pthread_mutex_t and deadlock.
+        emit(out, indent, decl(var, val));
+    }
+    void emitLockBegin(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "pthread_mutex_lock(&_ac_atomic_lock);");
+    }
+    void emitLockEnd(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "pthread_mutex_unlock(&_ac_atomic_lock);");
     }
     void emitConstDecl(std::ostringstream &out, int &indent,
                        const std::string &var, const std::string &val, IRType t) override
@@ -3382,19 +3953,53 @@ private:
         std::string expr = "(((long long)(" + lhs + ") % (long long)(" + rhs + ")) + (long long)(" + rhs + ")) % (long long)(" + rhs + ")";
         emit(out, indent, decl(res, expr));
     }
+    // Wrap a plain (non-AcDynVal) value into the right AcDynVal constructor by its apparent
+    // type — used everywhere a boxed var's operand might be an ordinary literal/var rather than
+    // another already-boxed value (C has no operator overloading/implicit conversion to do this
+    // automatically the way the C++ port's AcDynVal constructors do).
+    std::string boxWrap(const std::string& v, IRType t = IRType::VOID) const {
+        if (boxedVars_.count(v)) return v;
+        if (t == IRType::STRING || looksString(v) || isStringVar(v)) return "ac_dyn_s(" + v + ")";
+        if (t == IRType::FLOAT || isFloatVal(v)) return "ac_dyn_f(" + v + ")";
+        if (t == IRType::BOOL) return "ac_dyn_b(" + v + ")";
+        return "ac_dyn_i((long long)(" + v + "))";
+    }
     void emitTypedStoreVar(std::ostringstream &out, int &indent,
                            const std::string &var, const std::string &val, IRType t) override
     {
         // Bundle field write via a typed decl (e.g. `atomic hp = 5` as a field default) — same
         // translation as decl(): real struct field via `self->`, no redeclaration.
         if (var.rfind("self.", 0) == 0 || var.rfind("self->", 0) == 0) { emit(out, indent, decl(var, val)); return; }
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in the
-        // global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible RMW.
+        // Bundle field WRITE on a NAMED instance, not just `self` — decl()'s own matching fix
+        // (its comment explains the general shape). The shared driver's STORE_VAR dispatch
+        // ALWAYS calls emitTypedStoreVar (never decl() directly, see genInstr's STORE_VAR case)
+        // — decl()'s classInstanceVars_ check was therefore never actually reachable for a
+        // typed store, only for the untyped emitStoreVar path. Verified real bug: `u = (1.0,
+        // 2.5)` (a tuple whose slots are FLOAT) declared `double u.f0 = (double)(1.0);` —
+        // invalid C — while the plain-INT equivalent (`t = (7, 8)`) happened to already read
+        // correctly, purely by accident: `t.f0` had ALREADY been marked `declared` by an
+        // unrelated earlier emission, so its OWN fresh-declaration branch below was skipped in
+        // favor of the trailing `var = val;` fallback — a coincidence of `declared`-set state,
+        // not a real fix, and it silently broke the moment the field's inferred type changed.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot))) {
+                emit(out, indent, var + " = " + val + ";");
+                return;
+            }
+        }
+        // `atomic` var: no more inline lock wrap here — see emitStoreVar's matching
+        // comment (ir.cpp now brackets the whole RMW span, this would double-lock).
         if (castDeclType(var, IRType::VOID) == IRType::ATOMIC) {
             bool isNew = declared.insert(var).second;
-            emit(out, indent, "pthread_mutex_lock(&_ac_atomic_lock);");
             emit(out, indent, (isNew ? "ac_int " : "") + var + " = (ac_int)(" + val + ");");
-            emit(out, indent, "pthread_mutex_unlock(&_ac_atomic_lock);");
+            return;
+        }
+        // Boxed var (setBoxedVars/detectBoxedVars — see AcDynVal's comment in emitHeader): this
+        // needs to run BEFORE the string-unification branch below, which would otherwise force a
+        // plain `ac_str` declaration that can't hold this var's genuinely-numeric earlier value.
+        if (boxedVars_.count(var)) {
+            emit(out, indent, (declared.insert(var).second ? "AcDynVal " : "") + var + " = " + boxWrap(val, t) + ";");
             return;
         }
         // Re-typing coercion (#retype): a variable ever assigned a string is a string everywhere
@@ -3439,6 +4044,16 @@ private:
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand: C has no operator overloading, so unlike the C++ port this must
+        // explicitly call the right ac_dyn_* helper and wrap any non-boxed operand (a plain
+        // literal or ordinary var) via boxWrap — see AcDynVal's comment in emitHeader. Must run
+        // BEFORE the string-forcing branch below (ac_concat has no AcDynVal overload).
+        if (boxedVars_.count(lhs) || boxedVars_.count(rhs)) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string fn = op=="+" ? "ac_dyn_add" : op=="-" ? "ac_dyn_sub" : (op=="*"||op=="@") ? "ac_dyn_mul" : "ac_dyn_div";
+            emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + fn + "(" + l + ", " + r + ");");
+            return;
+        }
         // String concat (#6): `a + b` where either side is a string → ac_concat (malloc + copy).
         auto looksStr = [&](const std::string& v) {
             return (!v.empty() && v.front() == '"') || strVars.count(v) || isStringVar(v);
@@ -3460,6 +4075,16 @@ private:
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — same reasoning as emitBinaryOp's own boxed branch.
+        if ((op=="=="||op=="!="||op=="<"||op==">") && (boxedVars_.count(lhs) || boxedVars_.count(rhs))) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string cmp = op=="==" ? "ac_dyn_eq(" + l + ", " + r + ")"
+                             : op=="!=" ? "(!ac_dyn_eq(" + l + ", " + r + "))"
+                             : op=="<"  ? "ac_dyn_lt(" + l + ", " + r + ")"
+                             :            "ac_dyn_gt(" + l + ", " + r + ")";
+            emit(out, indent, decl(res, "(ac_int)(" + cmp + ")"));
+            return;
+        }
         // String equality is CONTENT (strcmp), not pointer compare (#6: `c is $l$` was `c=="l"`).
         auto looksStr = [&](const std::string& v) {
             return (!v.empty() && v.front() == '"') || strVars.count(v) || isStringVar(v);
@@ -3486,9 +4111,17 @@ private:
     static bool isFloatReturningFunc(const std::string &fn) {
         if (isIntReturningMathFunc(fn.c_str())) return false;
         if (isMLFloatReturningFunc(fn)) return true;
-        if (fn.rfind("math.", 0) == 0) return true;
+        // Both forms, same as isIntReturningMathFunc's own comment: C flattens a dotted ilib
+        // call (`math.sin`) to `math_sin` before this ever gets consulted for the temp/var
+        // DECLARATION type (verified real bug: `y = math.sin(x)` with a non-constant `x`
+        // declared `ac_int t_1 = math_sin(x);` instead of `double` — silently truncated to 0
+        // for any sin() result in (0,1) — only escaped notice because every existing example
+        // happened to call math functions with LITERAL constant args, which the constant
+        // folder resolves at compile time before this type-inference path is ever exercised).
+        if (fn.rfind("math.", 0) == 0 || fn.rfind("math_", 0) == 0) return true;
         if (fn.rfind("stat_", 0) == 0) return true;   // stat_avg, stat_median, ...
         if (fn.rfind("ac_",   0) == 0) return true;   // ac_sin, ac_sqrt, ...
+        if (fn == "aczip.get_ratio" || fn == "aczip_get_ratio") return true;
         return false;
     }
     static std::string trimCArg(const std::string& s) {
@@ -3543,7 +4176,8 @@ private:
     static bool isWidgetCtor(const std::string& func) {
         static const std::set<std::string> ctors = {
             "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
-            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch"
+            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch",
+            "textbox"
         };
         return ctors.count(func) > 0;
     }
@@ -3568,9 +4202,10 @@ private:
         std::vector<std::string> a = withoutLazy(raw);
         std::string call;
         if (func == "Screen") {
+            // title is mandatory (enforced at the ir.cpp level) — no geometry arg; use
+            // .dimensions(w, h) to size the window.
             std::string title = a.size() > 0 ? a[0] : "\"AC App\"";
-            std::string geom  = a.size() > 1 ? a[1] : "\"800x600\"";
-            call = "ac_widgets_screen_new(" + title + ", " + geom + ")";
+            call = "ac_widgets_screen_new(" + title + ")";
         } else if (func == "display") {
             std::string master = a.size() > 0 ? a[0] : "0";
             std::string text   = a.size() > 1 ? a[1] : "\"\"";
@@ -3626,6 +4261,11 @@ private:
             std::string width  = a.size() > 1 ? a[1] : "300";
             std::string height = a.size() > 2 ? a[2] : "200";
             call = "ac_widgets_sketch_new(" + master + ", (int)(" + width + "), (int)(" + height + "))";
+        } else if (func == "textbox") {
+            std::string master = a.size() > 0 ? a[0] : "0";
+            std::string color  = a.size() > 1 ? a[1] : "\"black\"";
+            std::string font   = a.size() > 2 ? a[2] : "\"monospace\"";
+            call = "ac_widgets_textbox_new(" + master + ", " + color + ", " + font + ")";
         }
         widgetVars_[res] = func;
         bool isNew = declared.insert(res).second;
@@ -3682,6 +4322,10 @@ private:
         if (method == "mainloop" && kind == "Screen") { emit(out, indent, "ac_widgets_screen_mainloop(" + recv + ");"); return true; }
         if (method == "update" && kind == "Screen")   { emit(out, indent, "ac_widgets_screen_update(" + recv + ");"); return true; }
         if (method == "destroy" && kind == "Screen")  { emit(out, indent, "ac_widgets_screen_destroy(" + recv + ");"); return true; }
+        if (method == "dimensions" && kind == "Screen" && a.size() >= 2) {
+            emit(out, indent, "ac_widgets_screen_dimensions(" + recv + ", (int)(" + a[0] + "), (int)(" + a[1] + "));");
+            return true;
+        }
         if (method == "add") {
             std::string fn = (kind == "dropdown" ? "ac_widgets_dropdown_add" :
                               kind == "listbox"  ? "ac_widgets_listbox_add"  :
@@ -3696,7 +4340,7 @@ private:
         }
         if (method == "get") {
             std::string fn = getFnFor(kind);
-            if (kind == "ask" || kind == "display" || kind == "dropdown") {
+            if (kind == "ask" || kind == "display" || kind == "dropdown" || kind == "textbox") {
                 if (!res.empty()) {
                     strVars.insert(res);
                     bool isNew = declared.insert(res).second;
@@ -3730,6 +4374,27 @@ private:
         }
         if (method == "clear" && kind == "sketch") {
             emit(out, indent, "ac_widgets_sketch_clear(" + recv + ");");
+            return true;
+        }
+        if (method == "write" && kind == "textbox") {
+            std::string val = a.empty() ? "\"\"" : a[0];
+            emit(out, indent, "ac_widgets_textbox_write(" + recv + ", " + val + ");");
+            return true;
+        }
+        if (method == "fix" && kind == "textbox") {
+            std::string val = a.empty() ? "\"\"" : a[0];
+            emit(out, indent, "ac_widgets_textbox_fix(" + recv + ", " + val + ");");
+            return true;
+        }
+        if (method == "find" && kind == "textbox") {
+            std::string val = a.empty() ? "\"\"" : a[0];
+            if (!res.empty()) {
+                strVars.insert(res);
+                bool isNew = declared.insert(res).second;
+                emit(out, indent, (isNew ? "ac_str " : "") + res + " = ac_widgets_textbox_find(" + recv + ", " + val + ");");
+            } else {
+                emit(out, indent, "ac_widgets_textbox_find(" + recv + ", " + val + ");");
+            }
             return true;
         }
         if ((method == "line" || method == "rect") && kind == "sketch" && a.size() >= 7) {
@@ -3787,6 +4452,12 @@ private:
             }
         }
         std::string call = func + "(" + args + ")";
+        // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
+        // see AcDynVal's comment in emitHeader.
+        if (!res.empty() && boxedVars_.count(res)) {
+            emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + boxWrap(call) + ";");
+            return;
+        }
         if (res.empty()) {
             emit(out, indent, call + ";");
         } else if (isAcStrFunc(func) && declared.insert(res).second) {
@@ -3811,6 +4482,27 @@ private:
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
+        // A generator's body runs inside `ac_gen_entry_<name>(void)` — a real C function with
+        // NO return value (the OUTER "creator" function's real return is the handle, emitted
+        // once in emitFunctionEnd). `return expr` inside a generator ends iteration early and
+        // DISCARDS expr (see the yield plan's own explicit scope cut) — `return <value>;`
+        // against a `void` function is a hard C type error.
+        //
+        // An EXPLICIT return (val non-empty here — even a bare `return` carries a non-empty
+        // placeholder value, see ir.cpp; only the IMPLICIT auto-appended trailing return reaches
+        // here with val truly empty) must NOT just emit a bare C `return;` — this function was
+        // entered via makecontext with uc_link=NULL, so a real C-level return doesn't return to
+        // a caller at all, it calls exit() on the WHOLE PROCESS (verified real bug: a mid-body
+        // `return` silently terminated the entire program instead of just ending the generator —
+        // everything after the loop that consumed it, e.g. a later `Term.display`, never ran).
+        // Must do the same done+swap emitFunctionEnd does for the implicit case, right here.
+        if (curFuncIsGenerator_) {
+            if (!val.empty()) {
+                emit(out, indent, "g->done = 1;");
+                emit(out, indent, "swapcontext(&g->genCtx, &g->callerCtx);");
+            }
+            return;
+        }
         if (!val.empty()) emit(out, indent, "return " + val + ";");
     }
     void emitIntDiv(std::ostringstream &out, int &indent, const std::string &res,
@@ -3820,7 +4512,12 @@ private:
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        if (looksString(val) || strVars.count(val) || isStringVar(val))
+        // Boxed var: ac_dyn_print reads its CURRENT tag — must be checked first, before the
+        // string/float branches below (which would try to pass an AcDynVal struct to printf's
+        // %s/%lld, a hard compile error).
+        if (boxedVars_.count(val))
+            emit(out, indent, "ac_dyn_print(" + val + ");");
+        else if (looksString(val) || strVars.count(val) || isStringVar(val))
             emit(out, indent, "printf(\"%s\\n\", " + val + ");");
         else if (listVars.count(val) || listParams_.count(val))
             emit(out, indent, "ac_arr_print(" + val + ");");  // [2, 3, 5] — matches PY
@@ -3853,8 +4550,9 @@ private:
         emit(out, indent, "usleep((unsigned int)((" + secs + ") * 1000000u));");
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
+        if (!argIsString) { emitLazyEval(out, indent, res, expr); return; }
         if (declared.insert(res).second) {
             floatVars.insert(res);
             emit(out, indent, "double " + res + " = _ac_builtin_eval(" + expr + ");");
@@ -4015,12 +4713,39 @@ private:
                    const std::string &var, const std::string &type,
                    const std::string &content, const std::string &content2 = "") override
     {
-        if (type == "range") {
-            rangeOf_[var] = content;
-            return;
-        }
-        if (type == "sequence") {
-            seqOf_[var] = {content, content2.empty() ? content : content2};
+        if (type == "range" || type == "sequence") {
+            // `rangeOf_`/`seqOf_` feed emitForBegin's fast native counted-loop path — but a
+            // range/sequence used as a plain VALUE (never immediately consumed by a FOR loop,
+            // e.g. `y = range 5; Term.display y`) has NO other declaration site at all: this
+            // used to just `return` with no codegen, leaving `var` completely undeclared —
+            // "cannot find symbol" the moment anything referenced it (verified real bug once a
+            // separate parser fix stopped silently mis-lowering `y = range 5` to the bare
+            // scalar `y = 5`). Materialize a real stretchy-buffer list too, same mechanism as
+            // every other list, so plain-value usage works — the FOR-loop fast path still wins
+            // when applicable since it's checked independently at loop-emission time.
+            std::string a, b, step;
+            if (type == "range") { rangeOf_[var] = content; a = "0"; b = content; }
+            else {
+                auto [b0, st] = splitSeqStep(content2);
+                b = b0.empty() ? content : b0; step = st;
+                seqOf_[var] = {content, b}; a = content;
+            }
+            thread_local int rngC = 0;
+            std::string iv = "_ac_rng_i_" + std::to_string(rngC++);
+            listVars.insert(var); declared.insert(var);
+            if (listGlobals_.count(var))
+                emit(out, indent, var + " = ac_arr_new(0);");
+            else
+                emit(out, indent, "ac_int* " + var + " = ac_arr_new(0);");
+            if (step.empty()) {
+                emit(out, indent, "for (ac_int " + iv + " = (" + a + "); " + iv + " < (" + b + "); " + iv + "++) "
+                                 + var + " = ac_arr_push(" + var + ", " + iv + ");");
+            } else {
+                std::string sv = "_ac_rng_st_" + std::to_string(rngC - 1);
+                emit(out, indent, "ac_int " + sv + " = (" + step + ");");
+                emit(out, indent, "for (ac_int " + iv + " = (" + a + "); (" + sv + " > 0) ? (" + iv + " < (" + b + ")) : (" + iv + " > (" + b + ")); " + iv + " += " + sv + ") "
+                                 + var + " = ac_arr_push(" + var + ", " + iv + ");");
+            }
             return;
         }
         if (type == "string")
@@ -4175,17 +4900,29 @@ private:
     // error — "conflicting types for 'is_odd'; have 'ac_int(ac_int)'" against an implicit
     // `int()` declaration synthesized from the first (undeclared) call site (verified:
     // examples/mutual_recursion.ac).
-    std::string typedParamListC(const std::string& params) const {
+    // `funcName` (default "" — a handful of call sites, e.g. generator struct-field building
+    // via paramNameTypesC, don't have one readily typed at all; those simply never resolve any
+    // class-typed param, same as before this fix existed) looks up classParamTypes_[funcName]
+    // by POSITION — matches ir.cpp's own tupleParamClasses_ convention exactly (0-based, the
+    // written call-argument position, not an index into fn.parameters, which has an extra
+    // leading "self" for methods the caller never writes explicitly).
+    std::string typedParamListC(const std::string& params, const std::string& funcName = "") const {
         std::string tparams;
         if (!params.empty()) {
+            static const std::map<int,std::string> emptyClassParams;
+            auto cptIt = classParamTypes_.find(funcName);
+            const std::map<int,std::string>& cpt = cptIt != classParamTypes_.end() ? cptIt->second : emptyClassParams;
             std::istringstream ss(params);
-            std::string tok; bool first = true;
+            std::string tok; bool first = true; int idx = 0;
             while (std::getline(ss, tok, ',')) {
                 size_t a = tok.find_first_not_of(' '), b = tok.find_last_not_of(' ');
                 std::string pname = (a == std::string::npos) ? "" : tok.substr(a, b - a + 1);
                 if (!first) tparams += ", ";
                 auto fit = funcTypedParams_.find(pname);
-                if (isStringVar(pname)) {
+                auto cit = cpt.find(idx);
+                if (cit != cpt.end()) {
+                    tparams += cit->second + " " + pname;   // bundle/tuple-instance param — real struct type, by value
+                } else if (isStringVar(pname)) {
                     tparams += "const char* " + pname;   // #6: inferred string param (char-iterable)
                 } else if (listParams_.count(pname)) {
                     tparams += "ac_int* " + pname;   // array parameter
@@ -4201,6 +4938,7 @@ private:
                     tparams += "ac_int " + pname;
                 }
                 first = false;
+                idx++;
             }
         }
         return tparams;
@@ -4208,8 +4946,27 @@ private:
     void emitFunctionPrototype(std::ostringstream &out, const std::string &name,
                                const std::string &params, int retKind) override
     {
-        std::string ret = retKind == 4 ? "void " : retKind == 2 ? "ac_int* " : retKind == 3 ? "ac_str " : retKind == 1 ? "double " : "ac_int ";
-        emit(out, 0, ret + name + "(" + typedParamListC(params) + ");");
+        auto cf = classReturnFuncs_.find(name);
+        std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
+                         : retKind == 4 ? "void " : retKind == 2 ? "ac_int* " : retKind == 3 ? "ac_str " : retKind == 1 ? "double " : "ac_int ";
+        emit(out, 0, ret + name + "(" + typedParamListC(params, name) + ");");
+    }
+    // Per-param (name, C type) breakdown — same type inference as typedParamListC, just not
+    // pre-joined into one string, needed to build a generator's per-field struct.
+    std::vector<std::pair<std::string,std::string>> paramNameTypesC(const std::string& params) const {
+        std::vector<std::pair<std::string,std::string>> out2;
+        if (params.empty()) return out2;
+        std::istringstream ss(params);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            size_t a = tok.find_first_not_of(' '), b = tok.find_last_not_of(' ');
+            std::string pname = (a == std::string::npos) ? "" : tok.substr(a, b - a + 1);
+            if (pname.empty()) continue;
+            std::string ptype = isStringVar(pname) ? "const char*"
+                               : listParams_.count(pname) ? "ac_int*" : "ac_int";
+            out2.push_back({pname, ptype});
+        }
+        return out2;
     }
     void emitFunctionBegin(std::ostringstream &out, int &indent,
                            const std::string &name, const std::string &params,
@@ -4229,9 +4986,71 @@ private:
             if (cParams.rfind("self, ", 0) == 0) cParams = cParams.substr(6);
             else if (cParams == "self") cParams = "";
         }
+        // Generator: a POSIX ucontext fiber. The struct only needs to carry ARGS (+ the
+        // ucontext_t pair + a done flag) — the body's own locals stay real C locals inside
+        // the entry function, which runs on its OWN separately-allocated stack that simply
+        // persists across each yield/resume switch, same free simplification the yield plan
+        // notes for BNY. Bundle-method generators (needing `self` in the struct too) are a
+        // scope cut for this pass, same as Rust — skip that combination.
+        curFuncIsGenerator_ = isGenerator_ && classOwner.empty();
+        if (curFuncIsGenerator_) {
+            genStructName_ = "AcGen_" + cName;
+            genParams_ = paramNameTypesC(cParams);
+            emitRaw(out, "typedef struct {");
+            emitRaw(out, "    ucontext_t genCtx, callerCtx;");
+            emitRaw(out, "    int done;");
+            emitRaw(out, "    ac_int value;");
+            for (auto& [pn, pt] : genParams_) emitRaw(out, "    " + pt + " " + pn + ";");
+            emitRaw(out, "} " + genStructName_ + ";");
+            emitRaw(out, "void ac_gen_entry_" + cName + "(void) {");
+            indent++;
+            emit(out, indent, genStructName_ + "* g = (" + genStructName_ + "*)ac_gen_cur;");
+            for (auto& [pn, pt] : genParams_) {
+                emit(out, indent, pt + " " + pn + " = g->" + pn + ";");
+                if (pt == "const char*") strVars.insert(pn);
+                if (pt == "ac_int*") listVars.insert(pn);
+                declared.insert(pn);
+            }
+            genFuncCName_ = cName;
+            for (const auto& [v, t] : hoistVars_) {
+                if (declared.count(v)) continue;
+                std::string line;
+                if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
+                else if (t == IRType::STRING)   line = "const char* " + v + " = 0;";
+                else if (t == IRType::LIST)     line = "ac_int* " + v + " = 0;";
+                else if (isNarrowInt(t))        line = std::string(acIntTy(t)) + " " + v + " = 0;";
+                else                            line = "ac_int " + v + " = 0;";
+                emit(out, indent, line);
+                declared.insert(v);
+            }
+            funcTypedParams_.clear();
+            return;
+        }
 
         // Build typed param list, using function-pointer type for func-typed params
-        std::string tparams = typedParamListC(cParams);
+        std::string tparams = typedParamListC(cParams, name);
+        // Pre-seed classInstanceVars_/classInstanceVarNames_ for any parameter classParamTypes_
+        // proved receives a bundle/tuple instance — typedParamListC (just above) already fixed
+        // this parameter's own declared TYPE; this is the separate fix for the body's dotted
+        // field accesses (`p.x`), which decl()/formatRef() format as a real struct read only
+        // when the var is known via these two maps (see their own comments on emitConstructCall).
+        {
+            auto cptIt = classParamTypes_.find(name);
+            if (cptIt != classParamTypes_.end()) {
+                std::istringstream ps(cParams);
+                std::string ptok; int pidx = 0;
+                while (std::getline(ps, ptok, ',')) {
+                    size_t a = ptok.find_first_not_of(' '), b = ptok.find_last_not_of(' ');
+                    std::string pname = (a == std::string::npos) ? "" : ptok.substr(a, b - a + 1);
+                    auto ci = cptIt->second.find(pidx);
+                    if (ci != cptIt->second.end() && !pname.empty()) {
+                        classInstanceVars_.insert(pname);
+                        classInstanceVarNames_[pname] = ci->second;
+                    }
+                    pidx++;
+                }
+            }
+        }
         if (!classOwner.empty()) {
             std::string selfParam = classOwner + "* self";
             tparams = tparams.empty() ? selfParam : selfParam + ", " + tparams;
@@ -4244,6 +5063,13 @@ private:
         // used it) but a real bug for event callbacks: `_ac_bind` takes `ac_evfn` = `void
         // (*)(void)`, and `ac_int (*)(void)` is an incompatible pointer type.
         std::string retT = returnIsVoid_ ? "void" : returnIsList_ ? "ac_int*" : baseReturnIsString_ ? "ac_str" : returnIsFloat_ ? "double" : "ac_int";
+        // A free function whose every `return` traces to one directly-constructed bundle
+        // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that class BY
+        // VALUE — a real, ordinary C capability (structs return by value fine), just never
+        // exercised before this fix. Overrides the int/float/list/string/void inference above
+        // entirely, since none of those scans know about bundle classes.
+        auto classRetIt = classReturnFuncs_.find(name);
+        if (classRetIt != classReturnFuncs_.end()) retT = classRetIt->second;
         returnIsFloat_ = false; returnIsList_ = false; baseReturnIsString_ = false; returnIsVoid_ = false;
         emit(out, indent, retT + " " + cName + "(" + tparams + ") {");
         indent++;
@@ -4263,6 +5089,37 @@ private:
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
+        if (curFuncIsGenerator_) {
+            emit(out, indent, "g->done = 1;");
+            emit(out, indent, "swapcontext(&g->genCtx, &g->callerCtx);");
+            indent--;
+            emit(out, indent, "}");   // closes ac_gen_entry_<name>
+            emitRaw(out, "");
+            // The "creator" — allocates state, copies args in, arms the fiber's OWN separate
+            // stack via makecontext, returns the handle. A totally separate C function from
+            // the entry function above (which is where the AC body's own statements landed).
+            std::string tparams;
+            for (size_t i = 0; i < genParams_.size(); i++) {
+                if (i) tparams += ", ";
+                tparams += genParams_[i].second + " " + genParams_[i].first;
+            }
+            if (tparams.empty()) tparams = "void";
+            emit(out, 0, genStructName_ + "* " + genFuncCName_ + "(" + tparams + ") {");
+            emit(out, 1, genStructName_ + "* g = (" + genStructName_ + "*)malloc(sizeof(" + genStructName_ + "));");
+            emit(out, 1, "g->done = 0;");
+            for (auto& [pn, pt] : genParams_) emit(out, 1, "g->" + pn + " = " + pn + ";");
+            emit(out, 1, "getcontext(&g->genCtx);");
+            emit(out, 1, "g->genCtx.uc_stack.ss_sp = malloc(65536);");
+            emit(out, 1, "g->genCtx.uc_stack.ss_size = 65536;");
+            emit(out, 1, "g->genCtx.uc_link = NULL;");
+            emit(out, 1, "makecontext(&g->genCtx, (void(*)(void))ac_gen_entry_" + genFuncCName_ + ", 0);");
+            emit(out, 1, "return g;");
+            emit(out, 0, "}");
+            emitRaw(out, "");
+            curFuncIsGenerator_ = false;
+            declared.clear(); floatVars.clear();
+            return;
+        }
         indent--;
         emit(out, indent, "}");
         emitRaw(out, "");
@@ -4325,11 +5182,22 @@ private:
         // `c = Critter()` becomes declare-then-init-by-pointer: `Critter c = {0}; Critter_init
         // (&c, args);`. init's own `ac_int` return value is discarded (nothing else uses it).
         classInstanceVars_.insert(res);   // see formatRef's note on `c.hp` vs dot-flattening
+        classInstanceVarNames_[res] = className;
         bool isNewDecl = declared.insert(res).second;
         if (isNewDecl) emit(out, indent, className + " " + res + " = {0};");
         std::string call = className + "_init(&" + res + (args.empty() ? "" : ", " + args) + ");";
         emit(out, indent, call);
     }
+    // `q = f()` where f is known to always construct+return one bundle class — same treatment
+    // as a direct construct-call for dotted-field-access purposes (see classFuncs_'s own
+    // comment in the shared driver). `q` itself is NOT freshly declared here — the ordinary
+    // emitCall(...) this fires alongside already declared/assigned it as a real `ClassName q =
+    // f(...);` via decl()'s isClassInstanceVar branch below (fixed as part of this same pass).
+    void noteInstanceClass(const std::string &var, const std::string &className) override {
+        classInstanceVars_.insert(var);
+        classInstanceVarNames_[var] = className;
+    }
+    void setClassReturnFuncs(const std::map<std::string,std::string> &m) override { classReturnFuncs_ = m; }
     std::string currentClass_;
     void emitLibImport(std::ostringstream &out, const std::string &libType,
                        const std::string &libName) override
@@ -4345,6 +5213,17 @@ private:
         // is not otherwise hoisted, so a bare assignment left it undeclared. Guarded by `declared`,
         // so hoisted vars (already in the set) get a plain assignment instead (no double-declare).
         bool isNew = declared.insert(var).second;
+        // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point. `src` is
+        // already a well-typed C expression for `t`; box it directly rather than running any of
+        // the branches below (which all assume a single, ALREADY-consistent declared type).
+        if (boxedVars_.count(var)) {
+            bool srcIsStr = looksString(src) || strVars.count(src) || isStringVar(src);
+            std::string rhs = (t == IRType::STRING) ? (srcIsStr ? "ac_dyn_s(" + src + ")" : "ac_dyn_s(ac_to_str(" + src + "))")
+                             : (t == IRType::FLOAT)  ? (srcIsStr ? "ac_dyn_f(atof(" + src + "))" : "ac_dyn_f((double)(" + src + "))")
+                             :                          (srcIsStr ? "ac_dyn_i(atoll(" + src + "))" : "ac_dyn_i((long long)(" + src + "))");
+            emit(out, indent, (isNew ? "AcDynVal " : "") + var + " = " + rhs + ";");
+            return;
+        }
         // `to_int`/`to_dec`/`short`/`mini`/`atomic` on a STRING source (`to_int n = $42$`) must
         // PARSE the text, not reinterpret its pointer bit-pattern as a number — `(ac_int)("42")`
         // is the string literal's ADDRESS cast to an integer (a garbage huge number), not 42.
@@ -4387,6 +5266,18 @@ private:
         emit(out, indent, "int main()");
         emit(out, indent, "{");
         indent++;
+        // `use ilib widgets` needs a one-time `ac_widgets_init()` (== gtk_init()) before ANY
+        // widget constructor — every OTHER backend self-initializes this somewhere (C++'s
+        // widgets.hpp has a static-guarded `_ac_widgets_init_once()` wrapping the ctor calls;
+        // Go/Rust/V/JS all self-init in their own FFI files; BNY's compileGlobal emits this
+        // same call explicitly). `widgets_c.h` (the plain-C header) has NEITHER — no auto-init
+        // wrapper AND nothing here ever called it either, so the first real GTK call crashed
+        // with "Can't create a GtkStyleContext without a display connection" (looks like "no
+        // display", actually means "GTK was never initialized" — same diagnosis as BNY's
+        // earlier, now-fixed version of this exact bug, see
+        // ac_widgets_gtk_init_bug_and_real_display.md).
+        for (auto& [lt, ln] : pendingImports_)
+            if (lt == "ilib" && ln == "widgets") { emit(out, indent, "ac_widgets_init();"); break; }
         // Same hoist fix as emitFunctionBegin (see its comment) — the mainloop is block-scoped
         // C code too, and never got this treatment at all before: a var first assigned inside
         // one `if`/`else` arm of the mainloop and read from a sibling arm or after the `if`
@@ -4420,6 +5311,31 @@ class CppStrategy : public BackendStrategy
 protected:
     std::set<std::string> declared;
     std::set<std::string> cppListVars_;
+    std::set<std::string> classInstanceVars_;   // vars holding a bundle instance — see emitConstructCall
+    std::map<std::string,std::string> classInstanceVarNames_;  // var -> class name
+    std::map<std::string,std::string> classReturnFuncs_;   // fn.name -> class name (see setClassReturnFuncs)
+    std::map<std::string, std::map<int, std::string>> classParamTypes_;  // see setClassParamTypes
+    void setClassParamTypes(const std::map<std::string, std::map<int, std::string>> &m) override { classParamTypes_ = m; }
+    std::string curFuncReturnClass_;   // set in emitFunctionBegin, consumed by emitReturn's empty-val fallback
+    void emitConstructCall(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &className, const std::string &args) override
+    {
+        // No override existed here at all before — the base default just calls emitCall,
+        // which (via decl()'s own `auto var = val;` fallback) already correctly declares a
+        // REAL `Point` value (C++'s `auto` deduces it straight from `Point(args)`'s own
+        // constructor-call syntax, no return-type bookkeeping needed the way C/Java's
+        // explicit `ClassName var = ...;` declarations do) — this override exists ONLY to
+        // additionally record `res` as a known bundle instance, for dotted-field-access
+        // translation (see formatRef/decl's matching fix, and classInstanceVars_' comment).
+        classInstanceVars_.insert(res);
+        classInstanceVarNames_[res] = className;
+        emitCall(out, indent, res, className, args);
+    }
+    void noteInstanceClass(const std::string &var, const std::string &className) override {
+        classInstanceVars_.insert(var);
+        classInstanceVarNames_[var] = className;
+    }
+    void setClassReturnFuncs(const std::map<std::string,std::string> &m) override { classReturnFuncs_ = m; }
     // NA->free: mainloop vars a later-defined function reads/writes (e.g. a button callback
     // calling `name_inp.get()`) must share ONE variable with mainloop, not each get their own
     // local shadow. CStrategy already implements this (see its own promotedGlobals_); CppStrategy
@@ -4455,6 +5371,14 @@ protected:
     bool curFuncReturnIsList_ = false;
     bool curFuncReturnIsString_ = false;   // persists through the body so emitReturn "" → std::string(), not 0
     bool curFuncReturnIsFloat_ = false;
+    // Same "persists through the body" need as the three above — the #retvoid fix in
+    // emitReturn checked the raw `returnIsVoid_` directly, but that gets reset to false
+    // immediately after the function prologue below (before the body's own trailing
+    // implicit `ret` ever reaches emitReturn), so the check always saw false by the time it
+    // mattered — verified: any void `Make X func()` with no explicit `return` (the ordinary
+    // case) still emitted `return 0;` despite the earlier fix. Same snapshot-before-reset
+    // pattern as its three siblings.
+    bool curFuncReturnIsVoid_ = false;
     bool curFuncIsConstructor_ = false;    // classOwner.init → real C++ constructor; `return 0;` is ill-formed there
     std::set<std::string> userFloatFuncs_;
     std::set<std::string> userListFuncs_;
@@ -4481,9 +5405,9 @@ protected:
     bool needsEvents_ = false;
     bool needsSave_ = false;
     void setNeedsSave(bool v) override { needsSave_ = v; }
-    bool hasIpowOp_ = false, hasIdivOp_ = false, hasRandomOp_ = false;
-    void setUsedBuiltinOps(bool /*div*/, bool ip, bool /*len*/, bool /*add*/, bool r, bool idiv, bool /*eval*/, bool /*etry*/) override {
-        hasIpowOp_ = ip; hasIdivOp_ = idiv; hasRandomOp_ = r;
+    bool hasIpowOp_ = false, hasIdivOp_ = false, hasRandomOp_ = false, hasEvalOp_ = false;
+    void setUsedBuiltinOps(bool /*div*/, bool ip, bool /*len*/, bool /*add*/, bool r, bool idiv, bool ev, bool /*etry*/) override {
+        hasIpowOp_ = ip; hasIdivOp_ = idiv; hasRandomOp_ = r; hasEvalOp_ = ev;
     }
     void emitCapture(std::ostringstream &out, int &indent, const std::string &val) override
     {
@@ -4558,8 +5482,57 @@ protected:
         emitRaw(out, "#include <thread>");
         emitRaw(out, "#include <chrono>");
         emitRaw(out, "#include <cstdint>");   // int32_t/int16_t for `short`/`mini`
+        // `yield`/generators: same POSIX ucontext.h fiber design as C — see CStrategy::emitHeader.
+        emitRaw(out, "#include <ucontext.h>");
+        emitRaw(out, "static void* ac_gen_cur; // single shared slot: fiber switches are strictly nested/sequential, never concurrent");
         emitRaw(out, "typedef long long ac_int;");
         emitRaw(out, "typedef const char* ac_str;");
+        // AcDynVal: a genuine boxed/tagged runtime value for the small set of variables
+        // (setBoxedVars, computed by detectBoxedVars) that the auto-retype spec requires to
+        // hold different types at different points in their own scope (`x=5; x=getSomething();
+        // x=$hello$`) — C++ can't give one variable name two different fixed declared types, so
+        // for exactly these vars (never for ordinary ones) the declared C++ type IS AcDynVal,
+        // and every value it's assigned (numeric literal, function-call result, string) is boxed
+        // through its own constructor. Emitted unconditionally (cheap; only referenced when a
+        // program actually needs it) rather than threading a whole-program precheck into
+        // emitHeader's call order, since boxedVars_ itself is computed per-function, after
+        // emitHeader has already run.
+        emitRaw(out, "struct AcDynVal {");
+        emitRaw(out, "    enum Tag { T_INT, T_FLOAT, T_STRING, T_BOOL } tag;");
+        emitRaw(out, "    long long i; double d; std::string s; bool b;");
+        emitRaw(out, "    AcDynVal() : tag(T_INT), i(0), d(0), b(false) {}");
+        emitRaw(out, "    AcDynVal(int v) : tag(T_INT), i(v), d(0), b(false) {}");
+        emitRaw(out, "    AcDynVal(long long v) : tag(T_INT), i(v), d(0), b(false) {}");
+        emitRaw(out, "    AcDynVal(double v) : tag(T_FLOAT), i(0), d(v), b(false) {}");
+        emitRaw(out, "    AcDynVal(const std::string& v) : tag(T_STRING), i(0), d(0), s(v), b(false) {}");
+        emitRaw(out, "    AcDynVal(const char* v) : tag(T_STRING), i(0), d(0), s(v ? v : \"\"), b(false) {}");
+        emitRaw(out, "    AcDynVal(bool v) : tag(T_BOOL), i(0), d(0), b(v) {}");
+        emitRaw(out, "    bool isNum() const { return tag == T_INT || tag == T_FLOAT || tag == T_BOOL; }");
+        emitRaw(out, "    double asDouble() const { return tag==T_FLOAT ? d : tag==T_INT ? (double)i : tag==T_BOOL ? (b?1.0:0.0) : 0.0; }");
+        emitRaw(out, "    long long asLL() const { return tag==T_INT ? i : tag==T_FLOAT ? (long long)d : tag==T_BOOL ? (b?1:0) : 0; }");
+        emitRaw(out, "    std::string asStr() const {");
+        emitRaw(out, "        if (tag == T_STRING) return s;");
+        emitRaw(out, "        if (tag == T_BOOL) return b ? \"true\" : \"false\";");
+        emitRaw(out, "        if (tag == T_INT) return std::to_string(i);");
+        emitRaw(out, "        long long xi = (long long)d; if ((double)xi == d) return std::to_string(xi);");
+        emitRaw(out, "        char buf[32]; std::snprintf(buf, sizeof(buf), \"%.17g\", d); return buf;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    AcDynVal operator+(const AcDynVal& o) const {");
+        emitRaw(out, "        if (tag == T_STRING || o.tag == T_STRING) return AcDynVal(asStr() + o.asStr());");
+        emitRaw(out, "        if (tag == T_FLOAT || o.tag == T_FLOAT) return AcDynVal(asDouble() + o.asDouble());");
+        emitRaw(out, "        return AcDynVal(asLL() + o.asLL());");
+        emitRaw(out, "    }");
+        emitRaw(out, "    AcDynVal operator-(const AcDynVal& o) const { return (tag==T_FLOAT||o.tag==T_FLOAT) ? AcDynVal(asDouble()-o.asDouble()) : AcDynVal(asLL()-o.asLL()); }");
+        emitRaw(out, "    AcDynVal operator*(const AcDynVal& o) const { return (tag==T_FLOAT||o.tag==T_FLOAT) ? AcDynVal(asDouble()*o.asDouble()) : AcDynVal(asLL()*o.asLL()); }");
+        emitRaw(out, "    AcDynVal operator/(const AcDynVal& o) const { return AcDynVal(asDouble()/o.asDouble()); }");
+        emitRaw(out, "    bool operator==(const AcDynVal& o) const { return (tag==T_STRING||o.tag==T_STRING) ? asStr()==o.asStr() : asDouble()==o.asDouble(); }");
+        emitRaw(out, "    bool operator!=(const AcDynVal& o) const { return !(*this == o); }");
+        emitRaw(out, "    bool operator<(const AcDynVal& o) const { return (tag==T_STRING||o.tag==T_STRING) ? asStr()<o.asStr() : asDouble()<o.asDouble(); }");
+        emitRaw(out, "    bool operator>(const AcDynVal& o) const { return (tag==T_STRING||o.tag==T_STRING) ? asStr()>o.asStr() : asDouble()>o.asDouble(); }");
+        emitRaw(out, "    bool operator<=(const AcDynVal& o) const { return !(*this > o); }");
+        emitRaw(out, "    bool operator>=(const AcDynVal& o) const { return !(*this < o); }");
+        emitRaw(out, "};");
+        emitRaw(out, "static inline std::ostream& operator<<(std::ostream& os, const AcDynVal& v) { return os << v.asStr(); }");
         if (anyAtomicVars()) {
             emitRaw(out, "#include <mutex>");
             emitRaw(out, "static std::mutex _ac_atomic_lock; // `atomic` vars: any op touching one is a global critical section");
@@ -4611,6 +5584,67 @@ protected:
             emitRaw(out, "    return xs[(size_t)ac_rand((long long)xs.size())];");
             emitRaw(out, "}");
             emitRaw(out, "#endif");
+        }
+        // eval(): self-contained arithmetic evaluator (+ - * / parens, unary +/-), ported from
+        // CStrategy's `_ac_builtin_eval` (same factor->term->expr grammar). Verified real bug:
+        // emitEval below used to call a bare `math_eval(...)` that was never declared anywhere
+        // in C++ output (no such function, no such header) — `eval($1+2$)` failed to compile on
+        // C++ AND on LIB (LibStrategy inherits this header), exactly the same class of bug
+        // JavaStrategy's own `_AcEval` port fixed for Java (see its comment) — that earlier fix
+        // never reached C++/LIB/Rust/Go, which all still called the nonexistent name.
+        if (hasEvalOp_) {
+            emitRaw(out, "static const char* _ac_ep;");
+            emitRaw(out, "static double _ac_eexpr(void);");
+            emitRaw(out, "static void _ac_ews(void) {");
+            emitRaw(out, "    while (*_ac_ep == ' ' || *_ac_ep == '\\t') _ac_ep++;");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_efac(void) {");
+            emitRaw(out, "    _ac_ews();");
+            emitRaw(out, "    if (*_ac_ep == '(') {");
+            emitRaw(out, "        _ac_ep++;");
+            emitRaw(out, "        double v = _ac_eexpr();");
+            emitRaw(out, "        _ac_ews();");
+            emitRaw(out, "        if (*_ac_ep == ')') _ac_ep++;");
+            emitRaw(out, "        return v;");
+            emitRaw(out, "    }");
+            emitRaw(out, "    if (*_ac_ep == '-') { _ac_ep++; return -_ac_efac(); }");
+            emitRaw(out, "    if (*_ac_ep == '+') { _ac_ep++; return _ac_efac(); }");
+            emitRaw(out, "    char* e;");
+            emitRaw(out, "    double v = strtod(_ac_ep, &e);");
+            emitRaw(out, "    if (e == _ac_ep) return 0.0;");
+            emitRaw(out, "    _ac_ep = e;");
+            emitRaw(out, "    return v;");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_eterm(void) {");
+            emitRaw(out, "    double v = _ac_efac();");
+            emitRaw(out, "    for (;;) {");
+            emitRaw(out, "        _ac_ews();");
+            emitRaw(out, "        char c = *_ac_ep;");
+            emitRaw(out, "        if (c == '*') { _ac_ep++; v *= _ac_efac(); }");
+            emitRaw(out, "        else if (c == '/') { _ac_ep++; double d = _ac_efac(); v = d != 0.0 ? v / d : 0.0; }");
+            emitRaw(out, "        else break;");
+            emitRaw(out, "    }");
+            emitRaw(out, "    return v;");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_eexpr(void) {");
+            emitRaw(out, "    double v = _ac_eterm();");
+            emitRaw(out, "    for (;;) {");
+            emitRaw(out, "        _ac_ews();");
+            emitRaw(out, "        char c = *_ac_ep;");
+            emitRaw(out, "        if (c == '+') { _ac_ep++; v += _ac_eterm(); }");
+            emitRaw(out, "        else if (c == '-') { _ac_ep++; v -= _ac_eterm(); }");
+            emitRaw(out, "        else break;");
+            emitRaw(out, "    }");
+            emitRaw(out, "    return v;");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_builtin_eval(const char* s) {");
+            emitRaw(out, "    if (!s) return 0.0;");
+            emitRaw(out, "    _ac_ep = s;");
+            emitRaw(out, "    return _ac_eexpr();");
+            emitRaw(out, "}");
+            // eval(expr) where expr is a std::string VAR (not a literal) needs this overload —
+            // std::string has no implicit conversion to const char*.
+            emitRaw(out, "static double _ac_builtin_eval(const std::string& s) { return _ac_builtin_eval(s.c_str()); }");
         }
         emitRaw(out, "#ifdef __cplusplus");
         emitRaw(out, "static void ac_print_list(const std::vector<long long>& v) {");
@@ -4677,26 +5711,48 @@ protected:
         for (auto& [lt, ln] : pendingImports_) {
             if (lt == "ilib") {
                 if (ln == "camera") {
-                    emitRaw(out, "#include \"library/ilib/camera/camera_wrapper.hpp\"");
-                    emitRaw(out, "// Link: g++ ... -lopencv_core -lopencv_videoio -lopencv_highgui -lopencv_imgproc -lopencv_imgcodecs");
-                    // Define global instances (camera.cpp is compiled into this TU)
+                    emitRaw(out, "#include \"" + resolveIlibDir("camera") + "/camera_wrapper.hpp\"");
+                    // -I/usr/include/opencv4 matters, not just the -l flags: without it,
+                    // `#include <opencv2/opencv.hpp>`'s __has_include check silently fails on
+                    // any system where the headers live under an opencv4/ subdir (Debian/
+                    // Ubuntu's pkg-config opencv4 layout) rather than directly on the default
+                    // include path, so HAVE_OPENCV falls back to 0 — camera.hpp's stub Camera/
+                    // Screen classes then get compiled instead of the real OpenCV-backed ones,
+                    // with a narrower method surface, even though OpenCV is fully installed.
+                    // Harmless -I on a system where this exact subdir doesn't exist.
+                    emitRaw(out, "// Link: g++ ... -I/usr/include/opencv4 -lopencv_core -lopencv_videoio -lopencv_highgui -lopencv_imgproc -lopencv_imgcodecs");
+                    // Define global instances (camera.cpp is compiled into this TU) —
+                    // named to match AC source's receivers directly (camera.init(), etc).
                     emitRaw(out, "namespace AC {");
-                    emitRaw(out, "    Camera WebCam;");
+                    emitRaw(out, "    Camera camera;");
                     emitRaw(out, "    Camera latestFrame;");
                     emitRaw(out, "    Camera firstFrame;");
                     emitRaw(out, "    SidebarConsole sidebar;");
-                    emitRaw(out, "    Screen Background;");
+                    emitRaw(out, "    Screen screen;");
+                    emitRaw(out, "    namespace { struct _WireAux { _WireAux() {");
+                    emitRaw(out, "        camera.attachAux(&latestFrame, &firstFrame);");
+                    emitRaw(out, "        screen.attachCamera(&camera);");
+                    emitRaw(out, "    } } _wireAux; }");
                     emitRaw(out, "}");
                     emitRaw(out, "using namespace AC;");
                 } else {
                     {
                         std::string absDir = resolveIlibDir(ln);
-                        emitRaw(out, "#include \"" + absDir + "/" + ln + ".hpp\"");
+                        // aczip.hpp's own C++ API lives in `namespace aczip { class ACZip {...} }`
+                        // — a variable literally named `aczip` (needed to match AC's dotted
+                        // `aczip.compress(...)` call syntax) can't coexist with a namespace of the
+                        // same name in the same scope, so this ilib gets its own thin wrapper
+                        // header instead of the generic "<lib>.hpp" include (see
+                        // aczip_wrapper.hpp's own comment).
+                        emitRaw(out, "#include \"" + absDir + "/" + (ln == "aczip" ? "aczip_wrapper.hpp" : ln + ".hpp") + "\"");
                         std::string _lnk;
                         if (ln == "machine-audio") _lnk = "acmachinaaudio";
                     else if (ln == "web-server") _lnk = "acserver";
                     else if (ln == "native-cpu") _lnk = "acncpu";
                         else if (ln == "os")       _lnk = "acoos";
+                        // aczip's name already reads as "AC Zip" — the real file is libaczip.so,
+                        // NOT libacaczip.so (see the C-target fix for this same issue above).
+                        else if (ln == "aczip")    _lnk = "aczip";
                         else { _lnk = "ac"; for (char c : ln) if (c != '-') _lnk += c; }
                         emitRaw(out, "// Link: g++ out.cpp -I. -L\"" + absDir + "\" -l" + _lnk
                                      + " -Wl,-rpath,\"" + absDir + "\"");
@@ -4784,6 +5840,14 @@ protected:
         // Bundle field READ (self.field as an operand, not just a STORE_VAR target): same
         // this->field translation as decl() applies to writes.
         if (s.rfind("self.", 0) == 0) return "this->" + s.substr(5);
+        // Bundle field READ on a NAMED instance, not just `self` (`q.x` after `q = f()` where
+        // f always constructs+returns one class) — commonRef preserves dots by default, so
+        // this is already valid C++ (`q` is a real value, `.` not `->`); this is mostly a
+        // documented no-op guard confirming it, same as JavaStrategy's matching comment.
+        if (r.kind == IRRef::Kind::VAR) {
+            auto dot = s.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(s.substr(0, dot))) return s;
+        }
         return s;
     }
 
@@ -4801,6 +5865,23 @@ protected:
             if (!isStringVar(checkVar) && looksString(val)) return field + " = " + acUnstring(val) + ";";
             return field + " = " + val + ";";
         }
+        // Bundle field WRITE on a NAMED instance, not just `self` (`q.x = 5` — verified real
+        // bug on the sibling C backend, same root cause: fell to the generic `auto` branch
+        // below and declared a bogus fresh `auto q.x = 5;`, invalid C++). A field on a real
+        // object is never independently "declared" — always a plain assignment.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot)))
+                return var + " = " + val + ";";
+        }
+        // A plain-variable copy of a list-typed value (`y = t_0` after `t_0 := ALLOC(range
+        // ...)`, e.g. `y = range 5` used as a plain value rather than a FOR-loop collection) —
+        // the generic `auto` fallback below WOULD correctly infer `std::vector<long long>` for
+        // the declaration itself, but never propagated `cppListVars_` membership onto the new
+        // name, so a later `Term.display y` (checking cppListVars_ to decide whether to print
+        // as an array) missed it and fell to a bare `std::cout << y`, which doesn't compile for
+        // a vector ("no match for operator<<").
+        if (cppListVars_.count(val)) cppListVars_.insert(var);
         if (declared.insert(var).second)
         {
             IRType ct = castDeclType(var, isStringVar(var) ? IRType::STRING : (floatVars.count(var) ? IRType::FLOAT : IRType::VOID));
@@ -4857,6 +5938,12 @@ protected:
     {
         emit(out, indent, decl(var, val));
     }
+    void emitLockBegin(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "_ac_atomic_lock.lock();");
+    }
+    void emitLockEnd(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "_ac_atomic_lock.unlock();");
+    }
     void emitConstDecl(std::ostringstream &out, int &indent,
                        const std::string &var, const std::string &val, IRType t) override
     {
@@ -4890,13 +5977,32 @@ protected:
         // Bundle field write via a typed decl (e.g. `atomic hp = 5` as a field default) — same
         // translation as decl(): real class member, no redeclaration, this->field not self.field.
         if (var.rfind("self.", 0) == 0 || var.rfind("this->", 0) == 0) { emit(out, indent, decl(var, val)); return; }
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in the
-        // global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible RMW.
+        // Bundle field WRITE on a NAMED instance, not just `self` — decl()'s own matching fix
+        // (see its comment). The shared driver's STORE_VAR dispatch ALWAYS calls
+        // emitTypedStoreVar (never decl() directly), so decl()'s classInstanceVars_ check alone
+        // was never reachable for a typed store — same gap as CStrategy's sibling fix, verified
+        // the identical way (a widened-to-FLOAT tuple field write declared a bogus
+        // `double u.f0 = ...;` here too).
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot))) {
+                emit(out, indent, var + " = " + val + ";");
+                return;
+            }
+        }
+        // `atomic` var: no inline lock wrap here anymore — see PythonStrategy's/
+        // CStrategy's matching emitStoreVar comment (ir.cpp now brackets the whole RMW
+        // span; this old store-only wrap would double-lock a non-reentrant std::mutex).
         if (castDeclType(var, IRType::VOID) == IRType::ATOMIC) {
             bool isNew = declared.insert(var).second;
-            emit(out, indent, "_ac_atomic_lock.lock();");
             emit(out, indent, (isNew ? "long long " : "") + var + " = (long long)(" + val + ");");
-            emit(out, indent, "_ac_atomic_lock.unlock();");
+            return;
+        }
+        // Boxed var (setBoxedVars/detectBoxedVars — see the struct comment on AcDynVal): declare
+        // as AcDynVal on first sight, plain assignment after — AcDynVal's own constructors pick
+        // the right tag from `val`'s real C++ type, so no per-type branching is needed here.
+        if (boxedVars_.count(var)) {
+            emit(out, indent, (declared.insert(var).second ? "AcDynVal " : "") + var + " = " + val + ";");
             return;
         }
         // #retype numeric-unified: a re-typed var (last assignment numeric) receiving a
@@ -4929,7 +6035,12 @@ protected:
         // std::string and coerce numeric operands via std::to_string / ac_fstr. Without this,
         // `"hi " + name` (name int) compiled as POINTER ARITHMETIC and `"a" + "b"` (two const
         // char*) didn't compile at all. Leading std::string() forces string-typed concat.
-        if (op == "+") {
+        // A boxed operand (see AcDynVal) must skip BOTH the string-forcing branch below (ac_cat
+        // has no AcDynVal overload) and the plain-numeric isFloat branch — it has its own
+        // operator+/-/*// that already does the right runtime-tag-dispatched thing; `auto res =
+        // lhs op rhs;` further down lets AcDynVal's own operators drive `res`'s deduced type.
+        bool anyBoxed = boxedVars_.count(lhs) || boxedVars_.count(rhs);
+        if (op == "+" && !anyBoxed) {
             bool lStr = looksString(lhs) || isStringVar(lhs);
             bool rStr = looksString(rhs) || isStringVar(rhs);
             if (lStr || rStr) {
@@ -4995,6 +6106,14 @@ protected:
                 cfunc = cfunc.substr(0, dot) + "->" + cfunc.substr(dot + 1);
         }
         std::string call = cfunc + "(" + args + ")";
+        // Boxed var (see AcDynVal): a CALL result flowing directly into a var that ALSO gets
+        // retyped later in its scope is exactly the case detectBoxedVars exists for — this path
+        // (not emitTypedStoreVar) is what runs for a plain `x = someFunc()`, since the driver
+        // emits the CALL with the var as its direct result, no separate STORE_VAR in between.
+        if (!res.empty() && boxedVars_.count(res)) {
+            emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + call + ";");
+            return;
+        }
         if (res.empty()) {
             emit(out, indent, call + ";");
         } else if ((isAcStrFunc(func) || isStringReturningFunc(func)) && declared.insert(res).second) {
@@ -5015,9 +6134,43 @@ protected:
         // `return 0;`/`return std::string();` are ill-formed there. Bare `return;` (no value)
         // is the only legal early-return form in a constructor.
         if (curFuncIsConstructor_) { emit(out, indent, "return;"); return; }
+        // A `return` inside a generator body ends iteration early. The DONE-marking swap
+        // happens once in emitFunctionEnd, immediately after the body's last statement — an
+        // implicit trailing empty return (val.empty(), the common case: a generator with no
+        // explicit `return`) must emit NOTHING here and just fall through into it, or the
+        // done-marking code after it becomes dead code following an unconditional early
+        // `return;` (verified real bug: exhaustion's "again"/"end" prints never ran — g->done
+        // was never set because `return;` short-circuited before it).
+        //
+        // An EXPLICIT mid-body return (val non-empty) is a DIFFERENT case that must NOT just
+        // fall through to a bare `return;` either: this function was entered via makecontext
+        // with uc_link=NULL, so a bare C++ return doesn't return to any caller — it calls
+        // exit() on the whole process (verified real bug, same root cause as CStrategy's own —
+        // see its comment: a mid-body `return` silently killed the entire program instead of
+        // just ending the generator). Must do the done+swap here too, same as emitFunctionEnd's
+        // own trailer.
+        if (curFuncIsGenerator_) {
+            if (!val.empty()) {
+                emit(out, indent, "g->done = true;");
+                emit(out, indent, "swapcontext(&g->genCtx, &g->callerCtx);");
+            }
+            return;
+        }
         if (val.empty()) {
             // An empty return must match the declared type — `return 0;` for a std::string func
             // builds a string from a null const char* → UB/crash; use the right zero-value.
+            // A void function's implicit trailing `ret` (no AC `return` statement at all — the
+            // common case for a `Make X func()` that never returns anything) reaches here too;
+            // `return 0;` is ill-formed C++ in a void function ("return-statement with a value,
+            // in function returning 'void'") — was NEVER checked before, verified: any AC void
+            // function with no explicit return failed to compile on CPP.
+            if (curFuncReturnIsVoid_) { emit(out, indent, "return;"); return; }
+            // A class-returning function's IMPLICIT trailing return (unreachable after the
+            // real `return p;`, but C++ — unlike javac — never complains about unreachable
+            // code, so it still has to COMPILE, just never execute) needs a real default-
+            // constructed value of the right type, not the bare `return 0;` fallback below —
+            // verified real error: "could not convert '0' from 'int' to 'Point'".
+            if (!curFuncReturnClass_.empty()) { emit(out, indent, "return " + curFuncReturnClass_ + "();"); return; }
             const char* z = curFuncReturnIsList_   ? "return {};"
                           : curFuncReturnIsString_ ? "return std::string();"
                           : curFuncReturnIsFloat_  ? "return 0.0;"
@@ -5037,6 +6190,11 @@ protected:
             emit(out, indent, "std::cout << \"null\" << \"\\n\";");
         else if (cppListVars_.count(val))
             emit(out, indent, "ac_print_list(" + val + ");");
+        // Boxed var: AcDynVal's own operator<< (see emitHeader) already prints its CURRENT tag
+        // correctly — must be checked before isFloatVal, which would otherwise force a `(double)`
+        // cast that doesn't compile against a struct.
+        else if (boxedVars_.count(val))
+            emit(out, indent, "std::cout << " + val + " << \"\\n\";");
         else if (isFloatVal(val))
             emit(out, indent, "_ac_dblprint((double)(" + val + "));");
         else
@@ -5063,13 +6221,14 @@ protected:
         emit(out, indent, "std::this_thread::sleep_for(std::chrono::duration<double>(" + secs + "));");
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
+        if (!argIsString) { emitLazyEval(out, indent, res, expr); return; }
         if (declared.insert(res).second) {
             floatVars.insert(res);
-            emit(out, indent, "double " + res + " = math_eval(" + expr + ");");
+            emit(out, indent, "double " + res + " = _ac_builtin_eval(" + expr + ");");
         } else {
-            emit(out, indent, res + " = math_eval(" + expr + ");");
+            emit(out, indent, res + " = _ac_builtin_eval(" + expr + ");");
         }
     }
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
@@ -5204,12 +6363,31 @@ protected:
                    const std::string &var, const std::string &type,
                    const std::string &content, const std::string &content2 = "") override
     {
-        if (type == "range") {
-            rangeOf_[var] = content;
-            return;
-        }
-        if (type == "sequence") {
-            seqOf_[var] = {content, content2.empty() ? content : content2};
+        if (type == "range" || type == "sequence") {
+            // See CStrategy's matching emitAlloc comment: rangeOf_/seqOf_ alone leave `var`
+            // completely undeclared when used as a plain VALUE, not immediately consumed by a
+            // FOR loop — "use of undeclared identifier" the moment anything referenced it.
+            std::string a, b, step;
+            if (type == "range") { rangeOf_[var] = content; a = "0"; b = content; }
+            else {
+                auto [b0, st] = splitSeqStep(content2);
+                b = b0.empty() ? content : b0; step = st;
+                seqOf_[var] = {content, b}; a = content;
+            }
+            thread_local int rngC = 0;
+            std::string iv = "_ac_rng_i_" + std::to_string(rngC++);
+            cppListVars_.insert(var);
+            emit(out, indent, "std::vector<long long> " + var + ";");
+            if (step.empty()) {
+                emit(out, indent, "for (long long " + iv + " = (" + a + "); " + iv + " < (" + b + "); " + iv + "++) "
+                                 + var + ".push_back(" + iv + ");");
+            } else {
+                std::string sv = "_ac_rng_st_" + std::to_string(rngC - 1);
+                emit(out, indent, "long long " + sv + " = (" + step + ");");
+                emit(out, indent, "for (long long " + iv + " = (" + a + "); (" + sv + " > 0) ? (" + iv + " < (" + b + ")) : (" + iv + " > (" + b + ")); " + iv + " += " + sv + ") "
+                                 + var + ".push_back(" + iv + ");");
+            }
+            declared.insert(var);
             return;
         }
         if (type == "dict") {
@@ -5313,17 +6491,24 @@ protected:
     std::set<std::string> stringParams_;  // params typed as strings (GL object names)
     void setStringParams(const std::set<std::string>& sp) override { stringParams_ = sp; }
     // Shared param-typing for signatures AND forward declarations.
-    std::string typedParamList(const std::string &cppParams)
+    // `funcName` default "" — see CStrategy's typedParamListC, same convention (0-based,
+    // call-argument position).
+    std::string typedParamList(const std::string &cppParams, const std::string &funcName = "")
     {
         std::string tparams;
         if (!cppParams.empty()) {
+            static const std::map<int,std::string> emptyClassParams;
+            auto cptIt = classParamTypes_.find(funcName);
+            const std::map<int,std::string>& cpt = cptIt != classParamTypes_.end() ? cptIt->second : emptyClassParams;
             std::istringstream ss(cppParams);
-            std::string tok; bool first = true;
+            std::string tok; bool first = true; int idx = 0;
             while (std::getline(ss, tok, ',')) {
                 size_t a = tok.find_first_not_of(' '), b = tok.find_last_not_of(' ');
                 std::string pname = (a == std::string::npos) ? "" : tok.substr(a, b - a + 1);
                 if (!first) tparams += ", ";
                 auto fit = funcTypedParams_.find(pname);
+                auto cit = cpt.find(idx);
+                idx++;
                 // isStringVar (whole-body string inference) MUST win when it also applies: the
                 // BODY-level codegen unconditionally calls `.c_str()` on anything isStringVar
                 // considers a string, regardless of how the PARAM got declared here — declaring
@@ -5333,7 +6518,9 @@ protected:
                 // member 'c_str' in 'arg', which is of non-class type 'const char*'").
                 // stringParams_ still matters on its own as a FALLBACK, for a param isStringVar
                 // never catches (see its own comment).
-                if (isStringVar(pname) || stringParams_.count(pname)) {
+                if (cit != cpt.end()) {
+                    tparams += cit->second + " " + pname;   // bundle/tuple-instance param — real struct/class type, by value
+                } else if (isStringVar(pname) || stringParams_.count(pname)) {
                     tparams += "std::string " + pname;   // #6: inferred string param (iterable as chars)
                 } else if (listParams_.count(pname)) {
                     tparams += "std::vector<long long>& " + pname;  // array parameter (by ref)
@@ -5353,12 +6540,65 @@ protected:
     void emitFunctionPrototype(std::ostringstream &out, const std::string &name,
                                const std::string &params, int retKind) override
     {
-        std::string ret = retKind == 4 ? "void "
+        auto cf = classReturnFuncs_.find(name);
+        std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
+                        : retKind == 4 ? "void "
                         : retKind == 2 ? "std::vector<long long> "
                         : retKind == 3 ? "std::string "
                         : retKind == 1 ? "double " : "long long ";
         int ind = 0;
-        emit(out, ind, ret + name + "(" + typedParamList(params) + ");");
+        emit(out, ind, ret + name + "(" + typedParamList(params, name) + ");");
+    }
+    // Per-param (name, C++ type) breakdown — same type inference as typedParamList, just not
+    // pre-joined, needed to build a generator's per-field struct. Uses VALUE semantics
+    // (std::string/std::vector<long long> by value, not typedParamList's `&` list param) since
+    // a struct field needs to own its storage across the fiber switch, not borrow the caller's.
+    std::vector<std::pair<std::string,std::string>> paramNameTypesCpp(const std::string& params) {
+        std::vector<std::pair<std::string,std::string>> out2;
+        if (params.empty()) return out2;
+        std::istringstream ss(params);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            size_t a = tok.find_first_not_of(' '), b = tok.find_last_not_of(' ');
+            std::string pname = (a == std::string::npos) ? "" : tok.substr(a, b - a + 1);
+            if (pname.empty()) continue;
+            std::string ptype = (isStringVar(pname) || stringParams_.count(pname)) ? "std::string"
+                               : listParams_.count(pname) ? "std::vector<long long>" : "long long";
+            out2.push_back({pname, ptype});
+        }
+        return out2;
+    }
+    bool curFuncIsGenerator_ = false;
+    bool isGenerator_ = false;
+    std::string genStructName_, genFuncCppName_;
+    std::vector<std::pair<std::string,std::string>> genParams_;
+    void setIsGenerator(bool v) override { isGenerator_ = v; }
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "g->value = " + val + ";");
+        emit(out, indent, "swapcontext(&g->genCtx, &g->callerCtx);");
+    }
+    // emitFunctionEnd emits a real "creator" function for every generator — this just calls it.
+    void emitGenCreate(std::ostringstream &out, int &indent, const std::string &res,
+                       const std::string &func, const std::string &args) override
+    {
+        emit(out, indent, "AcGen_" + func + "* " + res + " = " + func + "(" + args + ");");
+        declared.insert(res);
+        cppGenVars_.insert(res);
+    }
+    std::set<std::string> cppGenVars_;
+    void emitGenNext(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &handle) override
+    {
+        emit(out, indent, "if (!" + handle + "->done) { ac_gen_cur = " + handle + "; swapcontext(&" + handle + "->callerCtx, &" + handle + "->genCtx); }");
+        emit(out, indent, "long long " + res + " = " + handle + "->value;");
+        declared.insert(res);
+    }
+    void emitGenDone(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &handle) override
+    {
+        emit(out, indent, "long long " + res + " = " + handle + "->done;");
+        declared.insert(res);
     }
     void emitFunctionBegin(std::ostringstream &out, int &indent,
                            const std::string &name, const std::string &params,
@@ -5375,7 +6615,64 @@ protected:
             cppName = (name == "init") ? classOwner : name;
             curFuncIsConstructor_ = (name == "init");
         }
-        std::string tparams = typedParamList(cppParams);
+        // Generator: a POSIX ucontext fiber — identical design to CStrategy (see its own
+        // comment for the full rationale: only ARGS need to persist in the struct, the body's
+        // own locals stay real locals on the fiber's own separate stack). Bundle-method
+        // generators are a scope cut for this pass, same as C/Rust.
+        curFuncIsGenerator_ = isGenerator_ && classOwner.empty();
+        if (curFuncIsGenerator_) {
+            genStructName_ = "AcGen_" + cppName;
+            genParams_ = paramNameTypesCpp(cppParams);
+            emitRaw(out, "typedef struct {");
+            emitRaw(out, "    ucontext_t genCtx, callerCtx;");
+            emitRaw(out, "    bool done;");
+            emitRaw(out, "    long long value;");
+            for (auto& [pn, pt] : genParams_) emitRaw(out, "    " + pt + " " + pn + ";");
+            emitRaw(out, "} " + genStructName_ + ";");
+            emitRaw(out, "void ac_gen_entry_" + cppName + "(void) {");
+            indent++;
+            emit(out, indent, genStructName_ + "* g = (" + genStructName_ + "*)ac_gen_cur;");
+            for (auto& [pn, pt] : genParams_) {
+                emit(out, indent, pt + " " + pn + " = g->" + pn + ";");
+                if (pt == "std::string") stringVars_.insert(pn);
+                if (pt == "std::vector<long long>") cppListVars_.insert(pn);
+                declared.insert(pn);
+            }
+            genFuncCppName_ = cppName;
+            for (const auto& [v, t] : hoistVars_) {
+                if (declared.count(v)) continue;
+                std::string line;
+                if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double "  + v + " = 0;"; }
+                else if (t == IRType::STRING)   line = "std::string " + v + ";";
+                else if (t == IRType::LIST)     line = "std::vector<long long> " + v + ";";
+                else                            line = "long long "  + v + " = 0;";
+                emit(out, indent, line);
+                declared.insert(v);
+            }
+            funcTypedParams_.clear();
+            return;
+        }
+        std::string tparams = typedParamList(cppParams, name);
+        // Pre-seed classInstanceVars_/classInstanceVarNames_ for a param classParamTypes_
+        // proved receives a bundle/tuple instance — same fix as CStrategy's emitFunctionBegin,
+        // see its own comment.
+        {
+            auto cptIt = classParamTypes_.find(name);
+            if (cptIt != classParamTypes_.end()) {
+                std::istringstream ps(cppParams);
+                std::string ptok; int pidx = 0;
+                while (std::getline(ps, ptok, ',')) {
+                    size_t a = ptok.find_first_not_of(' '), b = ptok.find_last_not_of(' ');
+                    std::string pname = (a == std::string::npos) ? "" : ptok.substr(a, b - a + 1);
+                    auto ci = cptIt->second.find(pidx);
+                    if (ci != cptIt->second.end() && !pname.empty()) {
+                        classInstanceVars_.insert(pname);
+                        classInstanceVarNames_[pname] = ci->second;
+                    }
+                    pidx++;
+                }
+            }
+        }
         declareParams(cppParams, declared);
         curFuncReturnIsList_ = returnIsList_;
         curFuncReturnIsString_ = baseReturnIsString_;
@@ -5387,11 +6684,21 @@ protected:
         // correctly declaring it void — "ambiguating new declaration" (verified: examples/
         // gd.ac's key-callback `hop`/`__keycb_space`). Same fix as C/Rust/Go already have.
         bool isVoidFn = returnIsVoid_ && !(!classOwner.empty() && name == "init");
+        curFuncReturnIsVoid_ = isVoidFn;
         std::string retType = (!classOwner.empty() && name == "init") ? ""
             : isVoidFn ? "void "
             : returnIsList_ ? "std::vector<long long> "
             : baseReturnIsString_ ? "std::string "
             : returnIsFloat_ ? "double " : "long long ";
+        // A free function whose every `return` traces to one directly-constructed bundle
+        // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that class
+        // directly, by value — overrides every inference above, none of which know about
+        // bundle classes.
+        {
+            auto classRetIt = classReturnFuncs_.find(name);
+            curFuncReturnClass_ = classRetIt != classReturnFuncs_.end() ? classRetIt->second : "";
+            if (classRetIt != classReturnFuncs_.end()) retType = classRetIt->second + " ";
+        }
         returnIsFloat_ = false; returnIsList_ = false; baseReturnIsString_ = false; returnIsVoid_ = false;
         emit(out, indent, retType + cppName + "(" + tparams + ") {");
         indent++;
@@ -5411,6 +6718,37 @@ protected:
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
+        if (curFuncIsGenerator_) {
+            emit(out, indent, "g->done = true;");
+            emit(out, indent, "swapcontext(&g->genCtx, &g->callerCtx);");
+            indent--;
+            emit(out, indent, "}");   // closes ac_gen_entry_<name>
+            emitRaw(out, "");
+            std::string tparams;
+            for (size_t i = 0; i < genParams_.size(); i++) {
+                if (i) tparams += ", ";
+                tparams += genParams_[i].second + " " + genParams_[i].first;
+            }
+            emit(out, 0, genStructName_ + "* " + genFuncCppName_ + "(" + tparams + ") {");
+            emit(out, 1, genStructName_ + "* g = new " + genStructName_ + "();");
+            emit(out, 1, "g->done = false;");
+            for (auto& [pn, pt] : genParams_) emit(out, 1, "g->" + pn + " = " + pn + ";");
+            emit(out, 1, "getcontext(&g->genCtx);");
+            emit(out, 1, "g->genCtx.uc_stack.ss_sp = malloc(65536);");
+            emit(out, 1, "g->genCtx.uc_stack.ss_size = 65536;");
+            emit(out, 1, "g->genCtx.uc_link = NULL;");
+            emit(out, 1, "makecontext(&g->genCtx, (void(*)(void))ac_gen_entry_" + genFuncCppName_ + ", 0);");
+            emit(out, 1, "return g;");
+            emit(out, 0, "}");
+            emitRaw(out, "");
+            curFuncIsGenerator_ = false;
+            declared.clear(); floatVars.clear();
+            curFuncReturnIsList_ = false;
+            curFuncReturnIsString_ = false;
+            curFuncReturnIsFloat_ = false;
+            curFuncReturnIsVoid_ = false;
+            return;
+        }
         indent--;
         emit(out, indent, "}");
         emitRaw(out, "");
@@ -5418,6 +6756,7 @@ protected:
         curFuncReturnIsList_ = false;
         curFuncReturnIsString_ = false;
         curFuncReturnIsFloat_ = false;
+        curFuncReturnIsVoid_ = false;
     }
     void emitIndirectCall(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &func,
@@ -5461,15 +6800,49 @@ protected:
         // Statement coercion `to_int/to_string/to_dec x = expr` DECLARES x with the target type on
         // first sight (#7 — was emitting a bare `x = …` assignment to an undeclared var), and parses
         // string↔number at the boundary (stoll/stod/to_string) instead of casting a char* pointer.
-        bool isNew = declared.insert(var).second && !floatVars.count(var);
+        //
+        // Deliberately NOT `&& !floatVars.count(var)` here (an earlier version had that,
+        // meant to stop the FLOAT branch below from re-declaring a var whose true first
+        // declaration already happened elsewhere) — floatVars is the WHOLE-PROGRAM prescan
+        // result, so it's already true here whenever x is EVER float ANYWHERE in the
+        // program, even on x's actual first appearance with a completely different `t`
+        // (e.g. `atomic x = 5` when x is later reassigned `x = 5.5`, or `short x = 100`
+        // similarly) — that suppressed THIS declaration too, leaving x's ATOMIC/SHORT
+        // branch below emitting a bare `x = ...` to a var that was never declared at all
+        // (verified real compile error: "‘x’ was not declared in this scope"). Plain
+        // declared.insert(var).second already correctly implements "was this genuinely
+        // the first declaration" on its own — a var declared untyped first (`x = 5`) and
+        // later retyped to float via an explicit TYPE_CAST reaches this function with
+        // `declared` already containing it, so the float branch's "don't redeclare"
+        // check still works without any extra help from floatVars here.
+        bool isNew = declared.insert(var).second;
         bool srcIsStr = (!src.empty() && src.front() == '"') || isStringVar(src);
+        // Boxed var (see AcDynVal's comment in emitHeader): this IS the actual retype point —
+        // build the same well-typed RHS expression the branches below already know how to build
+        // for each target type, then let AcDynVal's constructor box it. No redeclare needed
+        // (AcDynVal was already declared for this var, possibly by emitTypedStoreVar earlier).
+        if (boxedVars_.count(var)) {
+            std::string rhs = (t == IRType::STRING) ? (srcIsStr ? src : "ac_cat(" + src + ")")
+                             : (t == IRType::FLOAT)  ? (srcIsStr ? "std::stod(" + src + ")" : "(double)(" + src + ")")
+                             : (srcIsStr ? "std::stoll(" + src + ")" : "(long long)(" + src + ")");
+            emit(out, indent, (isNew ? "AcDynVal " : "") + var + " = " + rhs + ";");
+            return;
+        }
         if (t == IRType::STRING) {
             // ac_cat resolves by the src's real C++ type — a double the detector missed (e.g. a
             // math.mod result temp) formats as "1" via ac_fstr, not "1.000000" from to_string(double).
             std::string rhs = srcIsStr ? src : ("ac_cat(" + src + ")");
             emit(out, indent, (isNew ? "std::string " : "") + var + " = " + rhs + ";");
         } else if (t == IRType::FLOAT || floatVars.count(var)) {
-            if (isNew) floatVars.insert(var);
+            // `floatVars.insert(var)` must NOT be gated behind `isNew` — a var already
+            // declared (e.g. `x = 5` earlier) that's now being retyped to float via an
+            // explicit TYPE_CAST (see ir.cpp's automatic-retype comment) still needs to be
+            // remembered as float from this point on for later reads/prints, even though
+            // `isNew` is false here (verified real bug: `x = 5; x = 5.5;` silently
+            // truncated back to `5` — `x = (double)(5.5);` assigning into the ALREADY
+            // `long long x` C++ declares it as narrows the double right back down, since
+            // nothing tracked that `x` was now meant to be float).
+            floatVars.insert(var);
             std::string rhs = srcIsStr ? "std::stod(" + src + ")" : "(double)(" + src + ")";
             emit(out, indent, (isNew ? "double " : "") + var + " = " + rhs + ";");
         } else if (irIntWidth(t)) {
@@ -5529,12 +6902,20 @@ public:
     void emitFunctionPrototype(std::ostringstream &out, const std::string &name,
                                const std::string &params, int retKind) override
     {
-        std::string ret = retKind == 4 ? "void "
+        // A class-returning free function (classReturnFuncs_, see CppStrategy's own comment)
+        // still needs a correct internal prototype to compile — same as any other function —
+        // even though (like generators, see ir_codegen.cpp's public-.h generator elsewhere)
+        // it's not a sensible candidate for the PUBLIC extern "C" API surface (a raw C ABI
+        // can't understand an arbitrary C++ class return value); that's a separate concern
+        // from just getting this .cpp to compile, which is all this prototype needs to do.
+        auto cf = classReturnFuncs_.find(name);
+        std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
+                        : retKind == 4 ? "void "
                         : retKind == 2 ? "std::vector<long long> "
                         : retKind == 3 ? "std::string "
                         : retKind == 1 ? "double " : "long long ";
         int ind = 0;
-        emit(out, ind, "extern \"C\" " + ret + name + "(" + typedParamList(params) + ");");
+        emit(out, ind, "extern \"C\" " + ret + name + "(" + typedParamList(params, name) + ");");
     }
 
     // No main() wrapper — exports top-level functions and globals only.
@@ -5556,6 +6937,13 @@ public:
         emitRaw(out, "#include <cstdio>");
         emitRaw(out, "#include <cstdlib>");
         emitRaw(out, "#include <cstring>");
+        // `yield`/generators: LibStrategy inherits CppStrategy's emitFunctionBegin/emitYield/etc
+        // (the generator codegen itself) but, like ac_print_list/ac_cat below, has its own
+        // separate emitHeader that never pulled in ucontext.h or the ac_gen_cur slot those
+        // rely on — "unknown type name 'ucontext_t'" on any `--target LIB` program with a
+        // generator. Same addition as CppStrategy::emitHeader.
+        emitRaw(out, "#include <ucontext.h>");
+        emitRaw(out, "static void* ac_gen_cur;");
         emitRaw(out, "typedef long long ac_int;");
         emitRaw(out, "typedef const char* ac_str;");
         // Same whole-number-float print fix as CppStrategy/CStrategy — see their comments.
@@ -5608,6 +6996,61 @@ public:
             emitRaw(out, "    if (!b) throw std::runtime_error(\"3rd grade mathematics violated (ZeroDivisionError)\");");
             emitRaw(out, "    return a / b;");
             emitRaw(out, "}");
+        }
+        // _ac_builtin_eval: same gap as ac_idiv/ac_cat above — LibStrategy inherits CppStrategy's
+        // emitEval (calls `_ac_builtin_eval`) but never defined it in its own separate header.
+        // Same definition as CppStrategy's emitHeader; see its comment for the eval() history.
+        if (hasEvalOp_) {
+            emitRaw(out, "static const char* _ac_ep;");
+            emitRaw(out, "static double _ac_eexpr(void);");
+            emitRaw(out, "static void _ac_ews(void) {");
+            emitRaw(out, "    while (*_ac_ep == ' ' || *_ac_ep == '\\t') _ac_ep++;");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_efac(void) {");
+            emitRaw(out, "    _ac_ews();");
+            emitRaw(out, "    if (*_ac_ep == '(') {");
+            emitRaw(out, "        _ac_ep++;");
+            emitRaw(out, "        double v = _ac_eexpr();");
+            emitRaw(out, "        _ac_ews();");
+            emitRaw(out, "        if (*_ac_ep == ')') _ac_ep++;");
+            emitRaw(out, "        return v;");
+            emitRaw(out, "    }");
+            emitRaw(out, "    if (*_ac_ep == '-') { _ac_ep++; return -_ac_efac(); }");
+            emitRaw(out, "    if (*_ac_ep == '+') { _ac_ep++; return _ac_efac(); }");
+            emitRaw(out, "    char* e;");
+            emitRaw(out, "    double v = strtod(_ac_ep, &e);");
+            emitRaw(out, "    if (e == _ac_ep) return 0.0;");
+            emitRaw(out, "    _ac_ep = e;");
+            emitRaw(out, "    return v;");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_eterm(void) {");
+            emitRaw(out, "    double v = _ac_efac();");
+            emitRaw(out, "    for (;;) {");
+            emitRaw(out, "        _ac_ews();");
+            emitRaw(out, "        char c = *_ac_ep;");
+            emitRaw(out, "        if (c == '*') { _ac_ep++; v *= _ac_efac(); }");
+            emitRaw(out, "        else if (c == '/') { _ac_ep++; double d = _ac_efac(); v = d != 0.0 ? v / d : 0.0; }");
+            emitRaw(out, "        else break;");
+            emitRaw(out, "    }");
+            emitRaw(out, "    return v;");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_eexpr(void) {");
+            emitRaw(out, "    double v = _ac_eterm();");
+            emitRaw(out, "    for (;;) {");
+            emitRaw(out, "        _ac_ews();");
+            emitRaw(out, "        char c = *_ac_ep;");
+            emitRaw(out, "        if (c == '+') { _ac_ep++; v += _ac_eterm(); }");
+            emitRaw(out, "        else if (c == '-') { _ac_ep++; v -= _ac_eterm(); }");
+            emitRaw(out, "        else break;");
+            emitRaw(out, "    }");
+            emitRaw(out, "    return v;");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_builtin_eval(const char* s) {");
+            emitRaw(out, "    if (!s) return 0.0;");
+            emitRaw(out, "    _ac_ep = s;");
+            emitRaw(out, "    return _ac_eexpr();");
+            emitRaw(out, "}");
+            emitRaw(out, "static double _ac_builtin_eval(const std::string& s) { return _ac_builtin_eval(s.c_str()); }");
         }
         emitRaw(out, "#ifdef __cplusplus");
         emitRaw(out, "#include <type_traits>");
@@ -5684,24 +7127,37 @@ public:
         for (auto& [lt, ln] : pendingImports_) {
             if (lt == "ilib") {
                 if (ln == "camera") {
-                    emitRaw(out, "#include \"library/ilib/camera/camera_wrapper.hpp\"");
+                    emitRaw(out, "#include \"" + resolveIlibDir("camera") + "/camera_wrapper.hpp\"");
                     emitRaw(out, "namespace AC {");
-                    emitRaw(out, "    Camera WebCam;");
+                    emitRaw(out, "    Camera camera;");
                     emitRaw(out, "    Camera latestFrame;");
                     emitRaw(out, "    Camera firstFrame;");
                     emitRaw(out, "    SidebarConsole sidebar;");
-                    emitRaw(out, "    Screen Background;");
+                    emitRaw(out, "    Screen screen;");
+                    emitRaw(out, "    namespace { struct _WireAux { _WireAux() {");
+                    emitRaw(out, "        camera.attachAux(&latestFrame, &firstFrame);");
+                    emitRaw(out, "        screen.attachCamera(&camera);");
+                    emitRaw(out, "    } } _wireAux; }");
                     emitRaw(out, "}");
                     emitRaw(out, "using namespace AC;");
                 } else {
                     {
                         std::string absDir = resolveIlibDir(ln);
-                        emitRaw(out, "#include \"" + absDir + "/" + ln + ".hpp\"");
+                        // aczip.hpp's own C++ API lives in `namespace aczip { class ACZip {...} }`
+                        // — a variable literally named `aczip` (needed to match AC's dotted
+                        // `aczip.compress(...)` call syntax) can't coexist with a namespace of the
+                        // same name in the same scope, so this ilib gets its own thin wrapper
+                        // header instead of the generic "<lib>.hpp" include (see
+                        // aczip_wrapper.hpp's own comment).
+                        emitRaw(out, "#include \"" + absDir + "/" + (ln == "aczip" ? "aczip_wrapper.hpp" : ln + ".hpp") + "\"");
                         std::string _lnk;
                         if (ln == "machine-audio") _lnk = "acmachinaaudio";
                     else if (ln == "web-server") _lnk = "acserver";
                     else if (ln == "native-cpu") _lnk = "acncpu";
                         else if (ln == "os")       _lnk = "acoos";
+                        // aczip's name already reads as "AC Zip" — the real file is libaczip.so,
+                        // NOT libacaczip.so (see the C-target fix for this same issue above).
+                        else if (ln == "aczip")    _lnk = "aczip";
                         else { _lnk = "ac"; for (char c : ln) if (c != '-') _lnk += c; }
                         emitRaw(out, "// Link: g++ out.cpp -I. -L\"" + absDir + "\" -l" + _lnk
                                      + " -Wl,-rpath,\"" + absDir + "\"");
@@ -5839,6 +7295,7 @@ class JavaStrategy : public BackendStrategy
     std::set<std::string> userStringFuncs_;
     void setStringReturnFuncs(const std::set<std::string>& s) override { userStringFuncs_ = s; }
     std::set<std::string> listVars;   // #23: lists are ArrayList<Long> (appends propagate)
+    std::set<std::string> stringListVars_;   // a literal all-string list — ArrayList<String>, not <Long>
     std::set<std::string> floatVars;
     void setFloatVarsFull(const std::set<std::string>& s) override {
         for (const auto& v : s) floatVars.insert(v);   // #42: pre-inferred float locals
@@ -5851,6 +7308,57 @@ class JavaStrategy : public BackendStrategy
     // this is also very likely the root of the long-standing gd.ac/geodeo.ac/gl_bounce.ac/
     // pong.ac Java gl-boolean gap, same shape).
     std::set<std::string> boolVars;
+    bool curFuncIsGenerator_ = false;
+    bool isGenerator_ = false;
+    // Tracks whether the body's last real statement was already an explicit early `return`
+    // (which — see emitReturn's own comment — now emits its own done-sentinel+return, exactly
+    // matching what emitFunctionEnd's own trailer does for the implicit case). Without this,
+    // emitFunctionEnd unconditionally emitted ITS OWN copy right after, which javac then
+    // rejected as unreachable — same idea as RustStrategy/VStrategy's `lastWasReturn`.
+    bool lastWasGenReturn_ = false;
+    void setIsGenerator(bool v) override { isGenerator_ = v; }
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "AcGen.put(ac_gen_h, " + val + ", false);");
+    }
+    void emitGenCreate(std::ostringstream &out, int &indent, const std::string &res,
+                       const std::string &func, const std::string &args) override
+    {
+        emit(out, indent, "AcGenHandle " + res + " = " + func + "(" + args + ");");
+        declared.insert(res);
+    }
+    // GEN_NEXT/GEN_DONE arrive as two SEPARATE IR instructions against the same handle, but a
+    // BlockingQueue can only be taken from once per value — cache the single AcGen.take()
+    // result so GEN_DONE reads its `.done` field without re-taking (which would either block
+    // forever or silently skip a real value). ir.cpp always emits them back to back with
+    // nothing else in between (the WHILE-shape's own fixed pattern), so a single member
+    // remembering "the last GEN_NEXT's temp name" correctly correlates them — a per-CALL
+    // unique name (a counter, not "<handle>_last") is required, not just convenient: the SAME
+    // handle var can be iterated by TWO SEPARATE, sequential FOR loops (`FOR x in g: ...` used
+    // twice — see generatorHandleVars_'s own comment), and Java block-scopes `{ }` — reusing
+    // one fixed "<handle>_last" name declared inside the FIRST loop's block left it out of
+    // scope by the time the SECOND loop's GEN_NEXT/GEN_DONE tried to reference it again
+    // ("cannot find symbol").
+    std::string lastGenResultVar_;
+    void emitGenNext(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &handle) override
+    {
+        thread_local int genNextC = 0;
+        lastGenResultVar_ = "ac_gen_last_" + std::to_string(genNextC++);
+        emit(out, indent, "AcGenResult " + lastGenResultVar_ + " = AcGen.take(" + handle + ");");
+        emit(out, indent, "long " + res + " = " + lastGenResultVar_ + ".value;");
+        declared.insert(res);
+    }
+    void emitGenDone(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &handle) override
+    {
+        (void)handle;
+        emit(out, indent, "boolean " + res + " = " + lastGenResultVar_ + ".done;");
+        declared.insert(res);
+        boolVars.insert(res);   // isBoolVal() must see this so the IR's NOT(res) emits `!res`,
+                                 // not `(res == 0)` — comparing a real boolean to int is a Java
+                                 // type error.
+    }
     // `v == "true"`/`"false"` are Java boolean LITERALS (not tracked variable names, so
     // boolVars.count alone misses them) — verified: geodeo.ac/gl_bounce.ac/audio_test.ac's
     // `t_4 == true`-shaped comparisons (a gl bool-returning call's result checked against a
@@ -5900,7 +7408,8 @@ class JavaStrategy : public BackendStrategy
     static bool isWidgetCtor(const std::string& func) {
         static const std::set<std::string> ctors = {
             "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
-            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch"
+            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch",
+            "textbox"
         };
         return ctors.count(func) > 0;
     }
@@ -5910,7 +7419,7 @@ class JavaStrategy : public BackendStrategy
             {"ckbtn","AcCkbtn"}, {"radbtn","AcRadbtn"}, {"dropdown","AcDropdown"},
             {"advance","AcAdvance"}, {"slider","AcSlider"}, {"group","AcGroup"},
             {"tabs","AcTabs"}, {"scroller","AcScroller"}, {"listbox","AcListbox"},
-            {"table","AcTable"}, {"sketch","AcSketch"},
+            {"table","AcTable"}, {"sketch","AcSketch"}, {"textbox","AcTextbox"},
         };
         auto it = m.find(func);
         return it == m.end() ? "" : it->second;
@@ -6049,7 +7558,11 @@ class JavaStrategy : public BackendStrategy
     void emitCapture(std::ostringstream &out, int &indent, const std::string &val) override
     {
         if (!needsSave_) return;
-        emit(out, indent, "_acSaved.append(String.valueOf(" + val + ")).append(\"\\n\");");
+        // Float-typed capture must match Term.display's _AcFmtG convention, not Java's
+        // default String.valueOf(double) (shortest-repr-ish) — otherwise the two could
+        // disagree on the identical value (same class of gap already fixed for Rust/Go).
+        std::string sval = isFloatVal(val) ? ("_AcFmtG.fmt(" + val + ")") : ("String.valueOf(" + val + ")");
+        emit(out, indent, "_acSaved.append(" + sval + ").append(\"\\n\");");
     }
     void emitSaveFile(std::ostringstream &out, int &indent, const std::string &filename) override
     {
@@ -6079,6 +7592,7 @@ class JavaStrategy : public BackendStrategy
         if (strncmp(s, "AcMath.", 7) == 0) s += 7;
         if (isMLFloatReturningFunc(fn)) return true;
         if (isIntReturningMathFunc(s)) return false;
+        if (fn == "aczip.get_ratio" || fn == "aczip_get_ratio") return true;
         return strncmp(s, "math_", 5) == 0 || strncmp(s, "math.", 5) == 0 || strncmp(s, "stat_", 5) == 0;
     }
     bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v) || isKnownFloatName(v); }
@@ -6135,6 +7649,113 @@ class JavaStrategy : public BackendStrategy
             ffiBodies_[ln] = body;
         }
         for (auto& imp : javaImportLines_) emitRaw(out, imp);
+        // `yield`/generators: one value+done unit per BlockingQueue element, enqueued
+        // ATOMICALLY (never two separate value/done signals — that's a real cross-thread
+        // TOCTOU race between "value published" and "done set"). AcGenHandle wraps the queue
+        // with an `exhausted` flag: the generator thread enqueues its done=true sentinel
+        // exactly ONCE, right before it terminates — a SECOND `FOR x in g:` over the same
+        // already-exhausted handle (a real, ordinary pattern: `g = twovals(); FOR x in g: ...;
+        // FOR x in g: ...`) would otherwise call take() again on an empty queue that nothing
+        // will ever fill again and BLOCK FOREVER (verified: hung for real). Once `exhausted`
+        // is set, take() short-circuits to a synthetic done result instead of blocking again —
+        // the same "never resume/re-read a finished generator" guard C's design gets for free
+        // from its ucontext done-flag check, needed explicitly here since Java's queue has no
+        // such state of its own. Emitted unconditionally (harmless if the program has no
+        // generators — an unused static nested class/method is not a Java compile error).
+        // put/take swallow InterruptedException — Thread.interrupt() is never used anywhere in
+        // this codegen, so it can only ever be spurious here, but Java's checked-exception
+        // rules still require handling it inline (a lambda body can't declare `throws`).
+        // AcDynVal: a genuine tagged runtime value for the small set of variables (setBoxedVars)
+        // that Abu's retype spec requires to hold different types at different points in their
+        // own scope — one fixed Java declared type per var name can't do that. Java has no
+        // operator overloading, so like the C port, every consumer calls these methods
+        // explicitly instead of `x + 3` just working. Emitted unconditionally (cheap).
+        emitRaw(out, "final class AcDynVal {");
+        emitRaw(out, "    static final int T_INT=0, T_FLOAT=1, T_STRING=2, T_BOOL=3;");
+        emitRaw(out, "    int tag; long i; double d; String s; boolean b;");
+        emitRaw(out, "    static AcDynVal ofInt(long v) { AcDynVal r=new AcDynVal(); r.tag=T_INT; r.i=v; return r; }");
+        emitRaw(out, "    static AcDynVal ofFloat(double v) { AcDynVal r=new AcDynVal(); r.tag=T_FLOAT; r.d=v; return r; }");
+        emitRaw(out, "    static AcDynVal ofString(String v) { AcDynVal r=new AcDynVal(); r.tag=T_STRING; r.s=v==null?\"\":v; return r; }");
+        emitRaw(out, "    static AcDynVal ofBool(boolean v) { AcDynVal r=new AcDynVal(); r.tag=T_BOOL; r.b=v; return r; }");
+        emitRaw(out, "    double asD() { return tag==T_FLOAT?d : tag==T_INT?(double)i : tag==T_BOOL?(b?1.0:0.0) : 0.0; }");
+        emitRaw(out, "    long asL() { return tag==T_INT?i : tag==T_FLOAT?(long)d : tag==T_BOOL?(b?1:0) : 0; }");
+        emitRaw(out, "    public String toString() {");
+        emitRaw(out, "        if (tag==T_STRING) return s;");
+        emitRaw(out, "        if (tag==T_BOOL) return b?\"true\":\"false\";");
+        emitRaw(out, "        if (tag==T_INT) return Long.toString(i);");
+        emitRaw(out, "        long xi=(long)d; return ((double)xi==d) ? Long.toString(xi) : Double.toString(d);");
+        emitRaw(out, "    }");
+        emitRaw(out, "    AcDynVal add(AcDynVal o) {");
+        emitRaw(out, "        if (tag==T_STRING||o.tag==T_STRING) return ofString(toString()+o.toString());");
+        emitRaw(out, "        if (tag==T_FLOAT||o.tag==T_FLOAT) return ofFloat(asD()+o.asD());");
+        emitRaw(out, "        return ofInt(asL()+o.asL());");
+        emitRaw(out, "    }");
+        emitRaw(out, "    AcDynVal sub(AcDynVal o) { return (tag==T_FLOAT||o.tag==T_FLOAT) ? ofFloat(asD()-o.asD()) : ofInt(asL()-o.asL()); }");
+        emitRaw(out, "    AcDynVal mul(AcDynVal o) { return (tag==T_FLOAT||o.tag==T_FLOAT) ? ofFloat(asD()*o.asD()) : ofInt(asL()*o.asL()); }");
+        emitRaw(out, "    AcDynVal div(AcDynVal o) { return ofFloat(asD()/o.asD()); }");
+        emitRaw(out, "    boolean eq(AcDynVal o) { return (tag==T_STRING||o.tag==T_STRING) ? toString().equals(o.toString()) : asD()==o.asD(); }");
+        emitRaw(out, "    boolean lt(AcDynVal o) { return (tag==T_STRING||o.tag==T_STRING) ? toString().compareTo(o.toString())<0 : asD()<o.asD(); }");
+        emitRaw(out, "    boolean gt(AcDynVal o) { return (tag==T_STRING||o.tag==T_STRING) ? toString().compareTo(o.toString())>0 : asD()>o.asD(); }");
+        emitRaw(out, "}");
+        // Cross-backend float-display convention (see JavaScriptStrategy::emitHeader's `ac_fmtg`
+        // for the full rationale) — Java's OWN `String.format("%.16g", ...)` was tried first and
+        // REJECTED: verified a genuine rounding bug in it independent of anything AC does
+        // (10.0/3.0's true value, per BigDecimal(double)'s exact decomposition, is
+        // 3.333333333333333481363...; correctly rounded to 16 sig figs that's
+        // "3.333333333333333" — glibc's %.16g agrees — but Java's Formatter prints
+        // "3.333333333333334", off in the last digit). BigDecimal(double) captures the EXACT
+        // binary value with no rounding at all, then .round(MathContext) does correct decimal
+        // rounding directly — verified byte-for-byte against real %.16g across the same spread
+        // used for the JS port (whole/negative/tiny/huge/scientific-boundary values). Uses
+        // fully-qualified java.math.* names so no import-ordering dance is needed.
+        emitRaw(out, "final class _AcFmtG {");
+        emitRaw(out, "    static String fmt(double d) {");
+        emitRaw(out, "        if (d == 0) return (1/d < 0) ? \"-0\" : \"0\";");
+        emitRaw(out, "        boolean neg = d < 0;");
+        emitRaw(out, "        java.math.BigDecimal bd = new java.math.BigDecimal(Math.abs(d));");
+        emitRaw(out, "        java.math.BigDecimal rounded = bd.round(new java.math.MathContext(16, java.math.RoundingMode.HALF_UP));");
+        emitRaw(out, "        java.math.BigDecimal stripped = rounded.stripTrailingZeros();");
+        emitRaw(out, "        String unscaled = stripped.unscaledValue().abs().toString();");
+        emitRaw(out, "        int scale = stripped.scale();");
+        emitRaw(out, "        int exp = unscaled.length() - 1 - scale;");
+        emitRaw(out, "        String result;");
+        emitRaw(out, "        if (exp < -4 || exp >= 16) {");
+        emitRaw(out, "            String mant = unscaled.length() > 1 ? unscaled.charAt(0) + \".\" + unscaled.substring(1) : unscaled;");
+        emitRaw(out, "            result = mant + \"e\" + (exp < 0 ? \"-\" : \"+\") + String.format(\"%02d\", Math.abs(exp));");
+        emitRaw(out, "        } else if (exp >= 0) {");
+        emitRaw(out, "            if (unscaled.length() <= exp + 1) {");
+        emitRaw(out, "                StringBuilder sb = new StringBuilder(unscaled);");
+        emitRaw(out, "                for (int i = unscaled.length(); i <= exp; i++) sb.append('0');");
+        emitRaw(out, "                result = sb.toString();");
+        emitRaw(out, "            } else {");
+        emitRaw(out, "                result = unscaled.substring(0, exp + 1) + \".\" + unscaled.substring(exp + 1);");
+        emitRaw(out, "            }");
+        emitRaw(out, "        } else {");
+        emitRaw(out, "            StringBuilder sb = new StringBuilder(\"0.\");");
+        emitRaw(out, "            for (int i = 0; i < -exp - 1; i++) sb.append('0');");
+        emitRaw(out, "            sb.append(unscaled);");
+        emitRaw(out, "            result = sb.toString();");
+        emitRaw(out, "        }");
+        emitRaw(out, "        String s = (neg ? \"-\" : \"\") + result;");
+        emitRaw(out, "        if (s.indexOf('.') < 0 && s.indexOf('e') < 0) s += \".0\";");
+        emitRaw(out, "        return s;");
+        emitRaw(out, "    }");
+        emitRaw(out, "}");
+        emitRaw(out, "class AcGenResult { long value; boolean done; AcGenResult(long v, boolean d) { value = v; done = d; } }");
+        emitRaw(out, "class AcGenHandle { java.util.concurrent.BlockingQueue<AcGenResult> queue = new java.util.concurrent.ArrayBlockingQueue<>(1); boolean exhausted = false; }");
+        emitRaw(out, "class AcGen {");
+        emitRaw(out, "    static void put(AcGenHandle h, long v, boolean done) {");
+        emitRaw(out, "        try { h.queue.put(new AcGenResult(v, done)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }");
+        emitRaw(out, "    }");
+        emitRaw(out, "    static AcGenResult take(AcGenHandle h) {");
+        emitRaw(out, "        if (h.exhausted) return new AcGenResult(0, true);");
+        emitRaw(out, "        try {");
+        emitRaw(out, "            AcGenResult r = h.queue.take();");
+        emitRaw(out, "            if (r.done) h.exhausted = true;");
+        emitRaw(out, "            return r;");
+        emitRaw(out, "        } catch (InterruptedException e) { Thread.currentThread().interrupt(); h.exhausted = true; return new AcGenResult(0, true); }");
+        emitRaw(out, "    }");
+        emitRaw(out, "}");
         // ilib FFI classes emitted before main class (Java allows multiple non-public classes per file)
         for (auto& [lt, ln] : pendingImports_) {
             if (lt == "ilib" && ln == "math") {
@@ -6332,6 +7953,18 @@ class JavaStrategy : public BackendStrategy
         // Bundle field READ (self.field as an operand, not just a STORE_VAR target): same
         // this.field translation as decl() applies to writes.
         if (s.rfind("self.", 0) == 0) return "this." + s.substr(5);
+        // Bundle field READ on a NAMED instance, not just `self` (`q.x` after `q = f()` where
+        // f always constructs+returns one class — see classInstanceVars_'s own comment). Java
+        // already natively supports `q.x` syntax once `q` is declared with its real class
+        // type (see decl()'s matching fix) — this dotted name just needs to pass through
+        // UNCHANGED rather than accidentally being touched by some other transform, so this
+        // is mostly a documented no-op guard; real work is in decl()'s WRITE-side fix.
+        {
+            auto dot = s.find('.');
+            if (r.kind == IRRef::Kind::VAR && dot != std::string::npos
+                    && classInstanceVars_.count(s.substr(0, dot)))
+                return s;
+        }
         // Dot-style (math.pi, math.sin): go to the `math` namespace class directly. This
         // referenced "AcMath" — a class that doesn't exist anywhere in Java's output (the real
         // shim class, emitted in emitHeader, is named `math`, lowercase, native
@@ -6353,6 +7986,24 @@ class JavaStrategy : public BackendStrategy
         // formatRef() on the READ side) — handle both, never double-translate.
         if (var.rfind("self.", 0) == 0) return "this." + var.substr(5) + " = " + val + ";";
         if (var.rfind("this.", 0) == 0) return var + " = " + val + ";";
+        // Bundle field WRITE on a NAMED instance, not just `self` (`q.x = 5` — verified real
+        // bug: fell through to the generic branch below, `long q.x = 5;`, invalid Java). A
+        // field on a real object is never independently "declared" — always a plain
+        // assignment, same as formatRef's matching read-side comment.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot)))
+                return var + " = " + val + ";";
+        }
+        // `q = f()` where f always constructs+returns one bundle class (classFuncs_'s prescan
+        // via noteInstanceClass) — declare `q` with its REAL type, not the generic fallback.
+        {
+            auto civ = classInstanceVarNames_.find(var);
+            if (civ != classInstanceVarNames_.end()) {
+                if (declared.insert(var).second) return civ->second + " " + var + " = " + val + ";";
+                return var + " = " + val + ";";
+            }
+        }
         if (declared.insert(var).second)
         {
             IRType ct = castDeclType(var, floatVars.count(var) ? IRType::FLOAT : IRType::VOID);
@@ -6383,6 +8034,15 @@ class JavaStrategy : public BackendStrategy
             return "long " + var + " = " + val + ";";
         }
         return var + " = " + val + ";";
+    }
+
+    void emitLockBegin(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "synchronized (_ac_atomic_lock) {");
+        indent++;
+    }
+    void emitLockEnd(std::ostringstream &out, int &indent) override {
+        indent--;
+        emit(out, indent, "}");
     }
 
     void emitStoreVar(std::ostringstream &out, int &indent, const std::string &var, const std::string &val) override
@@ -6425,21 +8085,56 @@ class JavaStrategy : public BackendStrategy
     void emitMod(std::ostringstream &out, int &indent,
                  const std::string &res, const std::string &lhs, const std::string &rhs) override
     { emit(out, indent, decl(res, "Math.floorMod((long)(" + lhs + "), (long)(" + rhs + "))")); }
+    // Wrap a plain (non-AcDynVal) value into the right AcDynVal.of* call by its apparent type —
+    // Java has no operator overloading/implicit user conversions, so unlike (say) the C++ port's
+    // AcDynVal, callers must always be explicit about which constructor applies.
+    std::string boxWrap(const std::string& v, IRType t = IRType::VOID) const {
+        if (boxedVars_.count(v)) return v;
+        if (t == IRType::STRING || looksString(v) || isStringVar(v)) return "AcDynVal.ofString(" + v + ")";
+        if (t == IRType::FLOAT || isFloatVal(v)) return "AcDynVal.ofFloat(" + v + ")";
+        if (t == IRType::BOOL) return "AcDynVal.ofBool(" + v + ")";
+        return "AcDynVal.ofInt((long)(" + v + "))";
+    }
     void emitTypedStoreVar(std::ostringstream &out, int &indent,
                            const std::string &var, const std::string &val, IRType t) override
     {
         // Bundle field write via a typed decl (e.g. `atomic hp = 5` as a field default) — same
         // translation as decl(): real class member, no redeclaration, this.field not self.field.
         if (var.rfind("self.", 0) == 0 || var.rfind("this.", 0) == 0) { emit(out, indent, decl(var, val)); return; }
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in the
-        // global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible RMW.
-        // The declaration itself stays OUTSIDE the synchronized block (a Java local declared inside
-        // a block is scoped to it — later reads of `var` would be "cannot find symbol").
+        // Bundle field WRITE on a NAMED instance, not just `self` — decl()'s own matching fix.
+        // The shared driver's STORE_VAR dispatch ALWAYS calls emitTypedStoreVar (never decl()
+        // directly), so decl()'s classInstanceVars_ check alone was never reachable for a typed
+        // store — same gap as CStrategy/CppStrategy's sibling fix, verified the identical way.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot))) {
+                emit(out, indent, var + " = " + val + ";");
+                return;
+            }
+        }
+        // `atomic` var: no inline synchronized-wrap here anymore — ir.cpp now brackets
+        // the WHOLE read-modify-write span with real LOCK_BEGIN/LOCK_END instructions
+        // (see emitLockBegin/emitLockEnd below), closing the TOCTOU race the old
+        // store-only wrap here could never actually close. Java's `synchronized` block
+        // is reentrant per-thread (unlike C's pthread_mutex/C++'s std::mutex), so this
+        // specific old wrap wouldn't have deadlocked if left nested — but it's still
+        // redundant and confusing, so removed for the same reason as every other
+        // backend. Keeps the declare-if-new step: a Java local declared inside a block
+        // is scoped to it, so the FIRST-ever write still needs `var` to exist before
+        // the (now external) lock brackets, if this fires for one at all — in
+        // practice it won't, since the initial `atomic x = e` declaration is a
+        // separate statement (TypeCoerceStmt) ir.cpp doesn't bracket, only later
+        // reassignments are, and those always find `var` already declared.
         if (castDeclType(var, IRType::VOID) == IRType::ATOMIC) {
             if (declared.insert(var).second) emit(out, indent, "long " + var + " = 0;");
-            emit(out, indent, "synchronized (_ac_atomic_lock) {");
-            emit(out, indent + 1, var + " = (long)(" + val + ");");
-            emit(out, indent, "}");
+            emit(out, indent, var + " = (long)(" + val + ");");
+            return;
+        }
+        // Boxed var (setBoxedVars/detectBoxedVars — see AcDynVal's comment in emitHeader): must
+        // run before the string-unification branch below, which would otherwise force a String
+        // declaration that can't hold this var's genuinely-numeric earlier value.
+        if (boxedVars_.count(var)) {
+            emit(out, indent, (declared.insert(var).second ? "AcDynVal " : "") + var + " = " + boxWrap(val, t) + ";");
             return;
         }
         // Re-typing coercion (#retype): a var ever assigned a string is a String everywhere;
@@ -6457,6 +8152,17 @@ class JavaStrategy : public BackendStrategy
             else                             emit(out, indent, var + " = " + bare + ";");
             return;
         }
+        // A plain-variable copy of a list-typed value (`y = t_0` after `t_0 := ALLOC(range
+        // ...)`, e.g. `y = range 5` used as a plain value rather than a FOR-loop collection) —
+        // neither branch below ever checked listVars, so it fell to the `long` default and
+        // punned an ArrayList<Long> through a scalar ("incompatible types: ArrayList<Long>
+        // cannot be converted to long").
+        if (listVars.count(val)) {
+            listVars.insert(var);
+            if (declared.insert(var).second) emit(out, indent, "java.util.ArrayList<Long> " + var + " = " + val + ";");
+            else                             emit(out, indent, var + " = " + val + ";");
+            return;
+        }
         if (declared.insert(var).second) {
             IRType declType = castDeclType(var, floatVars.count(var) ? IRType::FLOAT : t);
             if      (declType == IRType::FLOAT)  { floatVars.insert(var); emit(out, indent, "double " + var + " = (double)(" + val + ");"); }
@@ -6465,17 +8171,39 @@ class JavaStrategy : public BackendStrategy
                                                   emit(out, indent, "long " + var + " = (long)(" + val + ");");
             else { declared.erase(var); emit(out, indent, decl(var, val)); }
         } else {
-            // Float value assigned to a long variable: cast to long to avoid Java type error
+            // Same narrowing cast emitStoreVar (its sibling, used for the untyped store
+            // path) already applies for a short/mini var — missing here meant a PLAIN
+            // reassignment to an already-declared short/mini var (`x = <literal>`, not a
+            // compound op) skipped the cast entirely and left the RHS's `long` literal
+            // assigned straight to Java's `int`/`short` field: javac rejects that outright
+            // ("incompatible types: possible lossy conversion") even when the literal
+            // provably fits the narrower type, since Java requires an explicit narrowing
+            // cast regardless. Caught once the auto-retype sticky-fix started correctly
+            // keeping such a var short/mini-typed through a plain reassignment instead of
+            // silently widening it to `long` (which never needed this cast at all).
+            IRType ct = castDeclType(var, IRType::VOID);
             bool valIsFloat = (t == IRType::FLOAT) || isFloatVal(val);
-            if (valIsFloat && !floatVars.count(var))
+            if (irIntWidth(ct) && !valIsFloat) {
+                emit(out, indent, var + " = (" + acIntTypeJava(irIntWidth(ct)) + ")(" + val + ");");
+            } else if (valIsFloat && !floatVars.count(var)) {
+                // Float value assigned to a long variable: cast to long to avoid Java type error
                 emit(out, indent, var + " = (long)(" + val + ");");
-            else
+            } else {
                 emit(out, indent, var + " = " + val + ";");
+            }
         }
     }
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — see AcDynVal's comment in emitHeader; must run before the string
+        // branch below (Java's native `+` on a String and an AcDynVal doesn't compile).
+        if (boxedVars_.count(lhs) || boxedVars_.count(rhs)) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string fn = op=="+" ? "add" : op=="-" ? "sub" : (op=="*"||op=="@") ? "mul" : "div";
+            emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + l + "." + fn + "(" + r + ");");
+            return;
+        }
         bool isFloat = isFloatVal(lhs) || isFloatVal(rhs);
         // String concat: Java's + works natively — but the RESULT must be String, not long.
         auto looksStr2 = [&](const std::string& v) {
@@ -6505,6 +8233,14 @@ class JavaStrategy : public BackendStrategy
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — same reasoning as emitBinaryOp's own boxed branch.
+        if ((op=="=="||op=="!="||op=="<"||op==">") && (boxedVars_.count(lhs) || boxedVars_.count(rhs))) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string cmp = op=="==" ? l+".eq("+r+")" : op=="!=" ? "(!"+l+".eq("+r+"))"
+                             : op=="<"  ? l+".lt("+r+")" : l+".gt("+r+")";
+            emit(out, indent, decl(res, "(" + cmp + ") ? 1L : 0L"));
+            return;
+        }
         // Java String equality is CONTENT via .equals — `==` compares references (#6:
         // `c == "1"` was always false, silently zeroing bin_to_dec).
         auto looksStr = [&](const std::string& v) {
@@ -6530,12 +8266,23 @@ class JavaStrategy : public BackendStrategy
             expr = "Math.abs((" + lhs + ") - (" + rhs + ")) + 1L";
         else if (op == "not")
             expr = isBoolVal(lhs) ? ("!" + lhs + " ? 1L : 0L") : ("(" + lhs + " == 0) ? 1L : 0L");
-        else if (op == "==" || op == "!=")
+        else if (op == "==" || op == "!=") {
             // Short-circuit `or`/`and` lowering (ir.cpp's `ac_sc_N` temps) explicitly compares
             // a possibly-boolean operand against 0 with `!=`/`==` — same gap, different shape
             // (verified: pong.ac's `(A overlap B) or (A overlap C)` — "incomparable types:
             // boolean and long" on `t_6 != 0L` where t_6 is AcGl.hitboxOverlap's boolean result).
-            expr = "(" + truthy(lhs) + " " + op + " " + truthy(rhs) + ") ? 1L : 0L";
+            // Wrapping BOTH sides in truthy() unconditionally (the old code) turned every
+            // plain int/long comparison between two NON-boolean, non-constant operands into a
+            // truthiness XOR — (lhs!=0)!=(rhs!=0) instead of lhs!=rhs — silently wrong whenever
+            // neither side folded to a compile-time literal (verified: `WHILST i #= 6` with a
+            // runtime loop counter `i` skipped every iteration except i==0). Only coerce the
+            // side that ISN'T already a real Java boolean — comparing bool against a raw long is
+            // the actual type error being worked around here, not comparing two longs directly.
+            bool lb = isBoolVal(lhs), rb = isBoolVal(rhs);
+            std::string L = lb ? lhs : (rb ? "(" + lhs + " != 0)" : lhs);
+            std::string R = rb ? rhs : (lb ? "(" + rhs + " != 0)" : rhs);
+            expr = "(" + L + " " + op + " " + R + ") ? 1L : 0L";
+        }
         else
             expr = "(" + lhs + " " + op + " " + rhs + ") ? 1L : 0L";
         emit(out, indent, decl(res, expr));
@@ -6565,6 +8312,18 @@ class JavaStrategy : public BackendStrategy
                     emit(out, indent, func + "(" + joined + ");");
                     return;
                 }
+                // Screen.dimensions(w, h) — same "AC integer arg formats as `long`, javac won't
+                // narrow implicitly" fixup as sketch's byte params above, this time to (int)
+                // (verified: "incompatible types: possible lossy conversion from long to int" on
+                // `root.dimensions(400L, 300L)`).
+                if (wit != widgetVarClass_.end() && wit->second == "Screen" && method == "dimensions") {
+                    std::vector<std::string> a = splitTopArgs(args);
+                    for (auto& arg : a) arg = "(int)(" + arg + ")";
+                    std::string joined;
+                    for (size_t i = 0; i < a.size(); i++) { if (i) joined += ", "; joined += a[i]; }
+                    emit(out, indent, func + "(" + joined + ");");
+                    return;
+                }
             }
         }
         // `x = recv.get()` where recv is a widget var — the generic dot-call fallback below
@@ -6582,7 +8341,7 @@ class JavaStrategy : public BackendStrategy
                         {"AcAsk","String"}, {"AcDisplay","String"}, {"AcDropdown","String"},
                         {"AcAdvance","double"}, {"AcSlider","double"},
                         {"AcCkbtn","boolean"}, {"AcRadbtn","boolean"},
-                        {"AcListbox","java.util.List<String>"},
+                        {"AcListbox","java.util.List<String>"}, {"AcTextbox","String"},
                     };
                     auto tIt = getReturnType.find(wit->second);
                     if (tIt != getReturnType.end()) {
@@ -6594,6 +8353,21 @@ class JavaStrategy : public BackendStrategy
                         else if (ty == "double") floatVars.insert(res);
                         return;
                     }
+                }
+            }
+        }
+        // `x = tb.find($needle$)` — same return-type gap as `.get()` above but for a 1-arg
+        // method, so it falls outside that block's `args.empty()` gate entirely.
+        {
+            auto dot = func.rfind('.');
+            if (dot != std::string::npos && !args.empty() && !res.empty()) {
+                std::string recv = func.substr(0, dot), method = func.substr(dot + 1);
+                auto wit = widgetVarClass_.find(recv);
+                if (wit != widgetVarClass_.end() && wit->second == "AcTextbox" && method == "find") {
+                    bool isNew = declared.insert(res).second;
+                    emit(out, indent, (isNew ? "String " : "") + res + " = " + func + "(" + args + ");");
+                    stringVars_.insert(res);
+                    return;
                 }
             }
         }
@@ -6764,9 +8538,17 @@ class JavaStrategy : public BackendStrategy
             {"AcGl.drawVertex","sff"}, {"AcGl.drawLine","sffffbbb"}, {"AcGl.drawCircle","sfffbbb"},
             {"AcGl.frameUpdate","f"}, {"AcGl.screenInit","iis"},
         };
-        auto atIt = acGlArgTypes.find(actualFunc);
-        if (atIt != acGlArgTypes.end()) {
-            const std::string &types = atIt->second;
+        // Same lossy-conversion problem as gl above, for camera's one non-String numeric
+        // param: `sidebar.setinteractive(int)` (camera_ffi.java) rejects a bare AC long
+        // literal/var with "possible lossy conversion from long to int".
+        static const std::unordered_map<std::string,std::string> acCameraArgTypes = {
+            {"sidebar.setinteractive","i"},
+        };
+        const std::string* argTypes = nullptr;
+        { auto it = acGlArgTypes.find(actualFunc); if (it != acGlArgTypes.end()) argTypes = &it->second; }
+        if (!argTypes) { auto it = acCameraArgTypes.find(actualFunc); if (it != acCameraArgTypes.end()) argTypes = &it->second; }
+        if (argTypes) {
+            const std::string &types = *argTypes;
             std::vector<std::string> gargs; { std::string cur; int depth = 0;
                 for (char c : castArgs) { if (c=='('||c=='[') depth++; else if (c==')'||c==']') depth--;
                     if (c==',' && depth==0) { gargs.push_back(cur); cur.clear(); } else cur += c; }
@@ -6782,6 +8564,12 @@ class JavaStrategy : public BackendStrategy
             }
         }
         std::string call = actualFunc + "(" + castArgs + ")";
+        // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
+        // see AcDynVal's comment in emitHeader.
+        if (!res.empty() && boxedVars_.count(res)) {
+            emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + boxWrap(call) + ";");
+            return;
+        }
         if (glBoolFuncs.count(actualFunc)) {
             if (res.empty()) {
                 emit(out, indent, call + ";");
@@ -6836,6 +8624,28 @@ class JavaStrategy : public BackendStrategy
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
+        // A generator's body runs inside `new Thread(() -> { ... })` — a Runnable lambda with
+        // no return value, since the OUTER function's real return is the queue (emitted once,
+        // in emitFunctionEnd). `return expr` inside a generator ends iteration early and
+        // DISCARDS expr (see the yield plan's own explicit scope cut).
+        //
+        // An EXPLICIT mid-body return (val non-empty) must ALSO enqueue the done sentinel
+        // before returning — a bare Java `return;` here just ends the lambda/thread normally
+        // (no process-wide crash like C/CPP's makecontext design), but WITHOUT the sentinel the
+        // consumer's next `AcGen.take()` blocks forever waiting for a value the thread will
+        // never send (verified real bug: javac even rejected the naive fix — emitting nothing
+        // here left the yields textually AFTER the `return;` compiled as real code, which javac
+        // correctly flagged "unreachable statement" once a bare `return;` WAS emitted for the
+        // val-empty case elsewhere; the actual fix needs the sentinel-then-return done HERE,
+        // not deferred to emitFunctionEnd's trailer, which an early return skips entirely).
+        if (curFuncIsGenerator_) {
+            if (!val.empty()) {
+                emit(out, indent, "AcGen.put(ac_gen_h, 0, true);");
+                emit(out, indent, "return;");
+                lastWasGenReturn_ = true;
+            }
+            return;
+        }
         // Bare return (empty val) is the IR's safety fallthrough — suppress it in Java.
         // Java's own flow analysis catches genuinely missing returns.
         if (val.empty()) return;
@@ -6858,6 +8668,7 @@ class JavaStrategy : public BackendStrategy
         // to pick). Cast disambiguates to the String overload, which prints "null" as text —
         // matches every other backend's null/nil text representation.
         if (val == "null") emit(out, indent, "System.out.println((String) null);");
+        else if (isFloatVal(val)) emit(out, indent, "System.out.println(_AcFmtG.fmt(" + val + "));");
         else emit(out, indent, "System.out.println(" + val + ");");
     }
     // Same gap+fix as CStrategy's own emitConfirm (see its comment) — base default never
@@ -6881,8 +8692,24 @@ class JavaStrategy : public BackendStrategy
         emit(out, indent, "try { Thread.sleep((long)((" + secs + ") * 1000L)); } catch (InterruptedException _ac_ie) { Thread.currentThread().interrupt(); }");
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
+        if (!argIsString) {
+            // Same fix as GoStrategy (see its comment) — Java's generic emitLazyEval declares an
+            // `Object` result, a hard compile error once assigned into a statically-typed
+            // destination ("Object cannot be converted to long"). resultType from ir.cpp is
+            // unreliable for a call like sideEffectFn() (unknown until Java's OWN whole-program
+            // prescan runs, after ir.cpp); query expr's own tracked type instead — by the time
+            // emitEval runs, that prescan has already typed `expr` correctly.
+            std::string jt = isFloatVal(expr) ? "double" : isStringVar(expr) ? "String" : "long";
+            std::string zero = jt == "String" ? "\"\"" : "0";
+            if (declared.insert(res).second) {
+                if (jt == "double") floatVars.insert(res);
+                emit(out, indent, jt + " " + res + ";");
+            }
+            emit(out, indent, "try { " + res + " = " + expr + "; } catch (Throwable _e) { " + res + " = " + zero + "; }");
+            return;
+        }
         if (declared.insert(res).second) {
             floatVars.insert(res);
             emit(out, indent, "double " + res + " = _AcEval.eval(" + expr + ");");
@@ -7024,9 +8851,30 @@ class JavaStrategy : public BackendStrategy
                    const std::string &var, const std::string &type,
                    const std::string &content, const std::string &content2 = "") override
     {
-        if (type == "range") { rangeOf_[var] = content; return; }
-        if (type == "sequence") {
-            seqOf_[var] = {content, content2.empty() ? content : content2};
+        if (type == "range" || type == "sequence") {
+            // See CStrategy's matching emitAlloc comment: rangeOf_/seqOf_ alone leave `var`
+            // completely undeclared when used as a plain VALUE, not immediately consumed by a
+            // FOR loop — "cannot find symbol" the moment anything referenced it.
+            std::string a, b, step;
+            if (type == "range") { rangeOf_[var] = content; a = "0"; b = content; }
+            else {
+                auto [b0, st] = splitSeqStep(content2);
+                b = b0.empty() ? content : b0; step = st;
+                seqOf_[var] = {content, b}; a = content;
+            }
+            thread_local int rngC = 0;
+            std::string iv = "_ac_rng_i_" + std::to_string(rngC++);
+            listVars.insert(var); declared.insert(var);
+            emit(out, indent, "java.util.ArrayList<Long> " + var + " = new java.util.ArrayList<>();");
+            if (step.empty()) {
+                emit(out, indent, "for (long " + iv + " = (" + a + "); " + iv + " < (" + b + "); " + iv + "++) "
+                                 + var + ".add(" + iv + ");");
+            } else {
+                std::string sv = "_ac_rng_st_" + std::to_string(rngC - 1);
+                emit(out, indent, "long " + sv + " = (" + step + ");");
+                emit(out, indent, "for (long " + iv + " = (" + a + "); (" + sv + " > 0) ? (" + iv + " < (" + b + ")) : (" + iv + " > (" + b + ")); " + iv + " += " + sv + ") "
+                                 + var + ".add(" + iv + ");");
+            }
             return;
         }
         if (type == "string") {
@@ -7055,6 +8903,18 @@ class JavaStrategy : public BackendStrategy
                 emit(out, indent, "java.util.ArrayList<java.util.Map<String," + vt + ">> " + var
                     + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + listOf + "));");
                 declared.insert(var);
+                return;
+            }
+            // A literal all-string list (`[$a$, $b$, $c$]` / `[$a, b, c$]`) needs a real
+            // ArrayList<String> — the numeric branch below always assumed Long elements
+            // (verified real bug: `[$a$,$b$,$c$]` produced
+            // `Arrays.asList($a$, $b$, $c$)` — "cannot find symbol $a$", since content's
+            // raw `$..$` text was never converted to Java string literals at all).
+            if (isAllStringListContent(content)) {
+                stringListVars_.insert(var); declared.insert(var);
+                std::string elems = convertListContent(content,
+                    [](const std::string& s) { return "\"" + escapeStr(s) + "\""; });
+                emit(out, indent, "java.util.ArrayList<String> " + var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + elems + "));");
                 return;
             }
             listVars.insert(var); declared.insert(var);
@@ -7163,6 +9023,15 @@ class JavaStrategy : public BackendStrategy
         declareParams(jParams, declared);
         // Build typed params: use String for GL-name params, long for others
         std::string tparams;
+        std::vector<std::string> paramNames;
+        std::vector<std::string> paramTypes;
+        // classParamTypes_ (see its own comment): a param proven to receive a bundle/tuple
+        // instance argument needs the real class type, not `long` — same bug as C's `ac_int
+        // p`, fixed identically. Also pre-seeds classInstanceVars_/classInstanceVarNames_ so
+        // the body's `p.field` reads format as a real field access.
+        auto cptIt = classParamTypes_.find(name);
+        const std::map<int,std::string>* cpt = cptIt != classParamTypes_.end() ? &cptIt->second : nullptr;
+        int pIdx = 0;
         if (!jParams.empty()) {
             std::istringstream pss(jParams);
             std::string ptok;
@@ -7173,15 +9042,22 @@ class JavaStrategy : public BackendStrategy
                 std::string pname = (a != std::string::npos) ? ptok.substr(a, b-a+1) : ptok;
                 if (!pfirst) tparams += ", ";
                 auto fit = funcTypedParams_.find(pname);
-                if (isStringVar(pname)) {
-                    tparams += "String " + pname;    // #6: inferred string param
+                auto cit = cpt ? cpt->find(pIdx) : std::map<int,std::string>::const_iterator();
+                pIdx++;
+                std::string ptype;
+                if (cpt && cit != cpt->end()) {
+                    ptype = cit->second;
+                    classInstanceVars_.insert(pname);
+                    classInstanceVarNames_[pname] = cit->second;
+                } else if (isStringVar(pname)) {
+                    ptype = "String";    // #6: inferred string param
                 } else if (listParams_.count(pname)) {
-                    tparams += "java.util.ArrayList<Long> " + pname;   // #23: shared reference
+                    ptype = "java.util.ArrayList<Long>";   // #23: shared reference
                     listVars.insert(pname);
                 } else if (fit != funcTypedParams_.end()) {
                     // java.util.function: 1-arg → LongUnaryOperator, else LongFunction<Long>
-                    tparams += (fit->second == 1 ? "java.util.function.LongUnaryOperator "
-                                                 : "java.util.function.LongFunction<Long> ") + pname;
+                    ptype = (fit->second == 1 ? "java.util.function.LongUnaryOperator"
+                                              : "java.util.function.LongFunction<Long>");
                 } else if (floatParams_.count(pname)) {
                     // Same gap/fix as RustStrategy's floatParams_ (see its own comment) — a
                     // param the function's OWN body treats as float (`x / 2.0`) always
@@ -7189,12 +9065,60 @@ class JavaStrategy : public BackendStrategy
                     // literal was "incompatible types: possible lossy conversion from double to
                     // long" (verified: examples/newton_sqrt.ac's `nsqrt(2.0)`).
                     floatVars.insert(pname);
-                    tparams += "double " + pname;
+                    ptype = "double";
                 } else {
-                    tparams += (stringParams_.count(pname) ? "String " : "long ") + pname;
+                    ptype = stringParams_.count(pname) ? "String" : "long";
                 }
+                paramNames.push_back(pname);
+                paramTypes.push_back(ptype);
+                tparams += ptype + " " + pname;
                 pfirst = false;
             }
+        }
+        // Generator: real Thread + an AcGenHandle (a bounded capacity-1 BlockingQueue plus an
+        // exhausted flag — see AcGen/AcGenResult/AcGenHandle, emitted once in emitHeader). The
+        // body runs inside a Runnable
+        // lambda passed to `new Thread(...)`, a Thread with NO return type, so `yield`/
+        // `return` inside it never need one (see emitYield/emitReturn's own generator
+        // branches). Each param gets a FRESH local `long p = p_p;`-style copy inside the
+        // lambda (matching Go/Rust/V's own identical pattern) rather than relying on Java's
+        // implicit lambda capture-by-reference, since a captured local must be "effectively
+        // final" — a generator body that reassigns its own parameter directly (a completely
+        // ordinary AC pattern) would otherwise be a hard compile error.
+        curFuncIsGenerator_ = isGenerator_;
+        lastWasGenReturn_ = false;
+        if (curFuncIsGenerator_) {
+            // The OUTER function's own params are suffixed `_p` (Java forbids a lambda from
+            // declaring a local that shadows a variable captured from its enclosing scope —
+            // "variable n is already defined in the enclosing scope" — so the body-local
+            // "bare name" copy below can't reuse the outer signature's own param names).
+            std::string genSig;
+            for (size_t i = 0; i < paramNames.size(); i++) {
+                if (i) genSig += ", ";
+                genSig += paramTypes[i] + " " + paramNames[i] + "_p";
+            }
+            emit(out, indent, "static AcGenHandle " + jName + "(" + genSig + ") {");
+            indent++;
+            emit(out, indent, "AcGenHandle ac_gen_h = new AcGenHandle();");
+            emit(out, indent, "Thread ac_gen_t = new Thread(() -> {");
+            indent++;
+            for (size_t i = 0; i < paramNames.size(); i++) {
+                emit(out, indent, paramTypes[i] + " " + paramNames[i] + " = " + paramNames[i] + "_p;");
+                declared.insert(paramNames[i]);
+            }
+            for (const auto& [v, t] : hoistVars_) {
+                if (declared.count(v)) continue;
+                std::string line;
+                if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
+                else if (t == IRType::STRING)   line = "String " + v + " = \"\";";
+                else if (t == IRType::LIST)   { listVars.insert(v); line = "java.util.ArrayList<Long> " + v + " = new java.util.ArrayList<>();"; }
+                else                            line = "long " + v + " = 0;";
+                emit(out, indent, line);
+                declared.insert(v);
+            }
+            stringParams_.clear();
+            funcTypedParams_.clear();
+            return;
         }
         stringParams_.clear();
         funcTypedParams_.clear();
@@ -7202,6 +9126,14 @@ class JavaStrategy : public BackendStrategy
                          : baseReturnIsString_ ? "String"
                          : returnIsFloat_ ? "double"
                          : returnIsVoid_ ? "void" : "long";
+        // A free function whose every `return` traces to one directly-constructed bundle
+        // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that class
+        // directly — overrides the int/float/list/string/void inference above, none of which
+        // know about bundle classes.
+        {
+            auto classRetIt = classReturnFuncs_.find(name);
+            if (classRetIt != classReturnFuncs_.end()) retT = classRetIt->second;
+        }
         curFuncReturnIsString_ = baseReturnIsString_;
         returnIsList_ = false; baseReturnIsString_ = false;
         returnIsFloat_ = false; returnIsVoid_ = false;
@@ -7227,6 +9159,23 @@ class JavaStrategy : public BackendStrategy
     }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
+        if (curFuncIsGenerator_) {
+            // Skip if the body's last statement was already an explicit `return` — see
+            // lastWasGenReturn_'s own comment; its own emission already did this exact sentinel+
+            // return, so a second unconditional copy here is unreachable code javac rejects.
+            if (!lastWasGenReturn_) emit(out, indent, "AcGen.put(ac_gen_h, 0, true);");
+            indent--;
+            emit(out, indent, "});");
+            emit(out, indent, "ac_gen_t.setDaemon(true);");
+            emit(out, indent, "ac_gen_t.start();");
+            emit(out, indent, "return ac_gen_h;");
+            curFuncIsGenerator_ = false;
+            indent--;
+            emit(out, indent, "}");
+            emitRaw(out, "");
+            declared.clear(); floatVars.clear(); boolVars.clear();
+            return;
+        }
         indent--;
         emit(out, indent, "}");
         emitRaw(out, "");
@@ -7262,13 +9211,23 @@ class JavaStrategy : public BackendStrategy
         emit(out, indent, ty + field + ";");
     }
     std::set<std::string> classInstanceVars_;   // vars known to hold a bundle instance (Java needs the real type, not `long`)
+    std::map<std::string,std::string> classInstanceVarNames_;  // var -> class name (decl() needs it)
+    std::map<std::string,std::string> classReturnFuncs_;   // fn.name -> class name (see setClassReturnFuncs)
+    std::map<std::string, std::map<int, std::string>> classParamTypes_;  // see setClassParamTypes
+    void setClassParamTypes(const std::map<std::string, std::map<int, std::string>> &m) override { classParamTypes_ = m; }
     void emitConstructCall(std::ostringstream &out, int &indent, const std::string &res,
                            const std::string &className, const std::string &args) override
     {
         bool isNew = declared.insert(res).second;
         classInstanceVars_.insert(res);
+        classInstanceVarNames_[res] = className;
         emit(out, indent, (isNew ? className + " " : "") + res + " = new " + className + "(" + args + ");");
     }
+    void noteInstanceClass(const std::string &var, const std::string &className) override {
+        classInstanceVars_.insert(var);
+        classInstanceVarNames_[var] = className;
+    }
+    void setClassReturnFuncs(const std::map<std::string,std::string> &m) override { classReturnFuncs_ = m; }
     void emitClassEnd(std::ostringstream &out, int &indent) override
     {
         indent--;
@@ -7288,6 +9247,14 @@ class JavaStrategy : public BackendStrategy
         // #7 (Java): DECLARE on first sight; parse at the string↔number boundary.
         bool isNew = declared.insert(var).second;
         bool srcIsStr = (!src.empty() && src.front() == '"') || isStringVar(src);
+        // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point.
+        if (boxedVars_.count(var)) {
+            std::string rhs = (t == IRType::STRING) ? (srcIsStr ? "AcDynVal.ofString(" + src + ")" : "AcDynVal.ofString(String.valueOf(" + src + "))")
+                             : (t == IRType::FLOAT)  ? (srcIsStr ? "AcDynVal.ofFloat(Double.parseDouble(" + src + "))" : "AcDynVal.ofFloat((double)(" + src + "))")
+                             :                          (srcIsStr ? "AcDynVal.ofInt(Long.parseLong(" + src + "))" : "AcDynVal.ofInt((long)(" + src + "))");
+            emit(out, indent, (isNew ? "AcDynVal " : "") + var + " = " + rhs + ";");
+            return;
+        }
         if (t == IRType::STRING) {
             std::string rhs = srcIsStr ? src
                 : floatVars.count(src)
@@ -7352,6 +9319,14 @@ class RustStrategy : public BackendStrategy
     std::set<std::string> declared;
     std::set<std::string> floatVars;
     std::set<std::string> listVars;
+    // Vars holding a Vec<String> ilib-call result (isAcStrListFunc, e.g. stringm.split) —
+    // separate from `listVars` (Vec<i64>) since they need a different `let mut ...: TYPE`.
+    // Neither was ever consulted by emitTypedStoreVar (only decl()'s fallback path checks
+    // dictVars_ for the analogous map case) — a plain-variable copy of a list-of-strings
+    // result (`parts = stringm.split(...)`) always hit emitTypedStoreVar's `declType==INT`
+    // branch first, RustStrategy's own resultType default, defaulting to `let mut parts: i64
+    // = t_1;` against an actual `Vec<String>` — "expected i64, found Vec<String>".
+    std::set<std::string> stringListVars_;
     void setFloatVarsFull(const std::set<std::string>& s) override {
         for (const auto& v : s) floatVars.insert(v);   // #42: pre-inferred float locals
     }
@@ -7416,8 +9391,9 @@ class RustStrategy : public BackendStrategy
         // A plain `static mut String` needs `unsafe` at every touch and a print can happen
         // inside ANY function, not just main — same OnceLock<Mutex<...>> pattern already used
         // for `atomic`/events globals (see their comments) gives a safe global without that.
-        std::string fmt = isFloatVal(val) ? "{:?}" : "{}";
-        emit(out, indent, "_ac_save().push_str(&format!(\"" + fmt + "\\n\", " + val + "));");
+        // Cross-backend float-display convention — matches emitPrint's own ac_fmt_double call.
+        std::string expr = isFloatVal(val) ? "ac_fmt_double(" + val + ")" : "format!(\"{}\", " + val + ")";
+        emit(out, indent, "_ac_save().push_str(&format!(\"{}\\n\", " + expr + "));");
     }
     void emitSaveFile(std::ostringstream &out, int &indent, const std::string &filename) override
     {
@@ -7467,6 +9443,104 @@ class RustStrategy : public BackendStrategy
         // and correctly caught at runtime. Found via `examples/showcase.ac`'s try/catch test.
         emitRaw(out, "#![allow(unused_variables, unused_mut, unused_assignments, non_snake_case, unconditional_panic)]");
         emitRaw(out, "use std::io::Write;");
+        // Cross-backend float-display convention (see JavaScriptStrategy::emitHeader's `ac_fmtg`
+        // for the full rationale/verification). Rust's own `{}`/`{:?}`/`{:e}` all do shortest-
+        // round-trip formatting, not %.16g. Verified Rust's FIXED-decimal-places formatter
+        // (`{:.N}`, unlike its shortest-repr `{}`/`{:e}`) IS correctly rounded — matches glibc's
+        // %.16g exactly for the same cases that exposed real independent bugs in Java's
+        // String.format("%g") and Go's strconv.FormatFloat — so this builds on `{:.N}` directly
+        // rather than needing exact big-integer arithmetic the way the Go port does (Rust std
+        // has no arbitrary-precision numeric type). IMPORTANT: always verify against a
+        // RUNTIME-computed value (through a function call), never a bare literal expression —
+        // it's easy to accidentally test compiler-folded arithmetic instead of genuine runtime
+        // f64 semantics (this bit the Go port during development; Rust wasn't affected in
+        // practice here, but the same caution applies to how this is verified).
+        emitRaw(out, "fn ac_fmtg(d: f64) -> String {");
+        emitRaw(out, "    if d == 0.0 { return \"0\".to_string(); }");
+        emitRaw(out, "    let neg = d < 0.0;");
+        emitRaw(out, "    let ad = d.abs();");
+        emitRaw(out, "    let e_str = format!(\"{:e}\", ad);");
+        emitRaw(out, "    let epos = e_str.find('e').unwrap();");
+        emitRaw(out, "    let exp: i32 = e_str[epos + 1..].parse().unwrap();");
+        emitRaw(out, "    let mut digits: String;");
+        emitRaw(out, "    if exp >= 16 {");
+        emitRaw(out, "        let fixed = format!(\"{:.0}\", ad);");
+        emitRaw(out, "        let raw: String = fixed.chars().filter(|c| c.is_ascii_digit()).collect();");
+        emitRaw(out, "        if raw.len() > 16 {");
+        emitRaw(out, "            let mut keep: Vec<u8> = raw.as_bytes()[..16].to_vec();");
+        emitRaw(out, "            let round_up = raw.as_bytes()[16] >= b'5';");
+        emitRaw(out, "            let mut carried_out = false;");
+        emitRaw(out, "            if round_up {");
+        emitRaw(out, "                let mut i = 15i32;");
+        emitRaw(out, "                loop {");
+        emitRaw(out, "                    if i < 0 { carried_out = true; break; }");
+        emitRaw(out, "                    if keep[i as usize] == b'9' { keep[i as usize] = b'0'; i -= 1; }");
+        emitRaw(out, "                    else { keep[i as usize] += 1; break; }");
+        emitRaw(out, "                }");
+        emitRaw(out, "            }");
+        emitRaw(out, "            digits = String::from_utf8(keep).unwrap();");
+        emitRaw(out, "            if carried_out { digits = format!(\"1{}\", &digits[..15]); }");
+        emitRaw(out, "        } else { digits = raw; }");
+        emitRaw(out, "    } else {");
+        emitRaw(out, "        let decimals = (15 - exp).max(0) as usize;");
+        emitRaw(out, "        let fixed = format!(\"{:.*}\", decimals, ad);");
+        emitRaw(out, "        let raw: String = fixed.chars().filter(|c| c.is_ascii_digit()).collect();");
+        emitRaw(out, "        digits = if exp >= 0 { raw } else { raw.chars().skip((-exp) as usize).collect() };");
+        emitRaw(out, "    }");
+        emitRaw(out, "    digits = digits.trim_end_matches('0').to_string();");
+        emitRaw(out, "    if digits.is_empty() { digits = \"0\".to_string(); }");
+        emitRaw(out, "    let result = if exp < -4 || exp >= 16 {");
+        emitRaw(out, "        let mant = if digits.len() > 1 { format!(\"{}.{}\", &digits[..1], &digits[1..]) } else { digits.clone() };");
+        emitRaw(out, "        let sign = if exp < 0 { \"-\" } else { \"+\" };");
+        emitRaw(out, "        format!(\"{}e{}{:02}\", mant, sign, exp.abs())");
+        emitRaw(out, "    } else if exp >= 0 {");
+        emitRaw(out, "        if digits.len() as i32 <= exp + 1 {");
+        emitRaw(out, "            format!(\"{}{}\", digits, \"0\".repeat((exp + 1) as usize - digits.len()))");
+        emitRaw(out, "        } else {");
+        emitRaw(out, "            format!(\"{}.{}\", &digits[..(exp + 1) as usize], &digits[(exp + 1) as usize..])");
+        emitRaw(out, "        }");
+        emitRaw(out, "    } else {");
+        emitRaw(out, "        format!(\"0.{}{}\", \"0\".repeat((-exp - 1) as usize), digits)");
+        emitRaw(out, "    };");
+        emitRaw(out, "    if neg { format!(\"-{}\", result) } else { result }");
+        emitRaw(out, "}");
+        emitRaw(out, "fn ac_fmt_double(d: f64) -> String { let s = ac_fmtg(d); if !s.contains(|c| \".eEnN\".contains(c)) { format!(\"{}.0\", s) } else { s } }");
+        // AcDynVal: a genuine tagged runtime value for the small set of variables (setBoxedVars)
+        // that Abu's retype spec requires to hold different types at different points in their
+        // own scope — one fixed Rust declared type per var name can't do that. Uses associated
+        // functions (of_i/of_f/of_s/of_b) + methods taking &AcDynVal rather than the Add/Sub
+        // trait overloads Rust natively supports — sidesteps ownership/move complications (this
+        // way nothing here ever needs to be moved, only borrowed) and stays consistent with the
+        // C/Java/Go ports' explicit-call style. A Display impl means `{}`/println! formats it
+        // correctly with no special-casing at the print site.
+        emitRaw(out, "#[derive(Clone)]");
+        emitRaw(out, "enum AcDynVal { AcInt(i64), AcFloat(f64), AcStr(String), AcBool(bool) }");
+        emitRaw(out, "impl AcDynVal {");
+        emitRaw(out, "    fn of_i(v: i64) -> AcDynVal { AcDynVal::AcInt(v) }");
+        emitRaw(out, "    fn of_f(v: f64) -> AcDynVal { AcDynVal::AcFloat(v) }");
+        emitRaw(out, "    fn of_s(v: String) -> AcDynVal { AcDynVal::AcStr(v) }");
+        emitRaw(out, "    fn of_b(v: bool) -> AcDynVal { AcDynVal::AcBool(v) }");
+        emitRaw(out, "    fn as_d(&self) -> f64 { match self { AcDynVal::AcFloat(d)=>*d, AcDynVal::AcInt(i)=>*i as f64, AcDynVal::AcBool(b)=>if *b {1.0} else {0.0}, _=>0.0 } }");
+        emitRaw(out, "    fn as_i(&self) -> i64 { match self { AcDynVal::AcInt(i)=>*i, AcDynVal::AcFloat(d)=>*d as i64, AcDynVal::AcBool(b)=>if *b {1} else {0}, _=>0 } }");
+        emitRaw(out, "    fn is_str(&self) -> bool { matches!(self, AcDynVal::AcStr(_)) }");
+        emitRaw(out, "    fn ac_add(&self, o: &AcDynVal) -> AcDynVal { if self.is_str()||o.is_str() { AcDynVal::of_s(format!(\"{}{}\", self, o)) } else if matches!(self, AcDynVal::AcFloat(_))||matches!(o, AcDynVal::AcFloat(_)) { AcDynVal::of_f(self.as_d()+o.as_d()) } else { AcDynVal::of_i(self.as_i()+o.as_i()) } }");
+        emitRaw(out, "    fn ac_sub(&self, o: &AcDynVal) -> AcDynVal { if matches!(self, AcDynVal::AcFloat(_))||matches!(o, AcDynVal::AcFloat(_)) { AcDynVal::of_f(self.as_d()-o.as_d()) } else { AcDynVal::of_i(self.as_i()-o.as_i()) } }");
+        emitRaw(out, "    fn ac_mul(&self, o: &AcDynVal) -> AcDynVal { if matches!(self, AcDynVal::AcFloat(_))||matches!(o, AcDynVal::AcFloat(_)) { AcDynVal::of_f(self.as_d()*o.as_d()) } else { AcDynVal::of_i(self.as_i()*o.as_i()) } }");
+        emitRaw(out, "    fn ac_div(&self, o: &AcDynVal) -> AcDynVal { AcDynVal::of_f(self.as_d()/o.as_d()) }");
+        emitRaw(out, "    fn ac_eq(&self, o: &AcDynVal) -> bool { if self.is_str()||o.is_str() { format!(\"{}\",self)==format!(\"{}\",o) } else { self.as_d()==o.as_d() } }");
+        emitRaw(out, "    fn ac_lt(&self, o: &AcDynVal) -> bool { if self.is_str()||o.is_str() { format!(\"{}\",self)<format!(\"{}\",o) } else { self.as_d()<o.as_d() } }");
+        emitRaw(out, "    fn ac_gt(&self, o: &AcDynVal) -> bool { if self.is_str()||o.is_str() { format!(\"{}\",self)>format!(\"{}\",o) } else { self.as_d()>o.as_d() } }");
+        emitRaw(out, "}");
+        emitRaw(out, "impl std::fmt::Display for AcDynVal {");
+        emitRaw(out, "    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {");
+        emitRaw(out, "        match self {");
+        emitRaw(out, "            AcDynVal::AcStr(s) => write!(f, \"{}\", s),");
+        emitRaw(out, "            AcDynVal::AcBool(b) => write!(f, \"{}\", if *b {\"true\"} else {\"false\"}),");
+        emitRaw(out, "            AcDynVal::AcInt(i) => write!(f, \"{}\", i),");
+        emitRaw(out, "            AcDynVal::AcFloat(d) => { let xi = *d as i64; if xi as f64 == *d { write!(f, \"{}\", xi) } else { write!(f, \"{}\", d) } }");
+        emitRaw(out, "        }");
+        emitRaw(out, "    }");
+        emitRaw(out, "}");
         // std::sync::OnceLock is stable (1.70+, no external crate) — shared by `atomic` vars
         // AND the event-bind table below (both need a lazily-initialized global), so the
         // import must cover either needing it alone, not just anyAtomicVars().
@@ -7496,6 +9570,52 @@ class RustStrategy : public BackendStrategy
         emitRaw(out, "fn ac_rand(n: i64) -> i64 { if n <= 0 { return 0; } let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as u64; let mut x = t | 1; x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x % (n as u64)) as i64 }");
         emitRaw(out, "fn ac_choice(xs: Vec<i64>) -> i64 { xs[ac_rand(xs.len() as i64) as usize] }");
         emitRaw(out, "fn ac_stream(a: i64, b: i64, s: i64) -> String { let st = if s==0 {1} else {s}; let mut r=String::new(); let mut i=a; while (st>0 && i<b)||(st<0 && i>b) { r.push_str(&i.to_string()); i+=st; } r }");
+        // eval(): self-contained arithmetic evaluator (+ - * / parens, unary +/-), ported from
+        // CStrategy's `_ac_builtin_eval` (same factor->term->expr grammar). Verified real bug:
+        // emitEval used to call a nonexistent `math_eval(expr.as_str())` — undefined function
+        // AND `.as_str()` doesn't exist on `&str` (only on `String`), so a literal argument like
+        // `eval($1+2$)` failed BOTH ways at once. `impl AsRef<str>` lets one function accept
+        // either a `&str` literal or a `String` var with no `.as_str()` needed at the call site.
+        // Emitted unconditionally (matches ac_ipow/ac_rand above — Rust doesn't gate these on a
+        // hasXOp_ flag the way C/C++/Java do; an unused fn is a warning here, not an error).
+        emitRaw(out, "fn ac_builtin_eval(s: impl AsRef<str>) -> f64 {");
+        emitRaw(out, "    let b = s.as_ref().as_bytes();");
+        emitRaw(out, "    let mut p: usize = 0;");
+        emitRaw(out, "    fn ws(b: &[u8], p: &mut usize) { while *p < b.len() && (b[*p]==b' '||b[*p]==b'\\t') { *p += 1; } }");
+        emitRaw(out, "    fn factor(b: &[u8], p: &mut usize) -> f64 {");
+        emitRaw(out, "        ws(b, p);");
+        emitRaw(out, "        if *p < b.len() && b[*p]==b'(' {");
+        emitRaw(out, "            *p += 1; let v = expr(b, p); ws(b, p);");
+        emitRaw(out, "            if *p < b.len() && b[*p]==b')' { *p += 1; }");
+        emitRaw(out, "            return v;");
+        emitRaw(out, "        }");
+        emitRaw(out, "        if *p < b.len() && b[*p]==b'-' { *p += 1; return -factor(b, p); }");
+        emitRaw(out, "        if *p < b.len() && b[*p]==b'+' { *p += 1; return factor(b, p); }");
+        emitRaw(out, "        let start = *p;");
+        emitRaw(out, "        while *p < b.len() && (b[*p].is_ascii_digit() || b[*p]==b'.') { *p += 1; }");
+        emitRaw(out, "        if *p == start { return 0.0; }");
+        emitRaw(out, "        std::str::from_utf8(&b[start..*p]).ok().and_then(|t| t.parse::<f64>().ok()).unwrap_or(0.0)");
+        emitRaw(out, "    }");
+        emitRaw(out, "    fn term(b: &[u8], p: &mut usize) -> f64 {");
+        emitRaw(out, "        let mut v = factor(b, p);");
+        emitRaw(out, "        loop { ws(b, p);");
+        emitRaw(out, "            if *p < b.len() && b[*p]==b'*' { *p += 1; v *= factor(b, p); }");
+        emitRaw(out, "            else if *p < b.len() && b[*p]==b'/' { *p += 1; let d = factor(b, p); v = if d != 0.0 { v / d } else { 0.0 }; }");
+        emitRaw(out, "            else { break; }");
+        emitRaw(out, "        }");
+        emitRaw(out, "        v");
+        emitRaw(out, "    }");
+        emitRaw(out, "    fn expr(b: &[u8], p: &mut usize) -> f64 {");
+        emitRaw(out, "        let mut v = term(b, p);");
+        emitRaw(out, "        loop { ws(b, p);");
+        emitRaw(out, "            if *p < b.len() && b[*p]==b'+' { *p += 1; v += term(b, p); }");
+        emitRaw(out, "            else if *p < b.len() && b[*p]==b'-' { *p += 1; v -= term(b, p); }");
+        emitRaw(out, "            else { break; }");
+        emitRaw(out, "        }");
+        emitRaw(out, "        v");
+        emitRaw(out, "    }");
+        emitRaw(out, "    expr(b, &mut p)");
+        emitRaw(out, "}");
         // Two or more ilib FFI files, concatenated verbatim, commonly `use` the same std
         // items (verified: gl_ffi.rs's `use std::ffi::{CString, c_char};` and math_ffi.rs's
         // plain `use std::ffi::CString;` — same path, same item, different SYNTACTIC FORM —
@@ -7643,12 +9763,46 @@ class RustStrategy : public BackendStrategy
         // different locals, same spelling" into "one prefixed name declared twice" instead of
         // fixing the collision (verified real regression: sum_evens.ac/vowel_count.ac's `s`/`n`
         // locals, unrelated to the actual promoted mainloop var of the same name).
+        // Symbol-ID match, OR (name matches a real promoted global AND nothing else has
+        // locally `declared` that same bare name in the CURRENT scope) — a bare top-level
+        // read of a `free`/`<free>`-promoted var's name, from OUTSIDE the function that
+        // declared it, can carry a genuinely different symbol id than the one recorded
+        // while scanning that function (verified: reading `f` from <mainloop> after `free f
+        // = ...` only ever appeared inside a function — different `r.id` than the in-function
+        // writes/reads of the same conceptual variable, so the strict id-only gate silently
+        // fell back to the bare, undeclared name — "cannot find value `f` in this scope").
+        // `declared` still protects the original case this gate exists for: a genuinely
+        // UNRELATED local sharing the promoted global's name would already be in `declared`
+        // from its own decl() call, so it's excluded here same as before.
         if (r.kind == IRRef::Kind::VAR && promotedGlobals_.count(s)
-            && (r.id < 0 || promotedGlobalSymIds_.count(r.id)))
-            return promotedGlobalName(s);
+            && (r.id < 0 || promotedGlobalSymIds_.count(r.id) || !declared.count(s)))
+            // Modern rustc requires `unsafe` for READING a `static mut` too, not just writing
+            // it (E0133) — verified: a promoted global read inside a binary op
+            // (`_AC_FREE_x + 1`) or a print statement both hard-error without this. `unsafe {
+            // EXPR }` is a normal Rust expression (evaluates to EXPR), so wrapping just the
+            // bare identifier here composes safely into whatever larger expression this
+            // result gets embedded in. The ONE place this string is used as a WRITE TARGET,
+            // not a read (STORE_VAR's `var` in emitTypedStoreVar), unwraps it back — see
+            // stripPromotedGlobalWrap's own comment.
+            return "unsafe { " + promotedGlobalName(s) + " }";
         return s;
     }
     static std::string promotedGlobalName(const std::string &v) { return "_AC_FREE_" + v; }
+    // Reverses formatRef's read-side `unsafe { _AC_FREE_x }` wrapping for the ONE place this
+    // string is consumed as an ASSIGNMENT TARGET rather than a read value (`emitTypedStoreVar`'s
+    // `_AC_FREE_` branch) — `unsafe { X } = val;` isn't valid Rust (can't assign to a block
+    // expression), but `unsafe { X = val; }` is exactly right, so the statement-level `unsafe`
+    // wrap already applied by that branch replaces the need for this one at the identifier level.
+    static bool stripPromotedGlobalWrap(const std::string &v, std::string &bare) {
+        static const std::string pfx = "unsafe { ", sfx = " }";
+        if (v.size() > pfx.size() + sfx.size() && v.compare(0, pfx.size(), pfx) == 0 &&
+            v.compare(v.size() - sfx.size(), sfx.size(), sfx) == 0 &&
+            v.find("_AC_FREE_") != std::string::npos) {
+            bare = v.substr(pfx.size(), v.size() - pfx.size() - sfx.size());
+            return true;
+        }
+        return false;
+    }
     static bool isRustKeyword(const std::string &s) {
         static const std::set<std::string> kw = {
             "as","break","const","continue","crate","dyn","else","enum","extern","false","fn",
@@ -7660,6 +9814,8 @@ class RustStrategy : public BackendStrategy
         return kw.count(s) > 0;
     }
 
+    std::set<std::string> genChannelVars_;
+    void noteGeneratorCallResult(const std::string &resultVar) override { genChannelVars_.insert(resultVar); }
     std::string decl(const std::string &var, const std::string &val)
     {
         // Bundle field write (self.field = ...): Rust structs already use plain `self.field`
@@ -7678,11 +9834,44 @@ class RustStrategy : public BackendStrategy
             if (isStringVar(checkVar) && looksString(val)) return var + " = " + val + ".to_string();";
             return var + " = " + val + ";";
         }
-        // `var` arrives here ALREADY prefixed (formatRef's own promotedGlobals_ check ran
-        // before this, via the shared dispatcher's ref() call) — match the prefix, not the
-        // bare name, which promotedGlobals_ itself still stores.
-        if (var.rfind("_AC_FREE_", 0) == 0) {
-            return "unsafe { " + var + " = " + val + "; }";
+        // Bundle field WRITE on a NAMED instance, not just `self` (`q.x = 5` — same root cause
+        // as every sibling backend: fell to the generic `i64` default below and declared a
+        // bogus `let mut q.x: i64 = 5;`, invalid Rust). A field on a real struct value is
+        // never independently `let`-declared — always a plain assignment.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot)))
+                return var + " = " + val + ";";
+        }
+        // `q = f()` where f always constructs+returns one bundle class (classFuncs_'s prescan
+        // via noteInstanceClass) — declare `q` with its REAL type, same reasoning as
+        // emitConstructCall's own comment (decl()'s generic inference would default to i64).
+        {
+            auto civ = classInstanceVarNames_.find(var);
+            if (civ != classInstanceVarNames_.end()) {
+                if (declared.insert(var).second) return "let mut " + var + ": " + civ->second + " = " + val + ";";
+                return var + " = " + val + ";";
+            }
+        }
+        // `var` arrives here ALREADY prefixed AND read-wrapped (formatRef's own
+        // promotedGlobals_ check ran before this, via the shared dispatcher's ref() call —
+        // see formatRef's own comment for why it wraps in `unsafe { }`) — unwrap it back to
+        // the bare static name for use as a real assignment target.
+        { std::string bare;
+          if (stripPromotedGlobalWrap(var, bare)) return "unsafe { " + bare + " = " + val + "; }"; }
+        // A generator-call result (an `mpsc::Receiver<i64>`) — no other check here knows about
+        // channels, so it fell to the plain `let mut t: i64 = ...` default and Rust rejected the
+        // channel value outright ("expected i64, found Receiver<i64>"). No type annotation
+        // needed either way — Rust infers it from the RHS. MUST be `let mut`, not plain `let`
+        // — the mainloop's own loop save/restore mechanism reassigns any mainloop var it saves
+        // around a loop (`g = _ac_s0_g;` after the loop, unconditionally, for EVERY var it
+        // saved, generator handles included), and Rust rejects assigning twice to an immutable
+        // binding (verified: `g = twovals(); FOR x in g: ...` — "cannot assign twice to
+        // immutable variable `g`" — even though this specific program never explicitly
+        // reassigns `g` itself).
+        if (genChannelVars_.count(var)) {
+            if (declared.insert(var).second) return "let mut " + var + " = " + val + ";";
+            return var + " = " + val + ";";
         }
         if (declared.insert(var).second)
         {
@@ -7753,19 +9942,71 @@ class RustStrategy : public BackendStrategy
     void emitMod(std::ostringstream &out, int &indent,
                  const std::string &res, const std::string &lhs, const std::string &rhs) override
     { emit(out, indent, decl(res, "(((" + lhs + " as i64) % (" + rhs + " as i64)) + (" + rhs + " as i64)) % (" + rhs + " as i64)")); }
+    // `_ac_lg` (the RAII MutexGuard) stays alive for the whole span between these two —
+    // opening/closing one shared `{ }` block, exactly like the old single-statement
+    // version did, just spanning everything ir.cpp now brackets instead of one store.
+    void emitLockBegin(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "{ let _ac_lg = _ac_atomic_lock().lock().unwrap();");
+        indent++;
+    }
+    void emitLockEnd(std::ostringstream &out, int &indent) override {
+        indent--;
+        emit(out, indent, "}");
+    }
+    // Wrap a plain (non-AcDynVal) value into the right AcDynVal::of_* by its apparent type —
+    // Rust's AcDynVal deliberately avoids the Add/Sub trait overloads (see its emitHeader
+    // comment), so callers must always be explicit about which constructor applies.
+    std::string boxWrap(const std::string& v, IRType t = IRType::VOID) const {
+        if (boxedVars_.count(v)) return v;
+        if (t == IRType::STRING || looksString(v) || isStringVar(v)) return "AcDynVal::of_s((" + v + ").to_string())";
+        if (t == IRType::FLOAT || isFloatVal(v)) return "AcDynVal::of_f((" + v + ") as f64)";
+        if (t == IRType::BOOL) return "AcDynVal::of_b(" + v + ")";
+        return "AcDynVal::of_i((" + v + ") as i64)";
+    }
     void emitTypedStoreVar(std::ostringstream &out, int &indent,
                            const std::string &var, const std::string &val, IRType t) override
     {
         // Bundle field write via a typed decl (e.g. `atomic hp = 5` as a field default) — same
         // translation as decl(): real struct field, no `let`-redeclaration.
         if (var.rfind("self.", 0) == 0 || var.rfind("_ac_self.", 0) == 0) { emit(out, indent, decl(var, val)); return; }
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in the
-        // global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible RMW.
-        // Declaration stays OUTSIDE the lock's `{ }` scope — Rust's definite-assignment analysis
-        // is fine with `let mut x: i64; { x = 5; }`, and `var` needs to outlive that block anyway.
+        // Bundle field WRITE on a NAMED instance, not just `self` — decl()'s own matching fix.
+        // The shared driver's STORE_VAR dispatch ALWAYS calls emitTypedStoreVar (never decl()
+        // directly), so decl()'s classInstanceVars_ check alone was never reachable for a typed
+        // store — same gap as CStrategy/CppStrategy/JavaStrategy's sibling fix.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot))) {
+                emit(out, indent, var + " = " + val + ";");
+                return;
+            }
+        }
+        // A `free`-promoted global (`_AC_FREE_x`, already declared as `static mut` in
+        // emitHeader) — same translation as decl()'s own matching branch: STORE_VAR always
+        // dispatches through THIS function (see VStrategy's identical comment on the same
+        // point), so decl()'s branch alone never covered the case where a promoted var is
+        // written via a TYPED store (e.g. inside `<mainloop>`, which lowers with a resultType).
+        // Without this, `declared` (tracking bare names only) never marks the PREFIXED form
+        // as already-declared, so a second write re-`let mut`-declared it — "let bindings
+        // cannot shadow statics" (verified: a `free x = 5` read+written across a callback).
+        // `var` arrives read-wrapped like decl()'s own case — see stripPromotedGlobalWrap.
+        { std::string bare;
+          if (stripPromotedGlobalWrap(var, bare)) { emit(out, indent, "unsafe { " + bare + " = " + val + "; }"); return; } }
+        // `atomic` var: no inline lock-block wrap here anymore — ir.cpp now brackets the
+        // WHOLE read-modify-write span with real LOCK_BEGIN/LOCK_END instructions (see
+        // emitLockBegin/emitLockEnd below), closing the TOCTOU race the old store-only
+        // wrap here could never actually close. Declaration stays outside those
+        // brackets too (ir.cpp only brackets reassignments, not the initial `atomic x
+        // = e` declaration — nothing else can race a var before it exists).
         if (castDeclType(var, IRType::VOID) == IRType::ATOMIC) {
             if (declared.insert(var).second) emit(out, indent, "let mut " + var + ": i64;");
-            emit(out, indent, "{ let _ac_lg = _ac_atomic_lock().lock().unwrap(); " + var + " = (" + val + ") as i64; }");
+            emit(out, indent, var + " = (" + val + ") as i64;");
+            return;
+        }
+        // Boxed var (setBoxedVars/detectBoxedVars — see AcDynVal's comment in emitHeader): must
+        // run before the string-unification branch below, which would otherwise force a String
+        // declaration that can't hold this var's genuinely-numeric earlier value.
+        if (boxedVars_.count(var)) {
+            emit(out, indent, (declared.insert(var).second ? "let mut " + var + ": AcDynVal = " : var + " = ") + boxWrap(val, t) + ";");
             return;
         }
         if (declared.insert(var).second) {
@@ -7776,6 +10017,21 @@ class RustStrategy : public BackendStrategy
                 std::string bare = acUnstring(val);
                 std::string ty = (bare.find('.') != std::string::npos) ? ": f64" : ": i64";
                 emit(out, indent, "let mut " + var + ty + " = " + bare + ";"); return; }
+            // Same "known collection, but the static declType default (usually INT) would
+            // otherwise win first" gap as decl()'s own dictVars_ check — see stringListVars_'s
+            // declaration comment for the full verified failure.
+            if (stringListVars_.count(val)) {
+                stringListVars_.insert(var);
+                emit(out, indent, "let mut " + var + ": Vec<String> = " + val + ".clone();"); return; }
+            if (listVars.count(val)) {
+                listVars.insert(var);
+                emit(out, indent, "let mut " + var + ": Vec<i64> = " + val + ".clone();"); return; }
+            if (dictVars_.count(val)) {
+                dictVars_.insert(var);
+                bool strVal = dictStrVals_.count(val) > 0;
+                if (strVal) dictStrVals_.insert(var);
+                std::string vt = strVal ? "String" : "i64";
+                emit(out, indent, "let mut " + var + ": std::collections::HashMap<String," + vt + "> = " + val + ".clone();"); return; }
             if      (declType == IRType::FLOAT)  { floatVars.insert(var); emit(out, indent, "let mut " + var + ": f64 = " + (looksFloat(val) ? val : val + " as f64") + ";"); }
             else if (declType == IRType::STRING)  emit(out, indent, "let mut " + var + ": String = " + val + ".to_string();");
             else if (declType == IRType::BOOL)    emit(out, indent, "let mut " + var + ": bool = " + val + " != 0;");
@@ -7805,6 +10061,15 @@ class RustStrategy : public BackendStrategy
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — see AcDynVal's comment in emitHeader; must run before the string-forcing
+        // branch below (format! on an AcDynVal calls its Display impl and does the wrong thing —
+        // string-formats it unconditionally instead of adding/concatenating by CURRENT tag).
+        if (boxedVars_.count(lhs) || boxedVars_.count(rhs)) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string fn = op=="+" ? "ac_add" : op=="-" ? "ac_sub" : (op=="*"||op=="@") ? "ac_mul" : "ac_div";
+            emit(out, indent, (declared.insert(res).second ? "let mut " + res + ": AcDynVal = " : res + " = ") + l + "." + fn + "(&" + r + ");");
+            return;
+        }
         // Rust string concat: `String + String` is illegal (only String + &str). format! handles
         // every combination (String/&str/literal) cleanly. #6.
         // Checking isStringVar(RES) alone missed the common case: `res` is a freshly-minted
@@ -7851,6 +10116,14 @@ class RustStrategy : public BackendStrategy
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — same reasoning as emitBinaryOp's own boxed branch.
+        if ((op=="=="||op=="!="||op=="<"||op==">") && (boxedVars_.count(lhs) || boxedVars_.count(rhs))) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string cmp = op=="==" ? l+".ac_eq(&"+r+")" : op=="!=" ? "!"+l+".ac_eq(&"+r+")"
+                             : op=="<"  ? l+".ac_lt(&"+r+")" : l+".ac_gt(&"+r+")";
+            emit(out, indent, decl(res, "(" + cmp + ") as i64"));
+            return;
+        }
         std::string expr;
         if (op == "xor")
             expr = "((" + lhs + " != 0) ^ (" + rhs + " != 0)) as i64";
@@ -7886,6 +10159,9 @@ class RustStrategy : public BackendStrategy
         if (isMLFloatReturningFunc(fn)) return true;
         if (fn.rfind("math.", 0) == 0) return true;
         if (fn.rfind("stat_", 0) == 0) return true;
+        // aczip's compression-ratio percentage — same "known float-returning ilib
+        // function" pattern as math.* above.
+        if (fn == "aczip.get_ratio" || fn == "aczip_get_ratio") return true;
         return false;
     }
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
@@ -7942,6 +10218,31 @@ class RustStrategy : public BackendStrategy
             if (comma != std::string::npos) firstArg = args.substr(0, comma);
             std::string callD = "dropdown(" + firstArg + ")";
             emit(out, indent, res.empty() ? callD + ";" : decl(res, callD));
+            return;
+        }
+        // `textbox(master, color, font, lazy)` — same story as dropdown just above: Rust's
+        // wrapper doesn't implement lazy packing at all, and textbox(master, color, font)
+        // takes exactly 3 args, so a trailing `lazy` sentinel must be dropped before it
+        // reaches the call (verified: ac_ide.ac's `src_box = textbox(root, $white$,
+        // $monospace$, lazy)` — "this function takes 3 arguments but 4 arguments were
+        // supplied" without this).
+        if (func == "textbox") {
+            std::vector<std::string> a; std::string cur; int depth = 0; bool inStr = false;
+            for (char c : args) {
+                if (c == '"') inStr = !inStr;
+                if (!inStr && (c == '(' || c == '[')) depth++;
+                if (!inStr && (c == ')' || c == ']')) depth--;
+                if (c == ',' && depth == 0 && !inStr) { a.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+            if (!cur.empty()) a.push_back(cur);
+            for (auto& s : a) { size_t b = s.find_first_not_of(' '), e = s.find_last_not_of(' ');
+                s = (b == std::string::npos) ? "" : s.substr(b, e - b + 1); }
+            if (!a.empty() && (a.back() == "lazy" || a.back() == "\"lazy\"")) a.pop_back();
+            std::string joined;
+            for (size_t i = 0; i < a.size(); i++) { if (i) joined += ", "; joined += a[i]; }
+            std::string callT = "textbox(" + joined + ")";
+            emit(out, indent, res.empty() ? callT + ";" : decl(res, callT));
             return;
         }
         // `btn(master, text, cmd)` — Rust's wrapper hard-codes cmd's type as `fn(i64) -> i64`
@@ -8004,9 +10305,16 @@ class RustStrategy : public BackendStrategy
         // local (as opposed to a literal, which is natively `&str`) needs an explicit `&`
         // borrow (verified: jarvis.ac's `resolve(low)` where `low` is a `String` local and
         // `fn resolve(s: &str)` — "expected `&str`, found `String`"). Scoped to known USER
-        // functions (userFuncArity_) so this never touches ilib/gl calls, which have their own
-        // argument-marshaling rules already handled elsewhere in this method.
-        if (userFuncArity_.count(func)) {
+        // functions (userFuncArity_) — PLUS the os ilib specifically (`os_ffi.rs`'s
+        // `read`/`write_to`/`append_to`/`bash`/`sbash` etc all take `&str`, same as any user
+        // function): the "handled elsewhere in this method" this comment used to promise
+        // turned out not to cover the TEMP case — `stringVars_` correctly tracks a widget
+        // `.get()` result as a string (see isWidgetGet above), but nothing added the `&` when
+        // that TEMP (as opposed to a named var) was passed straight into an os.* call
+        // (verified: ac_ide.ac's `os.write_to(path_inp.get(), src_box.get())` and `os.read(...)`
+        // piped through a temp — "expected `&str`, found `String`", 4 separate call sites).
+        // Not widened to every ilib — gl/regex/stringm etc genuinely have their own marshaling.
+        if (userFuncArity_.count(func) || func.rfind("os.", 0) == 0) {
             std::vector<std::string> parts; { std::string cur; int depth = 0;
                 for (char c : args2) { if (c=='('||c=='[') depth++; else if (c==')'||c==']') depth--;
                     if (c==',' && depth==0) { parts.push_back(cur); cur.clear(); } else cur += c; }
@@ -8108,7 +10416,54 @@ class RustStrategy : public BackendStrategy
                 rfunc = "math.mod_int";
             }
         }
+        // Simple scalar math functions all take f64 args (see math_ffi.rs) — Rust never
+        // coerces a bare int-typed value to a float parameter (unlike C's implicit numeric
+        // promotion), so `math.sin(x)` with an int-typed `x` (e.g. from `random.number(...)`,
+        // or any other int-returning source) is a hard "expected f64, found i64" compile
+        // error. Only `math.sin` itself had ever been hand-patched around this class of bug
+        // before (via the gl set_direction/speed_mult casts above) — every OTHER simple
+        // trig/algebra function had the exact same gap, just never hit by an example using a
+        // non-constant/non-literal argument (the constant folder resolves literal-arg calls
+        // to a plain double before this codegen path is ever exercised). Deliberately an
+        // explicit allowlist, NOT a blanket "math." prefix match — the array-taking
+        // aggregates (sigma/PI/gradient/stat_*) and the genuinely int-param functions
+        // (abs_int/mod_int/gcd/lcm/is_prime/to_dec/pi_digits/e_digits, all handled by their
+        // own existing special cases or correctly needing int args) must NOT be touched here.
+        {
+            static const std::set<std::string> mathFloatArgFuncs = {
+                "sin","cos","tan","csc","sec","cot","asin","acos","atan","acsc","asec","acot",
+                "atan2","deg2rad","rad2deg","pow","sqrt","cbrt","abs","floor","ceil","round",
+                "hypot","ln","log","log2","log10","clamp",
+            };
+            std::string bare = rfunc;
+            if (bare.rfind("math.", 0) == 0) bare = bare.substr(5);
+            else if (bare.rfind("math_", 0) == 0) bare = bare.substr(5);
+            if (mathFloatArgFuncs.count(bare)) {
+                std::string cast, cur; int depth = 0; bool any = false;
+                auto flushArg = [&](std::string t) {
+                    size_t s = t.find_first_not_of(' '), e = t.find_last_not_of(' ');
+                    t = (s == std::string::npos) ? "" : t.substr(s, e - s + 1);
+                    if (t.empty()) return;
+                    if (!isFloatVal(t)) { cast += "(" + t + ") as f64"; any = true; }
+                    else cast += t;
+                };
+                for (char c : actualArgs) {
+                    if (c == '(' || c == '[') depth++;
+                    else if (c == ')' || c == ']') depth--;
+                    if (c == ',' && depth == 0) { flushArg(cur); cast += ", "; cur.clear(); continue; }
+                    cur += c;
+                }
+                flushArg(cur);
+                if (any) actualArgs = cast;
+            }
+        }
         std::string call = rfunc + "(" + actualArgs + ")";
+        // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
+        // see AcDynVal's comment in emitHeader.
+        if (!res.empty() && boxedVars_.count(res)) {
+            emit(out, indent, (declared.insert(res).second ? "let mut " + res + ": AcDynVal = " : res + " = ") + boxWrap(call) + ";");
+            return;
+        }
         // `recv.get()` on a widgets instance (display/ask/dropdown all expose a String-returning
         // `.get()` in widgets_ffi.rs) — `recv` is an arbitrary AC variable name, not a fixed
         // namespace, so isAcStrFunc's namespace-prefix table can't recognize it the way it does
@@ -8155,6 +10510,7 @@ class RustStrategy : public BackendStrategy
             stringVars_.insert(res);
             emit(out, indent, "let mut " + res + ": String = " + call + ";");
         } else if (isAcStrListFunc(func) && declared.insert(res).second) {
+            stringListVars_.insert(res);
             emit(out, indent, "let mut " + res + ": Vec<String> = " + call + ";");
         } else if (isListReturningFunc(func) && declared.insert(res).second) {
             listVars.insert(res);
@@ -8180,6 +10536,11 @@ class RustStrategy : public BackendStrategy
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
+        // A generator's body runs inside `thread::spawn(move || { ... })` — a closure
+        // returning `()`, since the OUTER function's real return value is the channel
+        // (emitted once, in emitFunctionEnd). `return expr` inside a generator ends
+        // iteration early and DISCARDS expr (see the yield plan's own explicit scope cut).
+        if (curFuncIsGenerator_) { if (!val.empty()) { emit(out, indent, "return;"); lastWasReturn = true; } return; }
         // Suppress bare empty return; emitFunctionEnd provides the fallthrough `0`
         if (!val.empty())
         {
@@ -8209,18 +10570,23 @@ class RustStrategy : public BackendStrategy
         // no meaningful VALUE to format anyway; just print the word, matching what every other
         // backend's text-based null/nil representation already does (e.g. Python's `None`).
         if (val == "None") emit(out, indent, "println!(\"None\");");
-        // A list (`Vec<i64>`) has no `Display` impl at all — only `Debug` (verified: sieve.ac's
-        // `Term.display primes`, "`Vec<i64>` doesn't implement `std::fmt::Display`"). Must be
-        // checked before the generic float/string fallthrough below.
-        else if (listVars.count(val) || listParams_.count(val) || listGlobals_.count(val))
+        // Boxed var: AcDynVal's Display impl already prints its CURRENT tag correctly — must be
+        // checked before the float branch below, which uses `{:?}` (Debug, unimplemented here).
+        else if (boxedVars_.count(val)) emit(out, indent, "println!(\"{}\", " + val + ");");
+        // A list (`Vec<i64>` or `Vec<String>`) has no `Display` impl at all — only `Debug`
+        // (verified: sieve.ac's `Term.display primes`, "`Vec<i64>` doesn't implement
+        // `std::fmt::Display`"; same error for `Vec<String>`, e.g. `parts =
+        // stringm.split(...)` then `Term.display parts`). Must be checked before the generic
+        // float/string fallthrough below.
+        else if (listVars.count(val) || listParams_.count(val) || listGlobals_.count(val) ||
+                 stringListVars_.count(val))
             emit(out, indent, "println!(\"{:?}\", " + val + ");");
-        // A float-typed value must use `{:?}` (Debug), not `{}` (Display): Rust's Display impl
-        // for f64 drops the trailing ".0" on whole numbers (`println!("{}", 9.0f64)` → "9"),
-        // which silently turns a float back into what LOOKS like an int in the output — wrong
-        // for any whole-number float (e.g. an expression-form `to_dec(9)` cast). `{:?}` always
-        // keeps the decimal point. Only floats: Debug-formatting a String would add quotes.
+        // Cross-backend float-display convention (see JavaScriptStrategy::emitHeader's `ac_fmtg`
+        // for the full rationale) — Rust's own `{}`/`{:?}` both do shortest-round-trip
+        // formatting (`{:?}` just also guarantees a decimal point), not the %.16g convention
+        // every other backend now uses.
         else if (isFloatVal(val))
-            emit(out, indent, "println!(\"{:?}\", " + val + ");");
+            emit(out, indent, "println!(\"{}\", ac_fmt_double(" + val + "));");
         else emit(out, indent, "println!(\"{}\", " + val + ");");
     }
     // Same gap+fix as CStrategy's own emitConfirm (see its comment) — base default never
@@ -8248,14 +10614,15 @@ class RustStrategy : public BackendStrategy
         emit(out, indent, "std::thread::sleep(std::time::Duration::from_secs_f64(" + secs + "));");
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
         lastWasReturn = false;
+        if (!argIsString) { emitLazyEval(out, indent, res, expr); return; }
         if (declared.insert(res).second) {
             floatVars.insert(res);
-            emit(out, indent, "let mut " + res + ": f64 = math_eval(" + expr + ".as_str());");
+            emit(out, indent, "let mut " + res + ": f64 = ac_builtin_eval(" + expr + ");");
         } else {
-            emit(out, indent, res + " = math_eval(" + expr + ".as_str());");
+            emit(out, indent, res + " = ac_builtin_eval(" + expr + ");");
         }
     }
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
@@ -8315,10 +10682,13 @@ class RustStrategy : public BackendStrategy
     {
         std::string pfx = "_ac_s" + std::to_string(depth) + "_";
         for (const auto &v : vars)
-            // Non-Copy types (String, Vec) would be MOVED by a plain save, leaving `v` unusable in
-            // the loop body. .clone() keeps the original live (#6/#22 loop-sandbox on Rust).
+            // Non-Copy types (String, Vec, and now any bundle/tuple class instance — every
+            // synthesized struct derives Clone, see emitClassBegin's own comment) would be
+            // MOVED by a plain save, leaving `v` unusable in the loop body. .clone() keeps the
+            // original live (#6/#22 loop-sandbox on Rust).
             emit(out, indent, "let mut " + pfx + v + " = " + v
-                              + ((isStringVar(v) || listVars.count(v) || listParams_.count(v) || listGlobals_.count(v)) ? ".clone();" : ";"));
+                              + ((isStringVar(v) || listVars.count(v) || listParams_.count(v) || listGlobals_.count(v)
+                                  || classInstanceVars_.count(v)) ? ".clone();" : ";"));
     }
     void emitScopeExit(std::ostringstream &out, int &indent,
                        const std::vector<std::string> &vars, int depth) override
@@ -8364,6 +10734,13 @@ class RustStrategy : public BackendStrategy
     void emitForBegin(std::ostringstream &out, int &indent,
                       const std::string &iterVar, const std::string &collection) override
     {
+        if (genChannelVars_.count(collection)) {
+            // mpsc::Receiver::iter() blocks until the channel closes and yields OWNED i64
+            // values directly — unlike a Vec's `.iter()` (references), no deref wrapper needed.
+            emit(out, indent, "for " + iterVar + " in " + collection + ".iter() {");
+            indent++;
+            return;
+        }
         if (rangeOf_.count(collection)) {
             emit(out, indent, "for " + iterVar + " in 0.." + rangeOf_[collection] + " {");
             indent++;
@@ -8404,9 +10781,37 @@ class RustStrategy : public BackendStrategy
                    const std::string &var, const std::string &type,
                    const std::string &content, const std::string &content2 = "") override
     {
-        if (type == "range") { rangeOf_[var] = content; return; }
-        if (type == "sequence") {
-            seqOf_[var] = {content, content2.empty() ? content : content2};
+        if (type == "range" || type == "sequence") {
+            // See CStrategy's matching emitAlloc comment: rangeOf_/seqOf_ alone leave `var`
+            // completely undeclared when used as a plain VALUE, not immediately consumed by a
+            // FOR loop — "cannot find value `var` in this scope" the moment anything
+            // referenced it. Rust's `(a..b).collect()` makes this a one-liner.
+            std::string a, b, step;
+            if (type == "range") { rangeOf_[var] = content; a = "0"; b = content; }
+            else {
+                auto [b0, st] = splitSeqStep(content2);
+                b = b0.empty() ? content : b0; step = st;
+                seqOf_[var] = {content, b}; a = content;
+            }
+            listVars.insert(var); declared.insert(var);
+            if (step.empty()) {
+                emit(out, indent, "let mut " + var + ": Vec<i64> = ((" + a + ")..(" + b + ")).collect();");
+            } else {
+                // A negative/runtime step rules out `(a..b).step_by(n)` (usize-only, positive-only)
+                // — a manual loop handles both directions the same way every other backend's does.
+                thread_local int rngC = 0;
+                std::string iv = "_ac_rng_i_" + std::to_string(rngC);
+                std::string sv = "_ac_rng_st_" + std::to_string(rngC++);
+                emit(out, indent, "let mut " + var + ": Vec<i64> = Vec::new();");
+                emit(out, indent, "let " + sv + ": i64 = (" + step + ");");
+                emit(out, indent, "let mut " + iv + ": i64 = (" + a + ");");
+                emit(out, indent, "while if " + sv + " > 0 { " + iv + " < (" + b + ") } else { " + iv + " > (" + b + ") } {");
+                indent++;
+                emit(out, indent, var + ".push(" + iv + ");");
+                emit(out, indent, iv + " += " + sv + ";");
+                indent--;
+                emit(out, indent, "}");
+            }
             return;
         }
         if (type == "string") {
@@ -8543,6 +10948,9 @@ class RustStrategy : public BackendStrategy
         }
         // Build typed params with fn() type for function-typed params
         std::string tparams;
+        auto cptIt = classParamTypes_.find(name);
+        const std::map<int,std::string>* cpt = cptIt != classParamTypes_.end() ? &cptIt->second : nullptr;
+        int rIdx = 0;
         if (!rParams.empty()) {
             std::istringstream ss(rParams);
             std::string tok; bool first = true;
@@ -8551,6 +10959,13 @@ class RustStrategy : public BackendStrategy
                 std::string pname = (a == std::string::npos) ? "" : tok.substr(a, b - a + 1);
                 if (!first) tparams += ", ";
                 auto fit = funcTypedParams_.find(pname);
+                // classParamTypes_ (see its own comment): a param proven to receive a
+                // bundle/tuple instance argument needs the real struct type, not `i64` — same
+                // bug as C's `ac_int p`, fixed identically. Also pre-seeds
+                // classInstanceVars_/classInstanceVarNames_ so the body's `p.field` reads
+                // format as a real field access instead of a flattened name.
+                auto cit = cpt ? cpt->find(rIdx) : std::map<int,std::string>::const_iterator();
+                rIdx++;
                 // stringParams_ (see its own comment) — RustStrategy never wired
                 // setStringParams at all before this (base class no-op default), so
                 // detectStringParams' whole-program result was silently discarded; isStringVar
@@ -8559,7 +10974,11 @@ class RustStrategy : public BackendStrategy
                 // (verified: gl_bounce.ac's `reset_ball(arg)` — `arg` only ever appears as the
                 // argument to `gl:obj.is`/`gl:obj.regen`, never itself assigned a string literal
                 // or compared to one — declared `i64`, then failed passing a `&str` key name).
-                if (isStringVar(pname) || stringParams_.count(pname)) {
+                if (cpt && cit != cpt->end()) {
+                    tparams += "mut " + pname + ": " + cit->second;
+                    classInstanceVars_.insert(pname);
+                    classInstanceVarNames_[pname] = cit->second;
+                } else if (isStringVar(pname) || stringParams_.count(pname)) {
                     stringVars_.insert(pname);
                     tparams += pname + ": &str";   // #6: read-only string param (literals pass free)
                 } else if (listParams_.count(pname)) {
@@ -8578,6 +10997,39 @@ class RustStrategy : public BackendStrategy
             }
         }
         declareParams(rParams, declared);
+        // Generator: real thread + mpsc channel (Rust has no native generator/coroutine on
+        // stable). The body runs inside `thread::spawn(move || { ... })` — a closure with no
+        // return type, so `yield`/`return` inside it never need one (see emitYield/emitReturn's
+        // own generator branches). `move` requires every captured value to be 'static, which a
+        // bundle-method generator's `&mut self` receiver can't satisfy — free-function
+        // generators only for this pass, same scope cut noted in the yield plan.
+        curFuncIsGenerator_ = isGenerator_;
+        if (curFuncIsGenerator_) {
+            emit(out, indent, "fn " + rName + "(" + tparams + ") -> std::sync::mpsc::Receiver<i64> {");
+            indent++;
+            // sync_channel(1), NOT channel() — plain mpsc::channel() is UNBOUNDED, so the
+            // generator thread would never block on send and would race ahead to completion
+            // immediately instead of pausing at each yield until the consumer asks for the
+            // next value, silently losing yield's whole "one step at a time" laziness (and
+            // hanging/OOMing outright on an infinite generator). Bound of 1 matches the same
+            // buffered-channel-of-1 choice made for Go, for the same reason (see the yield
+            // plan's own Risk 1 note).
+            emit(out, indent, "let (_ac_gen_tx, _ac_gen_rx) = std::sync::mpsc::sync_channel::<i64>(1);");
+            emit(out, indent, "std::thread::spawn(move || {");
+            indent++;
+            for (const auto& [v, t] : hoistVars_) {
+                if (declared.count(v)) continue;
+                std::string line;
+                if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "let mut " + v + ": f64 = 0.0;"; }
+                else if (t == IRType::STRING) { stringVars_.insert(v); line = "let mut " + v + ": String = String::new();"; }
+                else if (t == IRType::LIST)     line = "let mut " + v + ": Vec<i64> = Vec::new();";
+                else                             line = "let mut " + v + ": i64 = 0;";
+                emit(out, indent, line);
+                declared.insert(v);
+            }
+            funcTypedParams_.clear();
+            return;
+        }
         curFuncReturnIsList_ = returnIsList_;
         // #retstring: RustStrategy never consulted baseReturnIsString_ at all — a user function
         // returning a bare string literal (e.g. via `cond`/`return $prime$`) always got the
@@ -8599,6 +11051,16 @@ class RustStrategy : public BackendStrategy
         curFuncIsConstructor_ = isNew;
         curFuncReturnIsVoid_ = returnIsVoid_ && !isNew;
         std::string retT = curFuncReturnIsVoid_ ? "" : returnIsList_ ? "-> Vec<i64> " : baseReturnIsString_ ? "-> String " : returnIsFloat_ ? "-> f64 " : "-> i64 ";
+        // A free function whose every `return` traces to one directly-constructed bundle
+        // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that struct
+        // directly — overrides every inference above, none of which know about bundle
+        // classes. Not applicable to the constructor (isNew) path, which always returns
+        // Self via its own dedicated signature line regardless.
+        curFuncReturnClass_ = "";
+        if (!isNew) {
+            auto classRetIt = classReturnFuncs_.find(name);
+            if (classRetIt != classReturnFuncs_.end()) { curFuncReturnClass_ = classRetIt->second; retT = "-> " + classRetIt->second + " "; }
+        }
         returnIsList_ = false;
         returnIsFloat_ = false;
         baseReturnIsString_ = false;
@@ -8628,6 +11090,16 @@ class RustStrategy : public BackendStrategy
         // first assigned it).
         for (const auto& [v, t] : hoistVars_) {
             if (declared.count(v)) continue;
+            // A `free`-promoted global's ref() is ALREADY the wrapped "unsafe { _AC_FREE_x }"
+            // form (see formatRef/stripPromotedGlobalWrap's own comments) — if whatever built
+            // hoistVars_ picked that up as a var "name", declaring it here is wrong twice
+            // over: it already has a real `static mut` at file scope, and "let mut unsafe {
+            // _AC_FREE_x }: TYPE = ..." isn't even valid Rust syntax to begin with (verified:
+            // a `free`/`<free>`-declared var whose only other appearances are hoisted-into
+            // reads — "expected identifier, found keyword `unsafe`"). Skip it; the real
+            // declaration is emitHeader's job, not this hoist pass's.
+            std::string bare;
+            if (stripPromotedGlobalWrap(v, bare)) { declared.insert(v); continue; }
             std::string line;
             if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "let mut " + v + ": f64 = 0.0;"; }
             else if (t == IRType::STRING) { stringVars_.insert(v); line = "let mut " + v + ": String = String::new();"; }
@@ -8642,20 +11114,45 @@ class RustStrategy : public BackendStrategy
     bool curFuncReturnIsString_ = false;
     bool curFuncReturnIsVoid_ = false;
     bool curFuncIsConstructor_ = false;
+    bool curFuncIsGenerator_ = false;
     void setReturnIsVoid(bool v) override { returnIsVoid_ = v; }
     bool returnIsVoid_ = false;
+    void setIsGenerator(bool v) override { isGenerator_ = v; }
+    bool isGenerator_ = false;
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "_ac_gen_tx.send(" + val + ").ok();");
+    }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
+        if (curFuncIsGenerator_) {
+            indent--;
+            emit(out, indent, "});");
+            emit(out, indent, "_ac_gen_rx");
+            curFuncIsGenerator_ = false;
+            lastWasReturn = false;
+            indent--;
+            emit(out, indent, "}");
+            emitRaw(out, "");
+            declared.clear(); floatVars.clear();
+            return;
+        }
         // A void fn (unit return `()`) must NOT get a trailing bare value expression — `0` as
         // the last expression in a function with no `-> T` is itself a type error (Rust infers
         // `()` and `0` doesn't fit), unlike every OTHER case here which needs SOME fallthrough
         // value to match its declared non-void return type.
         if (!lastWasReturn && !curFuncReturnIsVoid_)
             emit(out, indent, curFuncIsConstructor_ ? "_ac_self"
+                             // Class-returning function's implicit trailing value (see
+                             // curFuncReturnClass_'s own comment in emitFunctionBegin) — same
+                             // "still has to typecheck even though unreachable after a real
+                             // `return p;`" reasoning as every sibling backend's matching fix.
+                             : !curFuncReturnClass_.empty() ? curFuncReturnClass_ + "::new()"
                              : curFuncReturnIsList_ ? "vec![]"
                              : curFuncReturnIsString_ ? "String::new()" : "0");
         lastWasReturn = false; curFuncReturnIsList_ = false;
         curFuncReturnIsString_ = false; curFuncIsConstructor_ = false; curFuncReturnIsVoid_ = false;
+        curFuncReturnClass_ = "";
         indent--;
         emit(out, indent, "}");
         emitRaw(out, "");
@@ -8672,7 +11169,13 @@ class RustStrategy : public BackendStrategy
         // need buffering every field-init statement instead of emitting them as normal
         // statements — Default sidesteps that with a two-line prologue).
         curClassName_ = name;
-        emit(out, indent, "#[derive(Default)]");
+        // Clone (every field type here — i64/f64/String/bool — always implements it) lets
+        // emitScopeEnter's loop save/restore explicitly `.clone()` a class-instance var
+        // instead of a plain `= t` copy, which Rust treats as a MOVE for any non-Copy struct
+        // (every struct here, since String isn't Copy) — verified real bug: a named (non-self)
+        // instance var referenced inside a WHILST loop moved out of itself on its own
+        // save-snapshot line, "value used here after move" on every later read in the loop body.
+        emit(out, indent, "#[derive(Default, Clone)]");
         emit(out, indent, "struct " + name + " {");
         indent++;
     }
@@ -8692,6 +11195,12 @@ class RustStrategy : public BackendStrategy
         emit(out, indent, "impl " + curClassName_ + " {");
         indent++;
     }
+    std::set<std::string> classInstanceVars_;
+    std::map<std::string,std::string> classInstanceVarNames_;
+    std::map<std::string,std::string> classReturnFuncs_;   // fn.name -> class name (see setClassReturnFuncs)
+    std::map<std::string, std::map<int, std::string>> classParamTypes_;  // see setClassParamTypes
+    void setClassParamTypes(const std::map<std::string, std::map<int, std::string>> &m) override { classParamTypes_ = m; }
+    std::string curFuncReturnClass_;
     void emitConstructCall(std::ostringstream &out, int &indent, const std::string &res,
                            const std::string &className, const std::string &args) override
     {
@@ -8700,9 +11209,16 @@ class RustStrategy : public BackendStrategy
         // type inference would default `res` to `i64` — it has no way to know the value is a
         // struct instance, so declare it with the real class type directly instead.
         bool isNew = declared.insert(res).second;
+        classInstanceVars_.insert(res);
+        classInstanceVarNames_[res] = className;
         emit(out, indent, (isNew ? "let mut " + res + ": " + className + " = " : res + " = ")
                           + className + "::new(" + args + ");");
     }
+    void noteInstanceClass(const std::string &var, const std::string &className) override {
+        classInstanceVars_.insert(var);
+        classInstanceVarNames_[var] = className;
+    }
+    void setClassReturnFuncs(const std::map<std::string,std::string> &m) override { classReturnFuncs_ = m; }
     void emitClassEnd(std::ostringstream &out, int &indent) override
     {
         indent--;
@@ -8730,6 +11246,14 @@ class RustStrategy : public BackendStrategy
         // A string source parses at the boundary (`"42".parse()`), not `as` (which won't compile
         // from &str). Fixes `to_int n = $42$` on Rust.
         bool srcIsStr = (!src.empty() && src.front() == '"') || isStringVar(src);
+        // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point.
+        if (boxedVars_.count(var)) {
+            std::string rhs = (t == IRType::STRING) ? "AcDynVal::of_s((" + src + ").to_string())"
+                             : (t == IRType::FLOAT)  ? (srcIsStr ? "AcDynVal::of_f((" + src + ").parse::<f64>().unwrap_or(0.0))" : "AcDynVal::of_f((" + src + ") as f64)")
+                             :                          (srcIsStr ? "AcDynVal::of_i((" + src + ").parse::<i64>().unwrap_or(0))" : "AcDynVal::of_i((" + src + ") as i64)");
+            emit(out, indent, (isNew ? "let mut " + var + ": AcDynVal = " : var + " = ") + rhs + ";");
+            return;
+        }
         if (floatVars.count(var) || t == IRType::FLOAT) {
             floatVars.insert(var);
             std::string rhs = srcIsStr ? (src + ".parse::<f64>().unwrap_or(0.0)") : (src + " as f64");
@@ -8762,6 +11286,11 @@ class RustStrategy : public BackendStrategy
         // inside one `if`/`else` arm of the REPL loop and read from sibling arms afterward).
         for (const auto& [v, t] : hoistVars_) {
             if (declared.count(v)) continue;
+            // Same promoted-global skip as emitFunctionBegin's identical hoist loop (see its
+            // comment) — a wrapped "unsafe { _AC_FREE_x }" already has a real declaration at
+            // file scope; re-"declaring" the wrapped string itself isn't even valid syntax.
+            std::string bare;
+            if (stripPromotedGlobalWrap(v, bare)) { declared.insert(v); continue; }
             std::string line;
             if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "let mut " + v + ": f64 = 0.0;"; }
             else if (t == IRType::STRING) { stringVars_.insert(v); line = "let mut " + v + ": String = String::new();"; }
@@ -8784,6 +11313,48 @@ class RustStrategy : public BackendStrategy
 
 class GoStrategy : public BackendStrategy
 {
+    // Widget ctor calls (`Screen(...)`, `textbox(...)`, etc) had NO special handling at all
+    // before this — they fell straight through emitCall's generic fallback to `decl(res,
+    // call)`, which has no way to know the real return type is `*AcScreen`/`*AcTextbox`/etc
+    // and defaults every widget var to `int64` (verified: `var root int64 = Screen("My
+    // App")` — a straight type mismatch against Screen's real `*AcScreen` return, and any
+    // later `root.dimensions(...)`/`root.mainloop()` call fails to even parse as a method on
+    // an int64). Also: Go's widget wrapper functions have NO lazy-packing support at all
+    // (mirrors Rust's same limitation, see its emitCall comment) — a trailing `lazy`
+    // sentinel arg was never stripped, so e.g. `dropdown(root, lazy)` passed the literal
+    // string "lazy" into dropdown's bulk-add `values` parameter, silently adding a bogus
+    // "lazy" item to the dropdown.
+    static bool isWidgetCtor(const std::string& func) {
+        static const std::set<std::string> ctors = {
+            "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
+            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch",
+            "textbox"
+        };
+        return ctors.count(func) > 0;
+    }
+    static std::string widgetGoType(const std::string& func) {
+        static const std::map<std::string,std::string> m = {
+            {"Screen","*AcScreen"}, {"display","*AcDisplay"}, {"ask","*AcAsk"},
+            {"btn","*AcBtn"}, {"ckbtn","*AcCkbtn"}, {"radbtn","*AcRadbtn"},
+            {"dropdown","*AcDropdown"}, {"advance","*AcAdvance"}, {"slider","*AcSlider"},
+            {"group","*AcGroup"}, {"tabs","*AcTabs"}, {"scroller","*AcScroller"},
+            {"listbox","*AcListbox"}, {"table","*AcTable"}, {"sketch","*AcSketch"},
+            {"textbox","*AcTextbox"},
+        };
+        auto it = m.find(func);
+        return it == m.end() ? "" : it->second;
+    }
+    std::map<std::string,std::string> widgetVarType_;
+    // The shared driver ALREADY computes exactly "which promoted globals are widget ctors,
+    // and which AC ctor name" (structGlobals, see its own big comment at the call site) and
+    // calls this unconditionally for any backend — GoStrategy just never overrode it before,
+    // so every promoted widget var fell back to the hardcoded `int64` in emitHeader below.
+    void setStructGlobals(const std::map<std::string, std::string> &m) override {
+        for (auto& [var, ctorName] : m) {
+            std::string ty = widgetGoType(ctorName);
+            if (!ty.empty()) widgetVarType_[var] = ty;
+        }
+    }
     bool curFuncRetString_ = false;
     std::set<std::string> userStringFuncs_;
 public:
@@ -8820,6 +11391,10 @@ private:
     bool isListReturningFunc(const std::string& fn) const { return userListFuncs_.count(fn) > 0; }
     std::unordered_map<std::string, std::string> rangeOf_;
     std::unordered_map<std::string, std::pair<std::string,std::string>> seqOf_;
+    // Vars materialized as []int64 by emitAlloc's range/sequence-as-value case (see its own
+    // comment) — decl()/emitTypedStoreVar need this to know a plain copy (`y := t_0`) should
+    // infer via Go's own `:=` instead of declaring `int64` and punning a slice through it.
+    std::set<std::string> goListVars_;
     std::set<std::string> pendingFreeVars_;
     // Relative path from output file's directory to project root (e.g. ".." for examples/)
     std::string relRoot_ = ".";
@@ -8837,6 +11412,7 @@ private:
         if (isMLFloatReturningFunc(fn)) return true;
         if (fn.rfind("math.", 0) == 0) return true;
         if (fn.rfind("stat_", 0) == 0) return true;
+        if (fn == "aczip.get_ratio" || fn == "aczip_get_ratio") return true;
         return false;
     }
     bool isFloatVal(const std::string &v) const { return looksFloat(v) || floatVars.count(v) || isKnownFloatName(v); }
@@ -8893,9 +11469,9 @@ private:
     bool needsEvents_ = false;
     bool needsSave_ = false;
     void setNeedsSave(bool v) override { needsSave_ = v; }
-    bool hasIpowOp_ = false, hasRandomOp_ = false;
-    void setUsedBuiltinOps(bool /*div*/, bool ip, bool /*len*/, bool /*add*/, bool r, bool /*idiv*/, bool /*eval*/, bool /*etry*/) override {
-        hasIpowOp_ = ip; hasRandomOp_ = r;
+    bool hasIpowOp_ = false, hasRandomOp_ = false, hasEvalOp_ = false;
+    void setUsedBuiltinOps(bool /*div*/, bool ip, bool /*len*/, bool /*add*/, bool r, bool /*idiv*/, bool ev, bool /*etry*/) override {
+        hasIpowOp_ = ip; hasRandomOp_ = r; hasEvalOp_ = ev;
     }
     void emitCapture(std::ostringstream &out, int &indent, const std::string &val) override
     {
@@ -8978,10 +11554,22 @@ private:
                 std::string cgoBlock, wrappers;
                 parseGoFFI(ln, cgoBlock, wrappers);
                 if (!cgoBlock.empty()) {
-                    // Replace ${SRCDIR}/library/ln with ${SRCDIR}/<relRoot_>/library/ln
-                    // so the path resolves correctly regardless of where the .go file lives.
+                    // ${SRCDIR}/<relRoot_>/library/ln relied on counting slashes in the OUTPUT
+                    // filename to guess how many `../` hops reach the project root — correct
+                    // only for "ac examples/foo.ac" run FROM the root; break it by `cd`-ing
+                    // into examples/ first and running "ac foo.ac" (a completely normal way to
+                    // invoke the compiler: bare filename → 0 slashes → relRoot_ stays "." even
+                    // though cwd is one level below root) and cgo can't find camera_c.h/etc.
+                    // resolveIlibDir already finds the real absolute directory regardless of
+                    // cwd/invocation style (AC_PATH → cwd-search → binary-relative) — substitute
+                    // that directly instead of guessing a relative path from the output name.
                     std::string from = "${SRCDIR}/library/ilib/" + ln;
-                    std::string to   = "${SRCDIR}/" + relRoot_ + "/library/ilib/" + ln;
+                    std::string absDir = resolveIlibDir(ln);
+                    // cgo's #cgo directive tokenizer supports shell-style quoting (needed here:
+                    // the resolved absolute path can contain spaces, e.g. a "kiro projects"
+                    // directory component — an unquoted path silently splits into two bogus
+                    // flag tokens, "invalid flag in #cgo CFLAGS").
+                    std::string to = !absDir.empty() ? ("\"" + absDir + "\"") : ("${SRCDIR}/" + relRoot_ + "/library/ilib/" + ln);
                     size_t pos = 0;
                     while ((pos = cgoBlock.find(from, pos)) != std::string::npos) {
                         cgoBlock.replace(pos, from.size(), to);
@@ -9041,18 +11629,18 @@ private:
         if (needsInput_) emitRaw(out, "    \"bufio\"");
         emitRaw(out, "    \"fmt\"");
         emitRaw(out, "    \"strconv\"");
+        emitRaw(out, "    \"strings\"");   // now also needed by ac_fmtg (cross-backend float display)
+        emitRaw(out, "    \"math/big\"");  // ac_fmtg uses exact big.Rat/big.Float decimal extraction
         if (needsOS_ || needsSave_)   emitRaw(out, "    \"os\"");
-        if (needsInput_ || needsSave_) emitRaw(out, "    \"strings\"");
         if (needsUnsafeImport) emitRaw(out, "    \"unsafe\"");
         if (wantsNativeMath)   emitRaw(out, "    gomath \"math\"");
         if (anyAtomicVars())   emitRaw(out, "    \"sync\"");
         emitRaw(out, "    \"syscall\"");
         {
             // Already-emitted-above imports would double-import if re-added — Go rejects that.
-            std::set<std::string> already = {"\"fmt\"", "\"strconv\"", "\"syscall\""};
+            std::set<std::string> already = {"\"fmt\"", "\"strconv\"", "\"syscall\"", "\"strings\"", "\"math/big\""};
             if (needsInput_) already.insert("\"bufio\"");
             if (needsOS_ || needsSave_) already.insert("\"os\"");
-            if (needsInput_ || needsSave_) already.insert("\"strings\"");
             if (needsUnsafeImport) already.insert("\"unsafe\"");
             if (anyAtomicVars()) already.insert("\"sync\"");
             for (auto& imp : hoistedImports)
@@ -9061,13 +11649,53 @@ private:
         emitRaw(out, ")\n");
         emitRaw(out, "func _b(b bool) int64 { if b { return 1 }; return 0 }");
         emitRaw(out, "func _ac_abort() { syscall.Kill(syscall.Getpid(), syscall.SIGABRT) }\n");
+        // AcDynVal: a genuine tagged runtime value for the small set of variables (setBoxedVars)
+        // that Abu's retype spec requires to hold different types at different points in their
+        // own scope — one fixed Go declared type per var name can't do that. Go has no operator
+        // overloading, so like the C/Java ports, every consumer calls these helpers explicitly.
+        // A String() method (Stringer interface) means fmt.Println(x) formats it correctly with
+        // no special-casing at the print site. strconv is already unconditionally imported.
+        emitRaw(out, "type AcDynVal struct { tag int; i int64; d float64; s string; b bool }");
+        emitRaw(out, "func acDynI(v int64) AcDynVal { return AcDynVal{tag:0, i:v} }");
+        emitRaw(out, "func acDynF(v float64) AcDynVal { return AcDynVal{tag:1, d:v} }");
+        emitRaw(out, "func acDynS(v string) AcDynVal { return AcDynVal{tag:2, s:v} }");
+        emitRaw(out, "func acDynB(v bool) AcDynVal { return AcDynVal{tag:3, b:v} }");
+        emitRaw(out, "func (v AcDynVal) acAsD() float64 { if v.tag==1 { return v.d }; if v.tag==3 { if v.b { return 1 }; return 0 }; return float64(v.i) }");
+        emitRaw(out, "func (v AcDynVal) acAsI() int64 { if v.tag==0 { return v.i }; if v.tag==1 { return int64(v.d) }; if v.b { return 1 }; return 0 }");
+        emitRaw(out, "func (v AcDynVal) String() string {");
+        emitRaw(out, "    switch v.tag {");
+        emitRaw(out, "    case 2: return v.s");
+        emitRaw(out, "    case 3: if v.b { return \"true\" }; return \"false\"");
+        emitRaw(out, "    case 0: return strconv.FormatInt(v.i, 10)");
+        emitRaw(out, "    default:");
+        emitRaw(out, "        xi := int64(v.d)");
+        emitRaw(out, "        if float64(xi) == v.d { return strconv.FormatInt(xi, 10) }");
+        emitRaw(out, "        return strconv.FormatFloat(v.d, 'g', -1, 64)");
+        emitRaw(out, "    }");
+        emitRaw(out, "}");
+        emitRaw(out, "func acDynAdd(a, b AcDynVal) AcDynVal {");
+        emitRaw(out, "    if a.tag==2 || b.tag==2 { return acDynS(a.String()+b.String()) }");
+        emitRaw(out, "    if a.tag==1 || b.tag==1 { return acDynF(a.acAsD()+b.acAsD()) }");
+        emitRaw(out, "    return acDynI(a.acAsI()+b.acAsI())");
+        emitRaw(out, "}");
+        emitRaw(out, "func acDynSub(a, b AcDynVal) AcDynVal { if a.tag==1||b.tag==1 { return acDynF(a.acAsD()-b.acAsD()) }; return acDynI(a.acAsI()-b.acAsI()) }");
+        emitRaw(out, "func acDynMul(a, b AcDynVal) AcDynVal { if a.tag==1||b.tag==1 { return acDynF(a.acAsD()*b.acAsD()) }; return acDynI(a.acAsI()*b.acAsI()) }");
+        emitRaw(out, "func acDynDiv(a, b AcDynVal) AcDynVal { return acDynF(a.acAsD()/b.acAsD()) }");
+        emitRaw(out, "func acDynEq(a, b AcDynVal) bool { if a.tag==2||b.tag==2 { return a.String()==b.String() }; return a.acAsD()==b.acAsD() }");
+        emitRaw(out, "func acDynLt(a, b AcDynVal) bool { if a.tag==2||b.tag==2 { return a.String()<b.String() }; return a.acAsD()<b.acAsD() }");
+        emitRaw(out, "func acDynGt(a, b AcDynVal) bool { if a.tag==2||b.tag==2 { return a.String()>b.String() }; return a.acAsD()>b.acAsD() }\n");
         // `to_int`/`to_dec`/`to_bool`/`short`/`mini`/`atomic` on a STRING source (`to_int n =
         // $42$`) must PARSE the text — Go's `int64("42")` is a hard compile error (no such
         // conversion exists at all, unlike C's silent-garbage pointer-cast bug).
         emitRaw(out, "func ac_atoi(s string) int64 { v, _ := strconv.ParseInt(s, 10, 64); return v }");
         emitRaw(out, "func ac_atof(s string) float64 { v, _ := strconv.ParseFloat(s, 64); return v }");
-        if (anyAtomicVars())
+        if (anyAtomicVars()) {
             emitRaw(out, "var _acAtomicLock sync.Mutex // `atomic` vars: any op touching one is a global critical section\n");
+            // See emitTypedStoreVar's ATOMIC branch comment: Go rejects `int64(5.5)`
+            // (a fractional CONSTANT conversion) at compile time; routing it through a
+            // function call sidesteps that restriction entirely.
+            emitRaw(out, "func ac_trunc64(f float64) int64 { return int64(f) }");
+        }
         if (needsEvents_) {
             emitRaw(out, "var _acEvents = map[string]func(){}");
             emitRaw(out, "func _acBind(key string, fn func()) { _acEvents[key] = fn }");
@@ -9124,6 +11752,57 @@ private:
             emitRaw(out, "    return r");
             emitRaw(out, "}");
         }
+        if (hasEvalOp_) {
+            // eval(): self-contained arithmetic evaluator (+ - * / parens, unary +/-), ported
+            // from CStrategy's `_ac_builtin_eval` (same factor->term->expr grammar). Verified
+            // real bug: emitEval called a nonexistent `math_eval(expr)` — "undefined: math_eval".
+            emitRaw(out, "func ac_eval_ws(s string, p int) int {");
+            emitRaw(out, "    for p < len(s) && (s[p] == ' ' || s[p] == '\\t') { p++ }");
+            emitRaw(out, "    return p");
+            emitRaw(out, "}");
+            emitRaw(out, "func ac_eval_factor(s string, p int) (float64, int) {");
+            emitRaw(out, "    p = ac_eval_ws(s, p)");
+            emitRaw(out, "    if p < len(s) && s[p] == '(' {");
+            emitRaw(out, "        p++");
+            emitRaw(out, "        v, np := ac_eval_expr(s, p)");
+            emitRaw(out, "        p = ac_eval_ws(s, np)");
+            emitRaw(out, "        if p < len(s) && s[p] == ')' { p++ }");
+            emitRaw(out, "        return v, p");
+            emitRaw(out, "    }");
+            emitRaw(out, "    if p < len(s) && s[p] == '-' { v, np := ac_eval_factor(s, p+1); return -v, np }");
+            emitRaw(out, "    if p < len(s) && s[p] == '+' { return ac_eval_factor(s, p+1) }");
+            emitRaw(out, "    start := p");
+            emitRaw(out, "    for p < len(s) && ((s[p] >= '0' && s[p] <= '9') || s[p] == '.') { p++ }");
+            emitRaw(out, "    if p == start { return 0.0, p }");
+            emitRaw(out, "    v, err := strconv.ParseFloat(s[start:p], 64)");
+            emitRaw(out, "    if err != nil { return 0.0, p }");
+            emitRaw(out, "    return v, p");
+            emitRaw(out, "}");
+            emitRaw(out, "func ac_eval_term(s string, p int) (float64, int) {");
+            emitRaw(out, "    v, p := ac_eval_factor(s, p)");
+            emitRaw(out, "    for {");
+            emitRaw(out, "        p = ac_eval_ws(s, p)");
+            emitRaw(out, "        if p < len(s) && s[p] == '*' { d, np := ac_eval_factor(s, p+1); v *= d; p = np");
+            emitRaw(out, "        } else if p < len(s) && s[p] == '/' { d, np := ac_eval_factor(s, p+1); if d != 0.0 { v /= d } else { v = 0.0 }; p = np");
+            emitRaw(out, "        } else { break }");
+            emitRaw(out, "    }");
+            emitRaw(out, "    return v, p");
+            emitRaw(out, "}");
+            emitRaw(out, "func ac_eval_expr(s string, p int) (float64, int) {");
+            emitRaw(out, "    v, p := ac_eval_term(s, p)");
+            emitRaw(out, "    for {");
+            emitRaw(out, "        p = ac_eval_ws(s, p)");
+            emitRaw(out, "        if p < len(s) && s[p] == '+' { d, np := ac_eval_term(s, p+1); v += d; p = np");
+            emitRaw(out, "        } else if p < len(s) && s[p] == '-' { d, np := ac_eval_term(s, p+1); v -= d; p = np");
+            emitRaw(out, "        } else { break }");
+            emitRaw(out, "    }");
+            emitRaw(out, "    return v, p");
+            emitRaw(out, "}");
+            emitRaw(out, "func ac_builtin_eval(s string) float64 {");
+            emitRaw(out, "    v, _ := ac_eval_expr(s, 0)");
+            emitRaw(out, "    return v");
+            emitRaw(out, "}");
+        }
         if (hasRandomOp_) {
             // `random.number(n)`: a uniform int in [0, n)
             emitRaw(out, "func ac_rand(n int64) int64 {");
@@ -9154,19 +11833,77 @@ private:
         emitRaw(out, "    }");
         emitRaw(out, "    return r");
         emitRaw(out, "}\n");
-        // Go's fmt.Println/%v for a float64 drops the trailing decimal point on a whole number
-        // (fmt.Println(9.0) -> "9"), same class of bug as C's bare %.16g — matches PY's repr(float)
-        // convention (always at least one digit after the point) instead.
-        emitRaw(out, "func _ac_dblprint(d float64) { if d == float64(int64(d)) { fmt.Printf(\"%.1f\\n\", d) } else { fmt.Println(d) } }");
+        // Cross-backend float-display convention (see JavaScriptStrategy::emitHeader's `ac_fmtg`
+        // for the full rationale/verification). Go's own strconv.FormatFloat was tried first and
+        // REJECTED: verified TWO independent real bugs in it — 'g' format with a positive
+        // precision still silently truncates like -1 (round-trip-shortest) mode for some values
+        // (3.14+2.5 -> "5.64" instead of the correctly-rounded 16-sig-fig "5.640000000000001"),
+        // and 'e' format with fixed precision rounds INCORRECTLY for that same value ("...000e+00"
+        // instead of "...001e+00" — verified against the true exact decimal expansion via
+        // Python's Decimal(), which has a nonzero, unambiguously-round-up-triggering tail at that
+        // position). big.Rat(exact value).Text('e', N) sidesteps both — it's an exact decimal
+        // expansion with no rounding of its own, so this function does the %.16g-style rounding
+        // itself, correctly, on top of it. IMPORTANT: verify against a RUNTIME-computed float64
+        // (e.g. through a function call), never a bare literal expression — Go constant-folds
+        // literal float arithmetic at arbitrary precision at COMPILE time, which silently
+        // produces a DIFFERENT bit pattern than genuine float64 runtime arithmetic and will look
+        // like a mismatch that isn't really there (this cost real time to track down: 3.14+2.5 as
+        // a Go literal is bit-for-bit different from add(3.14, 2.5) called at runtime).
+        emitRaw(out, "func ac_fmtg(d float64) string {");
+        emitRaw(out, "    if d == 0 { return \"0\" }");
+        emitRaw(out, "    neg := d < 0");
+        emitRaw(out, "    ad := d; if neg { ad = -d }");
+        emitRaw(out, "    r := new(big.Rat).SetFloat64(ad)");
+        emitRaw(out, "    bf := new(big.Float).SetPrec(200).SetRat(r)");
+        emitRaw(out, "    s := bf.Text('e', 30)");
+        emitRaw(out, "    parts := strings.SplitN(s, \"e\", 2)");
+        emitRaw(out, "    mantissa := strings.Replace(parts[0], \".\", \"\", 1)");
+        emitRaw(out, "    exp := 0");
+        emitRaw(out, "    fmt.Sscanf(parts[1], \"%d\", &exp)");
+        emitRaw(out, "    if len(mantissa) > 16 {");
+        emitRaw(out, "        keepBytes := []byte(mantissa[:16])");
+        emitRaw(out, "        if mantissa[16] >= '5' {");
+        emitRaw(out, "            i := len(keepBytes) - 1");
+        emitRaw(out, "            for i >= 0 {");
+        emitRaw(out, "                if keepBytes[i] == '9' { keepBytes[i] = '0'; i-- } else { keepBytes[i]++; break }");
+        emitRaw(out, "            }");
+        emitRaw(out, "            if i < 0 { keepBytes = append([]byte{'1'}, keepBytes...); keepBytes = keepBytes[:16]; exp++ }");
+        emitRaw(out, "        }");
+        emitRaw(out, "        mantissa = string(keepBytes)");
+        emitRaw(out, "    }");
+        emitRaw(out, "    mantissa = strings.TrimRight(mantissa, \"0\")");
+        emitRaw(out, "    if mantissa == \"\" { mantissa = \"0\" }");
+        emitRaw(out, "    var result string");
+        emitRaw(out, "    if exp < -4 || exp >= 16 {");
+        emitRaw(out, "        mant := mantissa; if len(mantissa) > 1 { mant = mantissa[:1] + \".\" + mantissa[1:] }");
+        emitRaw(out, "        sign := \"+\"; e := exp; if e < 0 { sign = \"-\"; e = -e }");
+        emitRaw(out, "        result = fmt.Sprintf(\"%se%s%02d\", mant, sign, e)");
+        emitRaw(out, "    } else if exp >= 0 {");
+        emitRaw(out, "        if len(mantissa) <= exp+1 {");
+        emitRaw(out, "            result = mantissa + strings.Repeat(\"0\", exp+1-len(mantissa))");
+        emitRaw(out, "        } else {");
+        emitRaw(out, "            result = mantissa[:exp+1] + \".\" + mantissa[exp+1:]");
+        emitRaw(out, "        }");
+        emitRaw(out, "    } else {");
+        emitRaw(out, "        result = \"0.\" + strings.Repeat(\"0\", -exp-1) + mantissa");
+        emitRaw(out, "    }");
+        emitRaw(out, "    if neg { result = \"-\" + result }");
+        emitRaw(out, "    return result");
+        emitRaw(out, "}");
+        emitRaw(out, "func ac_fmt_double(d float64) string { s := ac_fmtg(d); if !strings.ContainsAny(s, \".eEnN\") { s += \".0\" }; return s }");
+        emitRaw(out, "func _ac_dblprint(d float64) { fmt.Println(ac_fmt_double(d)) }");
         if (needsSave_) {
-            emitRaw(out, "func ac_fmt_double(d float64) string { if d == float64(int64(d)) { return fmt.Sprintf(\"%.1f\", d) }; return fmt.Sprintf(\"%v\", d) }");
             emitRaw(out, "var _acSaved strings.Builder  // `save as`: accumulates everything printed so far");
         }
         for (auto& w : wrapperBlocks)
             if (!w.empty()) out << w;
-        // Package-level vars promoted via `free` keyword
-        for (auto& v : promotedGlobals_)
-            emitRaw(out, "var " + v + " int64");
+        // Package-level vars promoted via `free` keyword — widget-typed ones (see
+        // setStructGlobals) get their real `*AcXxx` type; everything else keeps the int64
+        // default (scalars/lists promoted this way have always been plain ints in practice).
+        for (auto& v : promotedGlobals_) {
+            auto it = widgetVarType_.find(v);
+            emitRaw(out, "var " + v + " " + (it != widgetVarType_.end() ? it->second : "int64"));
+        }
         if (!promotedGlobals_.empty()) emitRaw(out, "");
     }
 
@@ -9190,6 +11927,33 @@ private:
                 return var + " = float64(" + val + ")";
             if (stringVars.count(var) && !looksString(val))
                 return var + " = fmt.Sprintf(\"%v\", " + val + ")";
+            return var + " = " + val;
+        }
+        // Bundle field WRITE on a NAMED instance, not just `self` (`q.x = 5` — same root cause
+        // as every sibling backend: fell to the generic `int64` default below and declared a
+        // bogus `var q.x int64 = 5`, invalid Go). A field on a real struct/pointer is never
+        // independently declared — always a plain assignment.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot)))
+                return var + " = " + val;
+        }
+        // `q = f()` where f always constructs+returns one bundle class (classFuncs_'s prescan
+        // via noteInstanceClass) — Go's own `:=` infers the pointer type directly from the
+        // RHS, same as the genChannelVars_ case just below; no explicit type needed.
+        {
+            auto civ = classInstanceVarNames_.find(var);
+            if (civ != classInstanceVarNames_.end()) {
+                if (declared.insert(var).second) return var + " := " + val;
+                return var + " = " + val;
+            }
+        }
+        // A generator-call result (a `<-chan int64`) — no other check here knows about
+        // channels, so it fell to the plain `var t int64 = ...` default and Go rejected the
+        // channel value outright ("cannot use ... as int64 value"). Go's own `:=` infers the
+        // channel type directly from the RHS, no explicit type needed either way.
+        if (genChannelVars_.count(var)) {
+            if (declared.insert(var).second) return var + " := " + val;
             return var + " = " + val;
         }
         if (declared.insert(var).second)
@@ -9254,19 +12018,62 @@ private:
     void emitMod(std::ostringstream &out, int &indent,
                  const std::string &res, const std::string &lhs, const std::string &rhs) override
     { declared.insert(res); emit(out, indent, res + " := ((int64(" + lhs + ") % int64(" + rhs + ")) + int64(" + rhs + ")) % int64(" + rhs + ")"); }
+    void emitLockBegin(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "_acAtomicLock.Lock()");
+    }
+    void emitLockEnd(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "_acAtomicLock.Unlock()");
+    }
+    // Wrap a plain (non-AcDynVal) value into the right acDyn* constructor by its apparent type —
+    // Go has no operator overloading/implicit conversion, so callers must be explicit.
+    std::string boxWrap(const std::string& v, IRType t = IRType::VOID) const {
+        if (boxedVars_.count(v)) return v;
+        if (t == IRType::STRING || looksString(v) || stringVars.count(v)) return "acDynS(" + v + ")";
+        if (t == IRType::FLOAT || isFloatVal(v)) return "acDynF(" + v + ")";
+        if (t == IRType::BOOL) return "acDynB(" + v + ")";
+        return "acDynI(int64(" + v + "))";
+    }
     void emitTypedStoreVar(std::ostringstream &out, int &indent,
                            const std::string &var, const std::string &val, IRType t) override
     {
         // Bundle field write via a typed decl (e.g. `atomic hp = 5` as a field default) — same
         // translation as decl(): real struct field, no `var`-redeclaration.
         if (var.rfind("self.", 0) == 0) { emit(out, indent, decl(var, val)); return; }
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in the
-        // global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible RMW.
+        // Bundle field WRITE on a NAMED instance, not just `self` — decl()'s own matching fix.
+        // The shared driver's STORE_VAR dispatch ALWAYS calls emitTypedStoreVar (never decl()
+        // directly), so decl()'s classInstanceVars_ check alone was never reachable for a typed
+        // store — same gap as CStrategy/CppStrategy/JavaStrategy/RustStrategy's sibling fix.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot))) {
+                emit(out, indent, var + " = " + val);
+                return;
+            }
+        }
+        // Boxed var (setBoxedVars/detectBoxedVars — see AcDynVal's comment in emitHeader): must
+        // run before the string-unification branch below, which would otherwise force a `string`
+        // declaration that can't hold this var's genuinely-numeric earlier value.
+        if (boxedVars_.count(var)) {
+            emit(out, indent, (declared.insert(var).second ? "var " + var + " AcDynVal = " : var + " = ") + boxWrap(val, t));
+            return;
+        }
+        // `atomic` var: no inline lock wrap here anymore — ir.cpp now brackets the WHOLE
+        // read-modify-write span with real LOCK_BEGIN/LOCK_END instructions (see
+        // emitLockBegin/emitLockEnd below), closing the TOCTOU race the old store-only
+        // wrap here could never actually close.
         if (castDeclType(var, IRType::VOID) == IRType::ATOMIC) {
             if (declared.insert(var).second) emit(out, indent, "var " + var + " int64");
-            emit(out, indent, "_acAtomicLock.Lock()");
-            emit(out, indent, var + " = " + goWrap(val, IRType::INT));
-            emit(out, indent, "_acAtomicLock.Unlock()");
+            // NOT goWrap here: Go statically rejects `int64(5.5)` outright ("constant
+            // 5.5 truncated to integer") whenever the converted expression is itself a
+            // compile-time constant with a fractional value — even though the identical
+            // conversion on a runtime float64 *variable* holding 5.5 is completely legal
+            // (and truncates toward zero, same as C). `atomic` being sticky (always an
+            // int, per its own doc comment — see ir.cpp) means a later `x = 5.5` reaches
+            // here as exactly that: a literal constant being coerced. ac_trunc64 (emitted
+            // below, only when anyAtomicVars()) sidesteps the restriction — a function
+            // call is never itself a Go constant expression, whatever it's called with.
+            std::string rhs = looksFloat(val) ? "ac_trunc64(" + val + ")" : goWrap(val, IRType::INT);
+            emit(out, indent, var + " = " + rhs);
             return;
         }
         // Re-typing coercion (#retype): a var ever assigned a string is a string everywhere;
@@ -9288,6 +12095,18 @@ private:
         // `int64 = t_2` where t_2 is a `string`, a hard Go compile error).
         if (!looksString(val) && stringVars.count(val)) {
             if (declared.insert(var).second) { stringVars.insert(var); emit(out, indent, "var " + var + " string = " + val); }
+            else                             emit(out, indent, var + " = " + val);
+            return;
+        }
+        // A plain-variable copy of a []int64-typed value (`y := t_0` after `t_0 := ALLOC(range
+        // ...)`, e.g. `y = range 5` used as a plain value rather than a FOR-loop collection) —
+        // neither this function's declType branches below nor decl()'s own fallback know about
+        // slices, so it fell to `var y int64 = t_0` and punned a slice through a scalar
+        // ("cannot use t_0 (variable of type []int64) as int64 value"). Go's `:=` infers the
+        // slice type on its own — no explicit type needed.
+        if (goListVars_.count(val)) {
+            goListVars_.insert(var);
+            if (declared.insert(var).second) emit(out, indent, var + " := " + val);
             else                             emit(out, indent, var + " = " + val);
             return;
         }
@@ -9329,6 +12148,15 @@ private:
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — see AcDynVal's comment in emitHeader; must run before the string-forcing
+        // branch below (fmt.Sprintf on an AcDynVal calls its String() and does the wrong thing —
+        // string-formats it unconditionally instead of adding/concatenating by CURRENT tag).
+        if (boxedVars_.count(lhs) || boxedVars_.count(rhs)) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string fn = op=="+" ? "acDynAdd" : op=="-" ? "acDynSub" : (op=="*"||op=="@") ? "acDynMul" : "acDynDiv";
+            emit(out, indent, (declared.insert(res).second ? "var " + res + " AcDynVal = " : res + " = ") + fn + "(" + l + ", " + r + ")");
+            return;
+        }
         // Go string concat: `+` on two strings is legal Go, but this function otherwise always
         // treats `+` numerically (declares `res` as int64/float64) — with no string check at
         // all, `label + "!"` declared `t_6 int64 = label + "!"`, a hard type mismatch (Go has
@@ -9365,6 +12193,14 @@ private:
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — same reasoning as emitBinaryOp's own boxed branch.
+        if ((op=="=="||op=="!="||op=="<"||op==">") && (boxedVars_.count(lhs) || boxedVars_.count(rhs))) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string cmp = op=="==" ? "acDynEq("+l+", "+r+")" : op=="!=" ? "!acDynEq("+l+", "+r+")"
+                             : op=="<"  ? "acDynLt("+l+", "+r+")" : "acDynGt("+l+", "+r+")";
+            emit(out, indent, decl(res, "_b(" + cmp + ")"));
+            return;
+        }
         std::string expr;
         if (op == "xor")
             expr = "_b((" + lhs + " != 0) != (" + rhs + " != 0))";
@@ -9388,8 +12224,116 @@ private:
         emit(out, indent, "go " + func + "(" + args + ")");
     }
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
-                  const std::string &func, const std::string &args) override
+                  const std::string &funcIn, const std::string &args) override
     {
+        // `os.read(...)`/`os.write_to(...)`/`os.bash(...)` etc — the os ilib's Go FFI defines
+        // real symbols named `os_read`/`os_write_to`/`os_bash` (underscore, matching every
+        // other ilib's flattened naming — see math's own dot-to-underscore rewrite just below
+        // for the established pattern), but nothing ever rewrote the AC-level dotted call text
+        // to match: `os.read(...)` was emitted VERBATIM, calling a nonexistent Go symbol named
+        // literally "os" with a ".read" selector — "undefined: os" (Go has no package named
+        // "os" imported here at all; AC's `os` ilib and Go's stdlib "os" package just happen to
+        // share a name). This was a pre-existing gap, not textbox-specific — ANY AC program
+        // using the os ilib on Go hit this.
+        std::string func = funcIn;
+        if (func.rfind("os.", 0) == 0) { func = func.substr(0, 2) + "_" + func.substr(3); }
+        // Same gap as os. above, for the camera ilib's three receivers: camera_ffi.go
+        // defines flat `camera_init`/`sidebar_setregion`/`screen_setmode`-style symbols
+        // (no Go package/struct named camera/sidebar/screen exists), but AC's dotted call
+        // text (`camera.init()`, `sidebar.setregion(...)`) was emitted verbatim — "undefined:
+        // camera"/"undefined: sidebar"/"undefined: screen".
+        for (const char* ns : {"camera", "sidebar", "screen"}) {
+            std::string p = std::string(ns) + ".";
+            if (func.rfind(p, 0) == 0) { func = std::string(ns) + "_" + func.substr(p.size()); break; }
+        }
+        // `x = recv.get()` / `x = recv.find($needle$)` where `recv` is a known widget var —
+        // the generic fallback below (`decl(res, call)`) has no way to know these return
+        // anything but the int64 default, but every wrapper's `.get()` actually returns
+        // string/float64/bool depending on widget kind (verified: `path_inp.get()` inside
+        // ac_ide.ac's OnOpen — "cannot use path_inp.get() (value of type string) as int64
+        // value in variable declaration"). Needs its own type map since Go infers `:=`/`var`
+        // types from the call text, and this compiler emits explicit `var res TYPE = call`
+        // which must already know TYPE. Uses widgetVarType_ (populated for both local ctor
+        // results AND promoted globals via setStructGlobals) to find the receiver's kind.
+        {
+            auto dot = func.rfind('.');
+            if (dot != std::string::npos && !res.empty()) {
+                std::string recv = func.substr(0, dot), method = func.substr(dot + 1);
+                auto wit = widgetVarType_.find(recv);
+                if (wit != widgetVarType_.end() && (method == "get" || method == "find")) {
+                    static const std::map<std::string,std::string> getReturnType = {
+                        {"*AcAsk","string"}, {"*AcDisplay","string"}, {"*AcDropdown","string"},
+                        {"*AcTextbox","string"}, {"*AcAdvance","float64"}, {"*AcSlider","float64"},
+                        {"*AcCkbtn","bool"}, {"*AcRadbtn","bool"},
+                    };
+                    auto tIt = getReturnType.find(wit->second);
+                    if (tIt != getReturnType.end()) {
+                        std::string ty = tIt->second;
+                        std::string call = func + "(" + args + ")";
+                        if (declared.insert(res).second) emit(out, indent, "var " + res + " " + ty + " = " + call);
+                        else                              emit(out, indent, res + " = " + call);
+                        if (ty == "string") stringVars.insert(res);
+                        else if (ty == "float64") floatVars.insert(res);
+                        else if (ty == "bool") boolVars.insert(res);
+                        return;
+                    }
+                }
+            }
+        }
+        // Widget ctor (`root = Screen(...)`, `src_box = textbox(root, c, f, lazy)`) — declare
+        // with the real `*AcXxx` type (see widgetGoType) instead of falling through to the
+        // generic int64 default, and strip a trailing `lazy` sentinel arg (Go's widget wrapper
+        // has no lazy-packing support at all, matching Rust's same limitation — see its
+        // emitCall comment). Promoted (cross-function) widget globals are ALREADY declared
+        // with the right type by setStructGlobals/emitHeader above; this handles the local
+        // (same-function, e.g. `root`) case AND re-assigns without re-declaring for promoted
+        // ones (already `declared` via promotedGlobals_, see emitFunctionBegin/emitMainBegin).
+        if (isWidgetCtor(func) && !res.empty()) {
+            std::vector<std::string> a; std::string cur; int depth = 0; bool inStr = false;
+            for (char c : args) {
+                if (c == '"') inStr = !inStr;
+                if (!inStr && (c == '(' || c == '[')) depth++;
+                if (!inStr && (c == ')' || c == ']')) depth--;
+                if (c == ',' && depth == 0 && !inStr) { a.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+            if (!cur.empty()) a.push_back(cur);
+            for (auto& s : a) { size_t b = s.find_first_not_of(' '), e = s.find_last_not_of(' ');
+                s = (b == std::string::npos) ? "" : s.substr(b, e - b + 1); }
+            if (!a.empty() && (a.back() == "lazy" || a.back() == "\"lazy\"")) a.pop_back();
+            // btn(master, text, Callback) — Go's AcBtn ctor takes exactly 2 args (master,
+            // text); the callback wires up via a SEPARATE .on_click() call afterward (mirrors
+            // every other backend's split, e.g. BNY's bnyWidgetCtor). Was entirely unhandled
+            // before — Go's widget FFI had no button-callback support at all (no //export
+            // trampoline, no on_click method); see widgets_ffi.go's new
+            // _ac_go_cb_trampoline/widgets_btn_on_click for the C-calls-back-into-Go plumbing.
+            std::string cbName;
+            if (func == "btn" && a.size() > 2) { cbName = a[2]; a.resize(2); }
+            // dropdown's Go wrapper has an extra `values string` bulk-add param not present
+            // in the raw C ctor (items are normally added later via `.add()`) — Go has no
+            // default args, so a stripped-down-to-1-arg call (`dropdown(root, lazy)` minus
+            // the sentinel) is a hard "not enough arguments" without an explicit "" pad.
+            if (func == "dropdown" && a.size() < 2) a.push_back("\"\"");
+            std::string joined;
+            for (size_t i = 0; i < a.size(); i++) { if (i) joined += ", "; joined += a[i]; }
+            std::string call = func + "(" + joined + ")";
+            std::string ty = widgetGoType(func);
+            widgetVarType_[res] = ty;
+            // A `display(...)` label (or any widget) that's never read again after
+            // construction — a common, entirely normal AC pattern (`path_lbl = display(root,
+            // $File:$)`, only ever packed, never referenced) — is a hard Go compile error
+            // ("declared and not used") for a genuinely-new local var. `_ = x` is always valid
+            // regardless of whether x IS used elsewhere too, so it's safe to emit
+            // unconditionally for fresh local declarations (promoted globals skip this
+            // entirely — package-level vars don't need "used", and re-assignment isn't a
+            // fresh declaration anyway, see the `else` branch below).
+            bool isNewLocal = declared.insert(res).second;
+            if (isNewLocal) emit(out, indent, "var " + res + " " + ty + " = " + call);
+            else            emit(out, indent, res + " = " + call);
+            if (!cbName.empty()) emit(out, indent, res + ".on_click(" + cbName + ")");
+            if (isNewLocal) emit(out, indent, "_ = " + res);
+            return;
+        }
         if (func == "ac_length" && !res.empty()) { if (declared.insert(res).second) emit(out, indent, "var " + res + " int64 = int64(len(" + args + "))"); else emit(out, indent, res + " = int64(len(" + args + "))"); return; }
         { auto ap = func.rfind(".append");
           if (ap != std::string::npos && ap == func.size() - 7) {
@@ -9437,13 +12381,42 @@ private:
         // math_to_int takes float64 — cast integer args explicitly
         std::string actualArgs = (func == "math_to_int") ? "float64(" + args + ")" : args;
         std::string call = func + "(" + actualArgs + ")";
+        // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
+        // see AcDynVal's comment in emitHeader.
+        if (!res.empty() && boxedVars_.count(res)) {
+            emit(out, indent, (declared.insert(res).second ? "var " + res + " AcDynVal = " : res + " = ") + boxWrap(call));
+            return;
+        }
+        // Native Go `bool` return (not AC's usual int64-everywhere convention) — `IF x is
+        // True` lowers to a literal `x == true` comparison (see formatRef's trueVal/
+        // falseVal), which only type-checks against an actual Go bool var, not int64.
+        // Before this, only `maudio.tts_ok` had ever been special-cased this way — every
+        // OTHER bool-returning ilib function on Go (verified real Go source: `func
+        // os_exists(path string) bool`, `func regex_match(...) bool`, etc.) hit the same
+        // "cannot use X (value of type bool) as int64 value" compile error the moment its
+        // result was assigned to a variable. Mirrors RustStrategy's already-proven
+        // `glBoolFuncs` set (same class of gap, same fix, same names — all three call-name
+        // forms included since which one reaches here can vary by call-site shape).
+        static const std::set<std::string> goBoolFuncs = {
+            "gl.init", "gl_init", "ac_gl_init",
+            "gl.obj_circle_fell", "gl_obj_circle_fell", "ac_gl_obj_circle_fell",
+            "gl.is_obj", "gl_is_obj", "ac_gl_is_obj",
+            "gl.is_draw", "gl_is_draw", "ac_gl_is_draw",
+            "gl.hitbox_overlap", "gl_hitbox_overlap", "ac_gl_hitbox_overlap",
+            "gl.hitbox_many_overlap", "gl_hitbox_many_overlap", "ac_gl_hitbox_many_overlap",
+            "gl.hitbox_overlap_boundary", "gl_hitbox_overlap_boundary", "ac_gl_hitbox_overlap_boundary",
+            "gl.hitbox_overlap_pattern", "gl_hitbox_overlap_pattern", "ac_gl_hitbox_overlap_pattern",
+            "gl.frame_begin", "gl_frame_begin", "ac_gl_frame_begin",
+            "gl.key_pressed", "gl_key_pressed", "ac_gl_key_pressed",
+            "gl.key_just_pressed", "gl_key_just_pressed", "ac_gl_key_just_pressed",
+            "os.exists", "os_exists", "ac_os_exists",
+            "regex.match", "regex_match", "ac_regex_match",
+            "regex.test", "regex_test", "ac_regex_test",
+            "maudio.tts_ok", "maudio_tts_ok", "ac_maudio_tts_ok",
+        };
         if (res.empty()) {
             emit(out, indent, call);
-        } else if ((func == "maudio.tts_ok" || func == "maudio_tts_ok") && declared.insert(res).second) {
-            // Native Go bool (not AC's usual int64-everywhere convention) — `IF x is True`
-            // lowers to a literal `x == true` comparison (see formatRef's trueVal/falseVal),
-            // which only type-checks against an actual Go bool var, not int64. Declaring this
-            // one result as `bool` matches that comparison instead of fighting it.
+        } else if (goBoolFuncs.count(func) && declared.insert(res).second) {
             boolVars.insert(res);
             emit(out, indent, "var " + res + " bool = " + call);
         } else if ((isAcStrFunc(func) || userStringFuncs_.count(func)) && declared.insert(res).second) {
@@ -9467,6 +12440,13 @@ private:
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
+        // A generator's body runs inside `go func() { ... }()` — a closure with NO return
+        // type, since the OUTER function's real return value is the channel (emitted once,
+        // in emitFunctionEnd). Any `return expr` written inside a generator ends iteration
+        // early and DISCARDS expr (see the yield plan's own explicit scope cut) — only the
+        // early-exit side effect matters, never a value, and Go rejects `return <value>`
+        // inside a function/closure with no declared return values outright.
+        if (curFuncIsGenerator_) { if (!val.empty()) emit(out, indent, "return"); return; }
         // Suppress bare empty returns — they are IR safety fallthroughs, not real returns.
         // Go functions that always exit via os.Exit or explicit return don't need them.
         if (val.empty()) return;
@@ -9509,13 +12489,33 @@ private:
         emit(out, indent, "{ _acs := float64(" + secs + "); syscall.Nanosleep(&syscall.Timespec{Sec: int64(_acs), Nsec: int64((_acs-float64(int64(_acs)))*1e9)}, nil) }");
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
+        if (!argIsString) {
+            // Go's generic emitLazyEval declares an `interface{}` result — fine for a fresh temp
+            // but a hard compile error once assigned into a statically-typed destination (Go
+            // rejects `var d int64 = <interface{} expr>`). resultType (from ir.cpp) is unreliable
+            // here — a call like sideEffectFn() has no known type until Go's OWN whole-program
+            // prescan runs, which is AFTER ir.cpp lowers this instruction; by the time emitEval
+            // actually runs, though, that prescan has already finished and typed `expr` itself
+            // correctly (verified: `var t_3 int64 = sideEffectFn()` already exists above this
+            // line) — so query expr's OWN tracked type instead, same as every other codegen
+            // decision in this class. Falls back to Go's own int64 default when neither float
+            // nor string was detected, matching how untyped temps already default elsewhere.
+            std::string gt = isFloatVal(expr) ? "float64" : isStringVar(expr) ? "string" : "int64";
+            if (declared.insert(res).second) {
+                if (gt == "float64") floatVars.insert(res);
+                emit(out, indent, "var " + res + " " + gt + " = func() (v " + gt + ") { defer func() { recover() }(); v = " + expr + "; return }()");
+            } else {
+                emit(out, indent, res + " = func() (v " + gt + ") { defer func() { recover() }(); v = " + expr + "; return }()");
+            }
+            return;
+        }
         if (declared.insert(res).second) {
             floatVars.insert(res);
-            emit(out, indent, "var " + res + " float64 = math_eval(" + expr + ")");
+            emit(out, indent, "var " + res + " float64 = ac_builtin_eval(" + expr + ")");
         } else {
-            emit(out, indent, res + " = math_eval(" + expr + ")");
+            emit(out, indent, res + " = ac_builtin_eval(" + expr + ")");
         }
     }
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
@@ -9632,9 +12632,19 @@ private:
         indent--;
         emit(out, indent, "}");
     }
+    std::set<std::string> genChannelVars_;
+    void noteGeneratorCallResult(const std::string &resultVar) override { genChannelVars_.insert(resultVar); }
     void emitForBegin(std::ostringstream &out, int &indent,
                       const std::string &iterVar, const std::string &collection) override
     {
+        if (genChannelVars_.count(collection)) {
+            // Go's `range` over a channel yields ONE value per iteration, not an index+value
+            // pair — the generic `for _, v := range x` fallback below is a hard compile error
+            // ("too many variables in range") against a `<-chan int64`.
+            emit(out, indent, "for " + iterVar + " := range " + collection + " {");
+            indent++;
+            return;
+        }
         if (rangeOf_.count(collection)) {
             emit(out, indent, "for " + iterVar + " := int64(0); " + iterVar + " < int64(" + rangeOf_[collection] + "); " + iterVar + "++ {");
             indent++;
@@ -9667,9 +12677,33 @@ private:
                    const std::string &var, const std::string &type,
                    const std::string &content, const std::string &content2 = "") override
     {
-        if (type == "range") { rangeOf_[var] = content; return; }
-        if (type == "sequence") {
-            seqOf_[var] = {content, content2.empty() ? content : content2};
+        if (type == "range" || type == "sequence") {
+            // See CStrategy's matching emitAlloc comment: rangeOf_/seqOf_ alone leave `var`
+            // completely undeclared when used as a plain VALUE, not immediately consumed by a
+            // FOR loop — "undefined: var" the moment anything referenced it.
+            std::string a, b, step;
+            if (type == "range") { rangeOf_[var] = content; a = "0"; b = content; }
+            else {
+                auto [b0, st] = splitSeqStep(content2);
+                b = b0.empty() ? content : b0; step = st;
+                seqOf_[var] = {content, b}; a = content;
+            }
+            thread_local int rngC = 0;
+            std::string iv = "_ac_rng_i_" + std::to_string(rngC++);
+            goListVars_.insert(var);
+            emit(out, indent, var + " := []int64{}");
+            if (step.empty()) {
+                emit(out, indent, "for " + iv + " := int64(" + a + "); " + iv + " < int64(" + b + "); " + iv + "++ {");
+            } else {
+                std::string sv = "_ac_rng_st_" + std::to_string(rngC - 1);
+                emit(out, indent, sv + " := int64(" + step + ")");
+                emit(out, indent, "for " + iv + " := int64(" + a + "); (" + sv + " > 0 && " + iv + " < int64(" + b + ")) || (" + sv + " <= 0 && " + iv + " > int64(" + b + ")); " + iv + " += " + sv + " {");
+            }
+            indent++;
+            emit(out, indent, var + " = append(" + var + ", " + iv + ")");
+            indent--;
+            emit(out, indent, "}");
+            declared.insert(var);
             return;
         }
         if (type == "dict") {
@@ -9787,6 +12821,9 @@ private:
         }
         // Build typed params with func type for function-typed params
         std::string tparams;
+        auto cptIt = classParamTypes_.find(name);
+        const std::map<int,std::string>* cpt = cptIt != classParamTypes_.end() ? &cptIt->second : nullptr;
+        int gIdx = 0;
         if (!gParams.empty()) {
             std::istringstream ss(gParams);
             std::string tok; bool first = true;
@@ -9795,7 +12832,19 @@ private:
                 std::string pname = (a == std::string::npos) ? "" : tok.substr(a, b - a + 1);
                 if (!first) tparams += ", ";
                 auto fit = funcTypedParams_.find(pname);
-                if (isStringVar(pname)) {
+                // classParamTypes_ (see its own comment): a param proven to receive a
+                // bundle/tuple instance argument needs the real POINTER type (matches Go's own
+                // `*ClassName` convention for every instance this backend already handles —
+                // see emitConstructCall/its return-type sibling), not `int64`. Also pre-seeds
+                // classInstanceVars_/classInstanceVarNames_ so the body's `p.field` reads
+                // format as a real (pointer-deref) field access.
+                auto cit = cpt ? cpt->find(gIdx) : std::map<int,std::string>::const_iterator();
+                gIdx++;
+                if (cpt && cit != cpt->end()) {
+                    tparams += pname + " *" + cit->second;
+                    classInstanceVars_.insert(pname);
+                    classInstanceVarNames_[pname] = cit->second;
+                } else if (isStringVar(pname)) {
                     tparams += pname + " string";    // #6: inferred string param
                 } else if (listParams_.count(pname)) {
                     tparams += pname + " []int64";   // array parameter (slice: mutations visible)
@@ -9810,6 +12859,37 @@ private:
             }
         }
         declareParams(gParams, declared);
+        // Generator: the outer function's real signature is `<-chan int64` (AC lists/values
+        // default to int64 throughout this backend already — see listParams_ above); its body
+        // runs inside a `go func() { ... }()` closure so `yield`/`return` inside it never need
+        // a Go return type at all (see emitYield/emitReturn's own generator branches).
+        // Values yielded elsewhere as strings/floats aren't tracked separately from RETURN's
+        // own return-type inference (which only sees `return`, not `yield`) — out of scope for
+        // this pass, same int64-default limitation the rest of this backend already has.
+        curFuncIsGenerator_ = isGenerator_;
+        if (curFuncIsGenerator_) {
+            if (!classOwner.empty())
+                emit(out, indent, "func (self *" + classOwner + ") " + gName + "(" + tparams + ") <-chan int64 {");
+            else
+                emit(out, indent, "func " + gName + "(" + tparams + ") <-chan int64 {");
+            indent++;
+            emit(out, indent, "ac_gen_ch := make(chan int64, 1)");
+            emit(out, indent, "go func() {");
+            indent++;
+            emit(out, indent, "defer close(ac_gen_ch)");
+            for (const auto& [v, t] : hoistVars_) {
+                if (declared.count(v)) continue;
+                std::string line;
+                if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "var " + v + " float64"; }
+                else if (t == IRType::STRING) { stringVars.insert(v); line = "var " + v + " string"; }
+                else if (t == IRType::LIST)     line = "var " + v + " []int64";
+                else                            line = "var " + v + " int64";
+                emit(out, indent, line);
+                declared.insert(v);
+            }
+            funcTypedParams_.clear();
+            return;
+        }
         curFuncReturnIsList_ = returnIsList_;
         bool isNew = !classOwner.empty() && name == "init";
         curFuncIsConstructor_ = isNew;
@@ -9825,6 +12905,16 @@ private:
                          : returnIsList_ ? "[]int64"
                          : baseReturnIsString_ ? "string"
                          : returnIsFloat_ ? "float64" : "int64";
+        // A free function whose every `return` traces to one directly-constructed bundle
+        // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that pointer type
+        // directly — overrides every inference above, none of which know about bundle
+        // classes. Not applicable to the constructor (isNew), which always returns `*Self`
+        // via its own dedicated signature line regardless.
+        curFuncReturnClass_ = "";
+        if (!isNew) {
+            auto classRetIt = classReturnFuncs_.find(name);
+            if (classRetIt != classReturnFuncs_.end()) { curFuncReturnClass_ = classRetIt->second; retT = "*" + classRetIt->second; }
+        }
         curFuncRetString_ = baseReturnIsString_;
         baseReturnIsString_ = false;
         returnIsList_ = false; returnIsFloat_ = false; returnIsVoid_ = false;
@@ -9864,16 +12954,39 @@ private:
     bool curFuncReturnIsList_ = false;
     bool curFuncIsConstructor_ = false;
     bool curFuncReturnIsVoid_ = false;
+    bool curFuncIsGenerator_ = false;
     void setReturnIsVoid(bool v) override { returnIsVoid_ = v; }
     bool returnIsVoid_ = false;
+    void setIsGenerator(bool v) override { isGenerator_ = v; }
+    bool isGenerator_ = false;
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "ac_gen_ch <- " + val);
+    }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
+        if (curFuncIsGenerator_) {
+            indent--;
+            emit(out, indent, "}()");
+            emit(out, indent, "return ac_gen_ch");
+            curFuncIsGenerator_ = false;
+            indent--;
+            emit(out, indent, "}");
+            emitRaw(out, "");
+            declared.clear(); floatVars.clear(); stringVars.clear();
+            return;
+        }
         if (!curFuncReturnIsVoid_)
             emit(out, indent, curFuncIsConstructor_ ? "return self"
+                            // Class-returning function's implicit trailing value — a bare
+                            // `nil` (Go's zero value for ANY pointer type) satisfies the real
+                            // `*ClassName` return type set in emitFunctionBegin; still has to
+                            // typecheck even though unreachable after a real `return p`.
+                            : !curFuncReturnClass_.empty() ? "return nil"
                             : curFuncReturnIsList_   ? "return nil"
                             : curFuncRetString_      ? "return \"\"" : "return 0");
         curFuncReturnIsList_ = false; curFuncRetString_ = false;
-        curFuncIsConstructor_ = false; curFuncReturnIsVoid_ = false;
+        curFuncIsConstructor_ = false; curFuncReturnIsVoid_ = false; curFuncReturnClass_ = "";
         indent--;
         emit(out, indent, "}");
         emitRaw(out, "");
@@ -9899,6 +13012,12 @@ private:
         emit(out, indent, "}");
         emitRaw(out, "");
     }
+    std::set<std::string> classInstanceVars_;
+    std::map<std::string,std::string> classInstanceVarNames_;
+    std::map<std::string,std::string> classReturnFuncs_;   // fn.name -> class name (see setClassReturnFuncs)
+    std::map<std::string, std::map<int, std::string>> classParamTypes_;  // see setClassParamTypes
+    void setClassParamTypes(const std::map<std::string, std::map<int, std::string>> &m) override { classParamTypes_ = m; }
+    std::string curFuncReturnClass_;
     void emitConstructCall(std::ostringstream &out, int &indent, const std::string &res,
                            const std::string &className, const std::string &args) override
     {
@@ -9907,9 +13026,16 @@ private:
         // decl()'s generic type inference would default `res` to `int64` — declare it with the
         // real pointer type directly instead, same reasoning as Rust's emitConstructCall.
         bool isNew = declared.insert(res).second;
+        classInstanceVars_.insert(res);
+        classInstanceVarNames_[res] = className;
         emit(out, indent, (isNew ? "var " + res + " *" + className + " = " : res + " = ")
                           + "New" + className + "(" + args + ")");
     }
+    void noteInstanceClass(const std::string &var, const std::string &className) override {
+        classInstanceVars_.insert(var);
+        classInstanceVarNames_[var] = className;
+    }
+    void setClassReturnFuncs(const std::map<std::string,std::string> &m) override { classReturnFuncs_ = m; }
     void emitClassEnd(std::ostringstream &out, int &indent) override
     {
         (void)out; (void)indent;
@@ -9938,6 +13064,14 @@ private:
         bool srcIsStr = looksString(src) || stringVars.count(src) || isStringVar(src);
         std::string intSrc = srcIsStr ? "ac_atoi(" + src + ")" : "int64(" + src + ")";
         std::string fltSrc = srcIsStr ? "ac_atof(" + src + ")" : "float64(" + src + ")";
+        // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point.
+        if (boxedVars_.count(var)) {
+            std::string rhs = (t == IRType::STRING) ? (srcIsStr ? "acDynS(" + src + ")" : "acDynS(fmt.Sprintf(\"%v\", " + src + "))")
+                             : (t == IRType::FLOAT)  ? "acDynF(" + fltSrc + ")"
+                             :                          "acDynI(" + intSrc + ")";
+            emit(out, indent, (declared.insert(var).second ? "var " + var + " AcDynVal = " : var + " = ") + rhs);
+            return;
+        }
         // `floatVars.count(var)` alone only catches a pre-scanned DECLARED variable (`to_dec d
         // = 7`) — an expression-form cast (`to_dec(9)`) targets a fresh temp the pre-scan never
         // saw, so it must also check the cast's own resultType `t` or it silently falls through
@@ -10016,8 +13150,71 @@ private:
 
 class VStrategy : public BackendStrategy
 {
+    std::set<std::string> classInstanceVars_;   // vars holding a bundle instance (V-transformed names)
+    std::map<std::string,std::string> classInstanceVarNames_;  // var -> class name (both V-transformed)
+    std::map<std::string,std::string> classReturnFuncs_;   // fn.name -> class name (see setClassReturnFuncs)
+    std::map<std::string, std::map<int, std::string>> classParamTypes_;  // see setClassParamTypes
+    void setClassParamTypes(const std::map<std::string, std::map<int, std::string>> &m) override { classParamTypes_ = m; }
+    std::string curFuncReturnClass_;
+    // Same gap, same fix shape as GoStrategy (see its matching, much larger comment) — widget
+    // ctors had zero special handling here either: no type awareness (`root` defaulted to
+    // int64 against Screen's real `AcScreen` return, V structs are value types not pointers
+    // unlike Go's `*AcXxx`), no lazy-sentinel stripping, no btn-callback splitting.
+    static bool isWidgetCtor(const std::string& func) {
+        // "screen" (lowercase) alongside "Screen" (capital) — some upstream step already
+        // applies vName()-style lowercasing to `func` before it reaches emitCall (verified:
+        // the generated call text already read "screen(...)", not "Screen(...)", even
+        // though this check — matching only the capital form — never fired, so it fell
+        // through to the generic i64()-wrapping fallback instead of this widget-ctor path).
+        static const std::set<std::string> ctors = {
+            "Screen", "screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
+            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch",
+            "textbox"
+        };
+        return ctors.count(func) > 0;
+    }
+    static std::string widgetVType(const std::string& func) {
+        static const std::map<std::string,std::string> m = {
+            {"Screen","AcScreen"}, {"screen","AcScreen"}, {"display","AcDisplay"}, {"ask","AcAsk"},
+            {"btn","AcBtn"}, {"ckbtn","AcCkbtn"}, {"radbtn","AcRadbtn"},
+            {"dropdown","AcDropdown"}, {"advance","AcAdvance"}, {"slider","AcSlider"},
+            {"group","AcGroup"}, {"tabs","AcTabs"}, {"scroller","AcScroller"},
+            {"listbox","AcListbox"}, {"table","AcTable"}, {"sketch","AcSketch"},
+            {"textbox","AcTextbox"},
+        };
+        auto it = m.find(func);
+        return it == m.end() ? "" : it->second;
+    }
+    std::map<std::string,std::string> widgetVarType_;
+    // Vars holding a widget `.get()`/`.find()` result OR any other genuinely string-returning
+    // ilib call (stringm.upper, os.read, ...) — see emitTypedStoreVar's use of this: needs to
+    // be told apart from a numeric value that was merely `.str()`-stringified, which looks
+    // identical (isStringVar(val) true either way) but means the OPPOSITE thing for a plain
+    // destination var: convert back to numeric, not keep as string.
+    std::set<std::string> genuineStringVars_;
+    // `free`-promoted vars (NA→free), same story as every other backend's promotedGlobals_
+    // (Go's is the closest reference — see its own comment): a var written in one function
+    // and read in another needs real module-level storage, not a `mut x :=` local. V's
+    // normal locals are function-scoped only; V's answer to a real mutable module-level var
+    // is a `__global (...)` block, which needs `-enable-globals` on the `v` command line —
+    // already passed unconditionally for every V run in main.cpp (originally added for
+    // web-server's singleton FFI state), so no harness change is needed here, just consuming
+    // it. Emitted in emitHeader; each function/mainloop-begin pre-marks these as `declared`
+    // (mirroring Go exactly) so stores fall through to plain `v = val` reassignment instead
+    // of a shadowing local `mut v := val`.
+    std::set<std::string> promotedGlobals_;
+    void setPromotedGlobals(const std::vector<std::string> &vars) override {
+        for (auto& v : vars) promotedGlobals_.insert(v);
+    }
+    void setStructGlobals(const std::map<std::string, std::string> &m) override {
+        for (auto& [var, ctorName] : m) {
+            std::string ty = widgetVType(ctorName);
+            if (!ty.empty()) widgetVarType_[var] = ty;
+        }
+    }
     std::set<std::string> declared;
     std::set<std::string> floatVars;
+    std::set<std::string> vBoolVars_;   // see vBoolFuncs' comment in emitCall
     void setFloatVarsFull(const std::set<std::string>& s) override {
         for (const auto& v : s) floatVars.insert(vName(v));   // #42 (V lowercases names)
     }
@@ -10041,10 +13238,13 @@ class VStrategy : public BackendStrategy
     void emitCapture(std::ostringstream &out, int &indent, const std::string &val) override
     {
         if (!needsSave_) return;
-        // V's `${}` string interpolation already matches its own println formatting exactly
-        // (verified: the whole-number-float fix applies identically to both), so no separate
-        // float-vs-int dispatch is needed here the way C/Go/Rust's emitCapture needs one.
-        emit(out, indent, "ac_save_append('${" + val + "}')");
+        // Correction: `${}` interpolation of a plain f64 uses V's own native formatter, NOT
+        // `ac_fmtg` (emitPrint's %.16g convention) — those only coincide by accident on simple
+        // values. Route floats through the same `ac_fmtg` call emitPrint uses so `save as`
+        // can't disagree with `Term.display` on the identical value (same class of gap already
+        // fixed for Rust/Go's emitCapture).
+        if (floatVars.count(val)) emit(out, indent, "ac_save_append(ac_fmtg(" + val + "))");
+        else emit(out, indent, "ac_save_append('${" + val + "}')");
     }
     void emitSaveFile(std::ostringstream &out, int &indent, const std::string &filename) override
     {
@@ -10142,13 +13342,26 @@ class VStrategy : public BackendStrategy
             }
             // Skip any leading "module" line — we're already in module main. Hoist `import `
             // lines now; keep everything else for the deferred body pass below.
+            // NOTE: "leading" means before the first REAL code, not literally line 1 — an FFI
+            // file's own header comments (widgets_ffi.v has two: "AC ilib: widgets..."/
+            // "Inlined by...") come before its `module main` line, and the old `first`-only-on-
+            // line-1 check missed it entirely once ANY earlier line existed — duplicate `module
+            // main` reached the output verbatim ("bad top level statement keyword `module`",
+            // V requires `module` to be the file's very first statement — verified: any program
+            // using `use ilib widgets` on V).
             std::istringstream ss(content);
             std::string line2;
-            bool first = true;
+            bool moduleSkipped = false;
             std::ostringstream body;
             while (std::getline(ss, line2)) {
-                if (first && line2.rfind("module ", 0) == 0) { first = false; continue; }
-                first = false;
+                if (!moduleSkipped) {
+                    std::string trimmed = line2;
+                    size_t b = trimmed.find_first_not_of(" \t");
+                    trimmed = (b == std::string::npos) ? "" : trimmed.substr(b);
+                    if (trimmed.rfind("module ", 0) == 0) { moduleSkipped = true; continue; }
+                    if (!trimmed.empty() && trimmed.rfind("//", 0) != 0)
+                        moduleSkipped = true; // hit real code before any module line — give up
+                }
                 if (line2.rfind("import ", 0) == 0) emitRaw(out, line2);
                 else body << line2 << "\n";
             }
@@ -10176,6 +13389,23 @@ class VStrategy : public BackendStrategy
             emitRaw(out, "    return a / b");
             emitRaw(out, "}");
         }
+        // Cross-backend float-display convention (see JavaScriptStrategy::emitHeader's `ac_fmtg`
+        // for the full rationale) — V's own .str()/.strg()/.strsci() all do shortest-round-trip
+        // formatting, not %.16g, and (like Java's/Go's own attempts) verified NOT reliable at 16
+        // sig figs either (10.0/3.0 -> "...334" via strsci(15), should be "...333"). V compiles
+        // to C, so this reaches straight for glibc's OWN %.16g via C interop instead of
+        // reimplementing digit-rounding a fourth time — the most reliable option available and
+        // the shortest path to it. No explicit `fn C.snprintf` declaration needed (verified: V
+        // resolves it directly inside `unsafe` without one, same as other unsafe-only C calls
+        // already used elsewhere in this file).
+        emitRaw(out, "fn ac_fmtg(d f64) string {");
+        emitRaw(out, "    mut buf := [64]u8{}");
+        emitRaw(out, "    unsafe { C.snprintf(&char(&buf[0]), 64, c'%.16g', d) }");
+        emitRaw(out, "    s := unsafe { cstring_to_vstring(&char(&buf[0])) }");
+        emitRaw(out, "    mut has_marker := false");
+        emitRaw(out, "    for ch in s { if ch == `.` || ch == `e` || ch == `E` || ch == `n` || ch == `N` { has_marker = true; break } }");
+        emitRaw(out, "    return if has_marker { s } else { s + '.0' }");
+        emitRaw(out, "}");
         if (anyAtomicVars()) {
             emitRaw(out, "__global ( ac_atomic_lock = sync.new_mutex() )  // `atomic` vars: any op touching one is a global critical section");
         }
@@ -10191,6 +13421,15 @@ class VStrategy : public BackendStrategy
         if (needsSave_) {
             emitRaw(out, "__global ( ac_save_buf = '' )");
             emitRaw(out, "fn ac_save_append(s string) { ac_save_buf += s + '\\n' }");
+        }
+        // `free`-promoted vars (NA→free): real module-level storage via `__global` (see
+        // promotedGlobals_'s own comment) — same `-enable-globals`-backed mechanism already
+        // proven above for ac_events/ac_save_buf, just applied to user `free` vars. Widget-typed
+        // ones get their real `AcXxx` type (setStructGlobals/widgetVarType_); everything else
+        // keeps the int64-equivalent `i64` default other backends use for a promoted scalar.
+        for (auto& v : promotedGlobals_) {
+            auto it = widgetVarType_.find(v);
+            emitRaw(out, "__global ( " + v + " " + (it != widgetVarType_.end() ? it->second : "i64") + " )");
         }
         for (auto& body : ffiBodies) {
             out << "\n" << body;
@@ -10209,6 +13448,37 @@ class VStrategy : public BackendStrategy
                 emitRaw(out, "// FLIB_SO_LINK: " + ln);
             }
         }
+        // AcDynVal: a genuine tagged runtime value for the small set of variables (setBoxedVars)
+        // that Abu's retype spec requires to hold different types at different points in their
+        // own scope — one fixed V declared type per var name can't do that. Like the C/Java/Go
+        // ports, every consumer calls these helpers explicitly. `.str()` is V's own convention
+        // for a type's string form — string interpolation and println use it automatically.
+        emitRaw(out, "struct AcDynVal { tag int i i64 d f64 s string b bool }");
+        emitRaw(out, "fn ac_dyn_i(v i64) AcDynVal { return AcDynVal{tag: 0, i: v} }");
+        emitRaw(out, "fn ac_dyn_f(v f64) AcDynVal { return AcDynVal{tag: 1, d: v} }");
+        emitRaw(out, "fn ac_dyn_s(v string) AcDynVal { return AcDynVal{tag: 2, s: v} }");
+        emitRaw(out, "fn ac_dyn_b(v bool) AcDynVal { return AcDynVal{tag: 3, b: v} }");
+        emitRaw(out, "fn (v AcDynVal) as_d() f64 { if v.tag == 1 { return v.d }; if v.tag == 3 { return if v.b { f64(1) } else { f64(0) } }; return f64(v.i) }");
+        emitRaw(out, "fn (v AcDynVal) as_i() i64 { if v.tag == 0 { return v.i }; if v.tag == 1 { return i64(v.d) }; return if v.b { i64(1) } else { i64(0) } }");
+        emitRaw(out, "fn (v AcDynVal) str() string {");
+        emitRaw(out, "    if v.tag == 2 { return v.s }");
+        emitRaw(out, "    if v.tag == 3 { return if v.b { 'true' } else { 'false' } }");
+        emitRaw(out, "    if v.tag == 0 { return v.i.str() }");
+        emitRaw(out, "    xi := i64(v.d)");
+        emitRaw(out, "    if f64(xi) == v.d { return xi.str() }");
+        emitRaw(out, "    return v.d.str()");
+        emitRaw(out, "}");
+        emitRaw(out, "fn ac_dyn_add(a AcDynVal, b AcDynVal) AcDynVal {");
+        emitRaw(out, "    if a.tag == 2 || b.tag == 2 { return ac_dyn_s(a.str() + b.str()) }");
+        emitRaw(out, "    if a.tag == 1 || b.tag == 1 { return ac_dyn_f(a.as_d() + b.as_d()) }");
+        emitRaw(out, "    return ac_dyn_i(a.as_i() + b.as_i())");
+        emitRaw(out, "}");
+        emitRaw(out, "fn ac_dyn_sub(a AcDynVal, b AcDynVal) AcDynVal { if a.tag == 1 || b.tag == 1 { return ac_dyn_f(a.as_d() - b.as_d()) }; return ac_dyn_i(a.as_i() - b.as_i()) }");
+        emitRaw(out, "fn ac_dyn_mul(a AcDynVal, b AcDynVal) AcDynVal { if a.tag == 1 || b.tag == 1 { return ac_dyn_f(a.as_d() * b.as_d()) }; return ac_dyn_i(a.as_i() * b.as_i()) }");
+        emitRaw(out, "fn ac_dyn_div(a AcDynVal, b AcDynVal) AcDynVal { return ac_dyn_f(a.as_d() / b.as_d()) }");
+        emitRaw(out, "fn ac_dyn_eq(a AcDynVal, b AcDynVal) bool { if a.tag == 2 || b.tag == 2 { return a.str() == b.str() }; return a.as_d() == b.as_d() }");
+        emitRaw(out, "fn ac_dyn_lt(a AcDynVal, b AcDynVal) bool { if a.tag == 2 || b.tag == 2 { return a.str() < b.str() }; return a.as_d() < b.as_d() }");
+        emitRaw(out, "fn ac_dyn_gt(a AcDynVal, b AcDynVal) bool { if a.tag == 2 || b.tag == 2 { return a.str() > b.str() }; return a.as_d() > b.as_d() }");
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
         emitRaw(out, "fn ac_iota(n i64) string {");
         emitRaw(out, "    mut r := ''");
@@ -10255,9 +13525,28 @@ class VStrategy : public BackendStrategy
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
         std::string s = commonRef(r, sym, "true", "false", "none", "none");
-        // V: VAR/TEMP names must be lowercase; lowercase them here
+        // V: VAR/TEMP names must be lowercase, AND can't start with `_` (vName()'s own doc
+        // comment) — this used to only lowercase, leaving a leading-underscore name's READ
+        // sites (routed through formatRef, here) rendered differently from its WRITE sites
+        // (emitTypedStoreVar/emitStoreVar, which both call vName()): a synthetic var like
+        // `_ac_kick_i_0` declared+incremented as `aac_kick_i_0` but compared/read as the
+        // untransformed `_ac_kick_i_0` — two different identifiers for the same variable, one
+        // of them always undefined. Route through the exact same vName() transform so every
+        // reference agrees (mirrors funcArgRef's own fix for the identical split-identity bug
+        // on callback names — see its comment).
         if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::TEMP)
-            for (char& c : s) c = (char)std::tolower((unsigned char)c);
+            s = vName(s);
+        // V uses bare `$` inside a double-quoted string for string interpolation
+        // (`$ident`/`${expr}`) — a totally V-specific meaning `escapeStr` (shared by every
+        // backend) has no reason to know about. A literal `$` surviving into a CONST STRING
+        // (e.g. AC's own `\$...\$`-escaped-dollar text) reads as an interpolation attempt
+        // and hard-errors ("undefined ident"). Escape it here, backend-locally, after the
+        // shared escaping already ran.
+        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING) {
+            std::string out; out.reserve(s.size());
+            for (char c : s) { if (c == '$') out += '\\'; out += c; }
+            s = out;
+        }
         return s;
     }
     // A bare function passed AS A VALUE (event-bind callback) needs the SAME name transform
@@ -10270,6 +13559,28 @@ class VStrategy : public BackendStrategy
 
     std::string decl(const std::string &var, const std::string &val)
     {
+        // A generator-call result (a `chan i64`) — no other check here knows about channels,
+        // so it fell to the `i64(...)` wrap and V rejected it outright ("cannot use `chan i64`
+        // as `i64`"). No wrapper needed either way — V's `:=` infers the channel type directly.
+        if (genChannelVars_.count(var)) {
+            if (declared.insert(var).second) return "mut " + var + " := " + val;
+            return var + " = " + val;
+        }
+        // Bundle field WRITE on a NAMED instance, not just `self` (`q.x = 5` — same root cause
+        // as every sibling backend). A field on a real struct value is never independently
+        // declared — always a plain assignment.
+        {
+            auto dot = var.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(var.substr(0, dot)))
+                return var + " = " + val;
+        }
+        // `q = f()` where f always constructs+returns one bundle class (classFuncs_'s prescan
+        // via noteInstanceClass) — V's own `:=` infers the struct type directly, same as
+        // genChannelVars_'s case just above; no explicit type needed.
+        if (classInstanceVarNames_.count(var)) {
+            if (declared.insert(var).second) return "mut " + var + " := " + val;
+            return var + " = " + val;
+        }
         if (declared.insert(var).second)
         {
             if (floatVars.count(var)) return "mut " + var + " := f64(" + val + ")";  // #42
@@ -10314,6 +13625,17 @@ class VStrategy : public BackendStrategy
         // `mut TYPE :=`-redeclared. `vName()` only lowercases — "self.hp" stays "self.hp",
         // already valid V for both reads and writes (same as Go/Rust's non-constructor case).
         if (vn.rfind("self.", 0) == 0) { emit(out, indent, vn + " = " + val); return; }
+        // Bundle field WRITE on a NAMED instance, not just `self` (`q.x = 5` — same root cause
+        // as every sibling backend: fell to the generic branches below and declared a bogus
+        // `mut q.x := 5`, invalid V). A field on a real struct/pointer is never independently
+        // declared — always a plain assignment.
+        {
+            auto dot = vn.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(vn.substr(0, dot))) {
+                emit(out, indent, vn + " = " + val);
+                return;
+            }
+        }
         // #42: pre-inferred float locals declare as f64 (V has no implicit int/float mixing)
         if (floatVars.count(vn)) {
             if (declared.insert(vn).second) emit(out, indent, "mut " + vn + " := f64(" + val + ")");
@@ -10349,10 +13671,37 @@ class VStrategy : public BackendStrategy
             else                            emit(out, indent, vn + " = " + val);
             return;
         }
+        // Same gap as the string/dict checks above, for a plain list-to-list reassignment
+        // (`arr = rebuiltList`, e.g. .kick()'s rebuild-and-reassign) — this function never
+        // called decl() (which also has no list case), so it fell to the generic numeric
+        // branch below: `i64(...)` on first declaration (wrong type entirely), or a bare
+        // `vn = val` on re-assignment — V rejects the latter outright ("use `array2 =
+        // array1.clone()` instead of `array2 = array1`"), since V arrays copy by value.
+        if (listVars_.count(val)) {
+            listVars_.insert(vn);
+            if (declared.insert(vn).second) emit(out, indent, "mut " + vn + " := " + val + ".clone()");
+            else                            emit(out, indent, vn + " = " + val + ".clone()");
+            return;
+        }
         if (declared.insert(vn).second)
             emit(out, indent, "mut " + vn + " := i64(" + val + ")");
         else
             emit(out, indent, vn + " = " + val);
+    }
+    void emitLockBegin(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "ac_atomic_lock.lock()");
+    }
+    void emitLockEnd(std::ostringstream &out, int &indent) override {
+        emit(out, indent, "ac_atomic_lock.unlock()");
+    }
+    // Wrap a plain (non-AcDynVal) value into the right ac_dyn_* by its apparent type — V has no
+    // operator overloading/implicit conversion, so callers must always be explicit.
+    std::string boxWrap(const std::string& v, IRType t = IRType::VOID) const {
+        if (boxedVars_.count(v)) return v;
+        if (t == IRType::STRING || looksString(v) || isStringVar(v)) return "ac_dyn_s(" + v + ")";
+        if (t == IRType::FLOAT || floatVars.count(v) || isFloatLiteral(v)) return "ac_dyn_f(" + v + ")";
+        if (t == IRType::BOOL) return "ac_dyn_b(" + v + ")";
+        return "ac_dyn_i(i64(" + v + "))";
     }
     void emitTypedStoreVar(std::ostringstream &out, int &indent,
                            const std::string &var, const std::string &val, IRType t) override
@@ -10361,21 +13710,44 @@ class VStrategy : public BackendStrategy
         // Bundle field write via a typed decl (e.g. `atomic hp = 5` as a field default) — same
         // translation as emitStoreVar: real struct field, no `mut`-redeclaration.
         if (vn.rfind("self.", 0) == 0) { emit(out, indent, vn + " = " + val); return; }
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in the
-        // global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible RMW.
+        // Same generalization as emitStoreVar's own — see its comment.
+        {
+            auto dot = vn.find('.');
+            if (dot != std::string::npos && classInstanceVars_.count(vn.substr(0, dot))) {
+                emit(out, indent, vn + " = " + val);
+                return;
+            }
+        }
+        // `atomic` var: no inline lock wrap here anymore — ir.cpp now brackets the WHOLE
+        // read-modify-write span with real LOCK_BEGIN/LOCK_END instructions (see
+        // emitLockBegin/emitLockEnd below), closing the TOCTOU race the old store-only
+        // wrap here could never actually close.
         if (t == IRType::ATOMIC) {
             if (declared.insert(vn).second) emit(out, indent, "mut " + vn + " := i64(0)");
-            emit(out, indent, "ac_atomic_lock.lock()");
             emit(out, indent, vn + " = i64(" + val + ")");
-            emit(out, indent, "ac_atomic_lock.unlock()");
             return;
         }
-        bool isFloat = (t == IRType::FLOAT) || floatVars.count(vn);   // #42: pre-inferred floats
+        // Boxed var (setBoxedVars/detectBoxedVars — see AcDynVal's comment in emitHeader): must
+        // run before the string-unification branch below, which would otherwise force a plain
+        // string declaration that can't hold this var's genuinely-numeric earlier value.
+        if (boxedVars_.count(var)) {
+            emit(out, indent, (declared.insert(vn).second ? "mut " + vn + " := " : vn + " = ") + boxWrap(val, t));
+            return;
+        }
+        // floatVars.count(val): same "plain-var copy of an ilib call result" gap as
+        // dictVars_/listVars_/genuineStringVars_ below (RHS-only marked, dest never
+        // consulted before) — a float-returning ilib call's TEMP (e.g. ml.take's `t_4`)
+        // was correctly marked float at the CALL site, but THIS copy (`before = t_4`)
+        // only ever checked the DESTINATION var name, never the source, so it fell to
+        // the `i64(...)` default below (verified: ml_scalar.ac's `before = ml.take(w)`
+        // printed truncated `2`/`1` instead of `2.0`/`1.64...`).
+        bool isFloat = (t == IRType::FLOAT) || floatVars.count(vn) || floatVars.count(val);   // #42: pre-inferred floats
         // Re-typing coercion (#retype): unify to string, coerce non-strings via .str().
-        if (isStringVar(var)) {
+        if (isStringVar(var) || genuineStringVars_.count(val)) {
             std::string rhs = (looksString(val) || isStringVar(val)) ? val : "(" + val + ").str()";
             if (declared.insert(vn).second) { stringVars_.insert(vn); emit(out, indent, "mut " + vn + " := " + rhs); }
             else                            emit(out, indent, vn + " = " + rhs);
+            if (genuineStringVars_.count(val)) genuineStringVars_.insert(vn);
             return;
         }
         if (looksString(val) || isStringVar(val)) {   // #retype numeric-unified ← stringified number
@@ -10402,11 +13774,48 @@ class VStrategy : public BackendStrategy
                 // scalars — "cannot copy map: call `move` or `clone` method").
                 emit(out, indent, "mut " + vn + " := " + val + ".clone()");
             }
+            // Same missing case as dictVars_ right above, for a list-returning ilib call's
+            // plain-variable copy (`parts = stringm.split(...)`, CALL-then-STORE_VAR): no
+            // branch here ever consulted listVars_ (populated at emitCall's isAcStrListFunc/
+            // userListFuncs_ sites, see their own comments) — every such copy hit the numeric
+            // `i64(...)` default below. `.clone()` for the same value-type-array reason as
+            // dictVars_ (see listVars_'s own declaration comment).
+            else if (listVars_.count(val)) {
+                listVars_.insert(vn);
+                emit(out, indent, "mut " + vn + " := " + val + ".clone()");
+            }
+            // Same missing case as dictVars_/listVars_ above, for a bool-returning ilib
+            // call's plain-variable copy (`e = t_0` after `t_0 := os.exists(...)`, a
+            // separate CALL-then-STORE_VAR pair) — see vBoolFuncs' comment in emitCall.
+            // Without this, the i64(...) default below re-wrapped an already-real V `bool`,
+            // "cannot use `bool` as `i64`".
+            else if (vBoolVars_.count(val)) {
+                vBoolVars_.insert(vn);
+                emit(out, indent, "mut " + vn + " := " + val);
+            }
             else                          emit(out, indent, "mut " + vn + " := i64("  + val + ")");
         } else {
             // Cast float→int when assigning float value to int variable
             if (isFloat && !floatVars.count(vn))
                 emit(out, indent, vn + " = i64(" + val + ")");
+            else if (vBoolVars_.count(val) && !vBoolVars_.count(vn)) {
+                vBoolVars_.insert(vn);
+                emit(out, indent, vn + " = " + val);
+            }
+            // Same dictVars_/listVars_ `.clone()` requirement as the fresh-declaration branch
+            // above — this "already declared" branch never consulted either set, so a plain
+            // reassignment of an EXISTING list/dict var (`arr = rebuiltList`, e.g. .kick()'s
+            // rebuild-and-reassign) fell to the bare `vn = val` default: "use `array2 =
+            // array1.clone()` instead of `array2 = array1`".
+            else if (dictVars_.count(val)) {
+                dictVars_.insert(vn);
+                if (dictStrVals_.count(val)) dictStrVals_.insert(vn);
+                emit(out, indent, vn + " = " + val + ".clone()");
+            }
+            else if (listVars_.count(val)) {
+                listVars_.insert(vn);
+                emit(out, indent, vn + " = " + val + ".clone()");
+            }
             else
                 emit(out, indent, vn + " = " + val);
         }
@@ -10414,6 +13823,14 @@ class VStrategy : public BackendStrategy
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — see AcDynVal's comment in emitHeader; must run before the string-forcing
+        // branch below (V's native `+` doesn't accept an AcDynVal struct operand).
+        if (boxedVars_.count(lhs) || boxedVars_.count(rhs)) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string fn = op=="+" ? "ac_dyn_add" : op=="-" ? "ac_dyn_sub" : (op=="*"||op=="@") ? "ac_dyn_mul" : "ac_dyn_div";
+            emit(out, indent, (declared.insert(res).second ? "mut " + res + " := " : res + " = ") + fn + "(" + l + ", " + r + ")");
+            return;
+        }
         // V string concat: `+` on two strings is legal V, but `decl()`'s `looksString(val)`
         // check (the generic fallback this used to fall through to) only recognizes a RAW
         // quoted literal — `looksString("label + \"!\"")` (the whole COMBINED expression
@@ -10463,6 +13880,14 @@ class VStrategy : public BackendStrategy
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        // Boxed operand — same reasoning as emitBinaryOp's own boxed branch.
+        if ((op=="=="||op=="!="||op=="<"||op==">") && (boxedVars_.count(lhs) || boxedVars_.count(rhs))) {
+            std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            std::string cmp = op=="==" ? "ac_dyn_eq("+l+", "+r+")" : op=="!=" ? "!ac_dyn_eq("+l+", "+r+")"
+                             : op=="<"  ? "ac_dyn_lt("+l+", "+r+")" : "ac_dyn_gt("+l+", "+r+")";
+            emit(out, indent, decl(res, "if " + cmp + " { i64(1) } else { i64(0) }"));
+            return;
+        }
         std::string expr;
         if (op == "xor")
             expr = "if (" + lhs + " != 0) != (" + rhs + " != 0) { i64(1) } else { i64(0) }";
@@ -10505,28 +13930,118 @@ class VStrategy : public BackendStrategy
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                   const std::string &func, const std::string &args) override
     {
+        // Widget ctor (`root = Screen(...)`, `tb = textbox(root, c, f, lazy)`) — V's own
+        // `:=` type inference means no explicit type annotation is needed here (unlike Go),
+        // so this only needs to: (1) lowercase "Screen" specifically (the ONLY capitalized
+        // widget ctor — V hard-rejects any capitalized function name, "screen" is the real
+        // symbol name in widgets_ffi.v; every other ctor was already lowercase by AC's own
+        // convention), (2) strip a trailing `lazy` sentinel (V's wrapper has no lazy-packing
+        // support, matching Go/Rust's same limitation), (3) split btn's 3rd (callback) arg
+        // into a separate call (V's AcBtn ctor takes exactly 2 args).
+        if (isWidgetCtor(func) && !res.empty()) {
+            std::vector<std::string> a; std::string cur; int depth = 0; bool inStr = false;
+            for (char c : args) {
+                if (c == '"') inStr = !inStr;
+                if (!inStr && (c == '(' || c == '[')) depth++;
+                if (!inStr && (c == ')' || c == ']')) depth--;
+                if (c == ',' && depth == 0 && !inStr) { a.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+            if (!cur.empty()) a.push_back(cur);
+            for (auto& s : a) { size_t b = s.find_first_not_of(' '), e = s.find_last_not_of(' ');
+                s = (b == std::string::npos) ? "" : s.substr(b, e - b + 1); }
+            if (!a.empty() && (a.back() == "lazy" || a.back() == "\"lazy\"")) a.pop_back();
+            std::string cbName;
+            if (func == "btn" && a.size() > 2) { cbName = a[2]; a.resize(2); }
+            // dropdown's V wrapper has an extra `values string` bulk-add param not present
+            // in the raw C ctor (mirrors Go's identical gap/fix) — pad with "" if lazy was
+            // the only 2nd arg and got stripped above.
+            if (func == "dropdown" && a.size() < 2) a.push_back("''");
+            std::string vfunc = (func == "Screen") ? "screen" : func;
+            std::string joined;
+            for (size_t i = 0; i < a.size(); i++) { if (i) joined += ", "; joined += a[i]; }
+            std::string call = vfunc + "(" + joined + ")";
+            widgetVarType_[res] = widgetVType(func);
+            if (declared.insert(res).second) emit(out, indent, "mut " + res + " := " + call);
+            else                              emit(out, indent, res + " = " + call);
+            if (!cbName.empty()) emit(out, indent, res + ".on_click(" + cbName + ")");
+            return;
+        }
+        // `x = recv.get()` / `x = recv.find($needle$)` where `recv` is a known widget var —
+        // every wrapper's `.get()`/`.find()` returns `string`, but func doesn't match
+        // anything the generic fallback below recognizes, so it defaulted to wrapping the
+        // call in `i64(...)` (verified: `mut t_0 := i64(tb.get())` — "cannot cast string to
+        // i64"). widgetVarType_ (populated by the ctor block above and by setStructGlobals
+        // for cross-function globals) is enough to know `recv` is ANY widget, without
+        // needing to know which specific kind — `.get()`/`.find()` are string-returning on
+        // every widget kind that has them at all.
+        {
+            auto dot = func.rfind('.');
+            if (dot != std::string::npos && !res.empty()) {
+                std::string recv = func.substr(0, dot), method = func.substr(dot + 1);
+                if ((method == "get" || method == "find") && widgetVarType_.count(recv)) {
+                    std::string call = func + "(" + args + ")";
+                    stringVars_.insert(res);   // propagate string-ness through a later plain
+                                                // copy (`content = t_0`), same class of gap
+                                                // as Go's identical "heard = t_2" fix.
+                    genuineStringVars_.insert(res);   // STORE_VAR always dispatches through
+                                                // emitTypedStoreVar (see its own comment), whose
+                                                // "#retype numeric-unified" branch assumes any
+                                                // isStringVar(val)-but-not-isStringVar(var) case
+                                                // is a stringified NUMBER to convert back with
+                                                // i64(...) — wrong for a genuine widget string
+                                                // like this. This set lets that branch tell the
+                                                // two apart.
+                    if (declared.insert(res).second) emit(out, indent, "mut " + res + " := " + call);
+                    else                              emit(out, indent, res + " = " + call);
+                    return;
+                }
+            }
+        }
         if (func == "ac_length" && !res.empty()) { bool nw = declared.insert(res).second; if (nw) emit(out, indent, "mut " + res + " := i64((" + args + ").len)"); else emit(out, indent, res + " = i64((" + args + ").len)"); return; }
         {   // AC list.append → V's << operator
             auto ap = func.rfind(".append");
             if (ap != std::string::npos && ap == func.size() - 7) {
-                emit(out, indent, func.substr(0, ap) + " << (" + args + ")");
+                // The receiver comes straight from the raw func-name text (never through
+                // formatRef/vName), so a receiver whose AC name starts with `_` (e.g. .kick()'s
+                // internal `_ac_kick_new_N`) rendered as its own untransformed self here while
+                // every other reference to the same var (declared via emitAlloc -> vName())
+                // used the "_"->"a" form — two different identifiers, "undefined ident" on V.
+                emit(out, indent, vName(func.substr(0, ap)) + " << (" + args + ")");
                 return;
             }
         }
         std::string call = func + "(" + args + ")";
+        // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
+        // see AcDynVal's comment in emitHeader.
+        if (!res.empty() && boxedVars_.count(res)) {
+            emit(out, indent, (declared.insert(res).second ? "mut " + res + " := " : res + " = ") + boxWrap(call));
+            return;
+        }
         if (!res.empty() && isAcStrFunc(func) && declared.insert(res).second) {
+            // Mark the TEMP as a real string — without this, a later plain-variable copy
+            // (`x = stringm.upper(...)`, lowered as a CALL-then-STORE_VAR pair) goes through
+            // emitTypedStoreVar, which has no way to know this TEMP is a string and wraps it
+            // in `i64(...)` ("cannot cast string to i64"). Same bug class, same fix shape as
+            // the widget `.get()`/`.find()` fix above — this is the general ilib-call case
+            // (confirmed to affect stringm/os/regex/etc, not just widgets).
+            stringVars_.insert(res);
+            genuineStringVars_.insert(res);
             emit(out, indent, "mut " + res + " := " + call); // string result, no i64() wrap
             return;
         }
         if (!res.empty() && isAcStrListFunc(func) && declared.insert(res).second) {
+            listVars_.insert(res); // same reasoning as stringVars_.insert above, for []string
             emit(out, indent, "mut " + res + " := " + call); // []string result, type-inferred
             return;
         }
         if (!res.empty() && userListFuncs_.count(func) && declared.insert(res).second) {
+            listVars_.insert(res); // same reasoning as stringVars_.insert above, for []i64
             emit(out, indent, "mut " + res + " := " + call); // []i64 result, no i64() wrap
             return;
         }
-        if (!res.empty() && isUserFloatReturningFunc(func)) {
+        if (!res.empty() && (isUserFloatReturningFunc(func) || isMLFloatReturningFunc(func)
+                             || isMathFloatReturningFunc(func))) {
             floatVars.insert(res);
             if (declared.insert(res).second) emit(out, indent, "mut " + res + " := " + call); // f64 result
             else                             emit(out, indent, res + " = " + call);
@@ -10537,10 +14052,46 @@ class VStrategy : public BackendStrategy
             else                             emit(out, indent, res + " = " + call);
             return;
         }
+        // Native V `bool` return — V had NO bool-returning-ilib-call registry at all before
+        // this (unlike Rust's already-proven `glBoolFuncs`/`rustBoolVars_`, or Go's
+        // equivalent fixed alongside this) — every one of these hit "cannot use `bool` as
+        // `i64`" the moment its result was assigned to a variable, since the generic
+        // fallback below wraps everything in `i64(...)`. `IF x is True`'s own comparison
+        // codegen already correctly emits `x == true` when `x` is genuinely bool-typed (see
+        // `vBoolVars_.count()` below) — the ONLY thing missing was declaring/propagating the
+        // result as a real `bool` instead of i64-wrapping it at the source.
+        static const std::set<std::string> vBoolFuncs = {
+            "gl.init", "gl_init", "ac_gl_init",
+            "gl.obj_circle_fell", "gl_obj_circle_fell", "ac_gl_obj_circle_fell",
+            "gl.is_obj", "gl_is_obj", "ac_gl_is_obj",
+            "gl.is_draw", "gl_is_draw", "ac_gl_is_draw",
+            "gl.hitbox_overlap", "gl_hitbox_overlap", "ac_gl_hitbox_overlap",
+            "gl.hitbox_many_overlap", "gl_hitbox_many_overlap", "ac_gl_hitbox_many_overlap",
+            "gl.hitbox_overlap_boundary", "gl_hitbox_overlap_boundary", "ac_gl_hitbox_overlap_boundary",
+            "gl.hitbox_overlap_pattern", "gl_hitbox_overlap_pattern", "ac_gl_hitbox_overlap_pattern",
+            "gl.frame_begin", "gl_frame_begin", "ac_gl_frame_begin",
+            "gl.key_pressed", "gl_key_pressed", "ac_gl_key_pressed",
+            "gl.key_just_pressed", "gl_key_just_pressed", "ac_gl_key_just_pressed",
+            "os.exists", "os_exists", "ac_os_exists",
+            "regex.match", "regex_match", "ac_regex_match",
+            "regex.test", "regex_test", "ac_regex_test",
+            "maudio.tts_ok", "maudio_tts_ok", "ac_maudio_tts_ok",
+        };
+        if (!res.empty() && vBoolFuncs.count(func)) {
+            vBoolVars_.insert(res);
+            if (declared.insert(res).second) emit(out, indent, "mut " + res + " := " + call);
+            else                             emit(out, indent, res + " = " + call);
+            return;
+        }
         emit(out, indent, res.empty() ? call : decl(res, call));
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
     {
+        // A generator's body runs inside `go fn(...) { ... }(...)` — a closure with no
+        // declared return value, since the OUTER function's real return is the channel
+        // (emitted once, in emitFunctionEnd). `return expr` inside a generator ends
+        // iteration early and DISCARDS expr (see the yield plan's own explicit scope cut).
+        if (curFuncIsGenerator_) { if (!val.empty()) { emit(out, indent, "return"); lastWasReturn = true; } return; }
         // Suppress bare empty return; emitFunctionEnd provides the fallthrough
         if (!val.empty())
         {
@@ -10564,7 +14115,8 @@ class VStrategy : public BackendStrategy
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
         lastWasReturn = false;
-        emit(out, indent, "println(" + val + ")");
+        if (floatVars.count(val)) emit(out, indent, "println(ac_fmtg(" + val + "))");
+        else emit(out, indent, "println(" + val + ")");
     }
     // Same gap+fix as CStrategy's own emitConfirm (see its comment) — base default never
     // assigns `res`, crashing `result = sure $x$` with "undefined ident" on this backend too.
@@ -10591,9 +14143,13 @@ class VStrategy : public BackendStrategy
         emit(out, indent, "actime.sleep(actime.second * int(" + secs + "))");
     }
     void emitEval(std::ostringstream &out, int &indent,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
         lastWasReturn = false;
+        // Only the STRING case (interpret x as arithmetic-code text) is unimplemented on V —
+        // the non-string case (evaluate a real expression directly) is just emitLazyEval, which
+        // already works, so eval()'s new default branch is a real capability gain here, not a stub.
+        if (!argIsString) { emitLazyEval(out, indent, res, expr); return; }
         emit(out, indent, "mut " + res + " := f64(0) /* eval(" + expr + ") not supported in V backend */");
         declared.insert(res);
     }
@@ -10667,26 +14223,34 @@ class VStrategy : public BackendStrategy
         // redeclaring the same name a second time ("redefinition of `acs0_a`") — same root
         // cause (and fix: reuse the slot, plain `=` after the first declare) as the analogous
         // C/Go bugs found via examples/keyword_catalog_core.ac.
-        // NOTE: a list-typed `v` here would need `.clone()` to satisfy V's copy-semantics rule
-        // (see listVars_'s comment) — NOT added: verified that doing so, while it compiles,
-        // changes RUNTIME behavior for a genuine loop accumulator (examples/array_append.ac's
-        // `squares.append(...)` inside a FOR loop) — the save/restore pair silently clobbers the
-        // accumulated appends back to the pre-loop snapshot instead of erroring, which is worse
-        // than the original compile error. This needs a real investigation into why this shared
-        // (cross-backend) save/restore mechanism is even firing around a plain accumulator
-        // loop — left as a known, separate, deeper pre-existing bug, not fixed here.
+        // A list-typed `v` needs `.clone()` to satisfy V's copy-semantics rule (see listVars_'s
+        // comment) — a plain top-level list var (any mainloop `nums = [...]` followed by ANY
+        // later loop, whether or not that loop touches `nums`) hard-errored on V ("use `array2 =
+        // array1.clone()`") without it, since V arrays copy by value, not reference. This used to
+        // be skipped entirely because doing it unconditionally silently clobbered a genuine loop
+        // accumulator (examples/array_append.ac's `squares.append(...)` inside a FOR loop) back
+        // to its pre-loop snapshot after the loop — worse than the compile error it replaced. The
+        // real fix was upstream: the shared (cross-backend) free-var scan now recognizes
+        // `arr.append(x)` inside a loop as a write to `arr` (V's append lowers to a pure in-place
+        // `arr << x`, invisible to the scan's STORE_VAR/result-VAR check, unlike C's realloc-
+        // driven `recv = ac_arr_push(...)` reassignment which already registered) and exempts it
+        // from save/restore entirely — so any list `v` that reaches this function was NOT
+        // append-mutated inside the loop, and cloning it here is safe.
         std::string pfx = "acs" + std::to_string(depth) + "_";  // V: no leading underscore
         for (const auto &v : vars) {
+            std::string rhs = listVars_.count(v) ? (v + ".clone()") : v;
             bool isNew = declared.insert(pfx + v).second;
-            emit(out, indent, (isNew ? "mut " : "") + pfx + v + (isNew ? " := " : " = ") + v);
+            emit(out, indent, (isNew ? "mut " : "") + pfx + v + (isNew ? " := " : " = ") + rhs);
         }
     }
     void emitScopeExit(std::ostringstream &out, int &indent,
                        const std::vector<std::string> &vars, int depth) override
     {
         std::string pfx = "acs" + std::to_string(depth) + "_";
-        for (const auto &v : vars)
-            emit(out, indent, v + " = " + pfx + v);
+        for (const auto &v : vars) {
+            std::string rhs = listVars_.count(v) ? (pfx + v + ".clone()") : (pfx + v);
+            emit(out, indent, v + " = " + rhs);
+        }
     }
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
@@ -10716,9 +14280,21 @@ class VStrategy : public BackendStrategy
         indent--;
         emit(out, indent, "}");
     }
+    std::set<std::string> genChannelVars_;
+    void noteGeneratorCallResult(const std::string &resultVar) override { genChannelVars_.insert(resultVar); }
     void emitForBegin(std::ostringstream &out, int &indent,
                       const std::string &iterVar, const std::string &collection) override
     {
+        if (genChannelVars_.count(collection)) {
+            // V has no `for v in ch` range form over a channel (verified: "for in: cannot
+            // index `chan int`") — `or { break }` on the receive is V's own idiom for
+            // "loop until the channel closes".
+            emit(out, indent, "for {");
+            indent++;
+            emit(out, indent, "mut " + iterVar + " := <-" + collection + " or { break }");
+            declared.insert(iterVar);
+            return;
+        }
         if (rangeOf_.count(collection)) {
             emit(out, indent, "for " + iterVar + " in 0.." + rangeOf_[collection] + " {");
             indent++;
@@ -10753,9 +14329,34 @@ class VStrategy : public BackendStrategy
                    const std::string &var, const std::string &type,
                    const std::string &content, const std::string &content2 = "") override
     {
-        if (type == "range") { rangeOf_[var] = content; return; }
-        if (type == "sequence") {
-            seqOf_[var] = {content, content2.empty() ? content : content2};
+        if (type == "range" || type == "sequence") {
+            // See CStrategy's matching emitAlloc comment: rangeOf_/seqOf_ alone leave `var`
+            // completely undeclared when used as a plain VALUE, not immediately consumed by a
+            // FOR loop — "undefined ident" the moment anything referenced it.
+            std::string a, b, step;
+            if (type == "range") { rangeOf_[var] = content; a = "0"; b = content; }
+            else {
+                auto [b0, st] = splitSeqStep(content2);
+                b = b0.empty() ? content : b0; step = st;
+                seqOf_[var] = {content, b}; a = content;
+            }
+            thread_local int rngC = 0;
+            // vName(): V rejects leading-underscore identifiers in a declaration outright.
+            std::string iv = vName("_ac_rng_i_" + std::to_string(rngC++));
+            listVars_.insert(var);
+            emit(out, indent, "mut " + var + " := []i64{}");
+            if (step.empty()) {
+                emit(out, indent, "for " + iv + " := i64(" + a + "); " + iv + " < i64(" + b + "); " + iv + "++ {");
+            } else {
+                std::string sv = vName("_ac_rng_st_" + std::to_string(rngC - 1));
+                emit(out, indent, "mut " + sv + " := i64(" + step + ")");
+                emit(out, indent, "for " + iv + " := i64(" + a + "); (" + sv + " > 0 && " + iv + " < i64(" + b + ")) || (" + sv + " <= 0 && " + iv + " > i64(" + b + ")); " + iv + " += " + sv + " {");
+            }
+            indent++;
+            emit(out, indent, var + " << " + iv);
+            indent--;
+            emit(out, indent, "}");
+            declared.insert(var);
             return;
         }
         if (type == "dict") {
@@ -10871,6 +14472,7 @@ class VStrategy : public BackendStrategy
                            const std::string &classOwner = "") override
     {
         declared.clear(); floatVars.clear();
+        for (auto& v : promotedGlobals_) declared.insert(v);   // real __global, never `mut v :=`
         lastWasReturn = false;
         std::string vParams = params;
         std::string funcName = VStrategy::vName(name);
@@ -10885,7 +14487,14 @@ class VStrategy : public BackendStrategy
             // collision and matches this codebase's Go-backend naming for the same concept.
             // V function names must be snake_case (no uppercase at all) — lowercase just the
             // function name here, the STRUCT/return type stays PascalCase (`classOwner` as-is).
-            funcName = isNew ? "new_" + vName(classOwner) : name;
+            // The non-constructor branch previously reassigned `funcName` to the RAW, un-
+            // lowercased `name` — a real, pre-existing bug (unrelated to the class-return-type
+            // work above; just newly exercised because a test method happened to be named
+            // `setX`), verified: "function names cannot contain uppercase letters" for any
+            // method whose AC name wasn't already all-lowercase. `funcName` was ALREADY
+            // correctly vName()'d two lines up — this branch only needs to override it for the
+            // constructor case, not clobber it for every other method.
+            funcName = isNew ? "new_" + vName(classOwner) : vName(name);
         }
         // V: primitive params can't be mut. Use renamed params (p_) and copy to mut locals.
         std::vector<std::string> paramNames;
@@ -10898,6 +14507,8 @@ class VStrategy : public BackendStrategy
         }
         // Build signature with renamed params (name + "_p"); list params are []i64
         std::string tparams;
+        auto cptIt = classParamTypes_.find(name);
+        const std::map<int,std::string>* cpt = cptIt != classParamTypes_.end() ? &cptIt->second : nullptr;
         for (size_t i = 0; i < paramNames.size(); i++) {
             if (i > 0) tparams += ", ";
             bool isStr  = isStringVar(paramNames[i]);
@@ -10907,7 +14518,68 @@ class VStrategy : public BackendStrategy
             // `i64` here regardless (verified: examples/newton_sqrt.ac's `nsqrt(2.0)` —
             // "cannot use `float literal` as `i64` in argument 1").
             bool isFloat = !isStr && !isList && floatParams_.count(paramNames[i]) > 0;
-            tparams += paramNames[i] + "_p " + (isStr ? "string" : isList ? "[]i64" : isFloat ? "f64" : "i64");
+            // classParamTypes_ (see its own comment): a param proven to receive a bundle/tuple
+            // instance argument needs the real struct type, not `i64` — same bug as C's
+            // `ac_int p`, fixed identically. classInstanceVars_/classInstanceVarNames_ get
+            // pre-seeded below, in the mut-local-copy loop, using the SAME vName'd param name
+            // that loop already declares as the body-visible local.
+            auto cit = cpt ? cpt->find((int)i) : std::map<int,std::string>::const_iterator();
+            if (cpt && cit != cpt->end()) {
+                tparams += paramNames[i] + "_p " + cit->second;
+            } else {
+                tparams += paramNames[i] + "_p " + (isStr ? "string" : isList ? "[]i64" : isFloat ? "f64" : "i64");
+            }
+        }
+        // Generator: real goroutine + buffered channel (verified real: V supports `go`/`chan`
+        // the same shape as Go, but with real differences — no `for v in ch` range form (use
+        // `v := <-ch or { break }`), channels literal-constructed as `chan T{cap: N}`, closed
+        // via `.close()`, and — per V's OWN existing param convention just above (mut params
+        // aren't allowed) — the goroutine closure needs the channel AND every param passed in
+        // explicitly by value, V closures don't implicitly capture outer locals the way Go's
+        // do). `defer { ch.close() }` (a BLOCK, not a bare statement — V requires braces here)
+        // guarantees the channel closes even on an early user `return` inside the generator.
+        curFuncIsGenerator_ = isGenerator_;
+        if (curFuncIsGenerator_) {
+            emit(out, indent, "fn " + funcName + "(" + tparams + ") chan i64 {");
+            indent++;
+            emit(out, indent, "ac_gen_ch := chan i64{cap: 1}");
+            std::string closureParams = "ac_gen_ch chan i64";
+            std::string callArgs = "ac_gen_ch";
+            for (size_t i = 0; i < paramNames.size(); i++) {
+                bool isStr  = isStringVar(paramNames[i]);
+                bool isList = !isStr && listParams_.count(paramNames[i]) > 0;
+                bool isFloat = !isStr && !isList && floatParams_.count(paramNames[i]) > 0;
+                closureParams += ", " + paramNames[i] + "_p " + (isStr ? "string" : isList ? "[]i64" : isFloat ? "f64" : "i64");
+                // The outer function's own real parameter is `name_p` (the local `mut name :=
+                // name_p` copy — same as every other V function — only exists a scope deeper,
+                // INSIDE the closure being invoked here, not yet at this call-site scope).
+                callArgs += ", " + paramNames[i] + "_p";
+            }
+            emit(out, indent, "go fn(" + closureParams + ") {");
+            indent++;
+            emit(out, indent, "defer { ac_gen_ch.close() }");
+            for (const auto& p : paramNames) {
+                bool isStr  = isStringVar(p);
+                bool isList = !isStr && listParams_.count(p) > 0;
+                bool isFloat = !isStr && !isList && floatParams_.count(p) > 0;
+                emit(out, indent, "mut " + p + " := " + p + "_p" + (isList ? ".clone()" : ""));
+                if (isStr) stringVars_.insert(vName(p));
+                if (isFloat) floatVars.insert(p);
+                declared.insert(p);
+            }
+            for (const auto& [v, t] : hoistVars_) {
+                std::string vn = VStrategy::vName(v);
+                if (declared.count(vn)) continue;
+                std::string init;
+                if      (t == IRType::FLOAT)  { floatVars.insert(vn); init = "f64(0)"; }
+                else if (t == IRType::STRING)   init = "''";
+                else if (t == IRType::LIST)     init = "[]i64{}";
+                else                            init = "i64(0)";
+                emit(out, indent, "mut " + vn + " := " + init);
+                declared.insert(vn);
+            }
+            genClosureCallArgs_ = callArgs;
+            return;
         }
         // #retvoid: a genuinely void function (e.g. a `configure event-listener` key-callback
         // body) defaulted to `i64` — same bug class already fixed for Rust/Go/C. V's void
@@ -10917,6 +14589,24 @@ class VStrategy : public BackendStrategy
         std::string vret = curFuncReturnIsVoid_ ? ""
                          : baseReturnIsString_ ? "string"
                          : baseReturnIsList_ ? "[]i64" : returnIsFloat_ ? "f64" : "i64";
+        // A free function whose every `return` traces to one directly-constructed bundle
+        // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that struct
+        // directly, by value — overrides every inference above. Not applicable to the
+        // constructor (isNew), which always returns `ClassName` via its own dedicated
+        // signature line regardless.
+        curFuncReturnClass_ = "";
+        if (!isNew) {
+            auto classRetIt = classReturnFuncs_.find(name);
+            // The class/struct TYPE name itself stays exactly as declared (`Point`, matching
+            // emitClassBegin's own unmodified `name`) — vName()'s lowercasing only applies to
+            // VARIABLE/FUNCTION identifiers (verified real bug: lowercased this to `point`,
+            // "unknown type `point`. Did you mean `Point`?" — V's struct names keep their
+            // original case; only the `new_ClassName` CONSTRUCTOR FUNCTION name needs vName()).
+            if (classRetIt != classReturnFuncs_.end()) {
+                curFuncReturnClass_ = classRetIt->second;
+                vret = curFuncReturnClass_;
+            }
+        }
         curFuncReturnIsString_ = baseReturnIsString_;
         baseReturnIsString_ = false;
         curFuncReturnIsFloat_ = returnIsFloat_;
@@ -10938,13 +14628,22 @@ class VStrategy : public BackendStrategy
         }
         indent++;
         // Emit mut local copies and add to declared (lists clone for V value semantics)
-        for (const auto& p : paramNames) {
+        for (size_t pi = 0; pi < paramNames.size(); pi++) {
+            const std::string& p = paramNames[pi];
             bool isStr  = isStringVar(p);
             bool isList = !isStr && listParams_.count(p) > 0;
             bool isFloat = !isStr && !isList && floatParams_.count(p) > 0;
             emit(out, indent, "mut " + p + " := " + p + "_p" + (isList ? ".clone()" : ""));
             if (isStr) stringVars_.insert(vName(p));   // keep string-ness for body codegen
             if (isFloat) floatVars.insert(p);          // keep float-ness for body codegen
+            // classParamTypes_: pre-seed classInstanceVars_/classInstanceVarNames_ under the
+            // SAME vName'd name this local copy now carries, so the body's `p.field` reads
+            // format as a real field access (see the signature-building loop's own comment).
+            auto cit = cpt ? cpt->find((int)pi) : std::map<int,std::string>::const_iterator();
+            if (cpt && cit != cpt->end()) {
+                classInstanceVars_.insert(p);
+                classInstanceVarNames_[p] = cit->second;
+            }
             declared.insert(p);
         }
         // Hoist cross-block locals (fixes #41: V scopes `:=` per block). Cross-block vars are
@@ -10963,14 +14662,40 @@ class VStrategy : public BackendStrategy
     }
     bool curFuncIsConstructor_ = false;
     bool curFuncReturnIsVoid_ = false;
+    bool curFuncIsGenerator_ = false;
+    std::string genClosureCallArgs_;
     void setReturnIsVoid(bool v) override { returnIsVoid_ = v; }
     bool returnIsVoid_ = false;
+    void setIsGenerator(bool v) override { isGenerator_ = v; }
+    bool isGenerator_ = false;
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "ac_gen_ch <- " + val);
+    }
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
+        if (curFuncIsGenerator_) {
+            indent--;
+            emit(out, indent, "}(" + genClosureCallArgs_ + ")");
+            emit(out, indent, "return ac_gen_ch");
+            curFuncIsGenerator_ = false;
+            lastWasReturn = false;
+            indent--;
+            emit(out, indent, "}");
+            emitRaw(out, "");
+            declared.clear();
+            return;
+        }
         if (!lastWasReturn && !curFuncReturnIsVoid_)
             emit(out, indent, curFuncIsConstructor_ ? "return self"
+                             // Class-returning function's implicit trailing value — a real
+                             // zero-valued struct literal (`ClassName{}` is valid V), same
+                             // "still has to typecheck even though unreachable after a real
+                             // `return p`" reasoning as every sibling backend's matching fix.
+                             : !curFuncReturnClass_.empty() ? "return " + curFuncReturnClass_ + "{}"
                              : curFuncReturnIsFloat_ ? "return f64(0)" : "return i64(0)");
         curFuncReturnIsFloat_ = false; curFuncIsConstructor_ = false; curFuncReturnIsVoid_ = false;
+        curFuncReturnClass_ = "";
         lastWasReturn = false;
         indent--;
         emit(out, indent, "}");
@@ -11004,9 +14729,17 @@ class VStrategy : public BackendStrategy
         // all (there's no implicit constructor / no bare-struct-name-as-callable in V).
         std::string vn = vName(res);
         bool isNewDecl = declared.insert(vn).second;
+        classInstanceVars_.insert(vn);
+        classInstanceVarNames_[vn] = className;   // TYPE name — original case, see emitFunctionBegin's comment
         emit(out, indent, (isNewDecl ? "mut " + vn + " := " : vn + " = ")
                           + "new_" + vName(className) + "(" + args + ")");
     }
+    void noteInstanceClass(const std::string &var, const std::string &className) override {
+        std::string vn = vName(var);
+        classInstanceVars_.insert(vn);
+        classInstanceVarNames_[vn] = className;   // TYPE name — original case
+    }
+    void setClassReturnFuncs(const std::map<std::string,std::string> &m) override { classReturnFuncs_ = m; }
     void emitClassEnd(std::ostringstream &out, int &indent) override
     {
         (void)out; (void)indent;
@@ -11026,6 +14759,14 @@ class VStrategy : public BackendStrategy
         // A string source parses at the boundary (`'42'.i64()`), not a numeric conversion (which V
         // rejects from a string). Fixes `to_int n = $42$` / `to_dec` on V.
         bool srcIsStr = (!src.empty() && (src.front() == '\'' || src.front() == '"')) || isStringVar(src);
+        // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point.
+        if (boxedVars_.count(var)) {
+            std::string rhs = (t == IRType::STRING) ? "ac_dyn_s(" + src + ".str())"
+                             : (t == IRType::FLOAT)  ? (srcIsStr ? "ac_dyn_f(" + src + ".f64())" : "ac_dyn_f(f64(" + src + "))")
+                             :                          (srcIsStr ? "ac_dyn_i(" + src + ".i64())" : "ac_dyn_i(i64(" + src + "))");
+            emit(out, indent, (declared.insert(var).second ? "mut " + var + " := " : var + " = ") + rhs);
+            return;
+        }
         if      (t == IRType::FLOAT)  expr = srcIsStr ? (src + ".f64()") : ("f64(" + src + ")");
         // V has no cast-type tracking (its decl() wraps every int in i64()), so it can't carry a
         // fixed width through arithmetic — short/mini are advisory i64 on V (as on Python/JS/BNY).
@@ -11045,13 +14786,29 @@ class VStrategy : public BackendStrategy
         if (declared.count(var)) emit(out, indent, var + " = " + expr);
         else {
             declared.insert(var);
-            emit(out, indent, "mut " + var + " := " + expr);
+            // A var known (whole-program floatVars prescan) to become float LATER, even
+            // though THIS cast is to something else entirely (e.g. `short x = 100` when a
+            // later `x = 5.5` retypes it), must be declared `f64` from the start — matches
+            // how the untyped assignment path already does (see its own "#42" comment).
+            // V has no true redeclaration (a `mut` var's type is fixed forever): without
+            // this, x got declared `i64` here, and the later float TYPE_CAST's plain `x =
+            // f64(5.5)` reassignment was a hard V compile error ("cannot assign to `x`:
+            // expected `i64`, not `f64`") since V permits zero implicit int<->float
+            // conversion on assignment, only in explicit casts building a NEW value.
+            if (t != IRType::FLOAT && floatVars.count(var)) {
+                floatVars.insert(var);
+                std::string fexpr = srcIsStr ? (src + ".f64()") : ("f64(" + src + ")");
+                emit(out, indent, "mut " + var + " := " + fexpr);
+            } else {
+                emit(out, indent, "mut " + var + " := " + expr);
+            }
         }
     }
 
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
         declared.clear();
+        for (auto& v : promotedGlobals_) declared.insert(v);   // real __global, never `mut v :=`
         lastWasReturn = false;
         emit(out, indent, "fn main() {");
         indent++;
@@ -11100,12 +14857,28 @@ class AsmStrategy : public BackendStrategy
     // `--all`/`--no-run` never actually assembles+links ASM output (see BNY's identical
     // "undefined label 'display'" — same root cause, different backend).
     std::map<std::string, std::string> widgetVars_;   // var name -> widget constructor kind
+    // widgetVars_ was ONLY ever populated inline, at ctor-codegen time (see asmWidgetCtor's
+    // `widgetVars_[res] = func;`) — meaning a widget var whose CTOR is scanned in a LATER
+    // function than a method call that USES it (the routine case: a callback function
+    // declared before <mainloop> in source, calling `.get()`/`.write()` on a var <mainloop>
+    // doesn't construct until later) never had its kind known yet, and every such call
+    // linked as an undefined bare-flattened symbol (`path_inp_get`, `src_box_write`, ...).
+    // BNY solved exactly this with its own whole-program prescan (widgetVarKind_ /
+    // collectExternalSymbols' prepassCtors) — this reuses the SAME data instead of
+    // duplicating that scan: the shared driver already computes "which promoted/cross-
+    // function global is which widget ctor name" (structGlobals) and calls setStructGlobals
+    // unconditionally for every backend; AsmStrategy just never consumed it before (same gap
+    // GoStrategy/VStrategy had, fixed the same way — see their matching comments).
+    void setStructGlobals(const std::map<std::string, std::string> &m) override {
+        for (auto& [var, ctorName] : m) widgetVars_[var] = ctorName;
+    }
     std::map<std::string, int> userFuncArity_;
     void setUserFuncArity(const std::map<std::string, int>& m) override { userFuncArity_ = m; }
     static bool isWidgetCtor(const std::string& func) {
         static const std::set<std::string> ctors = {
             "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
-            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch"
+            "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch",
+            "textbox"
         };
         return ctors.count(func) > 0;
     }
@@ -11158,7 +14931,9 @@ class AsmStrategy : public BackendStrategy
         auto arg = [&](size_t i, const std::string &def) { return i < a.size() ? a[i] : def; };
         std::string newFn;
         std::vector<std::string> callArgs;
-        if (func == "Screen") { newFn = "ac_widgets_screen_new"; callArgs = { arg(0, "\"AC App\""), arg(1, "\"800x600\"") }; }
+        // title is mandatory (enforced at the ir.cpp level) — no geometry arg; use
+        // .dimensions(w, h) to size the window.
+        if (func == "Screen") { newFn = "ac_widgets_screen_new"; callArgs = { arg(0, "\"AC App\"") }; }
         else if (func == "display") { newFn = "ac_widgets_display_new"; callArgs = { arg(0, "0"), arg(1, "\"\"") }; }
         else if (func == "ask") { newFn = "ac_widgets_ask_new"; callArgs = { arg(0, "0"), arg(1, "20") }; }
         else if (func == "btn") { newFn = "ac_widgets_btn_new"; callArgs = { arg(0, "0"), arg(1, "\"Button\"") }; }
@@ -11172,11 +14947,21 @@ class AsmStrategy : public BackendStrategy
         else if (func == "listbox") { newFn = "ac_widgets_listbox_new"; callArgs = { arg(0, "0"), arg(1, "20"), arg(2, "10") }; }
         else if (func == "table") { newFn = "ac_widgets_table_new"; callArgs = { arg(0, "0"), arg(1, "\"\""), arg(2, "10") }; }
         else if (func == "sketch") { newFn = "ac_widgets_sketch_new"; callArgs = { arg(0, "0"), arg(1, "300"), arg(2, "200") }; }
+        else if (func == "textbox") { newFn = "ac_widgets_textbox_new"; callArgs = { arg(0, "0"), arg(1, "\"black\""), arg(2, "\"monospace\"") }; }
         else return false;
         asmCallSimple(out, newFn, callArgs, res);
         widgetVars_[res] = func;
-        std::string packFn = packFnFor(func);
-        if (!packFn.empty()) asmCallSimple(out, packFn, {res}, "");
+        // A trailing `lazy` sentinel arg defers auto-pack to a manual caller-side `.pack()`
+        // later — every OTHER backend's widget ctor already checks this; ASM never did, so
+        // `dropdown(root, lazy)` etc always packed immediately here regardless, then packed
+        // AGAIN at the caller's explicit `.pack()` (wrong order relative to the intervening
+        // `.add()`/`.set()` calls, not just a harmless double-pack).
+        bool isLazy = !a.empty() && (a.back() == "lazy" || a.back() == "\"lazy\"");
+        if (isLazy) { calledFuncs_.insert("ac_widgets_set_lazy"); asmCallSimple(out, "ac_widgets_set_lazy", {res}, ""); }
+        else {
+            std::string packFn = packFnFor(func);
+            if (!packFn.empty()) asmCallSimple(out, packFn, {res}, "");
+        }
         if (func == "btn" && a.size() > 2) {
             std::string cb = a[2];
             auto ar = userFuncArity_.find(cb);
@@ -11215,6 +15000,10 @@ class AsmStrategy : public BackendStrategy
         if (method == "mainloop" && kind == "Screen") { asmCallSimple(out, "ac_widgets_screen_mainloop", {recv}, ""); return true; }
         if (method == "update" && kind == "Screen")   { asmCallSimple(out, "ac_widgets_screen_update", {recv}, ""); return true; }
         if (method == "destroy" && kind == "Screen")  { asmCallSimple(out, "ac_widgets_screen_destroy", {recv}, ""); return true; }
+        if (method == "dimensions" && kind == "Screen" && a.size() >= 2) {
+            asmCallSimple(out, "ac_widgets_screen_dimensions", {recv, a[0], a[1]}, "");
+            return true;
+        }
         if (method == "add") {
             std::string fn = (kind == "dropdown" ? "ac_widgets_dropdown_add" :
                               kind == "listbox"  ? "ac_widgets_listbox_add"  :
@@ -11232,8 +15021,24 @@ class AsmStrategy : public BackendStrategy
         if (method == "get") {
             std::string fn = getFnFor(kind);
             asmCallSimple(out, fn, {recv}, res);
-            if (!res.empty() && (kind == "ask" || kind == "display" || kind == "dropdown"))
+            if (!res.empty() && (kind == "ask" || kind == "display" || kind == "dropdown" || kind == "textbox"))
                 strVars_.insert(res);
+            return true;
+        }
+        if (method == "write" && kind == "textbox") {
+            std::string val = a.empty() ? "\"\"" : a[0];
+            asmCallSimple(out, "ac_widgets_textbox_write", {recv, val}, "");
+            return true;
+        }
+        if (method == "fix" && kind == "textbox") {
+            std::string val = a.empty() ? "\"\"" : a[0];
+            asmCallSimple(out, "ac_widgets_textbox_fix", {recv, val}, "");
+            return true;
+        }
+        if (method == "find" && kind == "textbox") {
+            std::string val = a.empty() ? "\"\"" : a[0];
+            asmCallSimple(out, "ac_widgets_textbox_find", {recv, val}, res);
+            if (!res.empty()) strVars_.insert(res);
             return true;
         }
         if (method == "on_click" && kind == "btn" && !a.empty()) {
@@ -11441,6 +15246,20 @@ class AsmStrategy : public BackendStrategy
     std::string currentClass_;
     std::map<std::string, std::vector<std::string>> classFields_;   // className -> ordered field names
     std::map<std::string, std::string> instanceClass_;              // instance var name -> className
+    // classParamTypes_ (see UnifiedIRCodeGen's own comment): a parameter proven to receive a
+    // bundle/tuple instance argument needs its name pre-seeded into instanceClass_, same as any
+    // other instance var, so resolveFieldAccess recognizes `p.x` as a real field access —
+    // unlike the 7 shared-driver backends this fixed for earlier, ASM needs no parameter-TYPE
+    // declaration fix at all (there's no static signature to get wrong: emitFunctionBegin's
+    // param-storing loop, just below, already unconditionally stores EVERY incoming argument
+    // into its own named slot regardless of whether the body ever references it bare — verified
+    // by reading that loop directly), so this is a pure instanceClass_ pre-seed, nothing more.
+    void setClassParamTypes(const std::map<std::string, std::map<int, std::string>> &m) override {
+        for (auto& [fn, params] : m)
+            for (auto& [idx, cls] : params)
+                classParamTypesByFn_[fn][idx] = cls;
+    }
+    std::map<std::string, std::map<int, std::string>> classParamTypesByFn_;
     int fieldOffset(const std::string &className, const std::string &field) const
     {
         auto it = classFields_.find(className);
@@ -11469,6 +15288,7 @@ class AsmStrategy : public BackendStrategy
     int lastTryIdx_ = -1;
     bool afterPending_ = false;
     int divGuardIdx_ = 0;
+    int appendGuardIdx_ = 0;  // unique label suffix per `.append` call site (see emitAppend's fast/slow split)
     // Shared by both `/` and `%` (both use `idiv`, both can trap on a zero divisor). Assumes RBX
     // already holds the divisor — matches every idiv call site's existing convention.
     void emitDivZeroGuard(std::ostringstream &out)
@@ -11578,6 +15398,29 @@ class AsmStrategy : public BackendStrategy
         return slot[name];
     }
 
+    // NA→free promoted globals — see setPromotedGlobals() and the `.bss` emission in the
+    // trailer section for the full rationale.
+    std::vector<std::string> promotedGlobals_;
+    void setPromotedGlobals(const std::vector<std::string> &vars) override { promotedGlobals_ = vars; }
+    bool isPromoted(const std::string &name) const
+    {
+        return std::find(promotedGlobals_.begin(), promotedGlobals_.end(), name) != promotedGlobals_.end();
+    }
+    static std::string sanitizeGlobalName(const std::string &n)
+    {
+        std::string s;
+        for (char c : n) s += (std::isalnum((unsigned char)c) ? c : '_');
+        return s;
+    }
+    // Every var-address operand in this class goes through here (or getSlot() directly, for
+    // the few call sites still being migrated) — a promoted var resolves to its fixed .bss
+    // label instead of a per-function stack offset, giving it real cross-function identity.
+    std::string slotAddr(const std::string &name)
+    {
+        if (isPromoted(name)) return "rel _AC_FREE_" + sanitizeGlobalName(name);
+        return "rbp-" + std::to_string(getSlot(name));
+    }
+
     // Emit code to load `val` into RAX
     void loadRAX(std::ostringstream &out, const std::string &val)
     {
@@ -11591,7 +15434,7 @@ class AsmStrategy : public BackendStrategy
         if (val.size() > 1 && val[0] == '&') { loadRAX(out, val.substr(1)); return; }
         std::string fbase; int foff;
         if (resolveFieldAccess(val, fbase, foff)) {
-            out << "    mov rax, [rbp-" << getSlot(fbase) << "]\n";  // rax = object pointer
+            out << "    mov rax, [" << slotAddr(fbase) << "]\n";  // rax = object pointer
             out << "    mov rax, [rax+" << foff << "]\n";
             return;
         }
@@ -11618,7 +15461,7 @@ class AsmStrategy : public BackendStrategy
         }
         else
         {
-            out << "    mov rax, [rbp-" << getSlot(val) << "]\n";
+            out << "    mov rax, [" << slotAddr(val) << "]\n";
         }
     }
 
@@ -11627,11 +15470,11 @@ class AsmStrategy : public BackendStrategy
         std::string fbase; int foff;
         if (resolveFieldAccess(dst, fbase, foff)) {
             out << "    mov rbx, rax\n";                          // rbx = value to store (rax about to be reused)
-            out << "    mov rax, [rbp-" << getSlot(fbase) << "]\n"; // rax = object pointer
+            out << "    mov rax, [" << slotAddr(fbase) << "]\n"; // rax = object pointer
             out << "    mov [rax+" << foff << "], rbx\n";
             return;
         }
-        out << "    mov [rbp-" << getSlot(dst) << "], rax\n";
+        out << "    mov [" << slotAddr(dst) << "], rax\n";
     }
 
     // Reinterpret a value's raw bit-slot as a double in XMM0/XMM1 for an actual float op. Only
@@ -11654,9 +15497,9 @@ class AsmStrategy : public BackendStrategy
         } else if (looksNumeric(val)) {
             out << "    mov rax, " << val << "\n    cvtsi2sd " << xmmReg << ", rax\n";
         } else if (isFloatVal(val)) {
-            out << "    mov rax, [rbp-" << getSlot(val) << "]\n    movq " << xmmReg << ", rax\n";
+            out << "    mov rax, [" << slotAddr(val) << "]\n    movq " << xmmReg << ", rax\n";
         } else {
-            out << "    mov rax, [rbp-" << getSlot(val) << "]\n    cvtsi2sd " << xmmReg << ", rax\n";
+            out << "    mov rax, [" << slotAddr(val) << "]\n    cvtsi2sd " << xmmReg << ", rax\n";
         }
     }
 
@@ -11677,10 +15520,47 @@ class AsmStrategy : public BackendStrategy
     void emitHeader(std::ostringstream &out) override
     {
         emitRaw(out, "; Generated by AC Compiler (AC->ASM)");
-        emitRaw(out, "; x86-64 Linux NASM — assemble: nasm -f elf64 out.s && gcc out.o -o out");
+        // Any ilib's `extern ac_X` symbols below need real -L/-l flags at link time — the
+        // plain "gcc out.o -o out" this comment used to document silently assumed no
+        // program would ever import one, so EVERY ilib-using ASM program (verified:
+        // regex_demo.ac, camera_demo.ac — "undefined reference to `ac_regex_match'"/etc)
+        // failed to link if you followed this file's own instructions literally. ASM has
+        // no auto-run step (unlike every other backend), so this is the one place that
+        // documented command can be corrected — collected into one combined "; Link:"
+        // line covering every ilib actually imported, same link-name convention already
+        // used by the C/C++/Go/BNY sides of this same lookup (see libForSym/soLinkFlags).
+        {
+            std::string linkFlags;
+            for (auto& [lt, ln] : pendingImports_) {
+                if (lt != "ilib") continue;
+                std::string absDir = resolveIlibDir(ln);
+                if (absDir.empty()) continue;
+                std::string lnk;
+                if (ln == "machine-audio") lnk = "acmachinaaudio";
+                else if (ln == "web-server") lnk = "acserver";
+                else if (ln == "native-cpu") lnk = "acncpu";
+                else if (ln == "os")       lnk = "acoos";
+                else if (ln == "aczip")    lnk = "aczip";
+                else { lnk = "ac"; for (char c : ln) if (c != '-') lnk += c; }
+                linkFlags += " -L\"" + absDir + "\" -l" + lnk + " -Wl,-rpath,\"" + absDir + "\"";
+            }
+            // -no-pie: this backend's raw NASM output isn't position-independent (absolute
+            // relocations against printf/malloc/etc), so modern gcc/ld's PIE-by-default
+            // fails EVERY link with "relocation ... can not be used when making a PIE
+            // object" — verified: this broke even the simplest ilib-free ASM program, not
+            // just ones using an ilib.
+            emitRaw(out, "; x86-64 Linux NASM — assemble: nasm -f elf64 out.s && gcc out.o -o out -no-pie" + linkFlags);
+        }
         emitRaw(out, "");
         emitRaw(out, "    default rel");
         emitRaw(out, "    extern printf, exit, abort, fflush, stderr, setjmp, longjmp");
+        // `yield`/generators: same real POSIX ucontext.h trio as C/CPP (see CStrategy's
+        // emitHeader comment) — called directly via NASM `extern`+`call`, exactly how this
+        // backend already calls setjmp/longjmp/printf above. NOT BNY's raw hand-rolled
+        // register-swap approach: this backend links real libc, so there's no reason to
+        // reimplement what glibc already provides. Unconditional, same as setjmp/longjmp above
+        // (harmless if unused — a plain extern declaration, no code emitted).
+        emitRaw(out, "    extern getcontext, makecontext, swapcontext, malloc");
         if (anyAtomicVars())
             emitRaw(out, "    extern pthread_mutex_init, pthread_mutex_lock, pthread_mutex_unlock");
         if (needsEvents_)
@@ -11728,6 +15608,13 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "section .bss");
         emitRaw(out, "    _ac_try_stack resb 6400");   // 32 slots * 200 bytes/jmp_buf (glibc x86-64)
         emitRaw(out, "    _ac_try_depth resq 1");
+        emitRaw(out, "");
+        // `yield`/generators: single shared "currently active generator" slot — same design as
+        // every other backend's fiber/thread implementation (see e.g. CStrategy's ac_gen_cur):
+        // fiber switches are strictly nested/sequential, never concurrent, so one slot suffices.
+        // Unconditional, same as the extern line in emitHeader above (harmless if unused).
+        emitRaw(out, "section .bss");
+        emitRaw(out, "    ac_gen_cur resq 1");
         emitRaw(out, "");
         if (anyAtomicVars()) {
             // `atomic` vars: a real pthread_mutex_t (sizeof == 40 on x86-64 Linux glibc),
@@ -11781,6 +15668,20 @@ class AsmStrategy : public BackendStrategy
             emitRaw(out, "    _ac_ev_keys resq 64");
             emitRaw(out, "    _ac_ev_fns  resq 64");
             emitRaw(out, "    _ac_ev_n    resq 1");
+            emitRaw(out, "");
+        }
+        if (!promotedGlobals_.empty()) {
+            // NA→free promoted vars (shared across functions): previously ASM never
+            // implemented setPromotedGlobals at all, so every function-local `slot[name]`
+            // was a FRESH stack offset in ITS OWN frame — a `free x` shared by two
+            // functions silently read/wrote two unrelated rbp-relative addresses (no
+            // error, just the wrong value). Fixed with one fixed .bss quadword per
+            // promoted var, addressed `[rel _AC_FREE_<name>]` from every function
+            // instead of `[rbp-N]` — same real-global approach every other backend
+            // already had (see slotAddr()).
+            emitRaw(out, "section .bss");
+            for (auto& v : promotedGlobals_)
+                emitRaw(out, "    _AC_FREE_" + sanitizeGlobalName(v) + " resq 1");
             emitRaw(out, "");
         }
         emitRaw(out, "section .text");
@@ -11897,26 +15798,29 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    pop rbx");
         emitRaw(out, "    ret");
         emitRaw(out, "");
-        // Dict runtime: string-keyed assoc, fixed 64-pair capacity (same "toy-scale, linear
-        // scan, no realloc" choice already made for the event-listener table above) — a
-        // malloc'd block [n(8)][k0(8)][v0(8)]...[k63(8)][v63(8)]. Values are raw 8-byte
-        // payloads (an int64 OR a string-pool pointer) — mirrors exp_bny.cpp's BNY dict
-        // runtime and CStrategy's ac_dict, both of which this was missing entirely before
-        // (emitAlloc unconditionally `return`ed for type=="dict" — any `d = {...}` literal
-        // left its var slot uninitialized garbage; `pets = [dc_pets_0, dc_pets_1]` (a
-        // datac-imported list of dict rows) then indexing it segfaulted on the garbage read).
+        // Dict runtime: string-keyed assoc, O(n) linear scan (real hashing is a bigger,
+        // separate follow-up — not attempted here), but capacity now grows dynamically
+        // instead of the old fixed 64-pair cap (which had NO overflow check at all — a 65th
+        // insert was an unguarded buffer overflow, a correctness bug, not just a perf one).
+        // Layout: [cap(8)][n(8)][k0(8)][v0(8)]...  — a hidden capacity word at ptr[-8], one
+        // slot before the n word every other dict-reading path already knows about (get only
+        // ever reads ptr[0]=n and ptr[8+16i]/ptr[16+16i] for keys/values, unaware ptr-8
+        // exists) — mirrors exp_bny.cpp's BNY dict fix. Values are raw 8-byte payloads (an
+        // int64 OR a string-pool pointer) — mirrors CStrategy's ac_dict too.
         definedFuncs_.insert("_ac_dict_new");
         definedFuncs_.insert("_ac_dict_get");
         definedFuncs_.insert("_ac_dict_set");
         calledFuncs_.insert("malloc"); calledFuncs_.insert("strcmp");
         calledFuncs_.insert("printf"); calledFuncs_.insert("exit");
-        emitRaw(out, "_ac_dict_new:");                 // -> rax = block ptr
-        emitRaw(out, "    mov rdi, " + std::to_string(8 + 64 * 16));
+        emitRaw(out, "_ac_dict_new:");                 // -> rax = ptr, seed cap = 8 pairs
+        emitRaw(out, "    mov rdi, " + std::to_string(16 * (8 + 1)));
         emitRaw(out, "    call malloc");
-        emitRaw(out, "    mov qword [rax], 0");
+        emitRaw(out, "    mov qword [rax], 8");        // raw[0] = cap
+        emitRaw(out, "    add rax, 8");                 // rax = ptr (skip cap word)
+        emitRaw(out, "    mov qword [rax], 0");         // ptr[0] = n = 0
         emitRaw(out, "    ret");
         emitRaw(out, "");
-        emitRaw(out, "_ac_dict_get:");                 // rdi=block, rsi=key -> rax=value
+        emitRaw(out, "_ac_dict_get:");                 // rdi=ptr, rsi=key -> rax=value
         emitRaw(out, "    push rbx");
         emitRaw(out, "    push r12");
         emitRaw(out, "    push r13");
@@ -11954,19 +15858,19 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    mov edi, 1");
         emitRaw(out, "    call exit");
         emitRaw(out, "");
-        emitRaw(out, "_ac_dict_set:");                 // rdi=block, rsi=key, rdx=val -> rax=block
+        emitRaw(out, "_ac_dict_set:");                 // rdi=ptr, rsi=key, rdx=val -> rax=ptr
         emitRaw(out, "    push rbx");
         emitRaw(out, "    push r12");
         emitRaw(out, "    push r13");
         emitRaw(out, "    push r14");
-        emitRaw(out, "    mov r12, rdi");
-        emitRaw(out, "    mov r13, rsi");
-        emitRaw(out, "    mov r14, rdx");
-        emitRaw(out, "    xor rbx, rbx");
+        emitRaw(out, "    mov r12, rdi");               // r12 = ptr
+        emitRaw(out, "    mov r13, rsi");               // r13 = key
+        emitRaw(out, "    mov r14, rdx");               // r14 = val
+        emitRaw(out, "    xor rbx, rbx");               // rbx = i (scan index)
         emitRaw(out, ".ac_ds_loop:");
-        emitRaw(out, "    mov rax, [r12]");
+        emitRaw(out, "    mov rax, [r12]");              // n
         emitRaw(out, "    cmp rbx, rax");
-        emitRaw(out, "    jge .ac_ds_append");
+        emitRaw(out, "    jge .ac_ds_grow");             // rbx == n -> no match, need insert
         emitRaw(out, "    lea rcx, [r12+8]");
         emitRaw(out, "    mov rax, rbx");
         emitRaw(out, "    imul rax, rax, 16");
@@ -11984,15 +15888,65 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, ".ac_ds_next:");
         emitRaw(out, "    inc rbx");
         emitRaw(out, "    jmp .ac_ds_loop");
-        emitRaw(out, ".ac_ds_append:");
-        emitRaw(out, "    lea rcx, [r12+8]");
-        emitRaw(out, "    mov rax, rbx");
-        emitRaw(out, "    imul rax, rax, 16");
-        emitRaw(out, "    add rcx, rax");
-        emitRaw(out, "    mov [rcx], r13");
-        emitRaw(out, "    mov [rcx+8], r14");
-        emitRaw(out, "    inc qword [r12]");
-        emitRaw(out, "    mov rax, r12");
+        emitRaw(out, "");
+        emitRaw(out, ".ac_ds_grow:");                    // rbx == n; fast (room) vs slow (full)?
+        emitRaw(out, "    mov rax, [r12-8]");             // rax = cap
+        emitRaw(out, "    cmp rbx, rax");
+        emitRaw(out, "    jl .ac_ds_fast");                // n < cap -> room already available
+        // ---- slow path: rbx == n == cap exactly (grow only ever triggers here, never
+        // n>cap) — rbx doubles as oldcap for free, no separate read needed. ----
+        emitRaw(out, "    mov rdi, rbx");
+        emitRaw(out, "    add rdi, rdi");
+        emitRaw(out, "    inc rdi");
+        emitRaw(out, "    imul rdi, rdi, 16");             // bytes = 16*(2*oldcap + 1)
+        emitRaw(out, "    call malloc");                    // rax = new raw block
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    add rcx, rcx");                    // rcx = newcap = 2*oldcap
+        emitRaw(out, "    mov qword [rax], rcx");            // new_raw[0] = newcap
+        emitRaw(out, "    add rax, 8");                       // rax = new ptr
+        // copy old_ptr[0..2*oldcap] (word0=n plus 2*oldcap pair-words); word0 overwritten after
+        emitRaw(out, "    xor rcx, rcx");
+        emitRaw(out, ".ac_ds_copy:");
+        emitRaw(out, "    mov rdx, rbx");
+        emitRaw(out, "    add rdx, rdx");
+        emitRaw(out, "    inc rdx");                           // bound = 2*oldcap+1
+        emitRaw(out, "    cmp rcx, rdx");
+        emitRaw(out, "    jge .ac_ds_copied");
+        emitRaw(out, "    mov rsi, rcx");
+        emitRaw(out, "    imul rsi, rsi, 8");
+        emitRaw(out, "    mov r8, r12");
+        emitRaw(out, "    add r8, rsi");
+        emitRaw(out, "    mov r9, [r8]");
+        emitRaw(out, "    mov r8, rax");
+        emitRaw(out, "    add r8, rsi");
+        emitRaw(out, "    mov [r8], r9");
+        emitRaw(out, "    inc rcx");
+        emitRaw(out, "    jmp .ac_ds_copy");
+        emitRaw(out, ".ac_ds_copied:");
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    inc rcx");
+        emitRaw(out, "    mov [rax], rcx");                    // new_ptr[0] = n+1
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    mov rdi, rax");
+        emitRaw(out, "    add rdi, rcx");
+        emitRaw(out, "    add rdi, 8");
+        emitRaw(out, "    mov [rdi], r13");                     // new key
+        emitRaw(out, "    mov qword [rdi+8], r14");              // new val
+        emitRaw(out, "    jmp .ac_ds_done");
+        emitRaw(out, "");
+        emitRaw(out, ".ac_ds_fast:");                            // n < cap — write in place, O(1)
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    mov rdi, r12");
+        emitRaw(out, "    add rdi, rcx");
+        emitRaw(out, "    add rdi, 8");
+        emitRaw(out, "    mov [rdi], r13");                       // key slot
+        emitRaw(out, "    mov qword [rdi+8], r14");                // value slot
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    inc rcx");
+        emitRaw(out, "    mov [r12], rcx");                         // ptr[0] = n+1
+        emitRaw(out, "    mov rax, r12");                            // return same ptr
         emitRaw(out, ".ac_ds_done:");
         emitRaw(out, "    pop r14");
         emitRaw(out, "    pop r13");
@@ -12086,6 +16040,9 @@ class AsmStrategy : public BackendStrategy
             {"sidebar.display","ac_sidebar_display"},{"sidebar.ask","ac_sidebar_ask"},
             {"sidebar.getinput","ac_sidebar_getinput"},
             {"screen.setmode","ac_screen_setmode"},{"screen.update","ac_screen_update"},
+            {"aczip.compress","ac_zip_compress_to_file"},
+            {"aczip.decompress","ac_zip_decompress_from_file"},
+            {"aczip.get_ratio","ac_get_compression_ratio"},
             {"web.open","ac_web_open"},{"web.file_open","ac_web_file_open"},
             {"web.popen","ac_web_popen"},{"web.ropen","ac_web_ropen"},
             {"web.browser","ac_web_browser"},{"web.pdf","ac_web_pdf"},
@@ -12160,18 +16117,40 @@ class AsmStrategy : public BackendStrategy
         return commonRef(r, sym, "1", "0", "0", "0", false);
     }
 
+    void emitLockBegin(std::ostringstream &out, int & /*indent*/) override {
+        out << "    lea rdi, [_ac_atomic_lock]\n    call pthread_mutex_lock\n";
+        calledFuncs_.insert("pthread_mutex_lock");
+    }
+    void emitLockEnd(std::ostringstream &out, int & /*indent*/) override {
+        out << "    lea rdi, [_ac_atomic_lock]\n    call pthread_mutex_unlock\n";
+        calledFuncs_.insert("pthread_mutex_unlock");
+    }
     void emitStoreVar(std::ostringstream &out, int & /*indent*/, const std::string &var, const std::string &val) override
     {
-        // `atomic` var: wrap the WHOLE statement (read-of-current-value via `val` + write) in
-        // the global lock, so a compound update like `x = x + 1` is a genuine, uninterruptible
-        // RMW — matches every other backend's `atomic` codegen.
+        // `atomic` var: no inline lock wrap here anymore — ir.cpp now brackets the WHOLE
+        // read-modify-write span with real LOCK_BEGIN/LOCK_END instructions (see
+        // emitLockBegin/emitLockEnd above), closing the TOCTOU race the old store-only
+        // wrap here could never actually close.
         if (atomicVars_.count(var)) {
-            out << "    lea rdi, [_ac_atomic_lock]\n    call pthread_mutex_lock\n";
-            calledFuncs_.insert("pthread_mutex_lock");
-            loadRAX(out, val);
+            // `atomic` is always an int variable (see its own doc comment, token.hpp) — a
+            // float value assigned to one must be TRUNCATED into a real integer, not
+            // bit-copied. loadRAX's normal float-literal path stashes the value's raw
+            // IEEE754 bits verbatim (correct for a context that reinterprets them back
+            // into a double via movq — wrong here) — verified real bug: `atomic x = 5; x
+            // = 5.5` loaded 5.5's raw bit pattern into x's slot, then printed it back as
+            // the huge decimal that bit pattern reads as when read back as a plain int64.
+            if (looksFloat(val)) {
+                long long truncated = (long long)std::stod(val);
+                out << "    mov rax, " << truncated << "\n";
+            } else if (isFloatVal(val)) {
+                // A float VARIABLE/temp (not a literal) — do a real truncating conversion
+                // from its actual double bits, not a raw copy.
+                loadXMM0(out, val);
+                out << "    cvttsd2si rax, xmm0\n";
+            } else {
+                loadRAX(out, val);
+            }
             storeRAX(out, var);
-            out << "    lea rdi, [_ac_atomic_lock]\n    call pthread_mutex_unlock\n";
-            calledFuncs_.insert("pthread_mutex_unlock");
             return;
         }
         // Propagate string/list-ness through a plain copy (`LOAD_VAR iterT, collRef` — how the
@@ -12199,6 +16178,20 @@ class AsmStrategy : public BackendStrategy
         // "4611686018427387904" — exactly 2.0's IEEE-754 bit pattern reinterpreted as int64 —
         // instead of "2.0").
         if (isFloatVal(val)) floatVars_.insert(var);
+        // A var that's ALREADY known float (from a LATER TYPE_CAST in this same var's
+        // lifetime — the whole-program `detectFloatVars` prescan runs before any codegen,
+        // so it already knows about a retype that hasn't happened yet in instruction order;
+        // see ir.cpp's AssignStmt automatic-retype) getting a plain int VALUE stored here
+        // needs a real int-to-double conversion, not a raw bit copy — otherwise this EARLY
+        // write (e.g. `x`'s first assignment, `x=5`, before the LATER `x=5.5` that's what
+        // actually earns `x` its spot in `floatVars_`) leaves int64 bits in the slot that
+        // every later float-typed read then reinterprets as denormalized garbage.
+        if (!isFloatVal(val) && floatVars_.count(var)) {
+            loadRAX(out, val);
+            out << "    cvtsi2sd xmm0, rax\n";
+            storeXMM0(out, var);
+            return;
+        }
         loadRAX(out, val);
         storeRAX(out, var);
     }
@@ -12216,7 +16209,18 @@ class AsmStrategy : public BackendStrategy
         if (t == IRType::ATOMIC) {
             out << "    lea rdi, [_ac_atomic_lock]\n    call pthread_mutex_lock\n";
             calledFuncs_.insert("pthread_mutex_lock");
-            loadRAX(out, src);
+            // Same truncate-not-bitcopy fix as emitStoreVar's ATOMIC branch (see its
+            // comment) — `atomic x = 5.5` as the INITIAL declaration needs the same
+            // real float->int truncation a later reassignment does.
+            if (looksFloat(src)) {
+                long long truncated = (long long)std::stod(src);
+                out << "    mov rax, " << truncated << "\n";
+            } else if (srcIsFloat) {
+                loadXMM0(out, src);
+                out << "    cvttsd2si rax, xmm0\n";
+            } else {
+                loadRAX(out, src);
+            }
             storeRAX(out, var);
             out << "    lea rdi, [_ac_atomic_lock]\n    call pthread_mutex_unlock\n";
             calledFuncs_.insert("pthread_mutex_unlock");
@@ -12251,6 +16255,19 @@ class AsmStrategy : public BackendStrategy
             loadRAX(out, src);
             out << "    test rax, rax\n    setne al\n    movzx rax, al\n";
             storeRAX(out, var);
+        }
+        else if (floatVars_.count(var) && t == IRType::INT) {
+            // Automatic-retype (ir.cpp's AssignStmt: a plain reassignment auto-inserts a
+            // TYPE_CAST the moment a var's value type changes) can emit an INT-typed
+            // TYPE_CAST for a var that's ALREADY tracked float from an EARLIER cast in its
+            // own lifetime (`x=5; x=5.5; x=10` — the third assignment's own literal is int,
+            // even though `x` conceptually stays float the rest of the program). Every
+            // OTHER branch here already checks `floatVars_`/`t==FLOAT` before dispatching;
+            // this plain-INT path didn't, storing raw int64 BITS that every later float-
+            // typed read then reinterpreted as denormalized garbage instead of the real
+            // value (matches the identical gap found+fixed in BNY's own TYPE_CAST case).
+            if (srcIsFloat) { loadRAX(out, src); storeRAX(out, var); }
+            else { loadRAX(out, src); out << "    cvtsi2sd xmm0, rax\n"; storeXMM0(out, var); }
         }
         else {   // INT / SHORT / MINI — plain integer family, with width truncation for short/mini
             if (srcIsStr) {
@@ -12355,7 +16372,7 @@ class AsmStrategy : public BackendStrategy
                 out << "    add rax, " << rhs << "\n";
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
                 out << "    add rax, rbx\n";
             }
         }
@@ -12365,7 +16382,7 @@ class AsmStrategy : public BackendStrategy
                 out << "    sub rax, " << rhs << "\n";
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
                 out << "    sub rax, rbx\n";
             }
         }
@@ -12377,7 +16394,7 @@ class AsmStrategy : public BackendStrategy
             }
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
             }
             out << "    imul rax, rbx\n";
         }
@@ -12389,7 +16406,7 @@ class AsmStrategy : public BackendStrategy
             }
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
             }
             emitDivZeroGuard(out);
             out << "    cqo\n    idiv rbx\n"; // quotient in RAX
@@ -12402,7 +16419,7 @@ class AsmStrategy : public BackendStrategy
             }
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
             }
             emitDivZeroGuard(out);
             out << "    cqo\n    idiv rbx\n    mov rax, rdx\n"; // remainder in RDX
@@ -12422,7 +16439,7 @@ class AsmStrategy : public BackendStrategy
                 out << "    " << insn << " rax, " << rhs << "\n";
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
                 out << "    " << insn << " rax, rbx\n";
             }
         }
@@ -12442,7 +16459,7 @@ class AsmStrategy : public BackendStrategy
             }
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
             }
             out << "    sub rax, rbx\n";
             out << "    cqo\n";          // sign-extend rax into rdx (0 or -1)
@@ -12463,7 +16480,7 @@ class AsmStrategy : public BackendStrategy
             }
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
             }
             out << "    test rbx, rbx\n";
             out << "    setne bl\n";
@@ -12483,12 +16500,31 @@ class AsmStrategy : public BackendStrategy
             }
             else
             {
-                out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+                out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
             }
             out << "    test rbx, rbx\n";
             out << "    setne bl\n";
             out << "    xor al, bl\n";
             out << "    xor al, 1\n"; // invert for xnor
+            out << "    movzx rax, al\n";
+            storeRAX(out, res);
+            return;
+        }
+        if (op == "not")
+        {
+            // A genuine PRE-EXISTING gap, unrelated to `yield` itself: this unary op was never
+            // given its own case here at all — it fell all the way through to the generic
+            // binary-relational fallback at the bottom of this function with `rhs` empty,
+            // which then did `mov rbx, [slotAddr("")]` (a bogus, uninitialized slot allocated
+            // for the literal empty string) and defaulted its setcc to "setge" (">=", the final
+            // else-branch — "not" matches none of ==/!=/</>/<=/>= above it) — i.e. computed
+            // `lhs >= garbage` instead of `lhs == 0`. Verified real bug via `yield`'s own
+            // `FOR x in gen():` loop shape (`JUMP_IF_FALSE(NOT(done))`), which never actually
+            // broke — the underlying booleans never went through any comparison that happened
+            // to trip on this. Real logical NOT: nonzero -> 0, zero -> 1.
+            loadRAX(out, lhs);
+            out << "    test rax, rax\n";
+            out << "    sete al\n";
             out << "    movzx rax, al\n";
             storeRAX(out, res);
             return;
@@ -12519,7 +16555,7 @@ class AsmStrategy : public BackendStrategy
             out << "    cmp rax, " << rhs << "\n";
         else
         {
-            out << "    mov rbx, [rbp-" << getSlot(rhs) << "]\n";
+            out << "    mov rbx, [" << slotAddr(rhs) << "]\n";
             out << "    cmp rax, rbx\n";
         }
         // SETcc → AL, then zero-extend
@@ -12582,6 +16618,9 @@ class AsmStrategy : public BackendStrategy
                 loadRAX(out, var);
                 out << "    mov rdi, rax\n";
                 out << "    call _ac_dict_set\n";
+                storeRAX(out, var);   // block may have moved on growth — was previously
+                                       // silently discarded, harmless only while the old
+                                       // fixed-64-slot dict never actually reallocated.
             }
             return;
         }
@@ -12608,10 +16647,18 @@ class AsmStrategy : public BackendStrategy
         }
         auto elems = splitElems(content);
         int n = (int)elems.size();
-        out << "    mov rdi, " << (8 * (n + 1)) << "\n    call malloc\n";
+        // Layout: [cap][len][e0][e1]...  — a hidden capacity word one slot before the len
+        // word every other array-reading path already knows about (indexing/iteration/print
+        // all only ever touch ptr[0]=len and ptr[8+8i]=elem_i, unaware ptr-8 exists). Lets
+        // `.append` grow in place (capacity-doubling, amortized O(1)) without any other code
+        // path changing. Seed cap >= 4 so small lists don't immediately need to re-grow.
+        int cap0 = n > 4 ? n : 4;
+        out << "    mov rdi, " << (8 * (cap0 + 2)) << "\n    call malloc\n";
         calledFuncs_.insert("malloc");
+        out << "    mov qword [rax], " << cap0 << "\n";   // raw[0] = cap
+        out << "    add rax, 8\n";                        // rax = ptr (skip cap word)
         out << "    mov rbx, rax\n";
-        out << "    mov qword [rbx], " << n << "\n";
+        out << "    mov qword [rbx], " << n << "\n";       // ptr[0] = len
         for (int idx = 0; idx < n; idx++) {
             loadRAX(out, elems[idx]);
             out << "    mov qword [rbx + " << (8 * (idx + 1)) << "], rax\n";
@@ -12696,6 +16743,9 @@ class AsmStrategy : public BackendStrategy
             loadRAX(out, val);
             out << "    mov rdx, rax\n";
             out << "    call _ac_dict_set\n";
+            storeRAX(out, arr);   // block may have moved on growth — was previously
+                                   // silently discarded, harmless only while the old
+                                   // fixed-64-slot dict never actually reallocated.
             return;
         }
         loadRAX(out, arr);
@@ -12750,38 +16800,59 @@ class AsmStrategy : public BackendStrategy
             storeRAX(out, res);
             return;
         }
-        // `arr.append(v)` — realloc-grow-by-one (mirrors CStrategy's ac_arr_push): malloc a
-        // block one element bigger, copy the old length-prefixed contents, append the new
-        // value, and reassign `recv` to the NEW pointer (the old block may have moved).
+        // `arr.append(v)` — O(1) amortized via the hidden capacity word at ptr[-8] (see
+        // emitAlloc's list-literal comment): if len < cap, write the new element in place
+        // and bump len — zero allocation, zero copy. Only when capacity is exhausted does
+        // this allocate a doubled block and copy (mirrors CStrategy's ac_arr_push). Previously
+        // this allocated a fresh len+1-sized block and copied every existing element on EVERY
+        // append — O(n^2) total memory traffic for an N-append loop.
         for (const char* suf : {".append", "_append"}) {
             auto ap = func.rfind(suf);
             if (ap != std::string::npos && ap == func.size() - 7 && ap > 0) {
                 std::string recv = func.substr(0, ap);
                 if (isListVar(recv)) {
+                    int g = appendGuardIdx_++;
                     loadRAX(out, recv);
-                    out << "    mov rbx, rax\n";           // rbx = old block ptr
-                    out << "    mov r13, qword [rbx]\n";   // r13 = old length n
-                    out << "    mov rax, r13\n";
-                    out << "    add rax, 2\n";              // n+2 words: header + (n+1) elements
+                    out << "    mov rbx, rax\n";              // rbx = ptr
+                    out << "    mov r13, qword [rbx]\n";      // r13 = len = ptr[0]
+                    out << "    mov r14, qword [rbx-8]\n";    // r14 = cap = ptr[-8]
+                    out << "    cmp r13, r14\n";
+                    out << "    jl .ac_append_fast" << g << "\n";
+                    // ---- slow path: capacity exhausted — double and copy ----
+                    out << "    add r14, r14\n";                // r14 = newcap = cap*2
+                    out << "    mov rax, r14\n";
+                    out << "    add rax, 2\n";                 // newcap+2 words
                     out << "    imul rax, rax, 8\n";
                     out << "    mov rdi, rax\n";
                     out << "    call malloc\n";
                     calledFuncs_.insert("malloc");
-                    out << "    mov r12, rax\n";            // r12 = new block ptr
+                    out << "    mov qword [rax], r14\n";       // new_raw[0] = newcap
+                    out << "    add rax, 8\n";                 // rax = new ptr (skip cap word)
+                    out << "    mov r12, rax\n";                // r12 = new ptr
                     out << "    mov rsi, rbx\n";
                     out << "    mov rdi, r12\n";
                     out << "    mov rcx, r13\n";
-                    out << "    inc rcx\n";                  // copy header + n old elements = n+1 words
+                    out << "    inc rcx\n";                     // copy len(word0) + len elements = len+1 words
                     out << "    rep movsq\n";
-                    loadRAX(out, args);                       // rax = value being appended
+                    loadRAX(out, args);                          // rax = value being appended
                     out << "    mov rbx, rax\n";
                     out << "    mov rax, r13\n";
                     out << "    mov qword [r12 + 8 + rax*8], rbx\n";
                     out << "    mov rax, r13\n";
                     out << "    inc rax\n";
-                    out << "    mov [r12], rax\n";            // update length
+                    out << "    mov [r12], rax\n";              // update length
                     out << "    mov rax, r12\n";
-                    storeRAX(out, recv);                       // reassign — the block may have moved
+                    storeRAX(out, recv);                         // reassign — the block moved
+                    out << "    jmp .ac_append_done" << g << "\n";
+                    // ---- fast path: len < cap — write in place, zero allocation/copy ----
+                    out << ".ac_append_fast" << g << ":\n";
+                    loadRAX(out, args);                          // rax = value being appended
+                    out << "    mov qword [rbx + 8 + r13*8], rax\n";
+                    out << "    inc r13\n";
+                    out << "    mov [rbx], r13\n";               // ptr[0] = len+1
+                    out << "    mov rax, rbx\n";
+                    storeRAX(out, recv);                          // same pointer — nothing moved
+                    out << ".ac_append_done" << g << ":\n";
                     return;
                 }
             }
@@ -12825,6 +16896,11 @@ class AsmStrategy : public BackendStrategy
             {"ac_mod", {"dd", 'd'}}, {"ac_log_base", {"dd", 'd'}},
             {"ac_clamp", {"ddd", 'd'}},
             {"ac_to_int", {"d", 'i'}}, {"ac_to_dec", {"i", 'd'}},
+            // aczip's compression-ratio percentage: BOTH args are size_t (int registers,
+            // not xmm — "ii", not "dd"), but it RETURNS a double via xmm0 — same calling-
+            // convention gap as math.* above (verified: aczip_demo.ac printed the raw
+            // integer byte count instead of a percentage, e.g. "193 percent" not "96.5").
+            {"ac_get_compression_ratio", {"ii", 'd'}},
             // ml ilib (libacml.h's "AC-native API" surface) — same calling-convention gap,
             // different library: `ml.tensor(2)` passed its double arg via rdi (int reg) instead
             // of xmm0, and `ml.take(w)` read its double RESULT out of rax instead of xmm0 —
@@ -12836,6 +16912,9 @@ class AsmStrategy : public BackendStrategy
             {"ml_weights", {"di", 'i'}}, {"ml_take", {"i", 'd'}},
             {"ml_add", {"ii", 'i'}}, {"ml_multiply", {"ii", 'i'}}, {"ml_relu", {"i", 'i'}},
             {"ml_backward", {"i", 'i'}}, {"ml_get_grad", {"i", 'i'}},
+            // ml.acl maps ml:grad -> ml.grad / ml:optimize -> ml.optimize — these are the
+            // actual exported alias names (see ml.cpp), not ml_get_grad/ml_sgd_step directly.
+            {"ml_grad", {"i", 'i'}}, {"ml_optimize", {"di", 'i'}},
         };
         auto sigIt = floatSig.find(func);
         if (sigIt != floatSig.end()) {
@@ -12886,6 +16965,22 @@ class AsmStrategy : public BackendStrategy
 
     void emitReturn(std::ostringstream &out, int & /*indent*/, const std::string &val) override
     {
+        // A generator's `return` (explicit OR the implicit auto-appended trailing one — UNLIKE
+        // CStrategy/CppStrategy/JavaStrategy, this does the done+swap unconditionally for BOTH,
+        // matching FuncCompiler::compileInstr's RETURN case for BNY — see its own comment for
+        // why: a bare `leave/ret` here would return through a normal SysV epilogue into whatever
+        // garbage return address sits on this fiber's OWN freshly-malloc'd stack, since it was
+        // never `call`'d into in the first place — ASM's `ret` just blindly pops [rsp] and jumps,
+        // no uc_link=NULL safety net like C/CPP's makecontext-based crash-instead-of-corrupt) ends
+        // iteration, discarding any value (matches every other backend's documented non-goal).
+        if (curFuncIsGenerator_) {
+            out << "    mov rcx, [rel ac_gen_cur]\n";
+            out << "    mov qword [rcx+" << GEN_OFF_DONE << "], 1\n";
+            out << "    mov rdi, [rcx+" << GEN_OFF_GENCTX << "]\n";
+            out << "    mov rsi, [rcx+" << GEN_OFF_CALLERCTX << "]\n";
+            out << "    call swapcontext\n";
+            return;
+        }
         if (!val.empty())
             loadRAX(out, val);
         else
@@ -13001,7 +17096,7 @@ class AsmStrategy : public BackendStrategy
                      const std::string &val) override
     {
         emitPrint(out, indent, val);
-        if (!res.empty()) out << "    mov qword [rbp-" << getSlot(res) << "], 0\n";
+        if (!res.empty()) out << "    mov qword [" << slotAddr(res) << "], 0\n";
     }
     void emitHalt(std::ostringstream &out, int & /*indent*/) override
     {
@@ -13009,10 +17104,12 @@ class AsmStrategy : public BackendStrategy
         out << "    call abort\n";
     }
     void emitEval(std::ostringstream &out, int & /*indent*/,
-                  const std::string &res, const std::string &expr) override
+                  const std::string &res, const std::string &expr, bool /*argIsString*/, IRType /*resultType*/) override
     {
+        // Neither branch (string-as-code, nor expr+try/catch) is implemented on ASM yet — same
+        // pre-existing "niche, not implemented" gap as before, not backend-specific to which one.
         out << "    ; eval(" << expr << ") — not implemented in ASM backend\n";
-        if (!res.empty()) out << "    mov qword [rbp-" << getSlot(res) << "], 0\n";
+        if (!res.empty()) out << "    mov qword [" << slotAddr(res) << "], 0\n";
     }
     void emitRaise(std::ostringstream &out, int & /*indent*/, const std::string &) override
     {
@@ -13071,7 +17168,7 @@ class AsmStrategy : public BackendStrategy
         // on the stack from before the try (matches C, no real message
         // propagation across the setjmp/longjmp model on either backend).
         if (!exVar.empty())
-            out << "    mov qword [rbp-" << getSlot(exVar) << "], 0\n";
+            out << "    mov qword [" << slotAddr(exVar) << "], 0\n";
     }
     void emitAfterBegin(std::ostringstream &out, int & /*indent*/) override
     {
@@ -13175,10 +17272,118 @@ class AsmStrategy : public BackendStrategy
         out << "    jnz " << label << "\n";
     }
 
+    // `yield`/generators — real POSIX ucontext.h (getcontext/makecontext/swapcontext), called
+    // directly as NASM `extern` symbols exactly like setjmp/printf already are (see emitHeader's
+    // extern line). State block layout (heap-malloc'd, byte offsets — this backend has no real
+    // struct/typedef facility, just raw addressing, same spirit as BNY's own flat layout but
+    // simpler: ucontext_t's own save/restore does ALL the register bookkeeping BNY had to
+    // hand-roll, so this state block only needs pointers to two separately malloc'd ucontext_t-
+    // sized buffers, not 14 individual register slots):
+    //   [0]=done  [8]=value  [16]=genCtx ptr  [24]=callerCtx ptr  [32..]=args[]
+    // ucontext_t's own internal field offsets (uc_link=8, uc_stack.ss_sp=16, uc_stack.ss_size=32)
+    // are real, stable glibc x86-64 ABI layout — verified directly against this build's own
+    // <ucontext.h> via offsetof() in a standalone C program before writing any of this, not
+    // assumed (sizeof(ucontext_t)=968 on this glibc; buffers sized 1024 for headroom).
+    static const int GEN_OFF_DONE = 0, GEN_OFF_VALUE = 8, GEN_OFF_GENCTX = 16, GEN_OFF_CALLERCTX = 24;
+    static const int GEN_HEADER_BYTES = 32;
+    static const int GEN_CTX_BYTES = 1024, GEN_STACK_BYTES = 65536;
+    static const int UC_LINK_OFF = 8, UC_STACK_SP_OFF = 16, UC_STACK_SIZE_OFF = 32;
+    bool curFuncIsGenerator_ = false;
+    bool isGenerator_ = false;
+    std::string genCreatorLabel_;
+    std::vector<std::string> genParamNames_;
+    void setIsGenerator(bool v) override { isGenerator_ = v; }
+    void emitYield(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        (void)indent;
+        if (!val.empty()) loadRAX(out, val);
+        else out << "    xor eax, eax\n";
+        out << "    mov rcx, [rel ac_gen_cur]\n";
+        out << "    mov [rcx+" << GEN_OFF_VALUE << "], rax\n";
+        out << "    mov rdi, [rcx+" << GEN_OFF_GENCTX << "]\n";
+        out << "    mov rsi, [rcx+" << GEN_OFF_CALLERCTX << "]\n";
+        out << "    call swapcontext\n";
+    }
+    void emitGenCreate(std::ostringstream &out, int &indent, const std::string &res,
+                       const std::string &func, const std::string &args) override
+    {
+        (void)indent;
+        std::vector<std::string> argList;
+        { std::istringstream as(args); std::string a; while (std::getline(as, a, ',')) {
+            size_t p = a.find_first_not_of(' '), q = a.find_last_not_of(' ');
+            if (p != std::string::npos) argList.push_back(a.substr(p, q - p + 1)); } }
+        static const char* argRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        for (size_t i = 0; i < argList.size() && i < 6; i++) {
+            loadRAX(out, argList[i]);
+            out << "    mov " << argRegs[i] << ", rax\n";
+        }
+        out << "    call " << func << "\n";
+        out << "    mov [" << slotAddr(res) << "], rax\n";
+        calledFuncs_.insert(func);
+    }
+    void emitGenNext(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &handle) override
+    {
+        (void)indent;
+        std::string skipL = "_gen_skip" + std::to_string(strIdx++);
+        loadRAX(out, handle);
+        out << "    mov rbx, rax\n";
+        out << "    mov rax, [rbx+" << GEN_OFF_DONE << "]\n";
+        out << "    test rax, rax\n";
+        out << "    jnz " << skipL << "\n";
+        out << "    mov [rel ac_gen_cur], rbx\n";
+        out << "    mov rdi, [rbx+" << GEN_OFF_CALLERCTX << "]\n";
+        out << "    mov rsi, [rbx+" << GEN_OFF_GENCTX << "]\n";
+        out << "    call swapcontext\n";
+        out << skipL << ":\n";
+        out << "    mov rax, [rbx+" << GEN_OFF_VALUE << "]\n";
+        out << "    mov [" << slotAddr(res) << "], rax\n";
+    }
+    void emitGenDone(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &handle) override
+    {
+        (void)indent;
+        loadRAX(out, handle);
+        out << "    mov rax, [rax+" << GEN_OFF_DONE << "]\n";
+        out << "    mov [" << slotAddr(res) << "], rax\n";
+    }
     void emitFunctionBegin(std::ostringstream &out, int &indent,
                            const std::string &name, const std::string &params,
                            const std::string &classOwner = "") override
     {
+        // Bundle-method generators are an explicit scope cut, same as every other backend —
+        // `self` has nowhere to come from without a real incoming `call`.
+        curFuncIsGenerator_ = isGenerator_ && classOwner.empty();
+        if (curFuncIsGenerator_) {
+            slot.clear(); nextSlot = 8;
+            std::string entryLabel = "ac_gen_entry_" + name;
+            genCreatorLabel_ = name;
+            definedFuncs_.insert(genCreatorLabel_);
+            emitRaw(out, "");
+            emitRaw(out, entryLabel + ":");
+            frameLabel_ = entryLabel;
+            out << "    push rbp\n    mov rbp, rsp\n    sub rsp, " << frameToken(entryLabel) << "\n";
+            out << "    mov [rbp-8], rbx\n";
+            // Parameters come from the state block's args area (via the shared ac_gen_cur slot),
+            // not from argRegs — there's no real incoming `call` here (see GEN_CREATE: it calls
+            // this label's own CREATOR half below, entered via `call` normally; THIS entry label
+            // is only ever reached via makecontext's own internal trampoline).
+            genParamNames_.clear();
+            out << "    mov rax, [rel ac_gen_cur]\n";
+            std::istringstream ps(params); std::string pname; int pi = 0;
+            while (std::getline(ps, pname, ',')) {
+                size_t a = pname.find_first_not_of(' ');
+                if (a == std::string::npos) continue;
+                size_t z = pname.find_last_not_of(' ');
+                pname = pname.substr(a, z - a + 1);
+                genParamNames_.push_back(pname);
+                out << "    mov rcx, [rax+" << (GEN_HEADER_BYTES + 8 * pi) << "]\n";
+                out << "    mov [" << slotAddr(pname) << "], rcx\n";
+                pi++;
+            }
+            currentClass_.clear();
+            return;
+        }
         slot.clear();
         // [rbp-8] is reserved for the caller's RBX (see emitFunctionEnd's matching restore) —
         // user locals/params start at [rbp-16]. RBX is callee-saved per the SysV ABI, but this
@@ -13216,13 +17421,18 @@ class AsmStrategy : public BackendStrategy
         // Save incoming arguments into their stack slots. Without this the params read as garbage
         // (fibonacci returned all 0). System V ABI: first 6 integer args in rdi,rsi,rdx,rcx,r8,r9.
         static const char* argRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        auto cptIt = classParamTypesByFn_.find(name);
+        const std::map<int,std::string>* cpt = cptIt != classParamTypesByFn_.end() ? &cptIt->second : nullptr;
         std::istringstream ps(params); std::string pname; int ai = 0;
         while (std::getline(ps, pname, ',') && ai < 6) {
             size_t a = pname.find_first_not_of(' ');
             if (a == std::string::npos) continue;
             size_t z = pname.find_last_not_of(' ');
             pname = pname.substr(a, z - a + 1);
-            out << "    mov [rbp-" << getSlot(pname) << "], " << argRegs[ai++] << "\n";
+            // classParamTypes_ pre-seed (see its own comment) — must happen before this
+            // parameter's own body gets emitted, so `p.field` reads resolve correctly.
+            if (cpt) { auto ci = cpt->find(ai); if (ci != cpt->end()) instanceClass_[pname] = ci->second; }
+            out << "    mov [" << slotAddr(pname) << "], " << argRegs[ai++] << "\n";
         }
         // Authoritative per-function, not just per-class: methods of DIFFERENT classes are
         // emitted sequentially and each needs `self.field` inside its OWN body resolved against
@@ -13233,6 +17443,65 @@ class AsmStrategy : public BackendStrategy
     void emitFunctionEnd(std::ostringstream &out, int &indent) override
     {
         (void)indent;
+        if (curFuncIsGenerator_) {
+            // No epilogue for the entry body — it's never `ret`'d into in the normal sense
+            // (entered via makecontext's own trampoline, exited via RETURN's own emitReturn
+            // generator branch, which always ends in a `call swapcontext` that — once done=1 —
+            // never resumes). Anything after that point is genuinely unreachable; NASM (unlike
+            // javac) doesn't care, so nothing further needs emitting here for the entry half.
+            recordFrameSize(frameLabel_);
+            slot.clear(); nextSlot = 8;
+
+            // The "creator": a REAL function (reached via a normal `call`, e.g. from GEN_CREATE)
+            // that allocates the state block + two ucontext_t-sized buffers + the fiber's own
+            // fresh stack, arms it via getcontext/makecontext, and returns the handle.
+            emitRaw(out, "");
+            emitRaw(out, genCreatorLabel_ + ":");
+            frameLabel_ = genCreatorLabel_;
+            definedFuncs_.insert(genCreatorLabel_);
+            out << "    push rbp\n    mov rbp, rsp\n    sub rsp, " << frameToken(genCreatorLabel_) << "\n";
+            out << "    mov [rbp-8], rbx\n";
+            static const char* argRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+            for (size_t i = 0; i < genParamNames_.size() && i < 6; i++)
+                out << "    mov [" << slotAddr(genParamNames_[i]) << "], " << argRegs[i] << "\n";
+
+            out << "    mov rdi, " << (GEN_HEADER_BYTES + 8 * (int)genParamNames_.size()) << "\n";
+            out << "    call malloc\n";
+            calledFuncs_.insert("malloc");
+            out << "    mov rbx, rax\n";                       // rbx = state ptr (kept live across
+                                                                  // the following calls — malloc
+                                                                  // preserves callee-saved RBX per
+                                                                  // the SysV ABI, same as the rest
+                                                                  // of this file already assumes)
+            out << "    mov qword [rbx+" << GEN_OFF_DONE << "], 0\n";
+            for (size_t i = 0; i < genParamNames_.size(); i++) {
+                out << "    mov rax, [" << slotAddr(genParamNames_[i]) << "]\n";
+                out << "    mov [rbx+" << (GEN_HEADER_BYTES + 8 * (int)i) << "], rax\n";
+            }
+            out << "    mov rdi, " << GEN_CTX_BYTES << "\n    call malloc\n";
+            out << "    mov [rbx+" << GEN_OFF_GENCTX << "], rax\n";
+            out << "    mov rdi, " << GEN_CTX_BYTES << "\n    call malloc\n";
+            out << "    mov [rbx+" << GEN_OFF_CALLERCTX << "], rax\n";
+            out << "    mov rdi, [rbx+" << GEN_OFF_GENCTX << "]\n";
+            out << "    call getcontext\n";
+            out << "    mov rdi, " << GEN_STACK_BYTES << "\n    call malloc\n";
+            out << "    mov r12, rax\n";                       // r12 = fresh fiber stack (callee-saved)
+            out << "    mov rax, [rbx+" << GEN_OFF_GENCTX << "]\n";
+            out << "    mov [rax+" << UC_STACK_SP_OFF << "], r12\n";
+            out << "    mov qword [rax+" << UC_STACK_SIZE_OFF << "], " << GEN_STACK_BYTES << "\n";
+            out << "    mov qword [rax+" << UC_LINK_OFF << "], 0\n";
+            out << "    mov rdi, [rbx+" << GEN_OFF_GENCTX << "]\n";
+            out << "    lea rsi, [rel ac_gen_entry_" << genCreatorLabel_ << "]\n";
+            out << "    xor edx, edx\n";
+            out << "    call makecontext\n";
+            out << "    mov rax, rbx\n";
+            out << "    mov rbx, [rbp-8]\n";
+            out << "    leave\n    ret\n";
+            recordFrameSize(genCreatorLabel_);
+            slot.clear(); nextSlot = 8;
+            curFuncIsGenerator_ = false;
+            return;
+        }
         out << "    xor eax, eax\n";
         out << "    mov rbx, [rbp-8]\n";   // restore caller's RBX (see emitFunctionBegin's note)
         out << "    leave\n    ret\n";
@@ -13281,6 +17550,21 @@ class AsmStrategy : public BackendStrategy
         calledFuncs_.insert(className + "_init");
         out << "    mov rax, rbx\n";
         storeRAX(out, res);
+    }
+    // `q = f()` where f always constructs+returns one bundle class (classFuncs_'s whole-
+    // program prescan in the shared driver) — same treatment as a direct construct-call
+    // (`instanceClass_[res] = className` above) for resolveFieldAccess's own lookup, even
+    // when the instance arrived across a function-return boundary. This backend's own
+    // instanceClass_ is a LOCAL member (unlike the 6 other shared-driver backends, which
+    // route through the driver's own instanceVarClass_) — the shared driver's
+    // noteInstanceClass hook exists exactly to bridge that gap; ASM just never implemented
+    // it. Verified real bug: without this, `q.x` after `q = f()` read garbage (an
+    // uninitialized/reused local slot the backend never knew was really a Point*), not 0
+    // like BNY's version of the same root bug — this backend's default fallback for an
+    // unresolved field access happens to fall through to a plain (wrong) local slot read
+    // rather than a zeroed one.
+    void noteInstanceClass(const std::string &var, const std::string &className) override {
+        instanceClass_[var] = className;
     }
     void emitMainBegin(std::ostringstream &out, int &indent) override
     {
@@ -13395,7 +17679,16 @@ static std::set<std::string> detectFloatVars(const std::vector<AC_IR::IRInstruct
                     const IRRef* tgt = nullptr; const IRRef* val = nullptr;
                     if (ins.opcode == IROpcode::STORE_VAR && ins.typedOperands.size() >= 2) { tgt = &ins.typedOperands[0]; val = &ins.typedOperands[1]; }
                     else if (ins.result.isValid() && !ins.typedOperands.empty()) { tgt = &ins.result; val = &ins.typedOperands[0]; }
-                    if (tgt && val && isF(*val)) mark(*tgt);
+                    // Same coercion-aware guard as the TYPE_CAST case above: a STORE_VAR
+                    // whose OWN resultType is a non-float qualifier (ATOMIC/SHORT/MINI —
+                    // ir.cpp's sticky-keep now emits a plain STORE_VAR, not a TYPE_CAST,
+                    // whenever the var's type doesn't actually change, e.g. `atomic x = 5;
+                    // x = 5.5` stays ATOMIC end-to-end) means the source value is being
+                    // coerced/truncated at this exact store, not turning the var float.
+                    bool coercedNonFloat = ins.resultType != IRType::VOID
+                        && ins.resultType != IRType::FLOAT
+                        && (ins.resultType == IRType::ATOMIC || irIntWidth(ins.resultType));
+                    if (tgt && val && !coercedNonFloat && isF(*val)) mark(*tgt);
                     break;
                 }
                 case IROpcode::CALL:
@@ -13407,6 +17700,42 @@ static std::set<std::string> detectFloatVars(const std::vector<AC_IR::IRInstruct
                             callee = std::get<std::string>(c.value.data);
                         if (!callee.empty() && floatFuncs.count(callee)) mark(ins.result);
                     }
+                    break;
+                // Automatic-retype's TYPE_CAST (see ir.cpp's AssignStmt comment: `x = 5; x
+                // = 5.5;` auto-inserts one instead of a plain STORE_VAR the moment a var's
+                // value type changes) was invisible to this whole-scope prescan — a var
+                // retyped to float via ONE of these was never declared `double`/`float64`
+                // from the start, so the LATER numeric narrowing (assigning a real double
+                // into a variable every OTHER backend still declared as int64) silently
+                // corrupted the value (verified: `x=5; x=5.5; x=10` printed `5, 5, 10` on
+                // C++ instead of `5, 5.5, 10.0` — the `.5` was truncated back to an int on
+                // assignment, not just a display/formatting bug). Same `isF(val)` check
+                // STORE_VAR already uses, just also covering this opcode.
+                case IROpcode::TYPE_CAST:
+                    if (ins.result.isValid() && ins.resultType == IRType::FLOAT) mark(ins.result);
+                    // A TYPE_CAST to a non-float qualifier (ATOMIC/SHORT/MINI/INT/etc) means
+                    // the source value is being COERCED into that type at this exact point —
+                    // `atomic x = 5; x = 5.5` truncates 5.5 into an int, it doesn't turn x
+                    // into a float var, even though the literal source operand is genuinely
+                    // float-typed. Only fall back to inspecting the source operand's own
+                    // type when resultType itself doesn't already settle the question.
+                    //
+                    // The condition below only ever excluded ATOMIC and SHORT/MINI (via
+                    // irIntWidth) from that fallback — a plain INT resultType (irIntWidth==0,
+                    // same as every other non-narrow type) fell straight through to "infer
+                    // float from the source" anyway, directly contradicting this comment's own
+                    // stated intent (it lists "INT" by name). Verified real bug: a tuple's
+                    // colloid coercion (`(n, 2; int)`, n a float var) emitted a real
+                    // TYPE_CAST(n) with resultType=INT, but detectFloatVars still marked the
+                    // cast's result float purely because n's OWN type was float — so C/CPP/
+                    // Java/RS declared it `double`, silently keeping the un-truncated value
+                    // (printed "3.7" where every other backend — which don't consult this
+                    // table for their own int-vs-float choice — correctly printed "3").
+                    else if (ins.result.isValid() && ins.resultType != IRType::VOID
+                             && ins.resultType != IRType::ATOMIC && ins.resultType != IRType::INT
+                             && irIntWidth(ins.resultType) == 0
+                             && !ins.typedOperands.empty() && isF(ins.typedOperands[0]))
+                        mark(ins.result);
                     break;
                 default: break;
             }
@@ -13455,13 +17784,29 @@ static std::set<std::string> detectStringVars(const std::vector<AC_IR::IRInstruc
         for (const auto& ins : insns) {
             switch (ins.opcode) {
                 case IROpcode::STORE_VAR:
-                case IROpcode::LOAD_CONST: {   // folded results (iota, concat) arrive as LOAD_CONST
+                case IROpcode::LOAD_CONST: { // folded results (iota, concat) arrive as LOAD_CONST
                     IRRef tgt, val;
                     if (ins.opcode == IROpcode::STORE_VAR && ins.typedOperands.size() >= 2) { tgt = ins.typedOperands[0]; val = ins.typedOperands[1]; }
                     else if (ins.result.isValid() && !ins.typedOperands.empty()) { tgt = ins.result; val = ins.typedOperands[0]; }
                     if ((tgt.kind == IRRef::Kind::VAR || tgt.kind == IRRef::Kind::TEMP)
                         && (known(val) || ins.resultType == IRType::STRING))
                         add(nm2(tgt));
+                    break;
+                }
+                case IROpcode::TYPE_CAST: {
+                    // auto-retype's inserted cast (ir.cpp AssignStmt) is just as much a "this var
+                    // becomes a string here" signal as a plain STORE_VAR — missing this meant a
+                    // var whose ONLY string-producing assignment happened via the retype
+                    // mechanism (not a plain literal store) was invisible here entirely. BUT
+                    // unlike STORE_VAR, a TYPE_CAST's SOURCE type says nothing about its RESULT
+                    // type — that's the whole point of casting — so only ins.resultType decides
+                    // here, never known(val) (checking the source): verified real regression,
+                    // `to_int n = $42$` (a STRING source cast TO int) was wrongly classifying `n`
+                    // as a string, since its string CONST source made known(val) true — "cannot
+                    // convert long long to std::string" a few lines later at `n == 42`.
+                    if (ins.result.isValid() && (ins.result.kind == IRRef::Kind::VAR || ins.result.kind == IRRef::Kind::TEMP)
+                        && ins.resultType == IRType::STRING)
+                        add(nm2(ins.result));
                     break;
                 }
                 case IROpcode::ADD: // string concat rides ADD
@@ -13583,6 +17928,88 @@ static std::set<std::string> detectNumericRetype(const std::vector<AC_IR::IRInst
     return numeric;
 }
 
+// Which vars need a genuine boxed/tagged runtime value rather than one fixed declared type
+// (see the setBoxedVars comment on BackendStrategy for the full spec). detectNumericRetype
+// (above) implements the EXISTING "last assignment wins" heuristic that decides a var's single
+// declared type from its whole lifetime; a var stays classified STRING there whenever its FINAL
+// assignment is a string, even if an EARLIER assignment genuinely was not — that earlier
+// assignment then gets force-declared as the string type, which only actually works when it's a
+// literal (`std::to_string(5)` compiles) — a function CALL result can't be converted the same
+// way (`std::string x = getNum();` is a hard C++ compile error). A var needs boxing exactly when
+// it's classified STRING by that heuristic AND has a CALL result flowing into it somewhere.
+// A fixpoint, like detectFloatVars/detectStringVars: boxedness on the SEED var (a stringVars_
+// member that also receives a CALL result — see below) must propagate to anything derived from
+// it (`y = x + 3` needs `y` boxed too, once `x` is, since `x + 3` is AcDynVal-typed C++ once x
+// is — verified real bug: without this, `y`'s declared type came from the SAME stale
+// stringVars_-based heuristic that caused the original bug one hop downstream, `std::string y =
+// t_0;` where t_0 is an AcDynVal). Tracks TEMPs too (via the "t_"+id key detectNumericRetype's
+// own nm2 uses), since a binary op's result almost always lands in one first.
+static std::set<std::string> detectBoxedVars(const std::vector<AC_IR::IRInstruction>& insns,
+                                              const AC_IR::SymbolTable& symbols,
+                                              const std::set<std::string>& stringVars,
+                                              const std::set<std::string>& stringReturningFuncs) {
+    using namespace AC_IR;
+    auto& S = const_cast<SymbolTable&>(symbols);
+    auto nm2 = [&](const IRRef& r) -> std::string {
+        if (r.kind == IRRef::Kind::TEMP) return "t_" + std::to_string(r.id);
+        if (r.kind == IRRef::Kind::VAR && r.id >= 0) return S.getName(r.id);
+        return "";
+    };
+    std::set<std::string> boxed;
+    // Seed: a var classified STRING by the whole-lifetime heuristic that ALSO receives a CALL
+    // result from a function NOT known to always return a string — the case the plain
+    // unification can't declare correctly. Excluding known string-returning callees matters: a
+    // var assigned ONLY from calls to a function that genuinely always returns a string (e.g.
+    // `cmd = resolve(low)` where resolve() always returns string) has no real type conflict at
+    // all and must NOT be boxed — verified real regression from an earlier, cruder version of
+    // this check: it boxed `cmd` anyway, and `cmd.c_str()` (an ilib string-arg site) then failed
+    // to compile since AcDynVal has no `.c_str()`.
+    for (const auto& ins : insns) {
+        if (ins.opcode != IROpcode::CALL || ins.result.kind != IRRef::Kind::VAR || ins.result.id < 0) continue;
+        if (ins.typedOperands.empty() || ins.typedOperands[0].kind != IRRef::Kind::VAR || ins.typedOperands[0].id < 0) continue;
+        std::string callee = S.getName(ins.typedOperands[0].id);
+        if (stringReturningFuncs.count(callee)) continue;
+        std::string v = S.getName(ins.result.id);
+        if (!v.empty() && stringVars.count(v)) boxed.insert(v);
+    }
+    if (boxed.empty()) return boxed;
+    // Propagate: any instruction whose result depends on an already-boxed operand is boxed too.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& ins : insns) {
+            std::string dst = nm2(ins.result);
+            if (dst.empty() || boxed.count(dst)) continue;
+            bool depBoxed = false;
+            switch (ins.opcode) {
+                case IROpcode::ADD: case IROpcode::SUB: case IROpcode::MUL: case IROpcode::PMUL:
+                case IROpcode::DIV: case IROpcode::IDIV: case IROpcode::FDIV: case IROpcode::MOD:
+                case IROpcode::EQ: case IROpcode::NEQ: case IROpcode::LT: case IROpcode::GT:
+                case IROpcode::LTE: case IROpcode::GTE:
+                    for (const auto& op : ins.typedOperands)
+                        if (boxed.count(nm2(op))) { depBoxed = true; break; }
+                    break;
+                case IROpcode::STORE_VAR: {
+                    // STORE_VAR(dst, {src}) OR STORE_VAR with dst as ins.result and src as
+                    // typedOperands[0] — both shapes appear elsewhere in this file.
+                    const IRRef* src = nullptr;
+                    if (ins.typedOperands.size() >= 2) src = &ins.typedOperands[1];
+                    else if (!ins.typedOperands.empty()) src = &ins.typedOperands[0];
+                    if (src && boxed.count(nm2(*src))) depBoxed = true;
+                    break;
+                }
+                default: break;
+            }
+            if (depBoxed) { boxed.insert(dst); changed = true; }
+        }
+    }
+    // Only report NAMED vars (a temp's boxedness is consulted directly by name at codegen time
+    // for the "auto t_N = ..." case, but setBoxedVars' contract — declared vars — only needs the
+    // named ones; keep temps in-set too since boxedVars_.count() is checked against whatever ref
+    // string a given call site has, named or "t_N" alike).
+    return boxed;
+}
+
 // Detect which parameters of a function hold LISTS, from usage: indexed (arr[i]),
 // measured (length arr), iterated (FOR v in arr), or appended (arr.append).
 // Infer which PARAMETERS are floats from local usage — detectFloatVars' fixpoint only ever marks
@@ -13680,8 +18107,16 @@ static std::set<std::string> detectListParams(const AC_IR::IRFunction& fn,
 // Compiler-synthesized var names (list-repeat, short-circuit, cond scrutinee) must be
 // invisible to the loop save/restore + free-var machinery, like _ac_-prefixed ones.
 static bool isSyntheticVar(const std::string& n) {
-    return n.rfind("_ac_", 0) == 0 || n.rfind("ac_rep", 0) == 0 ||
-           n.rfind("ac_sc_", 0) == 0 || n.rfind("ac_cond_", 0) == 0;
+    // "aac_" catches the SAME `_ac_`-prefixed names after V's formatRef/vName rewrite (a
+    // leading `_` becomes `a` — V rejects underscore-led identifiers outright). This free-var
+    // scan reads names through ref()/formatRef(), which is backend-specific, so on V a
+    // synthetic var like `_ac_kick_i_0` arrives here already rendered as `aac_kick_i_0` —
+    // without this, it read as non-synthetic and got wrongly pulled into the mainloop free-var/
+    // save-restore machinery (verified: a spurious `acs0_aac_kick_new_0` save/restore pair
+    // around .kick()'s own internal loop, purely from this prefix check missing V's rewrite).
+    return n.rfind("_ac_", 0) == 0 || n.rfind("aac_", 0) == 0 || n.rfind("ac_rep", 0) == 0 ||
+           n.rfind("ac_sc_", 0) == 0 || n.rfind("ac_cond_", 0) == 0 ||
+           n.rfind("ac_tern_", 0) == 0;
 }
 
 class UnifiedIRCodeGen
@@ -13709,8 +18144,30 @@ class UnifiedIRCodeGen
     std::set<std::string> userFuncNames_; // user-defined function names; unqualified calls not in this set get namespace prefix
     std::set<std::string> classNames_;    // bundle/class names — `c = ClassName()` is a construct-call
     std::map<std::string,std::string> instanceVarClass_;  // var -> class name, for backends without dotCallSyntax()
+    std::map<std::string,std::string> classFuncs_;  // free-fn name -> class name it ALWAYS constructs+returns
+                                                      // (`Make f(): p = ClassName(); ...; return p`) — lets
+                                                      // `q = f()` at any later call site be treated exactly
+                                                      // like a direct `q = ClassName()` construct-call for
+                                                      // dotted-field-access purposes (see instanceVarClass_'s
+                                                      // own comment, and BackendStrategy::noteInstanceClass).
+    // funcName -> {paramIndex (0-based, call-argument position) -> class name}. classFuncs_
+    // (just above) fixes a bundle instance flowing OUT of a function's return; this is the
+    // mirror gap for one flowing IN as a parameter — verified real and NOT tuple-specific (a
+    // plain `bundle Point` passed to `Make show func(p): Term.display p.x` miscompiled
+    // identically to the tuple case: C declared `void show(ac_int p)` instead of `void
+    // show(Point p)`, and the body read a nonexistent flat `p_x` instead of the real struct
+    // field `p.x`, since nothing ever told the callee's own codegen that `p` holds a class
+    // instance at all). Built by one whole-program prescan below (unlike classFuncs_, this
+    // needs a GLOBAL var->class map, not a per-function-local one, since the constructing var
+    // and the call site can be in different functions entirely) and pushed into every static
+    // backend via setClassParamTypes, consumed at both the parameter's declared TYPE (its own
+    // function signature) and inside its body (classInstanceVars_/classInstanceVarNames_, so
+    // `p.field` formats as a real struct access instead of a flattened `p_field` name).
+    std::map<std::string, std::map<int, std::string>> classParamTypes_;
     std::set<std::string> protoFloatFuncs_, protoListFuncs_, protoStringFuncs_; // fwd-decl return types
     std::set<std::string> voidUserFuncs_;   // user functions with no `return <value>;` anywhere
+    std::set<std::string> generatorFuncNamesIco_;   // fn.name for every fn.isGenerator (family B/C
+                                                     // need this at CALL sites, not just genFunction)
     std::unordered_map<std::string,std::set<std::string>> aliasGroups_; // var -> full bidirectional alias group
 
     std::string ref(const IRRef &r)
@@ -13741,8 +18198,38 @@ class UnifiedIRCodeGen
         return out;
     }
 
+    // javac (unlike gcc/rustc, which at most warn) hard-errors on ANY statement textually
+    // following an unconditional `return` in the same block ("unreachable statement") — a
+    // real, PRE-EXISTING, generator-independent gap (verified: even a plain non-generator AC
+    // function with a statement after an early `return` already failed to compile on Java),
+    // just newly exercised by a generator's mid-body `return` sitting before more `yield`s
+    // (ir.cpp emits the source order verbatim; nothing before this pruned it). V has the same
+    // problem but as a genuine PARSE error, not just a reachability check (verified: `return`
+    // directly followed by a channel-send statement — `ac_gen_ch <- 99` — fails with "unexpected
+    // argument, current function does not return anything", V's grammar apparently trying to
+    // parse the next statement as part of the return). Scoped to just these two — gcc/g++/rustc
+    // don't need this, and forcing it everywhere risks unrelated side effects for no benefit.
+    bool javaDeadCode_ = false;
+    bool needsDeadCodeSuppression() const { return ir.backend == "Java" || ir.backend == "V"; }
+    bool isBlockBoundaryOp(AC_IR::IROpcode op) const {
+        using OP = AC_IR::IROpcode;
+        switch (op) {
+            case OP::IF_BEGIN: case OP::IF_ELSE: case OP::IF_END:
+            case OP::WHILE_BEGIN: case OP::WHILE_END:
+            case OP::FOR_BEGIN: case OP::FOR_END:
+            case OP::FUNC_BEGIN: case OP::FUNC_END:
+            case OP::TRY_BEGIN: case OP::CATCH_BEGIN:
+            case OP::LABEL:
+                return true;
+            default: return false;
+        }
+    }
     void genInstr(const IRInstruction &i)
     {
+        if (needsDeadCodeSuppression()) {
+            if (isBlockBoundaryOp(i.opcode)) javaDeadCode_ = false;
+            else if (javaDeadCode_) return;   // unreachable — see this flag's own comment
+        }
         // Track which global vars exist at this point in the mainloop, so loop
         // save/restore only touches vars that are actually defined before the loop
         // (saving a not-yet-assigned var was a NameError/compile error on every backend).
@@ -13823,11 +18310,40 @@ class UnifiedIRCodeGen
                     return s;
                 };
                 std::string allocType = stripQ(ref(i.typedOperands[0]));
-                std::string content   = stripQ(ref(i.typedOperands[1]));
-                // For sequence: pass second arg (end) as extra content2
+                // "list" content can hold MULTIPLE `$..$`-delimited string elements
+                // (`[$a$, $b$, $c$]` -> "$a$,$b$,$c$") — ref()/formatRef()'s normal
+                // CONST-string path assumes a SINGLE `$..$` span (correct for every other
+                // allocType here — "string"/"object"/etc, which really are one scalar
+                // value) and strips only the outermost pair, corrupting anything with more
+                // than one span (verified real bug: "$a$,$b$,$c$" -> "a$,$b$,$c$", inner
+                // delimiters leaking through as literal `$` text — every backend's list
+                // literal then either syntax-errored or silently mis-parsed). Take the raw
+                // CONST string value directly for "list" so each backend's emitAlloc can do
+                // its own correct per-element handling via convertListContent() instead.
+                std::string content;
+                if (allocType == "list" && i.typedOperands[1].kind == IRRef::Kind::CONST
+                    && i.typedOperands[1].value.type == IRType::STRING)
+                    content = std::get<std::string>(i.typedOperands[1].value.data);
+                else
+                    content = stripQ(ref(i.typedOperands[1]));
+                // For sequence: pass second arg (end) as extra content2. A 4th operand is
+                // sequence/stream's optional STEP — emitAlloc's signature only carries two
+                // content strings, so encode it into content2 as "b\x1fstep" (a control byte no
+                // real expression text can contain) rather than widen the signature across
+                // every one of the 12 backend overrides for one optional argument. Each
+                // "sequence" handler that cares about the step splits on it (see their own
+                // comments) — every other allocType simply never sees a 4th operand, so this is
+                // a no-op there. Without this, a 3-arg `sequence(a,b,step)`/`stream(a,b,step)`
+                // used as a plain VALUE (not a FOR-loop collection, which reaches the step via
+                // a completely separate code path and was never affected) silently dropped the
+                // step (verified: `stream(1,20,3)` printed every integer 1..19, not just the
+                // step-3 subset — a real regression from unifying stream's value lowering with
+                // sequence's once iota/stream stopped wrongly building a concatenated string).
                 std::string content2;
                 if (i.typedOperands.size() >= 3)
                     content2 = stripQ(ref(i.typedOperands[2]));
+                if (i.typedOperands.size() >= 4)
+                    content2 += "\x1f" + stripQ(ref(i.typedOperands[3]));
                 strategy->emitAlloc(out, indentLevel, ref(i.result), allocType, content, content2);
             }
             break;
@@ -14199,12 +18715,44 @@ class UnifiedIRCodeGen
                               && rawName.find('.') == std::string::npos
                               && !i.typedOperands.empty()
                               && i.typedOperands[0].kind == IRRef::Kind::VAR;
+            // Must run BEFORE emitCall/emitConstructCall/emitIndirectCall (not after) —
+            // their own decl()-equivalent logic decides the declaration text SYNCHRONOUSLY
+            // inside that same call, so genChannelVars_/instanceVarClass_ need the result var
+            // populated already (verified real ordering bug, same class as genChannelVars_'s
+            // own documented one: a `noteInstanceClass` fired AFTER `emitCall` returned meant
+            // decl() had already committed to the wrong, non-class declaration text by the
+            // time the class became known).
+            if (!res.empty() && !rawName.empty() && generatorFuncNamesIco_.count(rawName))
+                strategy->noteGeneratorCallResult(res);
+            // `q = f()` where f always constructs+returns one bundle class (classFuncs_'s own
+            // prescan) — same treatment as a direct construct-call, just one level removed;
+            // see noteInstanceClass's own comment for why this matters.
+            if (!res.empty() && !rawName.empty() && !classNames_.count(rawName)) {
+                auto cf = classFuncs_.find(rawName);
+                if (cf != classFuncs_.end()) {
+                    instanceVarClass_[res] = cf->second;
+                    strategy->noteInstanceClass(res, cf->second);
+                }
+            }
             if (!rawName.empty() && classNames_.count(rawName)) {
                 strategy->emitConstructCall(out, indentLevel, res, func, args);
-                if (!res.empty()) instanceVarClass_[res] = rawName;
+                if (!res.empty()) { instanceVarClass_[res] = rawName; strategy->noteInstanceClass(res, rawName); }
             }
             else if (isIndirect)
                 strategy->emitIndirectCall(out, indentLevel, res, func, args);
+            else if (!strategy->dotCallSyntax() && rawName.find('.') != std::string::npos
+                     && instanceVarClass_.count(rawName.substr(0, rawName.find('.')))) {
+                // Bundle method call with NO arguments (`q.getX()`) — ir.cpp lowers a bare
+                // zero-arg dotted call as a plain CALL, not LIB_CALL (LIB_CALL only ever fires
+                // when there's at least one argument; a real, separate lowering asymmetry, not
+                // a stylistic choice) — so it never reached LIB_CALL's own identical
+                // dotCallSyntax fallback (see its comment) at all. Same translation, mirrored
+                // here for the opcode that actually carries a no-arg method call.
+                std::string instVar = rawName.substr(0, rawName.find('.'));
+                std::string methodName = rawName.substr(rawName.find('.') + 1);
+                strategy->emitCall(out, indentLevel, res,
+                                   instanceVarClass_[instVar] + "_" + methodName, "&" + instVar);
+            }
             else
                 strategy->emitCall(out, indentLevel, res, func, args);
             break;
@@ -14213,12 +18761,60 @@ class UnifiedIRCodeGen
         case IROpcode::RETURN:
             strategy->emitReturn(out, indentLevel,
                                  i.typedOperands.empty() ? "" : ref(i.typedOperands[0]));
+            // Only an EXPLICIT return (non-empty operand — see javaDeadCode_'s own comment on
+            // this distinction) actually emits a real `return;` javac will flag subsequent code
+            // against; the implicit auto-appended trailing one (empty operand) emits nothing.
+            if (needsDeadCodeSuppression() && !i.typedOperands.empty()) javaDeadCode_ = true;
+            break;
+
+        // ── generators (`yield`) — family C only for GEN_*, see BackendStrategy's own
+        // comment on these virtuals for the full family A/B/C split ──────────────────
+        case IROpcode::YIELD:
+            strategy->emitYield(out, indentLevel,
+                                i.typedOperands.empty() ? "" : ref(i.typedOperands[0]));
+            break;
+
+        case IROpcode::GEN_CREATE:
+        {
+            std::string func = i.typedOperands.empty() ? "" : ref(i.typedOperands[0]);
+            std::string args;
+            for (size_t ai = 1; ai < i.typedOperands.size(); ai++) {
+                if (ai > 1) args += ", ";
+                args += ref(i.typedOperands[ai]);
+            }
+            strategy->emitGenCreate(out, indentLevel, ref(i.result), func, args);
+            break;
+        }
+
+        case IROpcode::GEN_NEXT:
+            strategy->emitGenNext(out, indentLevel, ref(i.result),
+                                  i.typedOperands.empty() ? "" : ref(i.typedOperands[0]));
+            break;
+
+        case IROpcode::GEN_DONE:
+            strategy->emitGenDone(out, indentLevel, ref(i.result),
+                                  i.typedOperands.empty() ? "" : ref(i.typedOperands[0]));
             break;
 
         case IROpcode::EVAL:
         {
+            // eval(x): x's STATIC type decides the behavior (Abu's spec) — a STRING arg is
+            // interpreted as code (the arithmetic-string evaluator, unchanged); anything else
+            // is evaluated directly wrapped in try/catch (this used to be lazy_eval's job — see
+            // NodeType::LazyEvalExpr in ir.cpp for why it moved). Same isStr detection the
+            // LIB_CALL arg path above already uses (symbol table type OR the backend's own
+            // detectStringVars-tracked set).
             std::string expr = i.typedOperands.empty() ? "\"\"" : ref(i.typedOperands[0]);
-            strategy->emitEval(out, indentLevel, ref(i.result), expr);
+            bool argIsString = false;
+            if (!i.typedOperands.empty()) {
+                const auto& aop = i.typedOperands[0];
+                if (aop.kind == IRRef::Kind::CONST) argIsString = (aop.value.type == IRType::STRING);
+                else if (aop.kind == IRRef::Kind::VAR && aop.id >= 0)
+                    argIsString = ir.symbols.getType(aop.id) == IRType::STRING || strategy->isStringVar(expr);
+                else
+                    argIsString = strategy->isStringVar(expr);
+            }
+            strategy->emitEval(out, indentLevel, ref(i.result), expr, argIsString, i.resultType);
             break;
         }
 
@@ -14324,7 +18920,7 @@ class UnifiedIRCodeGen
                         {"gl",      {"screen", "obj", "draw", "hitbox", "key", "frame"}},
                         {"widgets", {"Screen", "display", "ask", "btn", "ckbtn", "radbtn",
                                      "dropdown", "advance", "slider", "group", "tabs",
-                                     "scroller", "listbox", "table", "sketch"}},
+                                     "scroller", "listbox", "table", "sketch", "textbox"}},
                         {"camera",  {"camera", "sidebar", "screen"}},
                     };
                     auto it = nsMap.find(libName);
@@ -14520,6 +19116,16 @@ class UnifiedIRCodeGen
             break;
         }
 
+        // `atomic` read-modify-write brackets (see ir.cpp's emitCompoundRef/AssignStmt
+        // comments) — hold the SAME global atomic lock every backend already has across
+        // the whole span instead of just the final store, closing the real TOCTOU race.
+        case IROpcode::LOCK_BEGIN:
+            strategy->emitLockBegin(out, indentLevel);
+            break;
+        case IROpcode::LOCK_END:
+            strategy->emitLockEnd(out, indentLevel);
+            break;
+
         default:
             break;
         }
@@ -14601,6 +19207,7 @@ class UnifiedIRCodeGen
         for (const auto& nv : detectNumericRetype(func.instructions, ir.symbols, fnStringVars))
             fnStringVars.erase(nv);   // #retype: last-assign numeric → NOT string-unified
         strategy->setStringVars(fnStringVars);
+        strategy->setBoxedVars(detectBoxedVars(func.instructions, ir.symbols, fnStringVars, protoStringFuncs_));
 
         // Pre-scan: detect function return type (float or list)
         // Note: list literals use mkTemp() → Kind::TEMP; named vars use Kind::VAR. Check both.
@@ -14614,7 +19221,11 @@ class UnifiedIRCodeGen
                                                               detectFloatParams(func, ir.symbols));
         {
             bool retFloat = false, retList = false, retString = false;
-            bool hasValueReturn = false;
+            // A generator's `return`s are always bare (value production goes through
+            // `yield`, not `return <value>`), but calling it always produces a genuine
+            // generator/channel object — never treat it as a void-returning function here
+            // (mirrors the identical fix in the global voidUserFuncs_ prescan above).
+            bool hasValueReturn = func.isGenerator;
             // Helper to get ref id regardless of VAR or TEMP kind
             auto refId = [](const IRRef& r) -> int { return r.id; };
             auto isVarLike = [](const IRRef& r) {
@@ -14758,6 +19369,7 @@ class UnifiedIRCodeGen
             for (const auto& p : func.parameters) if (fnFloatVars.count(p)) fnFloatParams.insert(p);
             strategy->setFloatParams(fnFloatParams);
         }
+        strategy->setIsGenerator(func.isGenerator);
         strategy->emitFunctionBegin(out, indentLevel, func.name, params, func.classOwner);
         strategy->setFloatVarsFull(fnFloatVars);
         inFunctionBody_ = true;
@@ -15012,6 +19624,18 @@ public:
                         varName = ref(ins.result);
                         symId = ins.result.id;
                     }
+                    // A dotted name (`t.f0 = 10`, a bundle/tuple field write, not `self.field`
+                    // — those never reach here as a bare STORE_VAR target the way a top-level
+                    // mainloop write does) is never independently "free" — its value is only
+                    // ever meaningful through the instance var that owns it, and THAT var (`t`)
+                    // is already its own separate freeVarSet candidate from its own construct-
+                    // call. Verified real bug: without this, "t.f0" ended up as its OWN entry
+                    // in freeVarNames_/saveSet, and emitScopeEnter's `"_ac_s0_" + v` naming
+                    // (which assumes every entry is a plain identifier) produced the malformed
+                    // "_ac_s0_t.f0" — a hard syntax error on every backend that doesn't already
+                    // tolerate a stray '.' in an identifier (CPP/Java/GO/V all rejected it; only
+                    // PY/JS/BNY happened to not choke on the resulting text).
+                    if (!varName.empty() && varName.find('.') != std::string::npos) varName.clear();
                     if (!varName.empty() && !isSyntheticVar(varName)) {
                         freeVarSet.insert(varName);
                         if (symId >= 0) freeVarSymIds.insert(symId);
@@ -15028,6 +19652,46 @@ public:
                         varName = ref(ins.result);
                     if (!varName.empty() && !isSyntheticVar(varName))
                         loopMutatedVars.insert(varName);
+                    // `arr.append(x)` inside a loop is ALSO an accumulator write to `arr` — but on
+                    // backends whose append is a pure in-place mutation (V's `arr << x`, no
+                    // reassignment) it never surfaces as a STORE_VAR/result-VAR at all, so this scan
+                    // never saw it and left the accumulator subject to save/restore — invisible on
+                    // backends where append DOES reassign (C's realloc-driven `recv = ac_arr_push(...)`
+                    // registers here already), but a real gap on V specifically (verified: a V program
+                    // needed to add `.clone()` here to even compile, which would have then silently
+                    // clobbered every accumulated append back to its pre-loop snapshot after the loop
+                    // — worse than the original compile error it was replacing).
+                    if (ins.opcode == IROpcode::LIB_CALL && !ins.typedOperands.empty()) {
+                        // The function-name operand arrives as EITHER a CONST string
+                        // (`mkConst(name + ".append")` — the [elem]@n repeat lowering and
+                        // .kick()'s own internal rebuild loop) OR a VAR whose interned symbol
+                        // NAME literally is the dotted text (`mkVar(n.value)` — the general
+                        // `recv.append(x)` statement fallback every ordinary example uses, incl.
+                        // array_append.ac). Checking only the CONST form left the far more common
+                        // VAR form invisible to this scan (verified: array_append.ac's own
+                        // `squares.append(i @ i)` still got its accumulated appends clobbered by
+                        // save/restore on V even after the CONST-only version of this fix). A VAR
+                        // ref goes through ref()/formatRef(), and C's (and others') own
+                        // formatCallName ALREADY flattens "." to "_" for identifier-safety by the
+                        // time it comes back here (verified: "squares.append" arrived as
+                        // "squares_append") — check both suffixes, matching the exact dual-suffix
+                        // check CStrategy's own .append-lowering already uses for the same reason.
+                        std::string fn;
+                        if (ins.typedOperands[0].kind == IRRef::Kind::CONST
+                                && ins.typedOperands[0].value.type == IRType::STRING)
+                            fn = std::get<std::string>(ins.typedOperands[0].value.data);
+                        else if (ins.typedOperands[0].kind == IRRef::Kind::VAR)
+                            fn = ref(ins.typedOperands[0]);
+                        for (const char* suf : {".append", "_append"}) {
+                            size_t sl = strlen(suf);
+                            if (fn.size() > sl && fn.compare(fn.size() - sl, sl, suf) == 0) {
+                                std::string recv = fn.substr(0, fn.size() - sl);
+                                if (!recv.empty() && !isSyntheticVar(recv))
+                                    loopMutatedVars.insert(recv);
+                                break;
+                            }
+                        }
+                    }
                 }
                 scanImport(ins);
             }
@@ -15112,6 +19776,19 @@ public:
                         std::string name = ref(ins.typedOperands[0]);
                         if (!stringOnlyGlobals.count(name) && seen.insert(name).second)
                             promoted.push_back(name);
+                        // Symbol ID too — globalVarSymIds_ (built just above this loop, from
+                        // ir.globalInit only) never sees a var whose ONLY appearance in the
+                        // whole program is a FREE_DECL inside a function (nothing at top level
+                        // to scan). Rust's formatRef gates the "_AC_FREE_x" rename on symbol-ID
+                        // membership in that same set (see its own comment) — without this, such
+                        // a var got a real `static mut _AC_FREE_x` declared (the NAME-based
+                        // `promoted` list above already added it unconditionally) but every
+                        // actual read/write of it, inside AND outside the function, stayed a
+                        // bare unprefixed `x` that was never declared anywhere else — "cannot
+                        // find value `x` in this scope" (verified: a `free x = ...` declared
+                        // only inside a function, read from the top level afterward).
+                        if (ins.typedOperands[0].kind == IRRef::Kind::VAR && ins.typedOperands[0].id >= 0)
+                            globalVarSymIds_.insert(ins.typedOperands[0].id);
                     }
             for (const auto& fn : ir.functions) {
                 std::set<std::string> paramSet(fn.parameters.begin(), fn.parameters.end());
@@ -15191,7 +19868,8 @@ public:
             if (!promoted.empty()) {
                 static const std::set<std::string> widgetCtors = {
                     "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
-                    "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch"
+                    "advance", "slider", "group", "tabs", "scroller", "listbox", "table", "sketch",
+                    "textbox"
                 };
                 std::set<std::string> promotedSet(promoted.begin(), promoted.end());
                 std::map<std::string, std::string> structGlobals;
@@ -15236,10 +19914,49 @@ public:
         // Static backends use this to declare variables with the correct type from the start.
         {
             std::map<std::string, IRType> varCastTypes;
+            // Once a var is EVER cast to FLOAT, it stays FLOAT for the rest of this scan —
+            // a plain overwrite here used to let a LATER TYPE_CAST silently win regardless
+            // of type, which was fine when TYPE_CAST meant one explicit, single, stable
+            // coercion per var (`short a = 5`, `atomic x = 5`) but breaks now that a plain
+            // reassignment auto-inserts a TYPE_CAST on every type CHANGE (see ir.cpp's
+            // AssignStmt automatic-retype) — `x=5; x=5.5; x=10` emits TWO casts for `x`
+            // (INT->FLOAT, then FLOAT->INT for the trailing int literal), and "last one
+            // wins" declared `x` as `ac_int` despite it genuinely holding 5.5 partway
+            // through, silently truncating that value on assignment (verified real bug:
+            // printed `5, 5, 10` instead of `5, 5.5, 10.0` — not a display issue, the
+            // ACTUAL stored value was corrupted). FLOAT-wins-over-INT here matches standard
+            // numeric widening: once a variable has ever held a float, a later int literal
+            // assigned to it should become that float's `.0`, not flip the variable back to
+            // a genuinely different, narrower declared type.
+            // Same stickiness for ATOMIC/SHORT/MINI as FLOAT above, and for the same reason:
+            // ir.cpp's own sticky-keep guard (see AssignStmt's comment) stops the common case
+            // from ever emitting a second, downgrading TYPE_CAST at all, but this is the
+            // second, independent layer — belt-and-suspenders against any other path that
+            // might still legitimately emit one (this scan can't tell "genuinely re-typed
+            // away from ATOMIC on purpose" from "a bug slipped a plain INT cast through"
+            // apart from trusting that ATOMIC/SHORT/MINI are meant to be stable once set).
+            // ATOMIC is fully sticky here too (matches ir.cpp's own stickyKeep, see its
+            // comment for the full story): it's documented as always an int variable, so
+            // nothing should ever overwrite it in this map, not even FLOAT. Verified real
+            // bug from the narrower "only sticky against INT" version: several backends'
+            // emitTypedStoreVar gate their special atomic-store branch on this map saying
+            // ATOMIC for the CURRENT var — once a later float type_cast won here, the
+            // var's OWN initial `atomic x = 5` declaration silently stopped being
+            // recognized as atomic (this map only ever holds ONE, final, type per var),
+            // so its declaration was skipped — undeclared-variable compile errors on some
+            // backends, silently-zero-initialized on others.
+            auto recordCast = [&](const std::string& name, IRType t) {
+                auto it = varCastTypes.find(name);
+                if (it == varCastTypes.end()) { varCastTypes[name] = t; return; }
+                if (it->second == IRType::FLOAT) return;
+                if (it->second == IRType::ATOMIC) return;
+                if ((it->second == IRType::SHORT || it->second == IRType::MINI) && t == IRType::INT) return;
+                varCastTypes[name] = t;
+            };
             auto scanCasts = [&](const std::vector<IRInstruction>& insns) {
                 for (const auto& ins : insns) {
                     if (ins.opcode == IROpcode::TYPE_CAST && ins.result.kind == IRRef::Kind::VAR)
-                        varCastTypes[ref(ins.result)] = ins.resultType;
+                        recordCast(ref(ins.result), ins.resultType);
                     // A `short`/`mini`-typed arithmetic result (temp OR var) must be declared at its
                     // real width too — else a `long`/`i64` temp assigned back into a `short` var is a
                     // lossy-conversion error on the strict backends (`short a = a * 4`).
@@ -15248,7 +19965,7 @@ public:
                              && (ins.opcode == IROpcode::ADD || ins.opcode == IROpcode::SUB
                               || ins.opcode == IROpcode::MUL || ins.opcode == IROpcode::PMUL
                               || ins.opcode == IROpcode::IDIV || ins.opcode == IROpcode::MOD))
-                        varCastTypes[ref(ins.result)] = ins.resultType;
+                        recordCast(ref(ins.result), ins.resultType);
                 }
             };
             scanCasts(ir.globalInit);
@@ -15260,6 +19977,8 @@ public:
         // Build user-defined function name set for unqualified-call resolution
         userFuncNames_.clear();
         classNames_.clear();
+        generatorFuncNamesIco_.clear();
+        for (const auto& fn : ir.functions) if (fn.isGenerator) generatorFuncNamesIco_.insert(fn.name);
         for (const auto& fn : ir.functions) {
             userFuncNames_.insert(fn.name);
             // `c = Critter()` (bare bundle instantiation) is a CALL whose callee is the class
@@ -15272,6 +19991,128 @@ public:
                 userFuncNames_.insert(fn.classOwner);
                 classNames_.insert(fn.classOwner);
             }
+        }
+        // Build classFuncs_: a free function whose EVERY `return` traces to a var directly
+        // constructed via `SomeClass()` earlier in that SAME function body (a real, PRE-
+        // EXISTING gap, found while implementing `tuple`'s bundle-based fallback: a bundle
+        // instance's dotted-field access — `q.x`, both read and write — was only ever
+        // recognized for a var assigned DIRECTLY from a construct-call, `q = ClassName()`.
+        // The moment an object flows back out through an ordinary function return
+        // (`Make f(): p = ClassName(); ...; return p` then `q = f(); q.x`), every
+        // statically-typed backend (C/CPP/Java/RS/GO/V) lost track of q's type and either
+        // miscompiled the write as a bogus fresh declaration (`ac_int p.x = 5;`, invalid C)
+        // or the read as an unrelated flat identifier (`q_x`, undeclared) — verified real,
+        // not theoretical, by hand-compiling the exact repro on all 6). classNames_ (just
+        // populated above) is required as input, so this scan must run after it.
+        classFuncs_.clear();
+        for (const auto& fn : ir.functions) {
+            if (!fn.classOwner.empty() || fn.isGenerator) continue;   // methods/generators: n/a
+            std::map<std::string, std::string> varClass;   // vars constructed in THIS function
+            for (const auto& ins : fn.instructions) {
+                if (ins.opcode == IROpcode::CALL && ins.result.kind == IRRef::Kind::VAR
+                        && ins.result.id >= 0 && !ins.typedOperands.empty()
+                        && ins.typedOperands[0].kind == IRRef::Kind::VAR
+                        && ins.typedOperands[0].id >= 0) {
+                    std::string callee = ir.symbols.getName(ins.typedOperands[0].id);
+                    if (classNames_.count(callee))
+                        varClass[ir.symbols.getName(ins.result.id)] = callee;
+                    // A function that itself just forwards another class-returning function's
+                    // result (`Make g(): return f()`, no local construct-call at all) is out
+                    // of scope for this first pass — real, but rarer; v1 only traces a direct
+                    // local construct-call, not transitive forwarding.
+                }
+            }
+            std::string retClass; bool any = false, consistent = true;
+            for (const auto& ins : fn.instructions) {
+                if (ins.opcode != IROpcode::RETURN || ins.typedOperands.empty()) continue;
+                const auto& rv = ins.typedOperands[0];
+                if (rv.kind != IRRef::Kind::VAR || rv.id < 0) { consistent = false; break; }
+                auto it = varClass.find(ir.symbols.getName(rv.id));
+                if (it == varClass.end()) { consistent = false; break; }
+                if (!any) { retClass = it->second; any = true; }
+                else if (retClass != it->second) { consistent = false; break; }
+            }
+            if (any && consistent) classFuncs_[fn.name] = retClass;
+        }
+        if (!classFuncs_.empty()) strategy->setClassReturnFuncs(classFuncs_);
+
+        // classParamTypes_ (see its own comment): a WHOLE-PROGRAM var->class map first (unlike
+        // classFuncs_'s per-function-local one — a construct-call and the call site that later
+        // passes that var as an argument are almost always in different functions), then one
+        // pass over every CALL/LIB_CALL's arguments against it.
+        {
+            std::map<std::string, std::string> varClassGlobal;
+            auto scanConstructs = [&](const std::vector<IRInstruction>& instrs) {
+                for (const auto& ins : instrs) {
+                    if (ins.opcode != IROpcode::CALL || ins.result.kind != IRRef::Kind::VAR
+                            || ins.result.id < 0 || ins.typedOperands.empty()
+                            || ins.typedOperands[0].kind != IRRef::Kind::VAR
+                            || ins.typedOperands[0].id < 0) continue;
+                    std::string callee = ir.symbols.getName(ins.typedOperands[0].id);
+                    if (classNames_.count(callee))
+                        varClassGlobal[ir.symbols.getName(ins.result.id)] = callee;
+                    else if (classFuncs_.count(callee))
+                        varClassGlobal[ir.symbols.getName(ins.result.id)] = classFuncs_[callee];
+                }
+            };
+            for (const auto& fn : ir.functions) scanConstructs(fn.instructions);
+            scanConstructs(ir.globalInit);
+            scanConstructs(ir.dataSection);
+            scanConstructs(ir.mainSection);
+
+            classParamTypes_.clear();
+            auto scanCalls = [&](const std::vector<IRInstruction>& instrs) {
+                for (const auto& ins : instrs) {
+                    if ((ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL)
+                            || ins.typedOperands.empty()
+                            || ins.typedOperands[0].kind != IRRef::Kind::VAR) continue;
+                    std::string calleeName = ir.symbols.getName(ins.typedOperands[0].id);
+                    for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
+                        const IRRef& arg = ins.typedOperands[ai];
+                        if (arg.kind != IRRef::Kind::VAR) continue;
+                        auto vc = varClassGlobal.find(ir.symbols.getName(arg.id));
+                        if (vc != varClassGlobal.end())
+                            classParamTypes_[calleeName][(int)(ai - 1)] = vc->second;
+                    }
+                }
+            };
+            for (const auto& fn : ir.functions) scanCalls(fn.instructions);
+            scanCalls(ir.globalInit);
+            scanCalls(ir.dataSection);
+            scanCalls(ir.mainSection);
+            if (!classParamTypes_.empty()) strategy->setClassParamTypes(classParamTypes_);
+        }
+        // Exempt generator-handle vars (`g = twovals()`) from loop save/restore too — a
+        // "snapshot and restore" doesn't mean anything for a live, actively-being-consumed
+        // generator/channel, and on backends where the handle type isn't Copy/Clone (Rust's
+        // mpsc::Receiver, specifically) the save/restore's own `let _ac_sN_g = g;` MOVES it
+        // out of `g`, leaving `g` invalid for the rest of the function the moment a loop
+        // appears anywhere after the assignment (verified: `g = twovals(); FOR x in g: ...` —
+        // "value moved here" / "value borrowed here after move" on the very next line). Must
+        // run AFTER generatorFuncNamesIco_ is populated just above (it's empty before that).
+        {
+            std::set<std::string> genHandles;
+            auto scanGen = [&](const std::vector<IRInstruction>& code) {
+                for (auto& ins : code) {
+                    // Family A/B: a plain CALL to a known generator function.
+                    if (ins.opcode == IROpcode::CALL && !ins.typedOperands.empty()
+                            && ins.typedOperands[0].kind == IRRef::Kind::VAR
+                            && ins.typedOperands[0].id >= 0
+                            && generatorFuncNamesIco_.count(ir.symbols.getName(ins.typedOperands[0].id))
+                            && ins.result.kind == IRRef::Kind::VAR)
+                        genHandles.insert(ref(ins.result));
+                    // Family C: GEN_CREATE's result is always a generator handle by definition.
+                    if (ins.opcode == IROpcode::GEN_CREATE && ins.result.kind == IRRef::Kind::VAR)
+                        genHandles.insert(ref(ins.result));
+                }
+            };
+            scanGen(ir.globalInit);
+            for (auto& fn : ir.functions) scanGen(fn.instructions);
+            if (!genHandles.empty())
+                freeVarNames_.erase(
+                    std::remove_if(freeVarNames_.begin(), freeVarNames_.end(),
+                        [&](const std::string& v){ return genHandles.count(v); }),
+                    freeVarNames_.end());
         }
         {
             std::map<std::string, int> arity;
@@ -15290,6 +20131,10 @@ public:
         // exactly these callees, so every backend's existing `res.empty()` bare-statement path
         // (already there for indirect/void-result calls) handles it correctly.
         for (const auto& fn : ir.functions) {
+            // A generator's `return`s are always bare (all real value production goes
+            // through `yield`, not `return <value>`) but calling it always produces a
+            // genuine generator/channel object to capture — never treat it as void here.
+            if (fn.isGenerator) continue;
             bool hasValueReturn = false;
             for (const auto& ins : fn.instructions)
                 if (ins.opcode == IROpcode::RETURN && !ins.typedOperands.empty()) { hasValueReturn = true; break; }
@@ -15303,6 +20148,18 @@ public:
             std::set<std::string> stringFuncs;
             std::map<std::string, std::set<int>> userFloatParamIdx;
             for (const auto& fn : ir.functions) {
+                // Same exemption as voidUserFuncs_ just above: a generator's `return` (if it has
+                // one at all — bare, by construction) tells this scan NOTHING about the function's
+                // real return type, which is always a generator/channel object, never a bare
+                // float/list/string — scanning it anyway misclassified the CALL-SITE result var
+                // (verified real bug, Go: `FOR x in gen():` where `gen` has an explicit mid-body
+                // `return` alongside its yields declared the loop's channel temp as `var t_0
+                // string`, a hard compile error — "cannot use foo() (value of type <-chan int64)
+                // as string value in variable declaration". A generator with ONLY the implicit
+                // trailing return never tripped this, since that scan target is empty by
+                // definition — only an explicit `return` (still always bare) inside the body
+                // supplied a spurious non-empty RETURN operand for this loop to key off of.)
+                if (fn.isGenerator) continue;
                 std::set<std::string> fnSV; bool fnSVdone = false;
                 auto fnStringVars = [&]() -> const std::set<std::string>& {
                     if (!fnSVdone) { fnSV = detectStringVars(fn.instructions, ir.symbols, detectStringParams(fn, ir.symbols)); fnSVdone = true; }
@@ -15518,12 +20375,78 @@ public:
             out << "\n";
         }
 
+        // Class definitions (with field defaults and methods) BEFORE any forward declaration
+        // or free function — moved ahead of both (was originally emitted last, after every
+        // free function). A free function returning/using a bundle by value needs the class's
+        // struct/typedef ALREADY VISIBLE at both its forward declaration and its real
+        // definition (`Point makePoint(...)`), not after — verified real bug via a minimal
+        // bundle+free-function repro: `gcc` rejected `unknown type name 'Point'` with the old
+        // ordering. Every backend already tolerates class defs coming first (nothing here
+        // reads free-function state to build a class), so this reorder is safe generally, not
+        // just for the new class-returning-function support just above.
+        {
+            bool inClass = false;
+            std::string curClass;
+            for (const auto &instr : ir.globalInit) {
+                if (instr.opcode == IROpcode::CLASS_BEGIN) {
+                    curClass = stripQuotes(ref(instr.typedOperands[0]));
+                    strategy->emitClassBegin(out, indentLevel, curClass);
+                    // Real member/struct-field declarations for backends that need them (C++,
+                    // Java, ...): scan every method of this class for `self.<field>` STORE_VAR/
+                    // TYPE_CAST targets and emit one declaration each, in first-seen order.
+                    // Backends without explicit field decls (Python, JS) leave emitFieldDecl a
+                    // no-op, so this scan is harmless there.
+                    {
+                        std::set<std::string> seenFields;
+                        for (const auto &func : ir.functions) {
+                            if (func.classOwner != curClass) continue;
+                            for (const auto &fi : func.instructions) {
+                                if (fi.opcode != IROpcode::STORE_VAR && fi.opcode != IROpcode::TYPE_CAST) continue;
+                                IRRef tgt;
+                                if (fi.opcode == IROpcode::TYPE_CAST) tgt = fi.result;
+                                else if (fi.typedOperands.size() >= 2) tgt = fi.typedOperands[0];
+                                else if (fi.result.isValid()) tgt = fi.result;
+                                if (tgt.kind != IRRef::Kind::VAR || tgt.id < 0) continue;
+                                std::string nm = ir.symbols.getName(tgt.id);
+                                if (nm.rfind("self.", 0) != 0) continue;
+                                std::string field = nm.substr(5);
+                                if (!seenFields.insert(field).second) continue;
+                                IRType ft = fi.resultType != IRType::VOID ? fi.resultType : IRType::INT;
+                                strategy->emitFieldDecl(out, indentLevel, field, ft);
+                            }
+                        }
+                        strategy->emitFieldsEnd(out, indentLevel);
+                    }
+                    inClass = true;
+                } else if (instr.opcode == IROpcode::CLASS_END) {
+                    // Emit methods for this class before closing
+                    for (const auto &func : ir.functions)
+                        if (func.classOwner == curClass) genFunction(func);
+                    strategy->emitClassEnd(out, indentLevel);
+                    inClass = false; curClass = "";
+                } else if (inClass && !strategy->suppressClassBody()) {
+                    genInstr(instr); // field defaults inside class body
+                }
+            }
+        }
+
         // Forward declarations first (C++ requires them for mutual recursion —
         // is_even calling is_odd defined later otherwise fails to compile).
         {
             // reuse the program-level list/float return sets computed above
             for (const auto &func : ir.functions) {
                 if (!func.classOwner.empty()) continue;
+                // A generator's real return type (a synthesized AcGen_<name>* struct pointer)
+                // has no retKind case here at all — every scope this pass DOES understand
+                // (int/list/float/string/void) is a scalar-ish family-agnostic concept, not a
+                // per-function synthesized type, so a forward declaration would either need the
+                // struct typedef to already be visible at this point (it isn't — that typedef
+                // is emitted as part of emitFunctionBegin, alongside the real definition, not
+                // before it) or guess wrong. Skip it — same scope cut as bundle methods just
+                // above (a generator inside a bundle is unsupported for this pass too); a
+                // generator called before its own definition is not supported by this fiber
+                // design for now.
+                if (func.isGenerator) continue;
                 std::string params;
                 for (size_t pi = 0; pi < func.parameters.size(); pi++) {
                     if (pi) params += ", ";
@@ -15590,53 +20513,6 @@ public:
         for (const auto &func : ir.functions)
             if (func.classOwner.empty()) genFunction(func);
 
-        // First pass over globalInit: emit class definitions (with field defaults and methods)
-        {
-            bool inClass = false;
-            std::string curClass;
-            for (const auto &instr : ir.globalInit) {
-                if (instr.opcode == IROpcode::CLASS_BEGIN) {
-                    curClass = stripQuotes(ref(instr.typedOperands[0]));
-                    strategy->emitClassBegin(out, indentLevel, curClass);
-                    // Real member/struct-field declarations for backends that need them (C++,
-                    // Java, ...): scan every method of this class for `self.<field>` STORE_VAR/
-                    // TYPE_CAST targets and emit one declaration each, in first-seen order.
-                    // Backends without explicit field decls (Python, JS) leave emitFieldDecl a
-                    // no-op, so this scan is harmless there.
-                    {
-                        std::set<std::string> seenFields;
-                        for (const auto &func : ir.functions) {
-                            if (func.classOwner != curClass) continue;
-                            for (const auto &fi : func.instructions) {
-                                if (fi.opcode != IROpcode::STORE_VAR && fi.opcode != IROpcode::TYPE_CAST) continue;
-                                IRRef tgt;
-                                if (fi.opcode == IROpcode::TYPE_CAST) tgt = fi.result;
-                                else if (fi.typedOperands.size() >= 2) tgt = fi.typedOperands[0];
-                                else if (fi.result.isValid()) tgt = fi.result;
-                                if (tgt.kind != IRRef::Kind::VAR || tgt.id < 0) continue;
-                                std::string nm = ir.symbols.getName(tgt.id);
-                                if (nm.rfind("self.", 0) != 0) continue;
-                                std::string field = nm.substr(5);
-                                if (!seenFields.insert(field).second) continue;
-                                IRType ft = fi.resultType != IRType::VOID ? fi.resultType : IRType::INT;
-                                strategy->emitFieldDecl(out, indentLevel, field, ft);
-                            }
-                        }
-                        strategy->emitFieldsEnd(out, indentLevel);
-                    }
-                    inClass = true;
-                } else if (instr.opcode == IROpcode::CLASS_END) {
-                    // Emit methods for this class before closing
-                    for (const auto &func : ir.functions)
-                        if (func.classOwner == curClass) genFunction(func);
-                    strategy->emitClassEnd(out, indentLevel);
-                    inClass = false; curClass = "";
-                } else if (inClass && !strategy->suppressClassBody()) {
-                    genInstr(instr); // field defaults inside class body
-                }
-            }
-        }
-
         // Second pass: emit main body (skip class blocks).
         // #6: the mainloop (globalInit) needs its own string inference — it's not a function, so
         // genFunction's setStringVars never ran for it. Without this, mainloop string vars are
@@ -15645,6 +20521,7 @@ public:
             std::set<std::string> mlStr = detectStringVars(ir.globalInit, ir.symbols, {}, protoStringFuncs_);
             for (const auto& nv : detectNumericRetype(ir.globalInit, ir.symbols, mlStr)) mlStr.erase(nv);
             strategy->setStringVars(mlStr);   // #retype
+            strategy->setBoxedVars(detectBoxedVars(ir.globalInit, ir.symbols, mlStr, protoStringFuncs_));
         }
         // Mainloop cross-block hoist (block-scoped backends: JS/C/C++/V/Java/Rust) — the mainloop
         // is not a function, so the per-function hoist pass above never covered it (#41 in main).

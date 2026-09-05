@@ -18,6 +18,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"in",       TokenType::KW_IN},
     {"WHILST",   TokenType::KW_WHILST},
     {"return",   TokenType::KW_RETURN},
+    {"yield",    TokenType::KW_YIELD},
     {"fn",       TokenType::KW_FN},
     // display is NOT a keyword — it's the widget label constructor; Term.display is the I/O keyword
     {"use",      TokenType::KW_USE},
@@ -60,10 +61,13 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"conglomer", TokenType::KW_CONGLOMER},
     {"datac",    TokenType::KW_DATAC},
     {"from",     TokenType::KW_FROM},
+    {"fetch",    TokenType::KW_FETCH},
     {"range",    TokenType::KW_RANGE},
     {"sequence", TokenType::KW_SEQUENCE},
     {"iota",     TokenType::KW_IOTA},
     {"stream",   TokenType::KW_STREAM},
+    {"xrange",   TokenType::KW_XRANGE},
+    {"xiota",    TokenType::KW_XIOTA},
     {"is",       TokenType::KW_IS},
     {"xsub",     TokenType::KW_XSUB},
     {"pass",     TokenType::KW_PASS},
@@ -145,10 +149,19 @@ public:
                 tokens.emplace_back(TokenType::NEWLINE, "\n", line, col);
                 pos++; line++; col = 1;
 
-                // Count leading spaces for indent tracking
+                // Count leading indentation for indent tracking. A SINGLE loop over both
+                // whitespace chars, in whatever order they actually appear — the old
+                // spaces-then-tabs shape (two separate while loops) silently stopped counting
+                // the moment it hit a tab-after-space OR a space-after-tab that broke the
+                // run, since each loop only consumes its OWN character and neither resumes
+                // after the other: "\t    " (tab then 4 spaces) counted only the tab (4) and
+                // silently dropped the trailing spaces. One loop over both counts every
+                // leading whitespace char regardless of interleaving.
                 int spaces = 0;
-                while (pos < src.size() && src[pos] == ' ') { spaces++; pos++; col++; }
-                while (pos < src.size() && src[pos] == '\t') { spaces += 4; pos++; col++; }
+                while (pos < src.size() && (src[pos] == ' ' || src[pos] == '\t')) {
+                    spaces += (src[pos] == '\t') ? 4 : 1;
+                    pos++; col++;
+                }
 
                 // Skip blank lines
                 if (pos < src.size() && src[pos] == '\n') continue;
@@ -219,7 +232,16 @@ public:
                             else if (esc == '$')  s += '$';
                             else { s += '\\'; s += esc; }
                         } else {
-                            if (src[pos] == '\n') { line++; col = 1; } else col++;
+                            // Just the newline-reset here — the unconditional `col++` right
+                            // below (shared with the escape-sequence branch above) already
+                            // handles the normal per-character increment; this branch used to
+                            // ALSO increment col itself, double-counting every plain character
+                            // in a normal (non-raw) string and skewing every column number
+                            // reported past one (verified real, if purely cosmetic — error
+                            // messages only). The raw-string branch just above never had this
+                            // duplicate (`s += src[pos++];`, one increment), which is how the
+                            // inconsistency shows up at all.
+                            if (src[pos] == '\n') { line++; col = 1; }
                             s += src[pos];
                         }
                         pos++; col++;
@@ -316,8 +338,13 @@ public:
                 continue;
             }
 
-            // Backend: AC->XX or AC LIB (library header, no mainloop)
-            if (src.compare(pos, 3, "AC-") == 0 || src.compare(pos, 3, "AI-") == 0) {   // AI = interpreted sibling (AI->VM)
+            // Backend: AC->XX or AC LIB (library header, no mainloop). ONLY at the very start
+            // of the file — every real .ac file has this as its literal first bytes (verified
+            // across all 125 example files) — not at ANY position. Without the `pos == 0`
+            // guard, this matched mid-file too: verified real bug, a variable literally named
+            // "AC" used in a no-space subtraction (`y = AC-5`) had its "AC-" substring
+            // swallowed as a second, bogus BACKEND token, corrupting the rest of the line.
+            if (pos == 0 && (src.compare(pos, 3, "AC-") == 0 || src.compare(pos, 3, "AI-") == 0)) {   // AI = interpreted sibling (AI->VM)
                 int sc = col;
                 pos += 3; col += 3;
                 if (pos < src.size() && src[pos] == '>') { pos++; col++; }
@@ -328,7 +355,7 @@ public:
                 tokens.emplace_back(TokenType::BACKEND, backend, line, sc);
                 continue;
             }
-            if (src.size() > pos + 5 && src.compare(pos, 6, "AC LIB") == 0) {
+            if (pos == 0 && src.size() > pos + 5 && src.compare(pos, 6, "AC LIB") == 0) {
                 // Check it's followed by end-of-line or EOF (not "AC LIBRARY" etc.)
                 size_t eol = pos + 6;
                 if (eol >= src.size() || src[eol] == '\n' || src[eol] == '\r' || src[eol] == ' ' || src[eol] == '\t') {
@@ -525,18 +552,30 @@ public:
                     }
                     break;
                 case '|':
-                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::PIPE_EQUAL, "|=", line, sc); }
-                    else tokens.emplace_back(TokenType::PIPE, "|", line, sc);
+                    tokens.emplace_back(TokenType::PIPE, "|", line, sc);
                     break;
-                case ';':
-                    // A trailing ';' is C muscle memory. AC ends statements with a newline —
-                    // we tolerate the semicolon (skip it, the statement still parses) but roast
-                    // the user for it. Warn once so a whole C-brained file isn't a wall of Toxic.
-                    if (!warnedSemicolon) {
-                        std::cerr << Toxic::usedC() << "\n";
-                        warnedSemicolon = true;
+                case ';': {
+                    // Only a ';' that ENDS THE LINE is C muscle memory (`x = 5;` instead of
+                    // `x = 5`) — that one is tolerated (dropped, no token) with a one-time
+                    // roast. A ';' with real content after it on the same line (e.g. a tuple's
+                    // type-annotation separator, `(1, 2; int)`) is genuine mid-line syntax and
+                    // becomes a real token — it used to be unconditionally dropped+roasted
+                    // regardless of position, which made it impossible for ANY feature to ever
+                    // use ';' for anything (verified: previously every ';' anywhere, including
+                    // mid-line, hit this same branch).
+                    size_t look = pos;
+                    while (look < src.size() && (src[look] == ' ' || src[look] == '\t')) look++;
+                    bool endsLine = (look >= src.size() || src[look] == '\n');
+                    if (endsLine) {
+                        if (!warnedSemicolon) {
+                            std::cerr << Toxic::usedC() << "\n";
+                            warnedSemicolon = true;
+                        }
+                    } else {
+                        tokens.emplace_back(TokenType::SEMICOLON, ";", line, sc);
                     }
                     break;
+                }
                 case '^': tokens.emplace_back(TokenType::CARET, "^", line, sc); break;
                 case '~': tokens.emplace_back(TokenType::TILDE, "~", line, sc); break;
                 case '%': tokens.emplace_back(TokenType::PERCENT, "%", line, sc); break;  // wildcard (was silently dropped)
@@ -560,7 +599,18 @@ public:
                     }
                     // otherwise skip bare backslash
                     break;
-                default: break; // skip unknown
+                default:
+                    // `\r` (CRLF line endings) is legitimately silent — not a syntax error,
+                    // just a character this lexer doesn't need a token for. Anything else
+                    // falling through here is a genuinely unrecognized byte — this used to be
+                    // silently dropped with no token AND no error (verified real bug: `5 ! 3`
+                    // compiled clean, the `!` just vanished, output was whatever `5 3`
+                    // happened to parse as — matches the token catalog's own documented `%`
+                    // fix, generalized to any other stray character instead of ignoring it).
+                    if (c == '\r') break;
+                    std::cerr << "Preposterous: SyntaxError (It's all Greek to me) at line " << line
+                              << " char " << sc << ": Unexpected character '" << c << "'\n";
+                    std::exit(1);
             }
         }
 

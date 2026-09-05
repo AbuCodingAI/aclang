@@ -91,6 +91,20 @@ public:
     static ACError unknownBackend(const std::string& name) {  // AC->Xyzzy where Xyzzy isn't a backend
         return ACError("Preposterous: I don't speak " + name);
     }
+    // A tuple with no `; any` / `; TYPE` annotation must be homogeneous (elements sharing one
+    // type, mixed int/dec widening to dec) — anything else is rejected at compile time rather
+    // than silently building a broken/mistyped shape.
+    static ACError tupleNotHomogeneous(const std::string& typeA, const std::string& typeB) {
+        return type("tuple elements have mismatched types (" + typeA + " and " + typeB +
+                    ") — wrap the tuple as `(...; any)` to allow mixed types (constant index "
+                    "only), or `(...; TYPE)` to convert every element to one type");
+    }
+    // `(elems; TYPE)` — a "colloid" tuple: every element is coerced to TYPE before IR is
+    // generated. A literal element that provably can't convert (e.g. `$hello$` to int) is
+    // rejected immediately at compile time, not deferred to a runtime failure.
+    static ACError tupleColloidConversionFailed(const std::string& literal, const std::string& targetType) {
+        return type("tuple element " + literal + " cannot convert to " + targetType);
+    }
     // Staged for math.MemInt (planned arbitrary-precision int, 64 MB/value cap): a value would blow
     // past the ceiling and starve the system → catchable error. Wire at the MemInt alloc guard.
     static ACError memIntRagequit() {

@@ -1,10 +1,93 @@
 AC->HTML
 
-/* HTML backend — the program IS a web page: output renders in the browser DOM */
+/* HTML backend showcase — the program IS the web page: every Term.display call
+   below renders live into the DOM. Exercises the full "display family" (plain
+   print, every styled rich-text variant, and the three real browser dialogs),
+   a spread of core language constructs, and three HTML/JS-native ilib
+   libraries (math, string-cheese, regex) — everything here runs with zero
+   external dependencies in a plain browser tab. */
+
+use ilib math
+use ilib string-cheese
+use ilib regex
+
+Make is_prime func(n)
+    IF n < 2
+        return 0
+    d = 2
+    WHILST d @ d #> n
+        IF math.mod(n, d) is 0
+            return 0
+        d += 1
+    return 1
+
+bundle Critter
+    public name = $a Critter$
+    public hp = 10
+    public Make greet func()
+        Term.display self.name + $ says hi, with $ + to_string(self.hp) + $ hp$
 
 <mainloop>
-    Term.display $This paragraph was compiled from AC$
-    FOR i in sequence(1, 6)
-        Term.display i @ i
-    Term.display iota 10
+    title.display $AC -> HTML showcase$
+
+    header.display $The Term.display family$
+    Term.display $plain Term.display — just text$
+    bold.display $bold.display$
+    italic.display $italic.display$
+    underline.display $underline.display$
+    mark.display $mark.display$
+    code.display $code.display — monospace text$
+    link.display $https://github.com/AbuCodingAI/aclang$
+    para.display $para.display wraps this whole line in a real <p> element$
+    hr.display $$
+
+    header.display $Core language$
+    IF is_prime(17) is 1
+        Term.display $17 is prime (IF/ELSEIF/OTHER + a real function call)$
+    ELSEIF is_prime(17) is 0
+        Term.display $17 is composite$
+    OTHER
+        Term.display $unreachable$
+
+    total = 0
+    FOR i in sequence(1, 5)
+        total += i
+    Term.display $sum of sequence(1, 5) — half-open, so 1+2+3+4 = $ + to_string(total)
+
+    counter = 0
+    WHILST counter #< 3
+        counter += 1
+    Term.display $WHILST counted to $ + to_string(counter)
+
+    primes = []
+    FOR n in sequence(2, 30)
+        IF is_prime(n) is 1
+            primes.append(n)
+    Term.display $primes under 30 (arrays + .append) = $ + to_string(primes)
+
+    xs = [10, 20, 30]
+    Term.display $xs[2] (1-indexed array literal) = $ + to_string(xs[2])
+
+    try
+        Term.display 10 // 0
+    catch
+        Term.display $caught a real runtime divide-by-zero (try/catch)$
+
+    c = Critter()
+    c.greet()
+    hr.display $$
+
+    header.display $Libraries$
+    Term.display $math.pi(4) = $ + to_string(math.pi(4))
+    Term.display $math.sqrt(2.0) = $ + to_string(math.sqrt(2.0))
+    Term.display $stringm.upper of shout this = $ + stringm.upper($shout this$)
+    Term.display $stringm.replace of a.b.c = $ + stringm.replace($a.b.c$, $.$, $_$)
+    Term.display $regex.match of hello123 against letters-then-digits = $ + to_string(regex.match($hello123$, $[a-z]+[0-9]+$))
+    hr.display $$
+
+    para.display $End of showcase — the three lines below trigger real browser dialogs.$
+    alert $This alert() came straight from AC source via the 'alert' keyword.$
+    result = sure $Did the showcase render correctly? (this is 'sure', wrapping confirm())$
+    Term.display $sure returned: $ + to_string(result)
+    print_page
 <mainloop>

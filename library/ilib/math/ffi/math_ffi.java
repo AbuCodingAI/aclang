@@ -8,11 +8,29 @@ import java.nio.file.*;
 final class AcMath {
     private static final Linker _L = Linker.nativeLinker();
     private static final SymbolLookup _SYM;
+    // AC_PATH-aware resolution — see camera_ffi.java's _resolveLib for why the plain
+    // user.dir-relative path broke whenever `ac` ran from anywhere but the project root.
+    private static Path _resolveLib(String rel) {
+        Path relP = Path.of("library", "ilib", "math", rel);
+        String acp = System.getenv("AC_PATH");
+        if (acp != null) {
+            Path cand = Path.of(acp).resolve(relP);
+            if (Files.exists(cand)) return cand.toAbsolutePath();
+        }
+        Path cwdCand = Path.of(".").resolve(relP);
+        if (Files.exists(cwdCand)) return cwdCand.toAbsolutePath();
+        try {
+            Path self = Path.of(AcMath.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            Path base = Files.isDirectory(self) ? self : self.getParent();
+            Path fromClass = base.resolve("..").resolve(relP).normalize();
+            if (Files.exists(fromClass)) return fromClass.toAbsolutePath();
+        } catch (Exception ignored) {}
+        return cwdCand.toAbsolutePath();
+    }
     static {
         String _os = System.getProperty("os.name").toLowerCase();
         String _libFile = _os.contains("win") ? "acmath.dll" : "libacmath.so";
-        Path _libPath = Path.of(System.getProperty("user.dir"))
-            .resolve("library/ilib/math/" + _libFile).toAbsolutePath();
+        Path _libPath = _resolveLib(_libFile);
         _SYM = SymbolLookup.libraryLookup(_libPath, Arena.global());
     }
     private static MethodHandle _mh(String name, FunctionDescriptor fd) {

@@ -7,6 +7,17 @@ package main
 #cgo LDFLAGS: -L${SRCDIR}/library/ilib/widgets -lacwidgets -Wl,-rpath,${SRCDIR}/library/ilib/widgets
 #include "widgets_c.h"
 #include <stdlib.h>
+
+// Forward-declare the //export'd trampoline below (matches the real symbol cgo generates
+// for it) and call ac_widgets_btn_on_click from C, since a Go func value has no directly
+// usable C-ABI function pointer — only a //export'd function does. This is the standard
+// cgo "C calls back into Go" pattern (see "runtime/cgo: passing Go pointers" — an integer
+// handle through void*, not a real Go pointer, since C can hold onto userdata indefinitely
+// and a real Go pointer could be moved/collected).
+extern void _ac_go_cb_trampoline(void*);
+static void _ac_register_btn_click(ac_widget_t h, void* userdata) {
+    ac_widgets_btn_on_click(h, _ac_go_cb_trampoline, userdata);
+}
 */
 import "C"
 import "unsafe"
@@ -15,14 +26,36 @@ import "fmt"
 
 func _ws(s string) (*C.char, func()) { cs := C.CString(s); return cs, func() { C.free(unsafe.Pointer(cs)) } }
 
-func widgets_screen_new(title, geometry string) C.ac_widget_t {
-	ct, ft := _ws(title); defer ft()
-	cg, fg := _ws(geometry); defer fg()
-	return C.ac_widgets_screen_new(ct, cg)
+// Go's widget FFI had NO button-callback support at all before this (no `//export`
+// trampoline, no on_click method, no ac_widgets_btn_on_click wrapper) — `btn(master, text,
+// Callback)` never wired the callback anywhere. _acCallbacks is a simple append-only
+// registry; the userdata passed to C is just the slice index (as an integer, not a real
+// pointer — see the preamble comment above for why).
+var _acCallbacks []func()
+
+//export _ac_go_cb_trampoline
+func _ac_go_cb_trampoline(userdata unsafe.Pointer) {
+	id := int(uintptr(userdata))
+	if id >= 0 && id < len(_acCallbacks) {
+		_acCallbacks[id]()
+	}
 }
-func widgets_screen_mainloop(h C.ac_widget_t) { C.ac_widgets_screen_mainloop(h) }
-func widgets_screen_update(h C.ac_widget_t)   { C.ac_widgets_screen_update(h) }
-func widgets_screen_destroy(h C.ac_widget_t)  { C.ac_widgets_screen_destroy(h) }
+
+func widgets_btn_on_click(h C.ac_widget_t, cb func()) {
+	id := len(_acCallbacks)
+	_acCallbacks = append(_acCallbacks, cb)
+	C._ac_register_btn_click(h, unsafe.Pointer(uintptr(id)))
+}
+
+// title is mandatory — no geometry positional arg. Use Dimensions(w, h) instead.
+func widgets_screen_new(title string) C.ac_widget_t {
+	ct, ft := _ws(title); defer ft()
+	return C.ac_widgets_screen_new(ct)
+}
+func widgets_screen_mainloop(h C.ac_widget_t)            { C.ac_widgets_screen_mainloop(h) }
+func widgets_screen_update(h C.ac_widget_t)              { C.ac_widgets_screen_update(h) }
+func widgets_screen_destroy(h C.ac_widget_t)             { C.ac_widgets_screen_destroy(h) }
+func widgets_screen_dimensions(h C.ac_widget_t, w, hh int) { C.ac_widgets_screen_dimensions(h, C.int(w), C.int(hh)) }
 
 func widgets_display_new(m C.ac_widget_t, text string) C.ac_widget_t {
 	ct, ft := _ws(text); defer ft(); return C.ac_widgets_display_new(m, ct)
@@ -100,6 +133,19 @@ func widgets_sketch_text(h C.ac_widget_t, x, y float64, t string, r, g, b uint8)
 	C.ac_widgets_sketch_text(h, C.double(x), C.double(y), ct, C.uint8_t(r), C.uint8_t(g), C.uint8_t(b))
 }
 
+func widgets_textbox_new(m C.ac_widget_t, color, font string) C.ac_widget_t {
+	cc, fc := _ws(color); defer fc()
+	cf, ff := _ws(font); defer ff()
+	return C.ac_widgets_textbox_new(m, cc, cf)
+}
+func widgets_textbox_pack(h C.ac_widget_t)          { C.ac_widgets_textbox_pack(h) }
+func widgets_textbox_write(h C.ac_widget_t, s string) { ct, ft := _ws(s); defer ft(); C.ac_widgets_textbox_write(h, ct) }
+func widgets_textbox_get(h C.ac_widget_t) string    { return C.GoString(C.ac_widgets_textbox_get(h)) }
+func widgets_textbox_find(h C.ac_widget_t, needle string) string {
+	ct, ft := _ws(needle); defer ft(); return C.GoString(C.ac_widgets_textbox_find(h, ct))
+}
+func widgets_textbox_fix(h C.ac_widget_t, s string) { ct, ft := _ws(s); defer ft(); C.ac_widgets_textbox_fix(h, ct) }
+
 // ── Go wrapper types ──────────────────────────────────────────────────────────
 
 func _splitComma(s string) []string {
@@ -114,10 +160,11 @@ func _splitComma(s string) []string {
 func init() { C.ac_widgets_init() }
 
 type AcScreen struct{ _h C.ac_widget_t }
-func Screen(title, geometry string) *AcScreen { return &AcScreen{_h: widgets_screen_new(title, geometry)} }
-func (s *AcScreen) mainloop()                  { widgets_screen_mainloop(s._h) }
-func (s *AcScreen) update()                    { widgets_screen_update(s._h) }
-func (s *AcScreen) destroy()                   { widgets_screen_destroy(s._h) }
+func Screen(title string) *AcScreen  { return &AcScreen{_h: widgets_screen_new(title)} }
+func (s *AcScreen) mainloop()        { widgets_screen_mainloop(s._h) }
+func (s *AcScreen) update()          { widgets_screen_update(s._h) }
+func (s *AcScreen) dimensions(w, h int) { widgets_screen_dimensions(s._h, w, h) }
+func (s *AcScreen) destroy()         { widgets_screen_destroy(s._h) }
 
 type AcDisplay struct{ _h C.ac_widget_t }
 func display(m *AcScreen, text string) *AcDisplay { return &AcDisplay{_h: widgets_display_new(m._h, text)} }
@@ -134,7 +181,8 @@ func (a *AcAsk) set(v string) { widgets_ask_set(a._h, v) }
 
 type AcBtn struct{ _h C.ac_widget_t }
 func btn(m *AcScreen, text string) *AcBtn { return &AcBtn{_h: widgets_btn_new(m._h, text)} }
-func (b *AcBtn) pack() { widgets_btn_pack(b._h) }
+func (b *AcBtn) pack()             { widgets_btn_pack(b._h) }
+func (b *AcBtn) on_click(cb func()) { widgets_btn_on_click(b._h, cb) }
 
 type AcCkbtn struct{ _h C.ac_widget_t }
 func ckbtn(m *AcScreen, text string) *AcCkbtn { return &AcCkbtn{_h: widgets_ckbtn_new(m._h, text)} }
@@ -153,8 +201,9 @@ func dropdown(m *AcScreen, values string) *AcDropdown {
 	for _, v := range _splitComma(values) { widgets_dropdown_add(d._h, v) }
 	return d
 }
-func (d *AcDropdown) pack()        { widgets_dropdown_pack(d._h) }
-func (d *AcDropdown) get() string  { return widgets_dropdown_get(d._h) }
+func (d *AcDropdown) pack()          { widgets_dropdown_pack(d._h) }
+func (d *AcDropdown) add(item string) { widgets_dropdown_add(d._h, item) }
+func (d *AcDropdown) get() string    { return widgets_dropdown_get(d._h) }
 func (d *AcDropdown) set(v string) { widgets_dropdown_set(d._h, v) }
 
 type AcAdvance struct{ _h C.ac_widget_t }
@@ -188,6 +237,16 @@ type AcTable struct{ _h C.ac_widget_t }
 func table(m *AcScreen) *AcTable { return &AcTable{_h: widgets_listbox_new(m._h, 40, 10)} }
 func (t *AcTable) pack()          { widgets_listbox_pack(t._h) }
 func (t *AcTable) add(row interface{}) { widgets_listbox_add(t._h, fmt.Sprintf("%v", row)) }
+
+type AcTextbox struct{ _h C.ac_widget_t }
+func textbox(m *AcScreen, color, font string) *AcTextbox {
+	return &AcTextbox{_h: widgets_textbox_new(m._h, color, font)}
+}
+func (t *AcTextbox) pack()               { widgets_textbox_pack(t._h) }
+func (t *AcTextbox) write(s string)      { widgets_textbox_write(t._h, s) }
+func (t *AcTextbox) get() string         { return widgets_textbox_get(t._h) }
+func (t *AcTextbox) find(needle string) string { return widgets_textbox_find(t._h, needle) }
+func (t *AcTextbox) fix(s string)        { widgets_textbox_fix(t._h, s) }
 
 type AcListbox struct{ _h C.ac_widget_t }
 func listbox(m *AcScreen, width, height int) *AcListbox {

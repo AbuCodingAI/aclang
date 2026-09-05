@@ -1,0 +1,52 @@
+AC->BNY
+
+use ilib gl
+use ilib math
+
+<mainloop>
+
+     <OBJECT>
+          obj.player /*Initialize object named player*/
+          player.config item=geometry(gl.size=0.33 width @ gl.size=0.05 length) - location=(x=left, y=center) - white /* the - dash separates qualities, newlines also do this job*/
+
+          obj.player2
+          player2.config item=geometry(gl.size=0.33 width @ gl.size=0.05 length) - location=(x=right, y=center) - white
+
+          obj.ball
+          ball.config item=square(50) - location=(x=center,y=center) - white
+          ball.velocity(20, 20) /*20 pixels per second along each axis*/
+     <OBJECT>
+
+     <SCREEN>
+          Make Screen object
+               Screen.OBJECT resize 1720x1080
+          background.config color=black
+          animate(60 fps)
+     <SCREEN>
+
+     <LOGIC>
+          configure event-listener
+               establish listener of keys
+                    on value is w /*One time press*/
+                         WHILST value is w /*Whilst held*/
+                              player.move_y 20
+                    on value is s
+                         WHILST value is s
+                              player.move_y -20
+                    on value is up
+                         WHILST value is up
+                              player2.move_y 20
+                    on value is down
+                         WHILST value is down
+                              player2.move_y -20
+
+          <StartHere>
+               IF ball.hitbox.coords overlap p%.hitbox.coords /*ball vs either paddle — p% wildcard-matches both "player" and "player2"*/
+                    ball.speed@=-1
+               IF ball.hitbox overlap boundary
+                    DEG ball.direction=45 /*change ball direction, DEG and RAD are math ilib sugar*/
+          <EndHere>
+
+     <LOGIC>
+
+<mainloop>

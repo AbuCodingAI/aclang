@@ -34,6 +34,15 @@ public:
     bool capture(const std::string&) { return false; }
     bool captureLatest() { return false; }
     bool captureFirst() { return false; }
+    // AC source calls `camera.capture_latest(f)`/`capture_first(f)` as methods on the
+    // single `camera` global — see the real-mode Camera class below (and camera_c.cpp's
+    // ac_camera_capture_latest/first) for why these forward to separate aux instances
+    // instead of being trivial self-calls.
+    Camera* latestPtr_ = nullptr;
+    Camera* firstPtr_ = nullptr;
+    void attachAux(Camera* latest, Camera* first) { latestPtr_ = latest; firstPtr_ = first; }
+    bool capture_latest(const std::string& f) { return latestPtr_ ? latestPtr_->capture(f) : false; }
+    bool capture_first(const std::string& f) { return firstPtr_ ? firstPtr_->capture(f) : false; }
 };
 
 class SidebarConsole {
@@ -45,6 +54,11 @@ public:
     std::string ask(const std::string& prompt) { fprintf(stderr, "[sidebar.ask] %s\n", prompt.c_str()); return ""; }
     std::string getInput() { return ""; }
     std::function<std::string(std::string)> inputCallback;
+    // snake_case aliases — AC source calls sidebar.setregion(...)/setinteractive(...)/
+    // getinput() (see camera.acl); the class itself uses camelCase (setRegion, etc).
+    void setregion(const std::string& r) { setRegion(r); }
+    void setinteractive(bool v) { setInteractive(v); }
+    std::string getinput() { return getInput(); }
 };
 
 class Screen {
@@ -52,6 +66,9 @@ public:
     Screen() {}
     void setMode(const std::string&) {}
     void update() {}
+    void setmode(const std::string& m) { setMode(m); }
+    void attachCamera(Camera*) {}
+    bool updateFrame(Camera&) { return false; }  // used by camera_wrapper.hpp's updateScreen()
 };
 
 #else // HAVE_OPENCV — full implementation below
@@ -138,6 +155,20 @@ public:
         }
         initialized = false;
     }
+
+    // AC source calls `camera.capture_latest(f)`/`capture_first(f)` as methods on the
+    // single `camera` global. The C ABI (camera_c.cpp's ac_camera_capture_latest/first)
+    // implements these via two SEPARATE, never-initialized Camera globals (latestFrame/
+    // firstFrame) — capture on an uninitialized Camera returns false, so both currently
+    // always report failure (verified identical on the PY and C backends: real device,
+    // camera.capture()=1, capture_latest()=capture_first()=0). These forwarders give the
+    // C++ backend the exact same observable behavior via the same aux-object design,
+    // wired up by the generated globals block right after construction.
+    Camera* latestPtr_ = nullptr;
+    Camera* firstPtr_ = nullptr;
+    void attachAux(Camera* latest, Camera* first) { latestPtr_ = latest; firstPtr_ = first; }
+    bool capture_latest(const std::string& f) { return latestPtr_ ? latestPtr_->capture(f) : false; }
+    bool capture_first(const std::string& f) { return firstPtr_ ? firstPtr_->capture(f) : false; }
 };
 
 /**
@@ -298,7 +329,13 @@ public:
         }
         return "";
     }
-    
+
+    // snake_case aliases — AC source calls sidebar.setregion(...)/setinteractive(...)/
+    // getinput() (see camera.acl); this class uses camelCase (setRegion, etc) internally.
+    void setregion(const std::string& r) { setRegion(r); }
+    void setinteractive(bool v) { setInteractive(v); }
+    std::string getinput() { return getInput(); }
+
     /**
      * Set input callback function
      * @param callback Function to call when input is requested
@@ -358,7 +395,8 @@ public:
     void setMode(const std::string& m) {
         mode = m;
     }
-    
+    void setmode(const std::string& m) { setMode(m); }
+
     /**
      * Display current frame
      * @param windowName Name of display window
@@ -377,7 +415,14 @@ public:
     bool updateFrame(Camera& camera) {
         return camera.capture(currentFrame);
     }
-    
+
+    // AC source calls `screen.update()` with no args (camera.acl: camera:screen.update ->
+    // ac_screen_update, which always updates from the one main camera — camera_c.cpp's
+    // `Background.updateFrame(WebCam)`). Wired up by the generated globals block.
+    Camera* mainCam_ = nullptr;
+    void attachCamera(Camera* c) { mainCam_ = c; }
+    void update() { if (mainCam_) updateFrame(*mainCam_); }
+
     /**
      * Set frame directly
      * @param frame Frame to display
@@ -404,11 +449,13 @@ public:
 };
 
 // Global instances (matching AC's global scope)
-extern Camera WebCam;
+// Names match AC source's receivers directly: `camera.init()`, `sidebar.display(...)`,
+// `screen.setmode(...)` (see camera.acl). Renamed from the older WebCam/Background.
+extern Camera camera;
 extern Camera latestFrame;
 extern Camera firstFrame;
 extern SidebarConsole sidebar;
-extern Screen Background;
+extern Screen screen;
 
 #endif // HAVE_OPENCV
 
