@@ -1,11 +1,15 @@
-AC->PY
+AC->BNY
 
 /* AC keyword catalog — MODULES: use/ilib/elib/clib/flib/datac/from/using/export/save.
-   conglomer is native-backend-only (raw C header linking) — see kw_conglomer.ac. */
+   conglomer is native-backend-only (raw C header linking) — see kw_conglomer.ac.
+
+   The DNS elib must be installed before running this example:
+       atar install dns
+   The target machine must also have the native ilib dns installed. */
 
 use ilib math
 from ilib math use sin, cos
-use elib greet
+use elib dns
 use clib kwdemo
 use flib flib_helper/helper.ac
 use datac kw_pets.datac as pets
@@ -21,7 +25,13 @@ Make local_double func(x)
     Term.display sin(0)
     Term.display cos(0)
     Term.display sqrt(9)
-    Term.display greet_count(4)
+    Term.display start($127.0.0.1$, 5353)
+    Term.display url($demo.abu$, $AC DNS demo$)
+    Term.display backend($demo.abu$, $127.0.0.1:8080$)
+    Term.display resolve($demo.abu$)
+    Term.display list()
+    Term.display remove($demo.abu$)
+    Term.display stop()
     Term.display double_it(5)
     Term.display clib_triple(3)
     Term.display flib_double(6)

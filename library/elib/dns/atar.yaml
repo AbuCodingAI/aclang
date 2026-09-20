@@ -1,0 +1,6 @@
+name: dns
+version: 1.0.0
+author: Abu
+description: Private authoritative DNS records and UDP resolver for AC
+license: MIT
+main: lib.ac

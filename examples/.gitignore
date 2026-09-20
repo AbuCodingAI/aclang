@@ -7,4 +7,7 @@
 # the source) that no extension-based pattern would ever cover.
 *
 !*.ac
+!experimental/
+!experimental/*.ac
+!experimental/README.md
 !.gitignore

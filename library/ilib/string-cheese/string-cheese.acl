@@ -9,6 +9,7 @@ stringm:UPPER       -> stringm.upper
 stringm:LOWER       -> stringm.lower
 stringm:find        -> stringm.find
 stringm:strip       -> stringm.strip
+stringm:stripln     -> stringm.stripln
 stringm:replace     -> stringm.replace
 stringm:split       -> stringm.split
 stringm:join        -> stringm.join

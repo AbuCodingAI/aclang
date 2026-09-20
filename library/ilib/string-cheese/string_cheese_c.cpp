@@ -70,6 +70,30 @@ const char* ac_stringm_strip(const char* s, const char* chars) {
     return _sc(r.substr(b, e - b + 1));
 }
 
+const char* ac_stringm_strip_clause(const char* mode, const char* clause, const char* s) {
+    if (!s || !clause || !mode) return s ? _sc(s) : _sc("");
+    std::string text(s), key(clause), direction(mode);
+    size_t at = text.find(key);
+    if (at == std::string::npos) return _sc(text);
+    if (direction == "before") return _sc(text.substr(at + key.size()));
+    if (direction == "after") return _sc(text.substr(0, at));
+    return _sc(text);
+}
+
+const char* ac_stringm_stripln(const char* s, const char* needle) {
+    if (!s || !needle) return "";
+    const char* line = s;
+    while (*line) {
+        const char* end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        std::string candidate(line, len);
+        if (candidate.find(needle) != std::string::npos) return _sc(candidate);
+        if (!end) break;
+        line = end + 1;
+    }
+    return _sc("");
+}
+
 int ac_stringm_find(const char* s, const char* pattern) {
     if (!s || !pattern) return -1;
     // ws sentinel: find first whitespace

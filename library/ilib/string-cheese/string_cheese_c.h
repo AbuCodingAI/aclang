@@ -15,6 +15,8 @@ const char* ac_stringm_lower(const char* s);
 const char* ac_stringm_upper(const char* s);
 const char* ac_stringm_trim(const char* s);
 const char* ac_stringm_strip(const char* s, const char* chars);
+const char* ac_stringm_strip_clause(const char* mode, const char* clause, const char* s);
+const char* ac_stringm_stripln(const char* s, const char* needle);
 int         ac_stringm_find(const char* s, const char* pattern);
 const char* ac_stringm_replace(const char* s, const char* old_sub, const char* new_sub);
 const char* ac_stringm_split_nth(const char* s, const char* sep, int n);
@@ -45,6 +47,8 @@ struct _ac_stringm_ns {
     const char* (*lower)(const char*)               = ac_stringm_lower;
     const char* (*trim)(const char*)                = ac_stringm_trim;
     const char* (*strip)(const char*)              = ac_stringm_trim; /* AC strip = 1-arg trim */
+    const char* (*strip_clause)(const char*, const char*, const char*) = ac_stringm_strip_clause;
+    const char* (*stripln)(const char*, const char*) = ac_stringm_stripln;
     int         (*find)(const char*, const char*)   = ac_stringm_find;
     const char* (*replace)(const char*, const char*, const char*) = ac_stringm_replace;
     long long   (*len)(const char*)                 = ac_stringm_len;
@@ -67,6 +71,8 @@ static _ac_stringm_ns stringm;
 #define stringm_lower      ac_stringm_lower
 #define stringm_trim       ac_stringm_trim
 #define stringm_strip      ac_stringm_trim /* AC strip = 1-arg trim */
+#define stringm_strip_clause ac_stringm_strip_clause
+#define stringm_stripln     ac_stringm_stripln
 #define stringm_find       ac_stringm_find
 #define stringm_replace    ac_stringm_replace
 #define stringm_len        ac_stringm_len

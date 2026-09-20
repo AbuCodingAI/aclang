@@ -4,6 +4,7 @@ extern "C" {
 #endif
 
 int         ac_os_bash(const char* cmd);
+int         ac_os_wait(int pid);
 int         ac_os_sbash(const char* cmd);
 int         ac_os_app_open(const char* app);
 int         ac_os_mkfile(const char* path);
@@ -11,6 +12,7 @@ int         ac_os_rmfile(const char* path);
 int         ac_os_mkdir(const char* path);
 int         ac_os_rmdir(const char* path);
 int         ac_os_exists(const char* path);
+int         ac_os_pid(int status);
 const char* ac_os_cwd(void);
 const char* ac_os_env(const char* key);
 int         ac_os_write_to(const char* path, const char* content);
@@ -36,6 +38,7 @@ const char* ac_os_read(const char* path);
 struct _ac_os_ns {
     static int bash(const char* cmd) { return ac_os_bash(cmd); }
     static int bash(const std::string& cmd) { return ac_os_bash(cmd.c_str()); }
+    static int wait(int pid) { return ac_os_wait(pid); }
     static int sbash(const char* cmd) { return ac_os_sbash(cmd); }
     static int sbash(const std::string& cmd) { return ac_os_sbash(cmd.c_str()); }
     static int app_open(const char* app) { return ac_os_app_open(app); }
@@ -50,6 +53,7 @@ struct _ac_os_ns {
     static int rmdir(const std::string& path) { return ac_os_rmdir(path.c_str()); }
     static int exists(const char* path) { return ac_os_exists(path); }
     static int exists(const std::string& path) { return ac_os_exists(path.c_str()); }
+    static int pid(int status) { return ac_os_pid(status); }
     static const char* cwd() { return ac_os_cwd(); }
     static const char* env(const char* key) { return ac_os_env(key); }
     static const char* env(const std::string& key) { return ac_os_env(key.c_str()); }
@@ -67,6 +71,7 @@ struct _ac_os_ns {
 static _ac_os_ns os;
 #else
 #define os_bash ac_os_bash
+#define os_wait ac_os_wait
 #define os_sbash ac_os_sbash
 #define os_app_open ac_os_app_open
 #define os_mkfile ac_os_mkfile
@@ -74,6 +79,7 @@ static _ac_os_ns os;
 #define os_mkdir ac_os_mkdir
 #define os_rmdir ac_os_rmdir
 #define os_exists ac_os_exists
+#define os_pid ac_os_pid
 #define os_cwd ac_os_cwd
 #define os_env ac_os_env
 #define os_read ac_os_read

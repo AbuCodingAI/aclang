@@ -12,7 +12,6 @@ Complete review of all AC internal libraries (ilib).
 | **string-cheese** | ⭐⭐⭐⭐⭐ | ✅ Complete | 95% | YES |
 | **os** | ⭐⭐⭐⭐⭐ | ✅ Complete | 100% | YES |
 | **regex** | ⭐⭐⭐⭐ | ✅ Complete | 90% | YES |
-| **gl** | ⭐⭐⭐⭐ | ✅ Complete | 85% | YES |
 | **machine-audio** | ⭐⭐⭐⭐ | ✅ Complete | 80% | YES |
 | **widgets** | ⭐⭐⭐⭐ | ✅ Complete | 75% | YES |
 | **web** | ⭐⭐⭐ | ✅ Complete | 60% | PARTIAL |
@@ -117,29 +116,6 @@ Files: regex.cpp, regex.hpp, libacregex.so
 **Quality:** 90% implemented
 **Minor issue:** Some edge cases with complex patterns
 **Verdict:** **VERY GOOD** — Ready for production.
-
----
-
-### 5. **gl** ⭐⭐⭐⭐
-
-```
-Status: ✅ Complete
-Location: ilib/gl/
-Files: gl.cpp, gl.hpp, libacgl.so (SDL2-based)
-```
-
-**What works:**
-- ✅ Window/screen creation
-- ✅ 2D drawing (lines, rectangles, circles, polygons)
-- ✅ Color support (RGB, RGBA)
-- ✅ Event handling (mouse, keyboard)
-- ✅ Sprite/image rendering
-- ✅ Expression evaluator for curves
-- ✅ FPS management
-
-**Quality:** 85% implemented
-**Missing:** 3D support, advanced shaders
-**Verdict:** **VERY GOOD** — Good for 2D games and graphics. Full 3D would be future work.
 
 ---
 
@@ -325,7 +301,6 @@ Files: libacml.h (C FFI), libacml.rs, libacml.go, LibACML.java, libacml.v
 - **string-cheese** ⭐⭐⭐⭐⭐
 - **os** ⭐⭐⭐⭐⭐
 - **regex** ⭐⭐⭐⭐
-- **gl** ⭐⭐⭐⭐
 - **machine-audio** ⭐⭐⭐⭐
 - **widgets** ⭐⭐⭐⭐
 - **keybinds** ⭐⭐⭐
@@ -371,7 +346,7 @@ This works because:
 ## Recommendations
 
 ### For v1.0 Release
-Include: **math, string-cheese, os, regex, gl, machine-audio, widgets, keybinds, web**
+Include: **math, string-cheese, os, regex, machine-audio, widgets, keybinds, web**
 
 ### Post-v1.0
 1. **Complete ml** (libacml.cpp + libacml.py)

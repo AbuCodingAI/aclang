@@ -6,6 +6,7 @@
 #include <cstring>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fstream>
@@ -57,7 +58,20 @@ extern "C" {
 
 int ac_os_bash(const char* cmd) {
     if (!cmd) return -1;
-    return system(cmd);
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, (char*)nullptr);
+        _exit(127);
+    }
+    return (int)pid;
+}
+
+int ac_os_wait(int pid) {
+    if (pid <= 0) return -1;
+    int status = 0;
+    if (waitpid((pid_t)pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 int ac_os_sbash(const char* cmd) {
@@ -127,6 +141,10 @@ int ac_os_exists(const char* path) {
     if (!path) return 0;
     struct stat st{};
     return stat(path, &st) == 0 ? 1 : 0;
+}
+
+int ac_os_pid(int status) {
+    return status > 0 ? status : -1;
 }
 
 const char* ac_os_cwd() {

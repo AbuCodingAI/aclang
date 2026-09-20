@@ -7,11 +7,12 @@ use ilib math
 Make is_leap func(y)
     IF math.mod(y, 400) is 0
         return $Leap Year$
-    IF math.mod(y, 100) is 0
+    ELSEIF math.mod(y, 100) is 0
         return $Not a leap year$
-    IF math.mod(y, 4) is 0
+    ELSEIF math.mod(y, 4) is 0
         return $Leap Year$
-    return 0
+    OTHER
+        return $Not a leap year$
 
 <mainloop>
     Term.display is_leap(2024)
