@@ -1,33 +1,68 @@
-*.acc
-*.lir
-*.datac
-*.pyc
+# AC repository layout — everything at the top level is ignored unless allow-listed here.
+# The repo ships: compiler source + includes + prebuilt binaries, examples/, library/,
+# README, LICENSE, install.sh. Anything else (IDE, LSP, website, scratch, benchmarks,
+# session notes) lives outside the repo.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/BUGS.md
+!/install.sh
+!/ac-compiler/
+!/examples/
+!/library/
+
+# ── ac-compiler/: source + includes + prebuilt binaries only ──────────────────────────────
+/ac-compiler/*
+!/ac-compiler/Makefile
+!/ac-compiler/src/
+!/ac-compiler/include/
+!/ac-compiler/wasm/
+!/ac-compiler/ac
+!/ac-compiler/ac.exe
+!/ac-compiler/ac.arm
+
+# wasm/ is source for the embedded blobs (wasm_blobs.hpp); its npm deps are not
+/ac-compiler/wasm/node_modules/
+
+# ── Build / run byproducts, anywhere in the tree ──────────────────────────────────────────
 *.o
 *.d
+*.obj
+*.core
+core
+core.*
+*.log
+*.tmp
+*.swp
+*~
 *.backup
+*.pyc
 __pycache__/
+.pytest_cache/
+node_modules/
+
+# AC compiler caches and intermediates (generated next to whatever file was compiled)
+**/ac-cache/
+*.acc
+*.lir
+*.irc
+*.datac
+*.acb
+
+# Editor / assistant state
 .kiro/
 .vscode/
+.idea/
 .windsurf/
-/examples/pong.ac
-node_modules/
-context.md
+.claude/
 .aider*
-/AC+
-/tests/
-/docs/SESSION_SUMMARY_2026-05-29.md
-# --- merged from former monorepo-root .gitignore (paths now relative to AC/) ---
-ac-compiler/ac_asan*
-ac-compiler/ac_dbg
-ac-compiler/ac_test
-ac-compiler/relics/
-**/ac-cache/
-*.irc
-perfect-ish.c
-perfect-ish.cpp
-perfect-ish.py
-disp
-disp.[!a]*
-disp.acb
-applicants.ndjson
-ac-compiler/kw_modules_out.txt
+context.md
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+credentials*.json

@@ -226,6 +226,42 @@ c = 7 xsub 3   /* c = 5   */
 6. `\|`, `#\|`
 7. `or`
 
+### `~>` — Call Rewiring (proposed, not yet implemented)
+
+`~>` redirects a call to a different function, in place, at the call site. The original callee
+is never invoked — `~>` fully replaces it, forwarding the same argument list:
+
+```ac
+result = malloc(5) ~> my_custom_heap_function
+/* equivalent to: result = my_custom_heap_function(5) */
+/* malloc is never called — my_custom_heap_function receives its arguments instead */
+```
+
+This is the call-site analog of `alias` (see [Scope and Aliasing](#scope-and-aliasing)): where
+`alias x = y` gives two *variables* one shared identity, `expr ~> target` gives a *call
+expression* a different destination without editing its argument list. It's meant for swapping
+out a low-level primitive (`malloc`, `free`, an ilib call) for a custom implementation at one
+call site, without rewriting every argument by hand.
+
+**Shape:**
+- LHS must be a call expression: `callee(args...)`. `callee` names the function being
+  *replaced* — it is parsed for its argument list only and is never resolved or invoked, so it
+  does not need to exist.
+- RHS must be a bare function reference (a name resolvable in scope: user-defined or ilib),
+  taking the same argument list `callee` would have.
+- Arguments are evaluated exactly once, left to right, exactly as written on the LHS.
+- Lexes as one token (`~>`), taking precedence over lexing `~` (bitwise NOT) followed by `>`
+  (greater-than) — the lexer must match the two-character operator greedily before falling back
+  to `~` alone.
+- Binds to the call expression as a postfix modifier, not as a general value-level binary
+  operator — it does not have a slot in the precedence table above, the way `is`/`type` casts
+  don't either.
+- Chaining (`f(x) ~> g ~> h`) is undefined for now and reserved for future design — don't rely
+  on any particular behavior from it yet.
+
+This section describes the intended design so it can be implemented against a stable spec; the
+lexer/parser/IR/codegen work itself hasn't started.
+
 ---
 
 ## Type Coercion
@@ -905,9 +941,12 @@ use ilib os
 <mainloop>
 ```
 
-Functions: `bash`, `sbash`, `app_open`, `mkfile`, `rmfile`, `mkdir`, `rmdir`, `exists`, `cwd`, `env`, `write_to`, `append_to`, `read`
+Functions: `bash`, `sbash`, `app_open`, `mkfile`, `rmfile`, `mkdir`, `rmdir`, `exists`, `cwd`, `env`, `write_to`, `append_to`, `read`, `pid`
 
-`os.bash(cmd)` runs a shell command and returns exit code. `os.sbash(cmd)` is the safer variant — it rejects `sudo`, `su`, `nohup`, `screen`, `tmux`, and trailing `&`. File helpers return `0` on success, `-1` on failure; `exists`, `cwd`, `env`, `read` return their natural values.
+`os.bash(cmd)` starts a shell command and returns its child PID. `os.wait(pid)` waits for it and returns its exit code. `os.sbash(cmd)` remains the protected blocking variant — it rejects `sudo`, `su`, `nohup`, `screen`, `tmux`, and trailing `&`. File helpers return `0` on success, `-1` on failure; `exists`, `cwd`, `env`, `read` return their natural values.
+
+`os.pid(process)` returns the PID from a process handle, which makes `os.pid(os.bash(cmd))`
+explicit and composable.
 
 ---
 
