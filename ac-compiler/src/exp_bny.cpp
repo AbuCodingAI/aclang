@@ -799,6 +799,13 @@ static bool returnsCString(const std::string& irName) {
     return cstr.count(irName) > 0;
 }
 
+// ir.cpp's smart-division pass tags a print of a value that came from `/` with "smart": a whole
+// value shows as an integer (8/2.0 is 4), a fractional one as %.16g. Hard floats keep their ".0".
+static bool insHasAttr(const AC_IR::IRInstruction& ins, const char* a) {
+    for (const auto& s : ins.attrs) if (s == a) return true;
+    return false;
+}
+
 static bool isFloatReturningCall(const std::string& irName) {
     return acCallReturnsFloat(irName);   // single authority in type.hpp (see acCallReturnsFloat)
 }
@@ -1846,7 +1853,7 @@ private:
         } else if (isFloatRef(val)) {
             load(val, R::RDI);
             em.movq_xmm0_from_gpr(R::RDI);
-            em.call("ac_print_double");
+            em.call(insHasAttr(ins, "smart") ? "ac_print_double_smart" : "ac_print_double");
         } else {
             load(val, abi.argRegs[0]);
             em.call("__ac_print_int__");
@@ -2087,21 +2094,13 @@ private:
                 if (srcIsStr) {
                     load(ops[0], R::RAX);          // already a string — copy the pointer
                 } else if (isFloatRef(ops[0])) {
-                    // float→string: truncate to int, then itoa. NOT a bug — matches every
-                    // other typed backend's own to_string(float) (C/C++/V all truncate the
-                    // same way via an implicit double->int argument conversion into their
-                    // own int-only ac_to_str helpers; see CStrategy's ac_to_str(ac_int n)).
-                    // A real digit-formatting version (__ac_dtoa__, still defined below)
-                    // was tried here first, but it broke dec_to_bin.ac — its algorithm
-                    // builds a binary string by concatenating to_string(math.mod(n,2)) one
-                    // digit at a time, relying on "1"/"0", not "1.0"/"0.0" — and made BNY
-                    // diverge from C/C++/V's matching (if imperfect) convention. Keep the
-                    // three consistent rather than "fixing" this one in isolation.
-                    load(ops[0], R::RDI);          // float→string: truncate to int, then itoa
+                    // float→string. The smart-division pass (ir.cpp) tells a
+                    // whole `/` result (or math.mod) from a real float, so to_string formats
+                    // properly — a smart value shows as "4"/"1.5", a hard float as "4.0"/"1.5" —
+                    // which is what makes to_string(math.mod(n,2)) still give "1", not "1.0".
+                    load(ops[0], R::RDI);
                     em.movq_xmm0_from_gpr(R::RDI);
-                    em.cvttsd2si_rax_xmm0();
-                    em.mov_rr(R::RDI, R::RAX);
-                    em.call("__ac_itoa__");
+                    em.call(insHasAttr(ins, "smart") ? "ac_double_to_str_smart" : "ac_double_to_str");
                 } else {
                     load(ops[0], R::RDI);          // int→heap decimal string (#7)
                     em.call("__ac_itoa__");
@@ -2756,7 +2755,7 @@ private:
                 } else if (isFloatRef(v)) {
                     load(v, R::RDI);
                     em.movq_xmm0_from_gpr(R::RDI);
-                    em.call("ac_print_double");
+                    em.call(insHasAttr(ins, "smart") ? "ac_print_double_smart" : "ac_print_double");
                     if (usesSave_) { load(v, R::RDI); em.movq_xmm0_from_gpr(R::RDI); em.call("__ac_save_append_double__"); }
                 } else {
                     load(v, abi.argRegs[0]);
@@ -4676,7 +4675,23 @@ static void emitPrintCStrLinux(X64Emitter& em) {
 //            dedicated stack byte (not a register) so it survives every later phase without
 //            fighting r14/rbx for space — see #28's fix below for why this rewrite needed one.
 static void emitPrintDoubleLinux(X64Emitter& em) {
+    // Four entry points over one body. RDI is a mode flag the body only reads at the ".0" step and
+    // at the final output step (it is otherwise unused until the final write syscall):
+    //   bit 0 = smart-division display (a whole value shows as "4", not "4.0")
+    //   bit 1 = to-string mode: no newline, no write — copy the text into a fresh heap string and
+    //           return its pointer in RAX (backs to_string(<float>))
+    em.label("ac_print_double_smart");
+    em.mov_ri32(R::RDI, 1);
+    em.jmp("__acd_body__");
+    em.label("ac_double_to_str");
+    em.mov_ri32(R::RDI, 2);
+    em.jmp("__acd_body__");
+    em.label("ac_double_to_str_smart");
+    em.mov_ri32(R::RDI, 3);
+    em.jmp("__acd_body__");
     em.label("ac_print_double");
+    em.mov_ri32(R::RDI, 0);
+    em.label("__acd_body__");
     em.push_rbp(); em.mov_rbp_rsp();
     em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15); em.push_r(R::RBX);
     em.sub_rsp_i32(264);
@@ -4976,18 +4991,48 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
 
     // ── Whole-valued float (after rounding) → append ".0" ─────────────────────────────────
     em.label("__acd_dotzero__");
+    em.mov_rr(R::RAX, R::RDI); em.mov_ri32(R::RCX, 1); em.and_rr(R::RAX, R::RCX);
+    em.test_rr(R::RAX, R::RAX);
+    em.jne("__acd_nl__");                // smart display: a whole value is just its integer digits
     em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
     em.mov_ri32(R::RAX, '0'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
     // fall through to newline + write
 
     // ── Newline + write ────────────────────────────────────────────────────────────────────
     em.label("__acd_nl__");
+    em.mov_rr(R::RAX, R::RDI); em.mov_ri32(R::RCX, 2); em.and_rr(R::RAX, R::RCX);
+    em.test_rr(R::RAX, R::RAX);
+    em.jne("__acd_tostr__");             // to-string mode: hand back a heap string, write nothing
     em.mov_ri32(R::RAX, '\n'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
     em.lea_r_rbp32(R::RSI, -180);        // buf start
     em.sub_rr(R::R12, R::RSI);
     em.mov_rr(R::RDX, R::R12);
     em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RAX, 1); em.syscall();
+    em.jmp("__acd_epi__");
 
+    // to-string mode: r12 = end of the formatted text (no newline). Copy len bytes into a fresh
+    // NUL-terminated heap block via the shared bump allocator and return it in rax.
+    em.label("__acd_tostr__");
+    em.lea_r_rbp32(R::RSI, -180);
+    em.sub_rr(R::R12, R::RSI);           // r12 = len
+    em.mov_rr(R::RBX, R::R12);           // rbx = len (callee-saved across the call)
+    em.mov_rr(R::RDI, R::RBX); em.add_ri32(R::RDI, 1);
+    em.call("__ac_alloc__");             // rax = dest
+    em.mov_rr(R::R13, R::RAX);           // r13 = dest base (returned)
+    em.mov_rr(R::R14, R::RAX);           // r14 = dest cursor
+    em.lea_r_rbp32(R::RSI, -180);        // src (reloaded: the call clobbers rsi)
+    em.label("__acd_copy__");
+    em.test_rr(R::RBX, R::RBX);
+    em.je("__acd_copydone__");
+    em.movzx_r64_ptr8(R::RAX, R::RSI);
+    em.mov_ptr_r8(R::R14, R::RAX);
+    em.inc_r(R::RSI); em.inc_r(R::R14); em.dec_r(R::RBX);
+    em.jmp("__acd_copy__");
+    em.label("__acd_copydone__");
+    em.mov_ri32(R::RAX, 0); em.mov_ptr_r8(R::R14, R::RAX);   // NUL
+    em.mov_rr(R::RAX, R::R13);           // return the string pointer
+
+    em.label("__acd_epi__");
     em.add_rsp_i32(264);
     em.pop_r(R::RBX); em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12);
     em.pop_rbp(); em.ret();

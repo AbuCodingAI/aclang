@@ -2262,8 +2262,17 @@ class ArmCompiler {
                     break;
                 }
                 if (ins.resultType == IRType::STRING) {
-                    if (isFloatRef(ins.typedOperands[0]))
-                        throw ACError::backend("ARM backend: float-to-string casts are not yet implemented");
+                    if (isFloatRef(ins.typedOperands[0])) {
+                        // to_string(<float>): a smart value (whole `/` result, math.mod) shows as
+                        // "4"/"1.5", a hard float as "4.0"/"1.5" — same routine Term.display uses.
+                        bool smart = false;
+                        for (const auto& a : ins.attrs) if (a == "smart") smart = true;
+                        loadFloatOperand(ins.typedOperands[0], R::X0);
+                        emitBranch(FixKind::BL, smart ? FLOAT_TOSTR_SMART_LABEL : FLOAT_TOSTR_LABEL);
+                        storeResult(ins.result, R::X0);
+                        markStringRef(ins.result);
+                        break;
+                    }
                     if (ins.typedOperands[0].kind == IRRef::Kind::CONST
                             && ins.typedOperands[0].value.type == IRType::STRING) {
                         loadOperand(ins.typedOperands[0], R::X0);
@@ -2428,7 +2437,11 @@ class ArmCompiler {
                 }
                 if (isFloatRef(ins.typedOperands[0])) {
                     loadFloatOperand(ins.typedOperands[0], R::X0);
-                    emitBranch(FixKind::BL, PRINT_FLOAT_LABEL);
+                    // ir.cpp's smart-division pass tags a print of a value that came from `/`: a
+                    // whole value shows as an integer (8/2.0 is 4), a fractional one as %.16g.
+                    bool smart = false;
+                    for (const auto& a : ins.attrs) if (a == "smart") smart = true;
+                    emitBranch(FixKind::BL, smart ? PRINT_FLOAT_SMART_LABEL : PRINT_FLOAT_LABEL);
                     break;
                 }
                 loadOperand(ins.typedOperands[0], R::X0);
@@ -2536,6 +2549,13 @@ class ArmCompiler {
     static const int DICT_SET_DONE_LABEL = -1058;
     static const int DICT_SET_CAPERR_LABEL = -1060;
     static const int DIVZERO_LABEL = -1061;
+    static const int PRINT_FLOAT_SMART_LABEL = -1062;
+    static const int PRINT_FLOAT_BODY_LABEL = -1063;
+    static const int FLOAT_TOSTR_LABEL = -1064;
+    static const int FLOAT_TOSTR_SMART_LABEL = -1065;
+    static const int FLOAT_TOSTR_OUT_LABEL = -1066;
+    static const int FLOAT_TOSTR_COPY_LABEL = -1067;
+    static const int FLOAT_TOSTR_DONE_LABEL = -1068;
     // __ac_print_int__: X0 = value (signed). Writes decimal digits + '\n' via write(2), no
     // libc. Same divide-by-10-from-the-back algorithm as BNY's own emitPrintIntCore
     // (exp_bny.cpp), re-expressed in AArch64 registers/instructions — SDIV+MSUB gives
@@ -2682,7 +2702,23 @@ class ArmCompiler {
     static const int32_t PRINT_FLOAT_FRAME = 192;
 
     void emitPrintFloatRoutine() {
+        // Four entry points over one body. X2 is a mode flag the body only reads at the ".0" step
+        // and at the final output step (X2 is otherwise first written by the final write-syscall
+        // setup): bit 0 = smart-division display (a whole value shows as "4", not "4.0"); bit 1 =
+        // to-string mode: no newline, no write — copy the text into a fresh heap string and return
+        // its pointer in X0 (backs to_string(<float>)).
+        emitLabel(PRINT_FLOAT_SMART_LABEL);
+        em.mov_imm64(R::X2, 1);
+        emitBranch(FixKind::B, PRINT_FLOAT_BODY_LABEL);
+        emitLabel(FLOAT_TOSTR_LABEL);
+        em.mov_imm64(R::X2, 2);
+        emitBranch(FixKind::B, PRINT_FLOAT_BODY_LABEL);
+        emitLabel(FLOAT_TOSTR_SMART_LABEL);
+        em.mov_imm64(R::X2, 3);
+        emitBranch(FixKind::B, PRINT_FLOAT_BODY_LABEL);
         emitLabel(PRINT_FLOAT_LABEL);
+        em.mov_imm64(R::X2, 0);
+        emitLabel(PRINT_FLOAT_BODY_LABEL);
         em.stp_x29_x30_presp16();
         em.mov_x29_sp();
         em.sub_imm(R::SP, R::SP, PRINT_FLOAT_FRAME);
@@ -2995,6 +3031,10 @@ class ArmCompiler {
             }
             emitBranch(FixKind::B, afterFrac);
             emitLabel(dotZero);
+            em.mov_imm64(R::X16, 1);
+            em.and_reg(R::X15, R::X2, R::X16);
+            em.cmp_reg(R::X15, R::XZR);
+            emitBranch(FixKind::BCOND, afterFrac, Cond::NE);   // smart display: just the integer digits
             em.mov_imm64(R::X15, (int64_t)'.');
             em.strb0(R::X15, R::X9);
             em.add_imm(R::X9, R::X9, 1);
@@ -3003,6 +3043,11 @@ class ArmCompiler {
             em.add_imm(R::X9, R::X9, 1);
             emitLabel(afterFrac);
         }
+
+        // ---- to-string mode (X2 bit 1): hand back a heap copy of the text, write nothing ----
+        em.mov_imm64(R::X16, 2);
+        em.and_reg(R::X15, R::X2, R::X16);
+        emitBranch(FixKind::CBNZ, FLOAT_TOSTR_OUT_LABEL, Cond::EQ, R::X15);
 
         // ---- Newline + write(1, outBuf, X9-outBuf) ----
         em.mov_imm64(R::X15, (int64_t)'\n');
@@ -3014,6 +3059,33 @@ class ArmCompiler {
         em.mov_imm64(R::X8, 64);
         em.svc0();
 
+        em.add_imm(R::SP, R::SP, PRINT_FLOAT_FRAME);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+
+        // to-string exit: len = X9-X17; the alloc call clobbers X9-X17 (and X0-X5, X8), so park
+        // len in the frame (X17+184, past the buffers) and rebuild the base from SP afterwards.
+        emitLabel(FLOAT_TOSTR_OUT_LABEL);
+        em.sub_reg(R::X12, R::X9, R::X17);
+        em.str_imm(R::X12, R::X17, 184);
+        em.add_imm(R::X0, R::X12, 1);
+        emitBranch(FixKind::BL, ALLOC_LABEL);
+        em.mov_reg(R::X13, R::X0);              // dest base (returned)
+        em.mov_reg(R::X12, R::X0);              // dest cursor
+        em.mov_from_sp(R::X17);
+        em.ldr_imm(R::X15, R::X17, 184);        // len
+        emitLabel(FLOAT_TOSTR_COPY_LABEL);
+        emitBranch(FixKind::CBZ, FLOAT_TOSTR_DONE_LABEL, Cond::EQ, R::X15);
+        em.ldrb0(R::X16, R::X17);
+        em.strb0(R::X16, R::X12);
+        em.add_imm(R::X17, R::X17, 1);
+        em.add_imm(R::X12, R::X12, 1);
+        em.sub_imm(R::X15, R::X15, 1);
+        emitBranch(FixKind::B, FLOAT_TOSTR_COPY_LABEL);
+        emitLabel(FLOAT_TOSTR_DONE_LABEL);
+        em.mov_imm64(R::X15, 0);
+        em.strb0(R::X15, R::X12);               // NUL
+        em.mov_reg(R::X0, R::X13);
         em.add_imm(R::SP, R::SP, PRINT_FLOAT_FRAME);
         em.ldp_x29_x30_postsp16();
         em.ret();

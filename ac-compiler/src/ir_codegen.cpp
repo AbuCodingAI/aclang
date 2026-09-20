@@ -592,6 +592,19 @@ static std::string commonRef(const IRRef &r, SymbolTable *sym,
 
 // ─── interface ───────────────────────────────────────────────────────────────
 
+// True when ir.cpp's smart-division pass tagged this instruction (see SmartPass): the value it
+// prints/casts came from `/`, so a whole result must show as an integer, not with a forced ".0".
+static bool hasSmartAttr(const IRInstruction &ins)
+{
+    for (const auto &a : ins.attrs) if (a == "smart") return true;
+    return false;
+}
+static bool hasHardAttr(const IRInstruction &ins)
+{
+    for (const auto &a : ins.attrs) if (a == "hard") return true;
+    return false;
+}
+
 class BackendStrategy
 {
 public:
@@ -733,6 +746,16 @@ public:
     virtual void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                           const std::string &func, const std::string &args) = 0;
     virtual void emitReturn(std::ostringstream &out, int &indent, const std::string &val) = 0;
+    // Set by the driver around each emitPrint/emitCapture when the printed ref is a SMART float
+    // (a value that came from `/`, see ir.cpp's smart-division pass): a whole value shows as an
+    // integer (8/2.0 is 4), a fractional one as %.16g. Hard floats (`///`, float literals) keep
+    // their forced ".0", so this is a separate path from isFloatVal, not a replacement for it.
+    bool smartPrint_ = false;
+    // Set for a HARD float (float literal, `///`, float arithmetic): always shown with ".0" when
+    // whole. Only JS/HTML/Go consult it — the others already type-track floats themselves.
+    bool hardPrint_ = false;
+    void setSmartPrint(bool b) { smartPrint_ = b; }
+    void setHardPrint(bool b) { hardPrint_ = b; }
     virtual void emitPrint(std::ostringstream &out, int &indent, const std::string &val) = 0;
     // Printing a bare `null`/`nil` literal: every text-substitution backend (commonRef's
     // nullVal/nilVal) already turns these into real readable text ("null"/"None"/etc) by the time
@@ -1351,6 +1374,15 @@ class PythonStrategy : public BackendStrategy
         emitRaw(out, "    return s");
         emitRaw(out, "def _ac_dblprint(d):");
         emitRaw(out, "    print(_ac_fmtg(d))");
+        // Smart-division display (see BackendStrategy::smartPrint_): a whole value shows as an
+        // integer (8/2.0 -> 4), a fractional one as %.16g. Exact for any |d| < 2**63.
+        emitRaw(out, "def _ac_smartfmt(d):");
+        emitRaw(out, "    if isinstance(d, float):");
+        emitRaw(out, "        if -9.2e18 < d < 9.2e18 and d == int(d): return str(int(d))");
+        emitRaw(out, "        return _ac_fmtg(d)");
+        emitRaw(out, "    return str(d)");
+        emitRaw(out, "def _ac_smartprint(d):");
+        emitRaw(out, "    print(_ac_smartfmt(d))");
         if (needsSave_) emitRaw(out, "_ac_saved = []  # `save as`: accumulates everything printed so far");
         if (anyAtomicVars()) {
             emitRaw(out, "import threading");
@@ -1486,7 +1518,10 @@ class PythonStrategy : public BackendStrategy
         else if (t == IRType::INT || t == IRType::SHORT || t == IRType::MINI)
                                       emit(out, indent, var + " = int(" + src + ")");
         else if (t == IRType::ATOMIC) emit(out, indent, "with _ac_atomic_lock: " + var + " = int(" + src + ")");
-        else if (t == IRType::STRING) emit(out, indent, var + " = str(" + src + ")");
+        else if (t == IRType::STRING)
+            emit(out, indent, var + " = " + (smartPrint_ ? "_ac_smartfmt(" + src + ")"
+                                             : hardPrint_ ? "_ac_fmtg(" + src + ")"
+                                             : "str(" + src + ")"));
         else if (t == IRType::BOOL)   emit(out, indent, var + " = bool(" + src + ")");
     }
     void emitStoreVar(std::ostringstream &out, int &indent, const std::string &var, const std::string &val) override
@@ -1582,7 +1617,8 @@ class PythonStrategy : public BackendStrategy
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        if (isFloatVal(val)) emit(out, indent, "_ac_dblprint(" + val + ")");
+        if (smartPrint_) emit(out, indent, "_ac_smartprint(" + val + ")");
+        else if (isFloatVal(val)) emit(out, indent, "_ac_dblprint(" + val + ")");
         else emit(out, indent, "print(" + val + ")");
     }
     // `sure $msg$` (browser confirm()) has no Python UI to ask through — the base
@@ -2088,6 +2124,14 @@ private:
         emitRaw(out, "    if (!/[.eEnN]/.test(s)) s += '.0';");
         emitRaw(out, "    console.log(s);");
         emitRaw(out, "}");
+        // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits
+        // (BigInt keeps them exact past 2**53, matching Python's int()), else %.16g.
+        emitRaw(out, "function ac_smartfmt(x) {");
+        emitRaw(out, "    if (Number.isInteger(x) && Math.abs(x) < 9.2e18) return BigInt(x).toString();");
+        emitRaw(out, "    return ac_fmtg(x);");
+        emitRaw(out, "}");
+        emitRaw(out, "function _acps(x) { console.log(ac_smartfmt(x)); }");
+        emitRaw(out, "function ac_hardfmt(x) { let s = ac_fmtg(x); if (!/[.eEnN]/.test(s)) s += '.0'; return s; }");
         // `//` truncating integer division
         if (hasIdivOp_) {
             emitRaw(out, "function ac_idiv(a, b) {");
@@ -2287,7 +2331,8 @@ private:
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        if (floatVars_.count(val)) emit(out, indent, "_acpf(" + val + ");");
+        if (smartPrint_) emit(out, indent, "_acps(" + val + ");");
+        else if (hardPrint_ || floatVars_.count(val)) emit(out, indent, "_acpf(" + val + ");");
         else emit(out, indent, "_acp(" + val + ");");   // array-aware (Node column-wraps long arrays)
     }
     void emitHalt(std::ostringstream &out, int &indent) override
@@ -2583,7 +2628,9 @@ private:
         // JS backend exposes at all, so there's nothing to protect against beyond what's already true.
         else if (t == IRType::INT || t == IRType::SHORT || t == IRType::MINI || t == IRType::ATOMIC)
                                       expr = "Math.trunc(Number(" + src + "))";
-        else if (t == IRType::STRING) expr = "String(" + src + ")";
+        else if (t == IRType::STRING) expr = smartPrint_ ? "ac_smartfmt(" + src + ")"
+                                             : hardPrint_ ? "ac_hardfmt(" + src + ")"
+                                             : "String(" + src + ")";
         else if (t == IRType::BOOL)   expr = "Boolean(" + src + ") ? 1 : 0";
         else return;
         emit(out, indent, decl(var, expr));
@@ -2713,6 +2760,12 @@ class HTMLStrategy : public JavaScriptStrategy
         emitRaw(out, "    if (!/[.eEnN]/.test(s)) s += '.0';");
         emitRaw(out, "    _el.appendChild(document.createTextNode(s + '\\n'));");
         emitRaw(out, "}");
+        emitRaw(out, "function ac_smartfmt(x) {");
+        emitRaw(out, "    if (Number.isInteger(x) && Math.abs(x) < 9.2e18) return BigInt(x).toString();");
+        emitRaw(out, "    return ac_fmtg(x);");
+        emitRaw(out, "}");
+        emitRaw(out, "function _prints(v) { _el.appendChild(document.createTextNode(ac_smartfmt(v) + '\\n')); }");
+        emitRaw(out, "function ac_hardfmt(x) { let s = ac_fmtg(x); if (!/[.eEnN]/.test(s)) s += '.0'; return s; }");
         emitRaw(out, "function _printHTML(h) { const d = document.createElement('div'); d.innerHTML = h; _el.appendChild(d); }");
         // HTML-escape any value before it goes into innerHTML/attributes — a displayed value
         // containing <script>…</script> or `\"` used to inject markup/JS into the page (XSS).
@@ -2926,7 +2979,8 @@ class HTMLStrategy : public JavaScriptStrategy
     // emitCall/emitReturn/arrays/strings all inherited from JavaScriptStrategy now.
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        if (floatVars_.count(val)) emit(out, indent, "_printf(" + val + ");");
+        if (smartPrint_) emit(out, indent, "_prints(" + val + ");");
+        else if (hardPrint_ || floatVars_.count(val)) emit(out, indent, "_printf(" + val + ");");
         else emit(out, indent, "_print(" + val + ");");  // render into the page, not the console
     }
     void emitStyledPrint(std::ostringstream &out, int &indent,
@@ -3213,7 +3267,9 @@ class HTMLStrategy : public JavaScriptStrategy
         // JS backend exposes at all, so there's nothing to protect against beyond what's already true.
         else if (t == IRType::INT || t == IRType::SHORT || t == IRType::MINI || t == IRType::ATOMIC)
                                       expr = "Math.trunc(Number(" + src + "))";
-        else if (t == IRType::STRING) expr = "String(" + src + ")";
+        else if (t == IRType::STRING) expr = smartPrint_ ? "ac_smartfmt(" + src + ")"
+                                             : hardPrint_ ? "ac_hardfmt(" + src + ")"
+                                             : "String(" + src + ")";
         else if (t == IRType::BOOL)   expr = "Boolean(" + src + ") ? 1 : 0";
         else return;
         emit(out, indent, decl(var, expr));
@@ -3609,6 +3665,20 @@ private:
         emitRaw(out, "    snprintf(r, 24, \"%lld\", (long long)n);");
         emitRaw(out, "    return r;");
         emitRaw(out, "}");
+        // to_string of a float (see BackendStrategy::smartPrint_): smart = a whole value is its
+        // integer digits, else %.16g; hard = %.16g with a forced ".0" when whole.
+        emitRaw(out, "static const char* ac_smart_to_str(double d) {");
+        emitRaw(out, "    if (d > -9.2e18 && d < 9.2e18 && d == (double)(long long)d) return ac_to_str((ac_int)(long long)d);");
+        emitRaw(out, "    char* r = (char*)malloc(40);");
+        emitRaw(out, "    snprintf(r, 40, \"%.16g\", d);");
+        emitRaw(out, "    return r;");
+        emitRaw(out, "}");
+        emitRaw(out, "static const char* ac_hard_to_str(double d) {");
+        emitRaw(out, "    char* r = (char*)malloc(48);");
+        emitRaw(out, "    snprintf(r, 40, \"%.16g\", d);");
+        emitRaw(out, "    if (!strpbrk(r, \".eEnN\")) strcat(r, \".0\");");
+        emitRaw(out, "    return r;");
+        emitRaw(out, "}");
         // `%.16g` alone drops the trailing decimal point on a whole-number double (9.0 -> "9"),
         // silently making a float print indistinguishable from an int — wrong for any
         // expression-form decimal cast that happens to land on a whole number (`to_dec(9)`).
@@ -3621,6 +3691,12 @@ private:
         emitRaw(out, "        snprintf(buf + l, sizeof(buf) - l, \".0\");");
         emitRaw(out, "    }");
         emitRaw(out, "    printf(\"%s\\n\", buf);");
+        emitRaw(out, "}");
+        // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits
+        // (exact for |d| < 2**63, same digits Python's int() gives), else the %.16g float form.
+        emitRaw(out, "static void _ac_smartprint(double d) {");
+        emitRaw(out, "    if (d > -9.2e18 && d < 9.2e18 && d == (double)(long long)d) printf(\"%lld\\n\", (long long)d);");
+        emitRaw(out, "    else _ac_dblprint(d);");
         emitRaw(out, "}");
         if (needsSave_) {
             // `save as <file>` — fixed 1MB accumulator (native backends can afford far more
@@ -4532,6 +4608,8 @@ private:
         // %s/%lld, a hard compile error).
         if (boxedVars_.count(val))
             emit(out, indent, "ac_dyn_print(" + val + ");");
+        else if (smartPrint_)
+            emit(out, indent, "_ac_smartprint((double)(" + val + "));");
         else if (looksString(val) || strVars.count(val) || isStringVar(val))
             emit(out, indent, "printf(\"%s\\n\", " + val + ");");
         else if (listVars.count(val) || listParams_.count(val))
@@ -5259,7 +5337,10 @@ private:
             // was actually a real bug (int-to-pointer). Every OTHER numeric-coercion branch in
             // this function already casts; this one just never did. Reuses the exact
             // "already-a-string?" heuristic decl()/emitTypedStoreVar use elsewhere in this class.
-            std::string rhs = srcIsStringLiteral ? src : "ac_to_str(" + src + ")";
+            std::string rhs = srcIsStringLiteral ? src
+                            : smartPrint_ ? "ac_smart_to_str((double)(" + src + "))"
+                            : hardPrint_  ? "ac_hard_to_str((double)(" + src + "))"
+                            : "ac_to_str(" + src + ")";
             emit(out, indent, (isNew ? "ac_str " : "") + var + " = " + rhs + ";");
             if (isNew) strVars.insert(var);
         } else if (isNarrowInt(t)) {
@@ -5680,6 +5761,17 @@ protected:
         emitRaw(out, "    std::snprintf(b, sizeof(b), \"%.17g\", x);");
         emitRaw(out, "    return b;");
         emitRaw(out, "}");
+        // to_string of a float (see BackendStrategy::smartPrint_): smart = whole -> integer digits
+        // else %.16g; hard = %.16g with a forced ".0" when whole.
+        emitRaw(out, "static std::string ac_smart_str(double d) {");
+        emitRaw(out, "    if (d > -9.2e18 && d < 9.2e18 && d == (double)(long long)d) return std::to_string((long long)d);");
+        emitRaw(out, "    char b[40]; std::snprintf(b, sizeof(b), \"%.16g\", d); return b;");
+        emitRaw(out, "}");
+        emitRaw(out, "static std::string ac_hard_str(double d) {");
+        emitRaw(out, "    char b[48]; std::snprintf(b, 40, \"%.16g\", d);");
+        emitRaw(out, "    if (!std::strpbrk(b, \".eEnN\")) std::strcat(b, \".0\");");
+        emitRaw(out, "    return b;");
+        emitRaw(out, "}");
         emitRaw(out, "#endif");
         // `%.16g` alone drops the trailing decimal point on a whole-number double (9.0 -> "9"),
         // silently making a float print indistinguishable from an int — matches the identical
@@ -5692,6 +5784,12 @@ protected:
         emitRaw(out, "        std::snprintf(buf + l, sizeof(buf) - l, \".0\");");
         emitRaw(out, "    }");
         emitRaw(out, "    printf(\"%s\\n\", buf);");
+        emitRaw(out, "}");
+        // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits
+        // (exact for |d| < 2**63, same digits Python's int() gives), else the %.16g float form.
+        emitRaw(out, "static void _ac_smartprint(double d) {");
+        emitRaw(out, "    if (d > -9.2e18 && d < 9.2e18 && d == (double)(long long)d) printf(\"%lld\\n\", (long long)d);");
+        emitRaw(out, "    else _ac_dblprint(d);");
         emitRaw(out, "}");
         if (needsSave_) {
             emitRaw(out, "#include <sstream>");
@@ -6210,6 +6308,8 @@ protected:
         // cast that doesn't compile against a struct.
         else if (boxedVars_.count(val))
             emit(out, indent, "std::cout << " + val + " << \"\\n\";");
+        else if (smartPrint_)
+            emit(out, indent, "_ac_smartprint((double)(" + val + "));");
         else if (isFloatVal(val))
             emit(out, indent, "_ac_dblprint((double)(" + val + "));");
         else
@@ -6846,7 +6946,10 @@ protected:
         if (t == IRType::STRING) {
             // ac_cat resolves by the src's real C++ type — a double the detector missed (e.g. a
             // math.mod result temp) formats as "1" via ac_fstr, not "1.000000" from to_string(double).
-            std::string rhs = srcIsStr ? src : ("ac_cat(" + src + ")");
+            std::string rhs = srcIsStr ? src
+                            : smartPrint_ ? "ac_smart_str((double)(" + src + "))"
+                            : hardPrint_  ? "ac_hard_str((double)(" + src + "))"
+                            : ("ac_cat(" + src + ")");
             emit(out, indent, (isNew ? "std::string " : "") + var + " = " + rhs + ";");
         } else if (t == IRType::FLOAT || floatVars.count(var)) {
             // `floatVars.insert(var)` must NOT be gated behind `isNew` — a var already
@@ -6973,6 +7076,12 @@ public:
         emitRaw(out, "    }");
         emitRaw(out, "    printf(\"%s\\n\", buf);");
         emitRaw(out, "}");
+        // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits
+        // (exact for |d| < 2**63, same digits Python's int() gives), else the %.16g float form.
+        emitRaw(out, "static void _ac_smartprint(double d) {");
+        emitRaw(out, "    if (d > -9.2e18 && d < 9.2e18 && d == (double)(long long)d) printf(\"%lld\\n\", (long long)d);");
+        emitRaw(out, "    else _ac_dblprint(d);");
+        emitRaw(out, "}");
         // `ac_print_list`: LibStrategy inherits CppStrategy's emitPrint (calls `ac_print_list`
         // for a list value) but never defined it in its own separate header at all —
         // "ac_print_list was not declared in this scope" on any program printing a list on
@@ -6999,6 +7108,17 @@ public:
         emitRaw(out, "    if ((double)xi == x) return std::to_string(xi);");
         emitRaw(out, "    char b[32];");
         emitRaw(out, "    std::snprintf(b, sizeof(b), \"%.17g\", x);");
+        emitRaw(out, "    return b;");
+        emitRaw(out, "}");
+        // to_string of a float (see BackendStrategy::smartPrint_): smart = whole -> integer digits
+        // else %.16g; hard = %.16g with a forced ".0" when whole.
+        emitRaw(out, "static std::string ac_smart_str(double d) {");
+        emitRaw(out, "    if (d > -9.2e18 && d < 9.2e18 && d == (double)(long long)d) return std::to_string((long long)d);");
+        emitRaw(out, "    char b[40]; std::snprintf(b, sizeof(b), \"%.16g\", d); return b;");
+        emitRaw(out, "}");
+        emitRaw(out, "static std::string ac_hard_str(double d) {");
+        emitRaw(out, "    char b[48]; std::snprintf(b, 40, \"%.16g\", d);");
+        emitRaw(out, "    if (!std::strpbrk(b, \".eEnN\")) std::strcat(b, \".0\");");
         emitRaw(out, "    return b;");
         emitRaw(out, "}");
         emitRaw(out, "#endif");
@@ -7754,6 +7874,11 @@ class JavaStrategy : public BackendStrategy
         emitRaw(out, "        String s = (neg ? \"-\" : \"\") + result;");
         emitRaw(out, "        if (s.indexOf('.') < 0 && s.indexOf('e') < 0) s += \".0\";");
         emitRaw(out, "        return s;");
+        emitRaw(out, "    }");
+        // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits.
+        emitRaw(out, "    static String smart(double d) {");
+        emitRaw(out, "        if (d > -9.2e18 && d < 9.2e18 && d == (double)(long)d) return Long.toString((long)d);");
+        emitRaw(out, "        return fmt(d);");
         emitRaw(out, "    }");
         emitRaw(out, "}");
         emitRaw(out, "class AcGenResult { long value; boolean done; AcGenResult(long v, boolean d) { value = v; done = d; } }");
@@ -8683,6 +8808,7 @@ class JavaStrategy : public BackendStrategy
         // to pick). Cast disambiguates to the String overload, which prints "null" as text —
         // matches every other backend's null/nil text representation.
         if (val == "null") emit(out, indent, "System.out.println((String) null);");
+        else if (smartPrint_) emit(out, indent, "System.out.println(_AcFmtG.smart(" + val + "));");
         else if (isFloatVal(val)) emit(out, indent, "System.out.println(_AcFmtG.fmt(" + val + "));");
         else emit(out, indent, "System.out.println(" + val + ");");
     }
@@ -9272,6 +9398,8 @@ class JavaStrategy : public BackendStrategy
         }
         if (t == IRType::STRING) {
             std::string rhs = srcIsStr ? src
+                : smartPrint_ ? "_AcFmtG.smart(" + src + ")"
+                : hardPrint_  ? "_AcFmtG.fmt(" + src + ")"
                 : floatVars.count(src)
                     ? "((" + src + ") == (long)(" + src + ") ? String.valueOf((long)(" + src + ")) : String.valueOf(" + src + "))"
                     : "String.valueOf(" + src + ")";
@@ -9520,6 +9648,9 @@ class RustStrategy : public BackendStrategy
         emitRaw(out, "    if neg { format!(\"-{}\", result) } else { result }");
         emitRaw(out, "}");
         emitRaw(out, "fn ac_fmt_double(d: f64) -> String { let s = ac_fmtg(d); if !s.contains(|c| \".eEnN\".contains(c)) { format!(\"{}.0\", s) } else { s } }");
+        // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits.
+        emitRaw(out, "#[allow(dead_code)]");
+        emitRaw(out, "fn ac_smart_double(d: f64) -> String { if d > -9.2e18 && d < 9.2e18 && d == (d as i64) as f64 { format!(\"{}\", d as i64) } else { ac_fmtg(d) } }");
         // AcDynVal: a genuine tagged runtime value for the small set of variables (setBoxedVars)
         // that Abu's retype spec requires to hold different types at different points in their
         // own scope — one fixed Rust declared type per var name can't do that. Uses associated
@@ -10600,6 +10731,8 @@ class RustStrategy : public BackendStrategy
         // for the full rationale) — Rust's own `{}`/`{:?}` both do shortest-round-trip
         // formatting (`{:?}` just also guarantees a decimal point), not the %.16g convention
         // every other backend now uses.
+        else if (smartPrint_)
+            emit(out, indent, "println!(\"{}\", ac_smart_double((" + val + ") as f64));");
         else if (isFloatVal(val))
             emit(out, indent, "println!(\"{}\", ac_fmt_double(" + val + "));");
         else emit(out, indent, "println!(\"{}\", " + val + ");");
@@ -11274,7 +11407,10 @@ class RustStrategy : public BackendStrategy
             std::string rhs = srcIsStr ? (src + ".parse::<f64>().unwrap_or(0.0)") : (src + " as f64");
             emit(out, indent, (isNew ? "let mut " + var + ": f64 = " : var + " = ") + rhs + ";");
         } else if (t == IRType::STRING) {
-            emit(out, indent, (isNew ? "let mut " + var + ": String = " : var + " = ") + src + ".to_string();");
+            emit(out, indent, (isNew ? "let mut " + var + ": String = " : var + " = ")
+                 + (smartPrint_ ? "ac_smart_double((" + src + ") as f64);"
+                    : hardPrint_ ? "ac_fmt_double((" + src + ") as f64);"
+                    : src + ".to_string();"));
         } else if (irIntWidth(t)) {
             std::string ty = acIntTypeRs(irIntWidth(t));   // i32 / i16 from the type include
             std::string rhs = srcIsStr ? (src + ".parse::<" + ty + ">().unwrap_or(0)") : (src + " as " + ty);
@@ -11906,6 +12042,8 @@ private:
         emitRaw(out, "    return result");
         emitRaw(out, "}");
         emitRaw(out, "func ac_fmt_double(d float64) string { s := ac_fmtg(d); if !strings.ContainsAny(s, \".eEnN\") { s += \".0\" }; return s }");
+        // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits.
+        emitRaw(out, "func ac_smart_double(d float64) string { if d > -9.2e18 && d < 9.2e18 && d == float64(int64(d)) { return fmt.Sprintf(\"%d\", int64(d)) }; return ac_fmtg(d) }");
         emitRaw(out, "func _ac_dblprint(d float64) { fmt.Println(ac_fmt_double(d)) }");
         if (needsSave_) {
             emitRaw(out, "var _acSaved strings.Builder  // `save as`: accumulates everything printed so far");
@@ -12479,7 +12617,8 @@ private:
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        if (floatVars.count(val)) emit(out, indent, "_ac_dblprint(" + val + ")");
+        if (smartPrint_) emit(out, indent, "fmt.Println(ac_smart_double(float64(" + val + ")))");
+        else if (hardPrint_ || floatVars.count(val)) emit(out, indent, "_ac_dblprint(float64(" + val + "))");
         else emit(out, indent, "fmt.Println(" + val + ")");
     }
     // Same gap+fix as CStrategy's own emitConfirm (see its comment) — base default never
@@ -13097,8 +13236,15 @@ private:
             if (declared.insert(var).second) emit(out, indent, "var " + var + " float64 = " + fltSrc);
             else emit(out, indent, var + " = " + fltSrc);
         }
-        else if (stringVars.count(var)) {
-            std::string rhs = srcIsStr ? src : "fmt.Sprintf(\"%v\", " + src + ")";
+        else if (t == IRType::STRING || stringVars.count(var)) {
+            // The cast's own target type is authoritative: keying this on stringVars alone let a
+            // `to_string(x / 2)` temp the string detector missed fall through to the int64 branch
+            // below and silently truncate (1.5 became "1").
+            stringVars.insert(var);
+            std::string rhs = srcIsStr ? src
+                            : smartPrint_ ? "ac_smart_double(float64(" + src + "))"
+                            : hardPrint_  ? "ac_fmt_double(float64(" + src + "))"
+                            : "fmt.Sprintf(\"%v\", " + src + ")";
             if (declared.insert(var).second) emit(out, indent, "var " + var + " string = " + rhs);
             else emit(out, indent, var + " = " + rhs);
         }
@@ -13420,6 +13566,11 @@ class VStrategy : public BackendStrategy
         emitRaw(out, "    mut has_marker := false");
         emitRaw(out, "    for ch in s { if ch == `.` || ch == `e` || ch == `E` || ch == `n` || ch == `N` { has_marker = true; break } }");
         emitRaw(out, "    return if has_marker { s } else { s + '.0' }");
+        emitRaw(out, "}");
+        // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits.
+        emitRaw(out, "fn ac_smart_double(d f64) string {");
+        emitRaw(out, "    if d > -9.2e18 && d < 9.2e18 && d == f64(i64(d)) { return i64(d).str() }");
+        emitRaw(out, "    return ac_fmtg(d)");
         emitRaw(out, "}");
         if (anyAtomicVars()) {
             emitRaw(out, "__global ( ac_atomic_lock = sync.new_mutex() )  // `atomic` vars: any op touching one is a global critical section");
@@ -14130,7 +14281,8 @@ class VStrategy : public BackendStrategy
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
         lastWasReturn = false;
-        if (floatVars.count(val)) emit(out, indent, "println(ac_fmtg(" + val + "))");
+        if (smartPrint_) emit(out, indent, "println(ac_smart_double(f64(" + val + ")))");
+        else if (floatVars.count(val)) emit(out, indent, "println(ac_fmtg(" + val + "))");
         else emit(out, indent, "println(" + val + ")");
     }
     // Same gap+fix as CStrategy's own emitConfirm (see its comment) — base default never
@@ -14787,7 +14939,9 @@ class VStrategy : public BackendStrategy
         // fixed width through arithmetic — short/mini are advisory i64 on V (as on Python/JS/BNY).
         else if (t == IRType::INT || irIntWidth(t))
                                       expr = srcIsStr ? (src + ".i64()") : ("i64(" + src + ")");
-        else if (t == IRType::STRING) expr = src + ".str()";
+        else if (t == IRType::STRING) expr = smartPrint_ ? "ac_smart_double(f64(" + src + "))"
+                                             : hardPrint_ ? "ac_fmtg(f64(" + src + "))"
+                                             : src + ".str()";
         else if (t == IRType::BOOL)   expr = "if " + src + " != 0 { i64(1) } else { i64(0) }";
         else if (t == IRType::ATOMIC) {
             expr = srcIsStr ? (src + ".i64()") : ("i64(" + src + ")");
@@ -16307,11 +16461,32 @@ class AsmStrategy : public BackendStrategy
         // For the int case, capture the value in r12 (callee-saved) BEFORE malloc — malloc clobbers
         // rax. For the float case, load xmm0 AFTER malloc instead of before it — XMM registers
         // aren't callee-saved across a call either, so loading early would just get clobbered.
+        std::string doneL, fltL;
+        if (srcIsFloat && smartPrint_) {
+            // Smart-division to_string (see BackendStrategy::smartPrint_): a whole value formats
+            // as its integer digits ("4"), a fractional one as %.16g. cvttsd2si -> cvtsi2sd round
+            // trip: out-of-range and NaN both fail the equality and take the float path.
+            int idx = fltPrintIdx_++;
+            fltL = "_smartstr_flt" + std::to_string(idx);
+            doneL = "_smartstr_done" + std::to_string(idx);
+            loadXMM0(out, src);
+            out << "    cvttsd2si rax, xmm0\n    cvtsi2sd xmm1, rax\n    ucomisd xmm0, xmm1\n";
+            out << "    jne " << fltL << "\n    jp " << fltL << "\n";
+            out << "    mov r12, rax\n";
+            out << "    mov rdi, 32\n    call malloc\n";
+            calledFuncs_.insert("malloc");
+            out << "    mov rbx, rax\n    mov rdi, rbx\n    mov rsi, 32\n";
+            out << "    lea rdx, [rel _fmt_dbare]\n    mov rcx, r12\n    xor eax, eax\n";
+            out << "    call snprintf\n";
+            calledFuncs_.insert("snprintf");
+            out << "    mov rax, rbx\n    jmp " << doneL << "\n";
+            out << fltL << ":\n";
+        }
         if (!srcIsFloat) { loadRAX(out, src); out << "    mov r12, rax\n"; }
-        out << "    mov rdi, 24\n    call malloc\n";
+        out << "    mov rdi, 32\n    call malloc\n";
         calledFuncs_.insert("malloc");
         out << "    mov rbx, rax\n";   // buffer ptr, callee-saved across the snprintf call below
-        out << "    mov rdi, rbx\n    mov rsi, 24\n";
+        out << "    mov rdi, rbx\n    mov rsi, 32\n";
         if (srcIsFloat) {
             out << "    lea rdx, [rel _fmt_fbare]\n";
             loadXMM0(out, src);
@@ -16321,7 +16496,21 @@ class AsmStrategy : public BackendStrategy
         }
         out << "    call snprintf\n";
         calledFuncs_.insert("snprintf");
+        if (srcIsFloat && hardPrint_ && !smartPrint_) {
+            // A hard float (`///`, float literal/arithmetic) always shows a decimal point: "4.0".
+            int idx = fltPrintIdx_++;
+            std::string haveDot = "_hardstr_havedot" + std::to_string(idx);
+            out << "    mov r12, rax\n";   // chars written (excludes the NUL)
+            out << "    mov rdi, rbx\n    lea rsi, [rel _fmt_dotcheck]\n    call strpbrk\n";
+            calledFuncs_.insert("strpbrk");
+            out << "    test rax, rax\n    jnz " << haveDot << "\n";
+            out << "    mov byte [rbx + r12], '.'\n";
+            out << "    mov byte [rbx + r12 + 1], '0'\n";
+            out << "    mov byte [rbx + r12 + 2], 0\n";
+            out << haveDot << ":\n";
+        }
         out << "    mov rax, rbx\n";
+        if (!doneL.empty()) out << doneL << ":\n";
     }
     // String `+` concat: malloc(strlen(a)+strlen(b)+1) + strcpy + strcat, mirrors CStrategy's
     // ac_concat. ASM's `+` previously did a plain integer `add rax, rbx` UNCONDITIONALLY — for
@@ -17068,6 +17257,37 @@ class AsmStrategy : public BackendStrategy
             }
             out << "    lea rdi, [rel _fmt_s]\n";
         }
+        else if (smartPrint_ && isFloatVal(val))
+        {
+            // Smart-division display (see BackendStrategy::smartPrint_): a whole double prints as
+            // its integer digits (8/2.0 -> 4). cvttsd2si -> cvtsi2sd round trip: an out-of-range
+            // value comes back as INT64_MIN's double and a NaN is unordered, so both fail the
+            // equality and take the %.16g float path below without a separate range check.
+            int idx = fltPrintIdx_++;
+            std::string fltL = "_smart_flt" + std::to_string(idx);
+            std::string doneL = "_smart_done" + std::to_string(idx);
+            loadXMM0(out, val);
+            out << "    cvttsd2si rax, xmm0\n";
+            out << "    cvtsi2sd xmm1, rax\n";
+            out << "    ucomisd xmm0, xmm1\n";
+            out << "    jne " << fltL << "\n    jp " << fltL << "\n";
+            out << "    mov rsi, rax\n    lea rdi, [rel _fmt_d]\n";
+            out << "    xor eax, eax\n    call printf\n";
+            out << "    jmp " << doneL << "\n";
+            out << fltL << ":\n";
+            std::string haveDot = "_flt_havedot" + std::to_string(fltPrintIdx_++);
+            out << "    mov rdi, 32\n    call malloc\n";
+            calledFuncs_.insert("malloc");
+            out << "    mov rbx, rax\n";
+            out << "    mov rdi, rbx\n    mov rsi, 32\n    lea rdx, [rel _fmt_fbare]\n";
+            loadXMM0(out, val);
+            out << "    mov al, 1\n    call snprintf\n";
+            calledFuncs_.insert("snprintf");
+            out << "    mov rsi, rbx\n    lea rdi, [rel _fmt_s]\n";
+            out << "    xor eax, eax\n    call printf\n";
+            out << doneL << ":\n";
+            return;
+        }
         else if (isFloatVal(val))
         {
             // Plain `%g` via printf drops the trailing decimal point on a whole-number double
@@ -17749,6 +17969,12 @@ static std::set<std::string> detectFloatVars(const std::vector<AC_IR::IRInstruct
                     else if (ins.result.isValid() && ins.resultType != IRType::VOID
                              && ins.resultType != IRType::ATOMIC && ins.resultType != IRType::INT
                              && irIntWidth(ins.resultType) == 0
+                             // A cast TO string/bool never yields a float no matter what its source
+                             // is. Verified real bug: `to_string(x / 2)` (float source) marked its
+                             // own string result float, so the following concat and print were
+                             // routed through float code — PY crashed (`'%.16g' % "whole: 4"`),
+                             // C/C++/Java/Rust/V failed to compile (a string passed as a double).
+                             && ins.resultType != IRType::STRING && ins.resultType != IRType::BOOL
                              && !ins.typedOperands.empty() && isF(ins.typedOperands[0]))
                         mark(ins.result);
                     break;
@@ -18850,8 +19076,12 @@ class UnifiedIRCodeGen
                     }
                 }
                 if (!handled) {
+                    strategy->setSmartPrint(hasSmartAttr(i));
+                    strategy->setHardPrint(hasHardAttr(i));
                     strategy->emitPrint(out, indentLevel, ref(pop));
                     strategy->emitCapture(out, indentLevel, ref(pop));
+                    strategy->setSmartPrint(false);
+                    strategy->setHardPrint(false);
                 }
             }
             break;
@@ -18892,7 +19122,11 @@ class UnifiedIRCodeGen
             if ((methodRaw == "Term.display" || methodRaw == "\"Term.display\"") &&
                 i.typedOperands.size() > 1)
             {
+                strategy->setSmartPrint(hasSmartAttr(i));
+                strategy->setHardPrint(hasHardAttr(i));
                 strategy->emitPrint(out, indentLevel, ref(i.typedOperands[1]));
+                strategy->setSmartPrint(false);
+                strategy->setHardPrint(false);
             }
             else if (methodRaw.rfind("Term.", 0) == 0 && methodRaw.size() > 5 &&
                      i.typedOperands.size() >= 1)
@@ -19112,7 +19346,13 @@ class UnifiedIRCodeGen
         case IROpcode::TYPE_CAST: {
             std::string varName = ref(i.result);
             std::string srcVal = i.typedOperands.empty() ? varName : ref(i.typedOperands[0]);
+            // A cast TO STRING of a smart/hard float formats it the same way Term.display would
+            // (whole `/` result -> "4", `///`/literal float -> "4.0"); see BackendStrategy::smartPrint_.
+            strategy->setSmartPrint(hasSmartAttr(i));
+            strategy->setHardPrint(hasHardAttr(i));
             strategy->emitTypeCast(out, indentLevel, varName, srcVal, i.resultType);
+            strategy->setSmartPrint(false);
+            strategy->setHardPrint(false);
             break;
         }
 

@@ -6306,11 +6306,25 @@ static void resolveDivisions(std::vector<IRInstruction>& code) {
             if (isFloat(ins.typedOperands[1])) floatForced.insert(key(ins.typedOperands[0]));
         }
     }
+    // Refs whose value is SHOWN (printed / cast to string): their smart-vs-float display depends
+    // on the opcode that produced them, so they must keep a real DIV. (`8 / 2.0` is 4, not 4.0 —
+    // only `///` is the always-float division. A float OPERAND therefore no longer forces FDIV:
+    // that rewrite used to turn `x / 2.0` into `x /// 2.0` and print 4.0.)
+    std::set<std::string> displayed;
+    for (const auto& ins : code) {
+        bool isDisplay = ins.opcode == IROpcode::PRINT
+                      || (ins.opcode == IROpcode::TYPE_CAST && ins.resultType == IRType::STRING)
+                      || ins.opcode == IROpcode::RETURN;
+        if (isDisplay && !ins.typedOperands.empty()) displayed.insert(key(ins.typedOperands[0]));
+        if (ins.opcode == IROpcode::LIB_CALL || ins.opcode == IROpcode::CALL)
+            for (size_t a = 1; a < ins.typedOperands.size(); ++a) displayed.insert(key(ins.typedOperands[a]));
+    }
     for (auto& ins : code) {
         if (ins.opcode != IROpcode::DIV || ins.typedOperands.size() < 2) continue;
         std::string rk = key(ins.result);
-        bool floatOperand = isFloat(ins.typedOperands[0]) || isFloat(ins.typedOperands[1]);
-        if (floatOperand || floatForced.count(rk)) {
+        // The perf rewrite is only invisible for a single-use temp that feeds float arithmetic and
+        // is never itself displayed, returned or passed on.
+        if (floatForced.count(rk) && ins.result.kind == IRRef::Kind::TEMP && !displayed.count(rk)) {
             ins.opcode = IROpcode::FDIV; ins.resultType = IRType::FLOAT;
         } else if (intForced.count(rk)) {
             ins.opcode = IROpcode::IDIV; ins.resultType = IRType::INT;
@@ -7548,6 +7562,176 @@ static bool astHasTupleLiteral(const ASTNode& n) {
     return false;
 }
 
+// ─── Smart-division display pass ──────────────────────────────────────────────────────────
+// `/` is AC's "smart" division: a whole quotient is an int (8/2.0 is 4, not 4.0), a fractional
+// one a float; `///` is the always-float division (8///2.0 is 4.0). Static backends keep both as
+// a plain double (there are no tagged numbers on native targets), so the DISPLAY has to remember
+// where a value came from. This pass classifies every numeric ref as
+//   NONE  — int / non-numeric,
+//   SMART — a value that came from `/` (or math.mod, whose wrapper is int-exact the same way),
+//           possibly through +,-,* with ints/other smart values,
+//   HARD  — float by literal, `///`, float arithmetic with a hard operand, or a float-returning
+//           call: always shown with its ".0" when whole,
+// and tags every PRINT / string cast of a SMART ref with a "smart" attr, which each backend turns
+// into "print whole values as integers, fractional ones as %.16g". Flow-insensitive max-join
+// (NONE < SMART < HARD) per variable, with function return/parameter flow, iterated to a fixpoint.
+// Ints are unaffected: a whole value shown through the smart path is the same digits either way.
+namespace {
+enum SmartLat { SL_NONE = 0, SL_SMART = 1, SL_HARD = 2 };
+
+struct SmartPass {
+    IRProgram& prog;
+    std::map<int, int> varLat;                                  // symbol id -> lattice
+    std::map<std::string, int> retLat;                          // user function -> return lattice
+    std::map<std::string, std::vector<int>> paramLat;           // user function -> per-param lattice
+    bool changed = false;
+    explicit SmartPass(IRProgram& p) : prog(p) {}
+
+    static bool hasAttr(const IRInstruction& i, const char* a) {
+        for (const auto& s : i.attrs) if (s == a) return true;
+        return false;
+    }
+    // "smart" -> show a whole value as an integer; "hard" -> show a whole value with its ".0".
+    // (Backends that already track float-typed vars/literals ignore "hard"; JS and Go, which
+    // can't see through a literal or an untracked temp, use it.)
+    static void tagDisplay(IRInstruction& ins, int lat) {
+        if (lat == SL_SMART && !hasAttr(ins, "smart")) ins.attrs.push_back("smart");
+        else if (lat == SL_HARD && !hasAttr(ins, "hard")) ins.attrs.push_back("hard");
+    }
+    std::string calleeName(const IRRef& r) const {
+        if (r.kind == IRRef::Kind::VAR && r.id >= 0) return prog.symbols.getName(r.id);
+        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING)
+            return std::get<std::string>(r.value.data);
+        return "";
+    }
+    int latOf(const IRRef& r, const std::map<int, int>& tempLat) const {
+        if (r.kind == IRRef::Kind::CONST) return r.value.type == IRType::FLOAT ? SL_HARD : SL_NONE;
+        if (r.kind == IRRef::Kind::VAR) {
+            auto it = varLat.find(r.id);
+            return it == varLat.end() ? SL_NONE : it->second;
+        }
+        if (r.kind == IRRef::Kind::TEMP) {
+            auto it = tempLat.find(r.id);
+            return it == tempLat.end() ? SL_NONE : it->second;
+        }
+        return SL_NONE;
+    }
+    void raise(const IRRef& r, int l, std::map<int, int>& tempLat) {
+        if (l == SL_NONE) return;
+        if (r.kind == IRRef::Kind::VAR && r.id >= 0) {
+            int& cur = varLat[r.id];
+            if (cur < l) { cur = l; changed = true; }
+        } else if (r.kind == IRRef::Kind::TEMP) {
+            int& cur = tempLat[r.id];
+            if (cur < l) { cur = l; changed = true; }
+        }
+    }
+
+    // One walk over an instruction list. When `annotate` is set, tags the qualifying PRINTs.
+    void walk(std::vector<IRInstruction>& instrs, const IRFunction* fn, bool annotate) {
+        std::map<int, int> tempLat;
+        if (fn) {
+            auto& pl = paramLat[fn->name];
+            pl.resize(fn->parameters.size(), SL_NONE);
+            for (size_t i = 0; i < fn->parameters.size(); ++i) {
+                int sid = prog.symbols.lookupAnyScope(fn->parameters[i]);
+                if (sid >= 0) raise(IRRef::var(sid), pl[i], tempLat);
+            }
+        }
+        for (auto& ins : instrs) {
+            switch (ins.opcode) {
+            case IROpcode::DIV:
+                if (ins.result.isValid()) raise(ins.result, SL_SMART, tempLat);
+                break;
+            case IROpcode::FDIV:
+                if (ins.result.isValid()) raise(ins.result, SL_HARD, tempLat);
+                break;
+            case IROpcode::ADD: case IROpcode::SUB: case IROpcode::MUL: case IROpcode::PMUL:
+                if (ins.result.isValid() && ins.resultType == IRType::FLOAT) {
+                    int l = SL_NONE;
+                    for (const auto& op : ins.typedOperands) l = std::max(l, latOf(op, tempLat));
+                    // Float-typed result whose operands we can't see a source for (an unmodelled
+                    // float var): treat as a genuine float rather than guess it whole-printable.
+                    raise(ins.result, l == SL_NONE ? SL_HARD : l, tempLat);
+                }
+                break;
+            case IROpcode::TYPE_CAST:
+                if (ins.result.isValid() && ins.resultType == IRType::FLOAT)
+                    raise(ins.result, SL_HARD, tempLat);
+                if (annotate && ins.resultType == IRType::STRING && !ins.typedOperands.empty())
+                    tagDisplay(ins, latOf(ins.typedOperands[0], tempLat));
+                break;
+            case IROpcode::LOAD_CONST: case IROpcode::LOAD_VAR:
+            case IROpcode::STORE_VAR:  case IROpcode::CONST_DECL: {
+                // STORE_VAR comes in two shapes: {result=tgt, operands={value}} and
+                // {operands={tgt, value}}; the value is the LAST typed operand in both.
+                if (ins.typedOperands.empty()) break;
+                const IRRef& src = ins.typedOperands.back();
+                int l = latOf(src, tempLat);
+                if (ins.result.isValid()) raise(ins.result, l, tempLat);
+                else if (ins.typedOperands.size() >= 2) raise(ins.typedOperands[0], l, tempLat);
+                break;
+            }
+            case IROpcode::CALL: case IROpcode::LIB_CALL: {
+                if (ins.typedOperands.empty()) break;
+                std::string callee = calleeName(ins.typedOperands[0]);
+                if (annotate && callee == "Term.display" && ins.opcode == IROpcode::LIB_CALL
+                        && ins.typedOperands.size() > 1)
+                    tagDisplay(ins, latOf(ins.typedOperands[1], tempLat));
+                const IRFunction* target = prog.findFunction(callee);
+                if (target && target->classOwner.empty()) {
+                    auto& pl = paramLat[callee];
+                    pl.resize(target->parameters.size(), SL_NONE);
+                    for (size_t a = 1; a < ins.typedOperands.size() && a - 1 < pl.size(); ++a) {
+                        int l = latOf(ins.typedOperands[a], tempLat);
+                        if (pl[a - 1] < l) { pl[a - 1] = l; changed = true; }
+                    }
+                    if (ins.result.isValid()) {
+                        int l = retLat[callee];
+                        if (l == SL_NONE && ins.resultType == IRType::FLOAT) l = SL_HARD;
+                        raise(ins.result, l, tempLat);
+                    }
+                } else if (ins.result.isValid() && ins.resultType == IRType::FLOAT) {
+                    // math.mod's own wrapper is "int-exact when whole" — the same contract as `/`.
+                    bool isMod = callee == "math.mod" || callee == "math_mod";
+                    raise(ins.result, isMod ? SL_SMART : SL_HARD, tempLat);
+                }
+                break;
+            }
+            case IROpcode::RETURN:
+                if (fn && !ins.typedOperands.empty()) {
+                    int l = latOf(ins.typedOperands[0], tempLat);
+                    int& cur = retLat[fn->name];
+                    if (cur < l) { cur = l; changed = true; }
+                }
+                break;
+            case IROpcode::PRINT:
+                if (annotate && !ins.typedOperands.empty())
+                    tagDisplay(ins, latOf(ins.typedOperands[0], tempLat));
+                break;
+            default: break;
+            }
+        }
+    }
+
+    void run() {
+        for (int round = 0; round < 8; ++round) {
+            changed = false;
+            walk(prog.globalInit, nullptr, false);
+            for (auto& fn : prog.functions) walk(fn.instructions, &fn, false);
+            if (!changed) break;
+        }
+        walk(prog.globalInit, nullptr, true);
+        for (auto& fn : prog.functions) walk(fn.instructions, &fn, true);
+    }
+};
+} // namespace
+
+static void annotateSmartFloats(IRProgram& prog) {
+    if (prog.backend == "LIB") return;
+    SmartPass(prog).run();
+}
+
 IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtimeMode, int optLevel) {
     IRGenerator g;
     if (astHasTupleLiteral(ast)) {
@@ -7627,6 +7811,7 @@ IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtim
     expandAliases(prog);
     if (prog.hasRestart)
         wrapWithRestartLoop(prog);
+    annotateSmartFloats(prog);
     return prog;
 }
 
