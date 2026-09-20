@@ -28,6 +28,8 @@
   #include <windows.h>
   #include <process.h>
   #define ac_mkdir(path) _mkdir(path)
+  // POSIX realpath() has no mingw equivalent; every caller passes a 4096-byte buffer.
+  static inline char* realpath(const char* p, char* out) { return _fullpath(out, p, 4096); }
 #else
   #define ac_mkdir(path) mkdir(path, 0755)
 #endif

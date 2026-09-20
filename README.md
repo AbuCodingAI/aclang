@@ -1,24 +1,58 @@
 # AC Language
 
-AC (AbuCompiled) is a high-level, indentation-based, multi-target compiled language. Write once, compile to any of twelve backends. The compiler lexes AC source into a Pratt-parsed AST, lowers it to a unified IR, runs optimization passes, and emits the selected target language.
+AC (AbuCompiled) is a high-level, indentation-based, multi-target compiled language. Write once, compile to any of twelve backends (plus an experimental AArch64 backend). The compiler lexes AC source into a Pratt-parsed AST, lowers it to a unified IR, runs optimization passes, and emits the selected target language.
 
-Current version: **AC 1** (npm `aclang@1.0.1`) — see `ac --version`. Java-style product versioning:
-"AC 1" is the release; the npm artifact rides a compliant semver underneath. (`1.0.0` was a burned prototype.)
+Current version: **AC 1** — see `ac --version`. Licensed under the [GNU GPL v3](#license).
 
 ---
 
 ## Install
 
-```bash
-npm install -g aclang
-```
-
-From source:
+AC targets Linux (its native backends emit ELF binaries). On Windows use WSL, or the prebuilt
+`ac-compiler/ac.exe` for the text-emitting backends.
 
 ```bash
-cd AC/ac-compiler
-make
+git clone https://github.com/AbuCodingAI/aclang.git
+cd aclang
+./install.sh
 ```
+
+`install.sh` installs the packages the compiler needs (via `pacman`, `apt`, `dnf` or `zypper`),
+builds `ac` from source, builds the ilib shared libraries, and installs everything under
+`/usr/local` with `ac` on your `PATH`. It only uses `sudo` where the destination needs it.
+
+| Option | Effect |
+|--------|--------|
+| `--user` | Install to `~/.local` — no root needed for the install itself |
+| `--prefix DIR` | Install somewhere else |
+| `--minimal` | Only what is needed to build the compiler (a C++17 toolchain and `make`) |
+| `--all` | Also the toolchains for every backend (JDK, Rust, Go) and the optional ilib dependencies |
+| `--dev` | Also the cross toolchains used to rebuild `ac.exe` and `ac.arm` |
+| `--no-deps` | Do not touch system packages |
+| `--prebuilt` | Use the shipped `ac-compiler/ac` instead of compiling (x86-64 only) |
+| `--dry-run` | Print what would happen, change nothing |
+| `--uninstall` | Remove a previous install |
+
+Default packages: a C++17 toolchain and `make`, `python3`, `nodejs`, `nasm`, `zlib` and GTK 3 (for
+the `aczip` and `widgets` ilibs). The V backend needs the V compiler, which most distros do not
+package — see <https://vlang.io>. `BNY` (AC's own native x86-64 backend) needs no external toolchain.
+
+Building by hand:
+
+```bash
+make -C ac-compiler            # ./ac-compiler/ac
+make -C ac-compiler arm        # ./ac-compiler/ac.arm   (needs an aarch64 cross g++)
+make -C ac-compiler windows    # ./ac-compiler/ac.exe   (needs mingw-w64)
+```
+
+### Repository layout
+
+| Path | Contents |
+|------|----------|
+| `ac-compiler/` | Compiler source (`src/`, `include/`, `Makefile`), the embedded wasm blob sources (`wasm/`), and prebuilt binaries: `ac` (Linux x86-64), `ac.exe` (Windows x86-64), `ac.arm` (Linux AArch64) |
+| `library/` | The standard libraries: `ilib/` (native C++ cores with FFI bindings per backend), `elib/` (AC-source packages) |
+| `examples/` | Runnable example programs |
+| `install.sh` | The installer described above |
 
 ---
 
@@ -80,6 +114,7 @@ Full flag reference:
 | Declaration | Output | Runner |
 |-------------|--------|--------|
 | `AC->BNY` | `.acb` | AC's own native x86-64 binary |
+| `AC->ARM` | `.acb` | AC's own native AArch64 (Linux) binary — **experimental**, see below |
 | `AC->ASM` | `.asm` | x86-64 NASM assembly → `nasm` + `gcc` |
 | `AC->C` | `.c` | C (C99) → compiled with `gcc` |
 | `AC->C++` or `AC->CPP` | `.cpp` | C++ (C++17) → compiled with `g++` |
@@ -94,6 +129,11 @@ Full flag reference:
 | `AC->LIB` | `.cpp` + `.h` | Shared library (`.so` / `.dll`) |
 
 `AC LIB` marks a source library used via `use flib`. `AC->LIB` builds a compiled shared library.
+
+**`AC->ARM` is experimental.** It handles integers, floats, strings, arrays, dicts, functions and
+recursion, and bundles/classes/tuples, printing floats exactly like the other backends. Still
+missing: `try`/`catch`, `atomic`, generators (`yield`), and ilib calls (the dynamic-linking path
+has a known bug). Anything unimplemented is a compile-time error, never silent wrong output.
 
 ---
 
@@ -180,9 +220,9 @@ data = null
 | `-` | Subtraction / unary negate | |
 | `*` | Numeric multiply |Not like Python *|
 | `@` | Polymorphic multiply | Numbers, strings, or lists |
-| `/` | Smart division | Int when it divides evenly, else float; `4/2 = 2`, `5/2 = 2.5`. Resolved to int or float at compile time when types are known. |
+| `/` | Smart division | Int when the quotient is whole, else float — whatever the operand types: `4/2 = 2`, `8/2.0 = 4`, `5/2 = 2.5` |
 | `//` | Integer division | Truncates toward zero; `5//2 = 2` |
-| `///` | Float division | Always yields float; `4///2 = 2.0` |
+| `///` | Float division | Always yields a float; `8///2.0 = 4.0` |
 | `math.mod(a, b)` | Modulo | math library function |
 | `a xsub b` | Inclusive distance | `|a − b| + 1` |
 
@@ -193,6 +233,13 @@ b = 5 // 2     /* b = 2   */
 e = 4 /// 2    /* e = 2.0 (always float) */
 c = 7 xsub 3   /* c = 5   */
 ```
+
+**How whole numbers display.** A value that came from `/` (or `math.mod`) shows as an integer when
+it is whole — `Term.display 8 / 2.0` prints `4`, and so does `to_string(8 / 2.0)`. A float that did
+*not* come from `/` keeps its `.0`: `8 /// 2.0` and the literal `8.0` print `8.0`, as do
+`math.sqrt(16.0)` and other library results. Fractional values print with up to 16 significant
+digits (`%.16g`). This is a display rule only: values are the same numbers either
+way, and a whole `/` result is still usable anywhere an integer is (indexing, `//`, comparisons).
 
 ### Comparison
 
@@ -215,6 +262,24 @@ c = 7 xsub 3   /* c = 5   */
 | `#\|` | XNOR |
 | `#` (prefix) | Boolean NOT |
 | `not` | Boolean NOT (synonym for `#`) |
+
+### Bitwise
+
+Bitwise operators are words, except `~`:
+
+| Operator | Meaning |
+|----------|---------|
+| `a band b` | Bitwise AND |
+| `a bor b` | Bitwise OR |
+| `a bxor b` | Bitwise XOR |
+| `bnot a` / `~ a` | Bitwise NOT |
+| `a ptm n` | Power-two multiply: `a * 2^n` (shift left) |
+| `a ptd n` | Power-two divide: `a / 2^n` (shift right) |
+
+```ac
+Term.display 12 band 10    /* 8  */
+Term.display 5 ptm 3       /* 40 */
+```
 
 ### Precedence (highest to lowest)
 
@@ -276,6 +341,21 @@ to_int    n = expr
 to_dec    price = total / count
 to_string label = count
 ```
+
+`to_string` of a float follows the same display rule as `Term.display` (a whole `/` result gives
+`"4"`, `8 /// 2.0` gives `"4.0"`); `to_int` truncates toward zero.
+
+### Sized and atomic integers
+
+```ac
+short s = 1000      /* 32-bit signed integer */
+mini  m = 100       /* 16-bit signed integer */
+atomic hits = 0     /* 64-bit integer; every read/write is a global critical section */
+hits += 1
+```
+
+An `atomic` read-modify-write (`hits += 1`) is one indivisible critical section on every backend,
+so it is safe under `quickthread`.
 
 ---
 
@@ -423,6 +503,15 @@ OTHER
     Term.display $not done$
 ```
 
+### Ternary
+
+`condition | when_true, # when_false` — read `|` as "such that":
+
+```ac
+label = n > 5 | $big$, # $small$
+Term.display 3 < 2 | 10, # 20    /* 20 */
+```
+
 ### `cond` — switch-style dispatch
 
 Evaluates the scrutinee once, then tests each `is` branch:
@@ -452,12 +541,7 @@ OTHER
     Term.display $never started$
 ```
 
-The `OTHER` clause runs when the loop condition is false from the start. GL special form:
-
-```ac
-WHILST many hitbox overlap
-    Term.display $collision$
-```
+The `OTHER` clause runs when the loop condition is false from the start.
 
 ### FOR
 
@@ -510,6 +594,31 @@ result = apply(square, 5)    /* result = 25 */
 Backends emit the correct first-class function type: function pointers in C, `std::function` in C++, `LongUnaryOperator` in Java, `fn()` in Rust, `func()` in Go.
 
 **Pure functions** with all-constant arguments are folded at compile time.
+
+### Generators
+
+A function containing `yield` is a generator; iterate it with `FOR`:
+
+```ac
+Make countdown func(n)
+    i = n
+    WHILST i > 0
+        yield i
+        i -= 1
+
+<mainloop>
+    FOR v in countdown(3)
+        Term.display v      /* 3, 2, 1 */
+<mainloop>
+```
+
+A generator's `return` value is discarded (there is no `.send()`).
+
+### `quickthread`
+
+`quickthread f(args)` runs `f` concurrently on backends that have real lightweight threads (a
+goroutine on Go); on every other backend it runs the call synchronously, with the same result and
+no parallelism.
 
 ---
 
@@ -576,15 +685,6 @@ Tags open and close with the **same** tag name — never XML-style `</tagname>`:
 | `<Local>` | Local scope section |
 | `<shutoff>` | Compiled as `__ac_shutoff__()`; called automatically before `/stop` |
 | `<Foreign>` | Raw passthrough to target language; requires `--allow-foreign` |
-
-### GL / GUI Tags
-
-| Tag | Meaning |
-|-----|---------|
-| `<gui>` | GUI container area |
-| `<OBJECT>` | Object declarations |
-| `<SCREEN>` | Screen / style definitions |
-| `<LOGIC>` | Logic / event section |
 
 ### Custom Tags
 
@@ -950,125 +1050,6 @@ explicit and composable.
 
 ---
 
-## GL Library
-
-```ac
-AC->JS
-
-use ilib gl
-
-<mainloop>
-    <gui>
-        <OBJECT>
-            obj.Player
-            Player.config item=square(50) - location=center - color=200,100,50
-        <OBJECT>
-
-        <SCREEN>
-            Make Screen object
-            Screen.OBJECT resize 1720x1080
-            background.config color=green
-            animate(60 fps)
-        <SCREEN>
-
-        <LOGIC>
-            Make jump func(arg)
-                arg.move_y -180
-
-            <StartHere>
-                configure event-listener
-                    use listener to establish rule
-                        on value is space
-                            jump(Player)
-            <EndHere>
-        <LOGIC>
-    <gui>
-<mainloop>
-```
-
-AC's GL library is SDL2-backed, not pygame.
-
-### Screen
-
-```ac
-gl.screen.create(w, h, $title$)
-gl.screen.set_bg(r, g, b)
-gl.screen.set_bg_by_name($color$)
-gl.screen.set_fps(fps)
-gl.screen.animate()
-gl.screen.w()    gl.screen.h()
-```
-
-### Object Management
-
-```ac
-gl.obj.create($name$)
-gl.obj.geometry($name$, w, h)
-gl.obj.square($name$, size)
-gl.obj.pos($name$, x, y)
-gl.obj.color($name$, r, g, b)
-gl.obj.color_by_name($name$, $color$)
-gl.obj.velocity($name$, vx, vy)
-gl.obj.set_speed($name$, speed)
-gl.obj.set_direction($name$, deg)
-gl.obj.speed_mult($name$, mult)
-gl.obj.move_x($name$, dx)
-gl.obj.move_y($name$, dy)
-gl.obj.x($name$)     gl.obj.y($name$)
-gl.obj.w($name$)     gl.obj.h($name$)
-gl.obj.to_draw($name$)
-gl.obj.circle_fall($name$, frac, $dir$)
-gl.obj.circle_fell($name$)
-gl.obj.set_spawn($name$)
-gl.obj.regen($name$)
-gl.obj.animate($name$, $dir$, speed)
-gl.is_obj($name$)      /* top-level gl namespace, not gl.obj */
-gl.is_draw($name$)     /* top-level gl namespace, not gl.obj */
-```
-
-Direction constants: `RightDir`, `LeftDir`, `UpDir`, `DownDir`
-
-### Drawing
-
-```ac
-gl.draw.create($name$)
-gl.draw.curveshape($name$, $expr$)
-gl.draw.vertex($name$, vx, vy)
-gl.draw.line($name$, x1, y1, x2, y2, r, g, b)
-gl.draw.circle($name$, cx, cy, radius, r, g, b)
-gl.draw.clear($name$)
-gl.draw.to_obj($name$)
-```
-
-### Hitbox
-
-```ac
-IF a.hitbox.coords overlap b.hitbox.coords
-gl.hitbox.overlap($a$, $b$)
-gl.hitbox.boundary($name$)
-gl.hitbox.overlap_pattern($name$, $pattern$)
-gl.hitbox.many_overlap()
-```
-
-### Keys
-
-```ac
-gl.key.pressed($key$)
-gl.key.just_pressed($key$)
-```
-
-### Frame Loop
-
-```ac
-gl.frame.begin()
-gl.frame.update(dt)
-gl.frame.render()
-gl.frame.end()
-gl.frame.delta()
-```
-
----
-
 ## Event System
 
 ```ac
@@ -1179,13 +1160,13 @@ Use `--force` or `--no-cache` when working on compiler internals.
 
 **Exceptions:** `try`, `catch`, `report`, `after`, `raise`, `ERR`
 
-**Functions:** `Make` / `make`, `func`, `eval`, `lazy_eval`
+**Functions:** `Make` / `make`, `func`, `eval`, `lazy_eval`, `yield`, `quickthread`
 
 **Imports:** `use`, `using`, `from`, `as`, `ilib`, `elib`, `clib`, `flib`, `datac`, `header`
 
 **Collections:** `range`, `sequence`, `dict`
 
-**Types / coercions:** `to_int`, `to_dec`, `to_string`, `to_bool`, `const`, `cp`
+**Types / coercions:** `to_int`, `to_dec`, `to_string`, `to_bool`, `short`, `mini`, `atomic`, `const`, `cp`
 
 **Scope / aliasing:** `alias`, `free`, `destroy`, `bound`
 
@@ -1197,7 +1178,7 @@ Use `--force` or `--no-cache` when working on compiler internals.
 
 **Literals:** `True`, `False`, `null`, `nil`
 
-**Operators:** `not`, `#`, `overlap`, `xsub`, `and`, `AND`, `or`, `OR`
+**Operators:** `not`, `#`, `overlap`, `xsub`, `and`, `AND`, `or`, `OR`, `band`, `bor`, `bxor`, `bnot`, `~`, `ptm`, `ptd`, `///`, `~>` (proposed)
 
 **Reserved / partial:** `programLoop`, `temp`, `at`, `save`, `type`
 
@@ -1205,4 +1186,10 @@ Use `--force` or `--no-cache` when working on compiler internals.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AC is free software under the **GNU General Public License, version 3** (`GPL-3.0-only`) — see
+[LICENSE](LICENSE), which also carries one additional term under section 7 of the GPL: **author
+anonymity**. The copyright holder is the pseudonym *AbuCodingAI*; that pseudonym satisfies every
+copyright-notice and attribution requirement in the license, and nobody may be required to
+identify the author by legal name. In short: you may use, modify and redistribute AC under the
+GPL, and you must keep the pseudonymous notice — but you never need to know, or be told, who
+wrote it.
