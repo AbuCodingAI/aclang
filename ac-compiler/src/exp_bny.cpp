@@ -313,6 +313,10 @@ public:
     void rdtsc() { emit(0x0F); emit(0x31); }                   // rdtsc → edx:eax
     void shl_r_i8(R r, uint8_t n) { rex(true,0,(int)r); emit(0xC1); modrm(3,4,(int)r); emit(n); } // shl r64, imm8
     void shr_r_i8(R r, uint8_t n) { rex(true,0,(int)r); emit(0xC1); modrm(3,5,(int)r); emit(n); } // shr r64, imm8
+    // shl/shr r64, cl — variable shift count (the shift amount must be in CL; the shift-target
+    // register itself can be any GPR, unlike shl_rax_cl/sar_rax_cl above which are RAX-only).
+    void shl_r_cl(R r) { rex(true,0,(int)r); emit(0xD3); modrm(3,4,(int)r); }
+    void shr_r_cl(R r) { rex(true,0,(int)r); emit(0xD3); modrm(3,5,(int)r); }
     // xor edx, edx (zero rdx for unsigned div)
     void xor_edx_edx() { emit(0x31); emit(0xD2); }
     // div rcx: unsigned divide rdx:rax by rcx
@@ -782,12 +786,13 @@ static bool returnsCString(const std::string& irName) {
     static const std::set<std::string> cstr = {
         "os.cwd", "os.env", "os.bash", "os.sbash", "os.read_from",
         "regex.search", "regex.replace", "regex.escape",
-        "stringm.upper", "stringm.lower", "stringm.strip", "stringm.trim",
+        "stringm.upper", "stringm.lower", "stringm.strip", "stringm.strip_clause", "stringm.stripln", "stringm.trim",
         "stringm.replace", "stringm.b", "stringm.f", "stringm.t", "stringm.format", "stringm.getline",
         "web.page_get", "web.help",
         "server.db_run", "server.db_run_p", "server.db_import",
         "server.db_reset", "server.help",
         "server.req_method", "server.req_path", "server.req_query",
+        "dns.resolve", "dns.list",
         "server.req_body", "server.req_header",
         "maudio.listen",
     };
@@ -1627,6 +1632,11 @@ private:
         else
             method = funcName(m);
 
+        // The one-argument strip remains whitespace trim. The three-argument form is the
+        // explicit clause operation: strip(before|after, clause, value).
+        if (method == "stringm.strip" && ins.typedOperands.size() == 4)
+            method = "stringm.strip_clause";
+
         // import — handled via PLT/GOT; nothing to emit at runtime
         if (method == "import") return;
 
@@ -1748,7 +1758,7 @@ private:
 
         // Namespaced ilib calls — ml.tensor(2), os.mkfile(p), regex.match(s,p),
         // stringm.upper(s), web.open(u), ncpu.dha(n) — all route through their .so PLT stubs.
-        if (method.rfind("ml.", 0) == 0 || method.rfind("os.", 0) == 0 ||
+        if (method.rfind("ml.", 0) == 0 || method.rfind("os.", 0) == 0 || method.rfind("dns.", 0) == 0 ||
             method.rfind("regex.", 0) == 0 || method.rfind("stringm.", 0) == 0 ||
             method.rfind("web.", 0) == 0 || method.rfind("ncpu.", 0) == 0 ||
             method.rfind("maudio.", 0) == 0 ||
@@ -1762,7 +1772,7 @@ private:
             // own string args, printed — interleaved with the real output).
             method.rfind("camera.", 0) == 0 || method.rfind("sidebar.", 0) == 0 ||
             method.rfind("screen.", 0) == 0 || method.rfind("aczip.", 0) == 0 ||
-            method.rfind("server.", 0) == 0) {
+            method.rfind("server.", 0) == 0 || method.rfind("dns.", 0) == 0) {
             if (method == "ml.weights" && ins.typedOperands.size() >= 3) {
                 load(ins.typedOperands[1], R::RAX);
                 if (isFloatRef(ins.typedOperands[1])) em.movq_xmm0_from_gpr(R::RAX);
@@ -2162,12 +2172,21 @@ private:
             break;
         }
         case IROpcode::FDIV:
-        case IROpcode::DIV:
+        case IROpcode::DIV: {
             // True division — load operands respecting their float/int type
             load(op0(), R::RAX);
             if (isFloatRef(op0())) em.movq_xmm0_from_gpr(R::RAX);
             else                   em.cvtsi2sd_xmm0_from_gpr(R::RAX);
             load(op1(), R::RCX);
+            // Zero-divisor guard (0 as a raw bit pattern is both plain int 0 AND +0.0, so one
+            // check covers both operand types). divsd by 0.0 doesn't trap on x86 — it silently
+            // yields +-inf/nan, which ac_print_double has no way to render — verified real bug:
+            // `5 / b` (b=0) printed garbage instead of erroring like PY's ZeroDivisionError does.
+            std::string okL = uniq("__ac_fdiv_ok_" + std::to_string(catchCounter_++) + "__");
+            em.test_rr(R::RCX, R::RCX);
+            em.jne(okL);
+            emitDivZeroTrap();
+            em.label(okL);
             if (isFloatRef(op1())) em.movq_xmm1_from_gpr(R::RCX);
             else                   em.cvtsi2sd_xmm1_from_gpr(R::RCX);
             em.divsd_xmm0_xmm1();
@@ -2181,6 +2200,7 @@ private:
                 if (!vn.empty()) floatVarNames_.insert(vn);
             }
             break;
+        }
         case IROpcode::IDIV: {
             // Integer (floor) division. Zero divisor → clean ZeroDivisionError (idiv on 0
             // raises SIGFPE = core dump; match C's guarded behavior instead).
@@ -2407,6 +2427,27 @@ private:
                 break;
             }
             std::string rawFn = funcName(ops[0]);
+            // math.mod(a,b) with two non-float operands is ALWAYS exact — PY's own math_mod
+            // wrapper ("int-exact when operands and result are whole") always returns a real int
+            // in this case, since integer modulo can never be fractional. The real ac_mod (the
+            // dynamically-linked ilib function this call would otherwise route to) always returns
+            // a double, which would permanently mark the result float even though it's provably
+            // always whole. Verified real bug this fixes: digit_sum/happy_number/reverse_number
+            // all accumulate math.mod(n,10) into a running total expected to stay a plain int —
+            // BNY printed "10.0"/"45.0" instead of matching PY's "10"/"45". math.mod_int is
+            // unaffected (already routes to genuine integer computation further below).
+            if ((rawFn == "math.mod" || rawFn == "math_mod") && ops.size() >= 3
+                    && !isFloatRef(ops[1]) && !isFloatRef(ops[2])) {
+                load(ops[1], R::RAX); load(ops[2], R::RCX);
+                std::string okL = uniq("__ac_mathmod_ok_" + std::to_string(catchCounter_++) + "__");
+                em.test_rr(R::RCX, R::RCX);
+                em.jne(okL);
+                emitDivZeroTrap();
+                em.label(okL);
+                em.cqo(); em.idiv_rcx();
+                if (ins.result.isValid()) store(ins.result, R::RDX);
+                break;
+            }
             // widgets ctor (`root = Screen(...)`, `lbl = display(root, ...)`) — must be checked
             // against the RAW name too, same reasoning as the bundle-construction check right
             // below: no function is ever literally named "display" (see widgetVarKind_'s header
@@ -2485,7 +2526,10 @@ private:
                 }
                 break;
             }
-            std::string fn = resolveFunc(rawFn);
+            std::string callFn = rawFn;
+            if (callFn == "stringm.strip" && ops.size() == 4)
+                callFn = "stringm.strip_clause";
+            std::string fn = resolveFunc(callFn);
             if (fn.empty()) break;
             if (fn == "ac_length" && ops.size() >= 2) {
                 auto& a = ops[1];
@@ -3374,10 +3418,25 @@ public:
                 // the SAME authority (acCallReturnsFloat / type.hpp) the codegen uses — checking only
                 // user `floatFuncs_` missed ilib floats like math.mod, so `total += math.mod(...)`
                 // never promoted `total` and summed a double's raw bits into an int.
+                //
+                // math.mod (bare, not math.mod_int) is a deliberate exception to that authority:
+                // its real codegen (the CALL case's own special case, above the generic dispatch)
+                // routes two non-float operands through genuine integer modulo instead of the
+                // real (always-double) ac_mod — matching PY's own math_mod wrapper ("int-exact
+                // when operands and result are whole", since int-mod can never be fractional).
+                // Blindly trusting isFloatReturningCall here (as this rule used to) would classify
+                // the result float while the actual stored value is a plain int64, so a later
+                // float-typed read reinterprets those bits as garbage IEEE-754 — verified real
+                // bug: digit_sum/happy_number/reverse_number/armstrong all accumulate
+                // math.mod(n,10) into a running total expected to stay a plain int.
                 if ((ins.opcode == AC_IR::IROpcode::CALL || ins.opcode == AC_IR::IROpcode::LIB_CALL)
                         && ins.result.isValid() && !ins.typedOperands.empty()) {
                     std::string callee = funcName(ins.typedOperands[0]);
-                    if ((floatFuncs_ && floatFuncs_->count(callee)) || isFloatReturningCall(callee))
+                    bool isIntExactMathMod = (callee == "math.mod" || callee == "math_mod")
+                        && ins.typedOperands.size() >= 3
+                        && !isFloatRef(ins.typedOperands[1]) && !isFloatRef(ins.typedOperands[2]);
+                    if (!isIntExactMathMod
+                            && ((floatFuncs_ && floatFuncs_->count(callee)) || isFloatReturningCall(callee)))
                         markDstFloat(ins.result);
                 }
             }
@@ -4620,18 +4679,18 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.label("ac_print_double");
     em.push_rbp(); em.mov_rbp_rsp();
     em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15); em.push_r(R::RBX);
-    em.sub_rsp_i32(200);
-    // Stack layout (200-byte local area, safe below saved regs at rbp-8..rbp-40):
-    //   rbp-192..rbp-163 : main output buffer (30 bytes max)
-    //   rbp-162..rbp-143 : reverse integer digit buffer (20 bytes)
-    //   rbp-142..rbp-125 : fractional digit buffer, raw 0-9 values, MSB-first (18 bytes: index 0
-    //                      at rbp-142 .. index 16 [guard] at rbp-126) — raw values, not ASCII,
-    //                      since rounding needs to compare/increment digit VALUES.
-    //   rbp-125          : sign flag byte (0 = non-negative, 1 = negative)
-    //   rbp-124..rbp-49  : spare
+    em.sub_rsp_i32(264);
+    // Stack layout (264-byte local area, safe below saved regs at rbp-8..rbp-40):
+    //   rbp-260..rbp-219 : fractional digit buffer, raw 0-9 values, MSB-first (42 bytes: enough
+    //                      for 25 leading-zero slots + 16 significant + 1 guard — see the budget
+    //                      step below for why this needed to grow from the original 17).
+    //   rbp-190          : reverse-integer-digit sentinel (fills downward from rbp-191, 24 bytes)
+    //   rbp-180..rbp-85  : main output buffer (96 bytes — grown from 30 to fit longer fractions)
+    //   rbp-78           : sign flag byte (0 = non-negative, 1 = negative)
+    //   rbp-70..rbp-63   : fracKeep (qword)
 
-    // r12 = write pointer into main output buffer at rbp-192
-    em.lea_r_rbp32(R::R12, -192);
+    // r12 = write pointer into main output buffer at rbp-180
+    em.lea_r_rbp32(R::R12, -180);
 
     // ── Integer part + sign ─────────────────────────────────────────────────
     em.cvttsd2si_r13_xmm0();            // r13 = trunc(value)   [xmm0 still = ORIGINAL value]
@@ -4642,7 +4701,7 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     // real bug (two layers, both already fixed once): -2.5 printed "-2.+" (cvttsd2si on an
     // un-negated fraction, -0.5*10=-5.0, truncates to digit -5; `-5+'0'` is ASCII '+', not
     // '5'); -0.25 printed "0..+" (r13==0 has no sign of its own). Stash the flag in a stack
-    // byte (rbp-125) — a register can't survive the several phases (fraction-digit extraction,
+    // byte (rbp-78) — a register can't survive the several phases (fraction-digit extraction,
     // rounding/carry, integer-digit extraction) that all need scratch registers of their own.
     em.mov_ri32(R::RAX, 0);
     em.cvtsi2sd_xmm1_from_gpr(R::RAX); // xmm1 = 0.0 (temporary — repurposed for (double)r13 below)
@@ -4651,8 +4710,8 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.jcc(0x03, "__acd_notneg__");    // JAE/JNB (CF=0): value >= 0.0 → not negative
     em.mov_ri32(R::RAX, 1);
     em.label("__acd_notneg__");
-    em.lea_r_rbp32(R::RCX, -125);
-    em.mov_ptr_r8(R::RCX, R::RAX);     // [rbp-125] = sign flag
+    em.lea_r_rbp32(R::RCX, -78);
+    em.mov_ptr_r8(R::RCX, R::RAX);     // [rbp-78] = sign flag
 
     em.cvtsi2sd_xmm1_from_gpr(R::R13); // xmm1 = (double)r13
     em.subsd_xmm0_xmm1();              // xmm0 = fractional part (NEGATIVE when value < 0,
@@ -4678,7 +4737,7 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     // FRACTIONAL digits regardless of the integer part gave 17 total significant digits for
     // 5.640000000000001 (int part "5" = 1 digit + 16 kept fractional = 17), printing
     // "5.6400000000000006" instead of the correct "5.640000000000001" (15 fractional digits).
-    // Stored at [rbp-124] since later phases (guard-digit position, rounding-carry start,
+    // Stored at [rbp-70] since later phases (guard-digit position, rounding-carry start,
     // strip-loop's initial count) all need it and none of them have a spare register free.
     { em.mov_rr(R::RAX, R::RBX);
       em.mov_ri32(R::R14, 0);
@@ -4694,65 +4753,146 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
       em.jge("__acd_fkok__");
       em.mov_ri32(R::RAX, 0);
       em.label("__acd_fkok__");
-      em.lea_r_rbp32(R::RCX, -124);
-      em.mov_ptr_r(R::RCX, R::RAX);     // [rbp-124] = fracKeep (0-15)
+      em.lea_r_rbp32(R::RCX, -70);
+      em.mov_ptr_r(R::RCX, R::RAX);     // [rbp-70] = fracKeep (0-15)
     }
 
-    // ── #28: fractional digits via EXACT 64-bit integer arithmetic, correctly rounded ──────
-    // The OLD algorithm repeatedly did `frac *= 10.0` in DOUBLE precision — each multiply/
-    // subtract step rounds, and by the ~13th-15th digit the accumulated error was large enough
-    // that `frac` prematurely computed as exactly 0.0, truncating real digits (verified: 3.14 +
-    // 2.5's true nearest double is 5.6400000000000005684...; PY's shortest round-trip repr is
-    // "5.640000000000001" — glibc's `%.16g`, ALREADY the convention CStrategy/CppStrategy use
-    // elsewhere in this codebase, agrees exactly — but the old BNY algorithm printed "5.64",
-    // stopping 13 digits early). Fix: `frac` has at most 52 significant mantissa bits, so
-    // `frac * 2^52` is an EXACT integer (no rounding — multiplying a double by a power of 2
-    // only shifts its exponent) representable in a 64-bit register. Extracting decimal digits
-    // from THAT via repeated `*10` / shift-52 / mask-52 is exact 64-bit integer arithmetic —
-    // no floating-point rounding anywhere in the loop, so no premature-zero termination.
-    em.mov_ri64(R::RAX, (uint64_t)0x4330000000000000ULL); // 2^52 as a double
-    em.movq_xmm1_from_gpr(R::RAX);
-    em.mulsd_xmm0_xmm1();               // xmm0 = frac * 2^52 (exact, still < 2^52)
-    em.cvttsd2si_rax_xmm0();            // rax = scaled fraction, exact 64-bit integer
-    em.mov_rr(R::R15, R::RAX);          // r15 = scaled
+    // ── Exact fixed-point scale, derived from frac's OWN IEEE-754 exponent/mantissa bits, not a
+    // fixed frac*2^52 multiply. The fixed-2^52 approach silently loses precision for ANY
+    // frac<0.5 (every binary exponent below -1 needs more than 52 bits of scale to be exact) —
+    // verified real bug: 2/7's frac has exponent -2, so frac*2^52 lands on an exact half-integer,
+    // and cvttsd2si's truncation of that half-unit compounded through the digit-extraction loop
+    // into a wrong final rounding decision ("...142856" instead of the correct "...142857").
+    // Fix: pull frac's raw 53-bit mantissa (with the implicit leading 1) straight out of its bit
+    // pattern as M, and its true binary exponent E; frac == M * 2^(E-52) EXACTLY (no multiply, no
+    // rounding — just reading bits IEEE-754 already stores). Scaling by SH = 52-E instead of a
+    // fixed 52 makes M itself the exact "scaled fraction" for any frac down to about 2^-8 before
+    // SH would make the loop's *10 step overflow 64 bits; smaller fracs than that fall back to
+    // the old approximate path rather than reach for 128-bit arithmetic this routine has nowhere
+    // to put.
+    em.movq_gpr_from_xmm0(R::R8);          // r8 = raw bits of frac
+    em.mov_rr(R::R9, R::R8);
+    em.shr_r_i8(R::R9, 52);
+    em.mov_ri64(R::R10, 0x7FFULL);
+    em.and_rr(R::R9, R::R10);              // r9 = biased exponent (0 for subnormal/zero)
+    em.mov_ri64(R::R10, 0xFFFFFFFFFFFFFULL); // (1<<52)-1
+    em.and_rr(R::R8, R::R10);              // r8 = raw mantissa bits
+    em.mov_ri64(R::R10, 0x10000000000000ULL); // 1<<52 (implicit leading bit)
+    em.or_rr(R::R8, R::R10);               // r8 = M (53-bit exact mantissa)
+    em.mov_ri64(R::R10, 1075);
+    em.sub_rr(R::R10, R::R9);              // r10 = SH = 1075 - biased_exponent = 52 - E
+    em.mov_ri64(R::R11, 60);
+    em.cmp_rr(R::R10, R::R11);
+    {
+      em.jle("__acd_exact__");
+      // Fallback: frac too small for a single-register exact scale — old approximate path.
+      em.mov_ri64(R::RAX, (uint64_t)0x4330000000000000ULL); // 2^52 as a double
+      em.movq_xmm1_from_gpr(R::RAX);
+      em.mulsd_xmm0_xmm1();
+      em.cvttsd2si_rax_xmm0();
+      em.mov_rr(R::R15, R::RAX);
+      em.mov_ri64(R::R10, 52);
+      em.jmp("__acd_scaledone__");
+      em.label("__acd_exact__");
+      em.mov_rr(R::R15, R::R8);            // r15 = M (exact scaled fraction, no truncation)
+      em.label("__acd_scaledone__");
+    }
+    // r10 = SH (persists for the whole extraction loop); r9 = mask = (1<<SH)-1
+    em.mov_ri64(R::R9, 1);
+    em.mov_rr(R::RCX, R::R10);
+    em.shl_r_cl(R::R9);
+    em.dec_r(R::R9);
 
-    // Extract 17 raw digit values (16 to keep + 1 guard digit for rounding) into
-    // [rbp-142..rbp-126], MSB-first, via: scaled*=10; digit=scaled>>52; scaled&=(2^52-1).
-    em.lea_r_rbp32(R::R14, -142);       // r14 = write cursor into the fraction-digit buffer
+    // Extract FRACBUF_LEN raw digit values into the fraction-digit buffer, MSB-first:
+    // scaled*=10; digit=scaled>>SH; scaled&=mask. Extracting far more than the 16-significant+
+    // 1-guard minimum lets the budget step below correctly skip past leading zeros in the
+    // fraction (see that step's own comment for the bug this fixes) instead of hard-capping at 17.
+    static const int FRACBUF_LEN = 42;
+    em.lea_r_rbp32(R::R14, -260);       // r14 = write cursor into the fraction-digit buffer
     { // rcx is the loop counter (pushed/popped each iteration — also needed as scratch inside)
-      em.mov_ri32(R::RCX, 17);
+      em.mov_ri32(R::RCX, FRACBUF_LEN);
       em.label("__acd_fdig__");
       em.push_r(R::RCX);
       em.mov_ri32(R::RCX, 10);
-      em.imul_rr(R::R15, R::RCX);       // r15 *= 10 (safe: <2^52 * 10 < 2^56, fits in 64 bits)
+      em.imul_rr(R::R15, R::RCX);       // r15 *= 10 (safe: r15<2^SH<=2^60, so *10 < 2^64)
       em.mov_rr(R::RAX, R::R15);
-      em.shr_r_i8(R::RAX, 52);          // rax = top digit (0-9)
+      em.mov_rr(R::RCX, R::R10);        // rcx = SH (variable shift needs the count in CL)
+      em.shr_r_cl(R::RAX);              // rax = top digit (0-9)
       em.mov_ptr_r8(R::R14, R::RAX); em.inc_r(R::R14);
-      em.mov_ri64(R::RCX, (uint64_t)0xFFFFFFFFFFFFFULL); // (1<<52)-1
-      em.and_rr(R::R15, R::RCX);        // r15 &= mask
+      em.and_rr(R::R15, R::R9);         // r15 &= mask
       em.pop_r(R::RCX);
       em.dec_r(R::RCX); em.test_rr(R::RCX, R::RCX); em.jne("__acd_fdig__");
     }
 
+    // ── Leading-zero budget override (intpart==0 only). The digit-count step above always
+    // reserves 1 significant-digit slot for the integer part, even when that part is "0" —
+    // correct when intpart!=0, but %.16g does NOT count a leading "0." as a significant digit,
+    // so for |value|<1 that reservation is one digit too many. Worse, every leading zero the
+    // fraction itself has (0.0001... has 3) also needs to NOT count against the 16-digit budget,
+    // or those digits get silently dropped. Verified real bugs this fixes: 2/7 printed
+    // "0.285714285714286" (15 digits, correct is "...142857", 16) and 0.0001234567890123456
+    // printed "0.000123456789012" (lost 4 trailing digits) — both because fracKeep was capped at
+    // 15 regardless of how many of the extracted digits were non-significant leading zeros.
+    // Fix: when intpart==0, scan the already-extracted fraction buffer for the first nonzero
+    // digit at index k, then fracKeep = k+16 (every leading zero is kept+printed, then 16 real
+    // significant digits after it) instead of the flat 15. Clamped so fracKeep+1 (the guard
+    // digit) stays inside the buffer; an all-zero buffer means nothing survives at this precision
+    // at all, so fracKeep=0 (prints ".0"), matching the existing strip-to-zero path.
+    {
+      em.test_rr(R::RBX, R::RBX);
+      em.jne("__acd_fkskip__");                       // intpart != 0 -> keep tentative fracKeep
+
+      em.lea_r_rbp32(R::R14, -260);         // r14 = scan cursor
+      em.mov_ri64(R::R9, 0);                // r9 = k
+      em.label("__acd_fkscan__");
+      em.movzx_r64_ptr8(R::RAX, R::R14);
+      em.test_rr(R::RAX, R::RAX);
+      em.jne("__acd_fkfound__");
+      em.inc_r(R::R14);
+      em.inc_r(R::R9);
+      em.mov_ri64(R::R10, FRACBUF_LEN);
+      em.cmp_rr(R::R9, R::R10);
+      em.jl("__acd_fkscan__");
+      em.jmp("__acd_fknone__");                       // scanned the whole buffer, all zero
+      em.label("__acd_fkfound__");
+      em.mov_ri64(R::R10, FRACBUF_LEN - 17); // max k so k+16+1(guard) <= FRACBUF_LEN
+      em.cmp_rr(R::R9, R::R10);
+      {
+        em.jle("__acd_fkclampok__");
+        em.mov_ri64(R::R9, FRACBUF_LEN - 17);
+        em.label("__acd_fkclampok__");
+      }
+      em.mov_rr(R::RAX, R::R9);
+      em.add_ri32(R::RAX, 16);              // fracKeep = k + 16
+      em.lea_r_rbp32(R::RCX, -70);
+      em.mov_ptr_r(R::RCX, R::RAX);
+      em.jmp("__acd_fkskip__");
+      em.label("__acd_fknone__");
+      em.mov_ri64(R::RAX, 0);
+      em.lea_r_rbp32(R::RCX, -70);
+      em.mov_ptr_r(R::RCX, R::RAX);
+      em.label("__acd_fkskip__");
+    }
+
     // ── Round-half-up using the guard digit at index fracKeep, carrying leftward through the
-    // fracKeep kept digits at [rbp-142..rbp-142+fracKeep-1]; a carry that escapes past digit 0
+    // fracKeep kept digits at [rbp-260..rbp-260+fracKeep-1]; a carry that escapes past digit 0
     // (or fracKeep==0, meaning there's no fractional digit to carry through at all) bumps rbx
     // (the integer part) by 1 BEFORE the integer-digit loop below runs, so e.g.
     // 8.99999999999999996 → "9", not "8" with a wrong fractional tail.
-    em.lea_r_rbp32(R::RAX, -142);
-    em.lea_r_rbp32(R::RCX, -124); em.mov_r_ptr(R::RCX, R::RCX); // rcx = fracKeep
+    em.lea_r_rbp32(R::RAX, -260);
+    em.lea_r_rbp32(R::RCX, -70); em.mov_r_ptr(R::RCX, R::RCX); // rcx = fracKeep
     em.add_rr(R::RAX, R::RCX);          // rax = &fracbuf[fracKeep] (the guard digit)
     em.movzx_r64_ptr8(R::RAX, R::RAX);
     em.cmp_r_i32(R::RAX, 5);
     em.jl("__acd_noround__");
-    em.lea_r_rbp32(R::RCX, -124); em.mov_r_ptr(R::RCX, R::RCX);
+    em.lea_r_rbp32(R::RCX, -70); em.mov_r_ptr(R::RCX, R::RCX);
     em.test_rr(R::RCX, R::RCX);
     em.jne("__acd_havefrac__");
     em.inc_r(R::RBX);                   // fracKeep==0: nothing to carry through, bump directly
     em.jmp("__acd_noround__");
     em.label("__acd_havefrac__");
-    em.lea_r_rbp32(R::R14, -142);
-    em.lea_r_rbp32(R::RCX, -124); em.mov_r_ptr(R::RCX, R::RCX);
+    em.lea_r_rbp32(R::R14, -260);
+    em.lea_r_rbp32(R::RCX, -70); em.mov_r_ptr(R::RCX, R::RCX);
     em.add_rr(R::R14, R::RCX); em.dec_r(R::R14); // r14 = &fracbuf[fracKeep-1] (last kept digit)
     em.label("__acd_carry__");
     em.movzx_r64_ptr8(R::RAX, R::R14);
@@ -4762,9 +4902,9 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.mov_ri32(R::RAX, 0);
     em.mov_ptr_r8(R::R14, R::RAX);
     em.dec_r(R::R14);
-    { // Carry escaped past digit 0 (index -1, address rbp-143) → bump the integer part.
+    { // Carry escaped past digit 0 (one before fracBuf's own start) → bump the integer part.
       std::string cont = "__acd_carrycont__";
-      em.lea_r_rbp32(R::RAX, -143);
+      em.lea_r_rbp32(R::RAX, -261);
       em.cmp_rr(R::R14, R::RAX);
       em.jne(cont);
       em.inc_r(R::RBX);
@@ -4777,7 +4917,7 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.label("__acd_noround__");
 
     // ── Sign character (rbx now holds the FINAL, possibly rounding-bumped integer value) ──
-    em.lea_r_rbp32(R::RAX, -125);
+    em.lea_r_rbp32(R::RAX, -78);
     em.movzx_r64_ptr8(R::RAX, R::RAX);
     em.test_rr(R::RAX, R::RAX);
     em.je("__acd_nosign__");
@@ -4785,8 +4925,8 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
     em.label("__acd_nosign__");
 
-    // ── Integer digits: reverse-extract rbx into [rbp-162..rbp-143], copy forward ──────────
-    em.lea_r_rbp32(R::R14, -143);       // r14 = one past end of reverse area
+    // ── Integer digits: reverse-extract rbx into the reverse-digit area, copy forward ──────
+    em.lea_r_rbp32(R::R14, -190);       // r14 = one past end of reverse area
     em.label("__acd_idig__");
     em.mov_rr(R::RAX, R::RBX);
     em.mov_ri32(R::RCX, 10);
@@ -4797,7 +4937,7 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.mov_rr(R::RBX, R::RAX);
     em.test_rr(R::RBX, R::RBX);
     em.jne("__acd_idig__");
-    em.lea_r_rbp32(R::RBX, -143);
+    em.lea_r_rbp32(R::RBX, -190);
     em.label("__acd_icpy__");
     em.movzx_r64_ptr8(R::RAX, R::R14);
     em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12); em.inc_r(R::R14);
@@ -4806,11 +4946,11 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
 
     // ── Fractional digits: strip trailing zeros from the (rounded, fracKeep-digit) buffer ──
     // rcx = count of digits still kept (starts at fracKeep, shrinks while the last is 0).
-    em.lea_r_rbp32(R::RCX, -124); em.mov_r_ptr(R::RCX, R::RCX);
+    em.lea_r_rbp32(R::RCX, -70); em.mov_r_ptr(R::RCX, R::RCX);
     em.label("__acd_striploop__");
     em.test_rr(R::RCX, R::RCX);
     em.je("__acd_stripdone__");         // stripped everything → whole-valued, print ".0"
-    em.lea_r_rbp32(R::RAX, -142);
+    em.lea_r_rbp32(R::RAX, -260);
     em.add_rr(R::RAX, R::RCX);
     em.dec_r(R::RAX);                   // rax = &fracbuf[rcx-1] (the last currently-kept digit)
     em.movzx_r64_ptr8(R::RDX, R::RAX);
@@ -4825,7 +4965,7 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
 
     // ── Print '.' + the rcx kept fractional digits (ASCII) ────────────────────────────────
     em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
-    em.lea_r_rbp32(R::R14, -142);        // r14 = cursor into fraction buffer, index 0 first
+    em.lea_r_rbp32(R::R14, -260);        // r14 = cursor into fraction buffer, index 0 first
     em.mov_rr(R::RBX, R::RCX);           // rbx free again (integer part already fully printed)
     em.label("__acd_fcpy__");
     em.movzx_r64_ptr8(R::RAX, R::R14);
@@ -4843,12 +4983,12 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     // ── Newline + write ────────────────────────────────────────────────────────────────────
     em.label("__acd_nl__");
     em.mov_ri32(R::RAX, '\n'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
-    em.lea_r_rbp32(R::RSI, -192);        // buf start
+    em.lea_r_rbp32(R::RSI, -180);        // buf start
     em.sub_rr(R::R12, R::RSI);
     em.mov_rr(R::RDX, R::R12);
     em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RAX, 1); em.syscall();
 
-    em.add_rsp_i32(200);
+    em.add_rsp_i32(264);
     em.pop_r(R::RBX); em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12);
     em.pop_rbp(); em.ret();
 }
@@ -5872,6 +6012,9 @@ static std::string normalizeExtSym(const std::string& irName) {
         {"math.tau",    "ac_math_tau_const"},
         {"math.em",     "ac_math_em_const"},
         {"math.inf",    "ac_math_inf"},
+        {"stringm.strip",        "ac_stringm_trim"},
+        {"stringm.strip_clause", "ac_stringm_strip_clause"},
+        {"stringm.stripln",      "ac_stringm_stripln"},
         // ── Print helper ──────────────────────────────────────────────────────
         {"ac_print_double", "ac_print_double"},
         // ── Camera library ────────────────────────────────────────────────────
@@ -5942,13 +6085,15 @@ static std::string normalizeExtSym(const std::string& irName) {
         // which would produce "ac_maudio_stop" (the PER-TRACK stop, takes a handle int — wrong
         // arity for a 0-arg call). ac_maudio_stop_all() is the real 0-arg one.
         {"maudio.stop",              "ac_maudio_stop_all"},
+        {"stringm.strip_clause",     "ac_stringm_strip_clause"},
+        {"stringm.stripln",          "ac_stringm_stripln"},
     };
     auto it = tbl.find(irName);
     if (it != tbl.end()) return it->second;
     // Generic ilib namespace fallback: os.cwd -> ac_os_cwd, regex.match -> ac_regex_match,
     // stringm.upper -> ac_stringm_upper, ncpu.dha -> ac_ncpu_dha, maudio.speak -> ac_maudio_speak
     // (the C-core export convention).
-    for (const char* ns : {"os.", "regex.", "stringm.", "ncpu.", "maudio."}) {
+    for (const char* ns : {"os.", "regex.", "stringm.", "ncpu.", "maudio.", "dns."}) {
         if (irName.rfind(ns, 0) == 0) {
             std::string s = "ac_" + irName;
             for (auto& c : s) if (c == '.') c = '_';
@@ -6002,6 +6147,7 @@ static std::string libForSym(const std::string& exportName) {
     if (exportName.rfind("ac_stringm_", 0) == 0) return "libacstringcheese.so";
     if (exportName.rfind("ac_ncpu_", 0) == 0)    return "libacncpu.so";
     if (exportName.rfind("ac_maudio_", 0) == 0)  return "libacmachinaaudio.so";
+    if (exportName.rfind("ac_dns_", 0) == 0) return "libacdns.so";
     // native-cpu's carried-over ptr_* functions stay bare (no ac_ncpu_ prefix) — see
     // isNativeCpuPtrSym().
     if (isNativeCpuPtrSym(exportName)) return "libacncpu.so";
@@ -6976,6 +7122,8 @@ class BinaryCompiler {
                     if (r.id >= 0) irName = prog.symbols.getName(r.id);
                     if (irName.empty() && r.value.type == AC_IR::IRType::STRING)
                         irName = std::get<std::string>(r.value.data);
+                    if (irName == "stringm.strip" && ins.typedOperands.size() == 4)
+                        irName = "stringm.strip_clause";
                     if (bnyIsWidgetCtorName(irName)) {
                         addSym(bnyWidgetNewFn(irName));
                         std::string packFn = bnyWidgetPackFn(irName);
@@ -7003,7 +7151,7 @@ class BinaryCompiler {
                         irName.find("web.") != std::string::npos ||
                         irName.rfind("server.", 0) == 0 ||
                         irName.find("ml.") != std::string::npos ||
-                        irName.rfind("os.", 0) == 0 ||
+                        irName.rfind("os.", 0) == 0 || irName.rfind("dns.", 0) == 0 ||
                         irName.rfind("regex.", 0) == 0 ||
                         irName.rfind("stringm.", 0) == 0 ||
                         irName.rfind("ncpu.", 0) == 0 ||
@@ -7045,7 +7193,7 @@ class BinaryCompiler {
                              m.value.type == AC_IR::IRType::STRING)
                         mname = std::get<std::string>(m.value.data);
                     if (tryWidgetMethodSym(mname, (int)ins.typedOperands.size() - 1)) continue;
-                    if (mname.rfind("ml.", 0) == 0 || mname.rfind("os.", 0) == 0 ||
+                    if (mname.rfind("ml.", 0) == 0 || mname.rfind("os.", 0) == 0 || mname.rfind("dns.", 0) == 0 ||
                         mname.rfind("regex.", 0) == 0 || mname.rfind("stringm.", 0) == 0 ||
                         mname.rfind("web.", 0) == 0 || mname.rfind("server.", 0) == 0 ||
                         mname.rfind("ncpu.", 0) == 0 || mname.rfind("maudio.", 0) == 0 ||

@@ -1,5 +1,7 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -O2 -MMD -MP
+ARM_CXX ?= aarch64-linux-gnu-g++
+ARM_CXXFLAGS ?= -std=c++17 -Wall -O0 -g0 -static
 
 SRC = src/main.cpp src/lexer.cpp src/parser.cpp src/backend_registry.cpp src/ir.cpp src/ir_codegen.cpp src/exp_bny.cpp src/exp_arm.cpp src/exp_arm_asm.cpp
 OBJ = $(SRC:.cpp=.o)
@@ -25,6 +27,9 @@ endif
 
 windows:
 	x86_64-w64-mingw32-g++ -std=c++17 -O2 -static $(SRC) -o ac.exe
+
+arm:
+	$(ARM_CXX) $(ARM_CXXFLAGS) $(SRC) -o ac.arm
 
 clean:
 ifeq ($(OS),Windows_NT)

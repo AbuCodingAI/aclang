@@ -8,14 +8,36 @@
   the ARM ARM alone) — see the session notes for the exact .s snippets used to confirm each
   bit pattern before it was hardcoded here.
 
-  v1 scope (deliberately, not a hidden gap): a single <mainloop>, integer arithmetic,
-  comparisons, WHILST/IF control flow, and Term.display of an int. No user functions, no
-  strings, no floats, no arrays/dicts/bundles yet — this is the same starting point BNY itself
-  would have had before its many follow-up passes added those. Globals/temps live in a small
-  fixed-address data page (no relocation/fixup machinery needed for v1: both the data page and
-  the code page have addresses fixed at compile time, independent of how much code is
-  generated), so there is no two-pass address-patching system yet either — that becomes
-  necessary once string constants (rodata) are added.
+  Current scope (v1.2, verified via byte-for-byte comparison against PY across the whole
+  examples/ suite — not a hidden gap list, an honest snapshot): a single <mainloop>, integer and
+  double arithmetic (a genuinely exact %.16g-equivalent printer, derived from each value's own
+  IEEE-754 exponent/mantissa bits rather than a fixed 2^52 scale — see emitPrintFloatRoutine),
+  comparisons, WHILST/IF control flow, user functions (incl. recursion, real per-call stack
+  frames), a whole-program float pre-scan (preScanFloatVars) that correctly promotes
+  loop-carried accumulators even when the promotion only becomes visible after the first
+  iteration, Term.display of integers/floats/strings/arrays, Term.ask string input, plain
+  integer arrays/lists (literal construction, indexing, mutation, .append with
+  capacity-doubling growth, length, FOR-in iteration — ported from BNY's own
+  [cap][len][e0][e1]... heap layout and bump allocator), real heap-allocated strings (concat,
+  compare, index, itoa/atoi, length — ported from BNY's NUL-terminated C-string design), and
+  dicts (linear-scan get/set with the same capacity-doubling growth as arrays), and
+  bundles/classes — flat 8-bytes-per-field instances (no header, no vtable), a whole-program
+  field-order + classReturnFuncs_/classParamTypes pre-scan (computeClassFields/
+  computeClassParamTypes) so `self.field`, an external `p.field`/`p.method()`, a bundle-typed
+  free-function parameter, and an instance returned across a function boundary all resolve
+  statically — and tuples, which need no ARM-specific code at all (ir.cpp scalarizes/synthesizes
+  them into anonymous bundles backend-agnostically; this phase's own test suite is what actually
+  exercises that path on ARM for the first time). Division by zero (DIV/FDIV/IDIV/MOD) raises a
+  clean runtime error instead of AArch64's silent SDIV-returns-0/FDIV-returns-inf behavior.
+  Still missing, same as BNY's own early history: try/catch, atomics, generators, and ilib
+  dynamic linking (the ELF/PLT/GOT machinery exists but has a known writable-globals-page bug —
+  see the ARM-parity plan's Phase 7). Native ilib calls use the AArch64 dynamic ELF path
+  by default, or the static cross-link path with --static-link when their ARM build is available.
+  Globals/temps live in a small fixed-address data page
+  (no relocation/fixup machinery needed for v1: both the data page and the code page have
+  addresses fixed at compile time, independent of how much code is generated), so there is no
+  two-pass address-patching system yet either — that becomes necessary once string constants
+  (rodata) are added.
 */
 #include "../include/ac.hpp"
 #include "../include/error.hpp"
@@ -28,6 +50,9 @@
 #include <cstring>
 #include <cstdint>
 #include <stdexcept>
+#include <cmath>
+#include <algorithm>
+#include <sys/stat.h>
 
 namespace AC_ArmGen {
 
@@ -62,6 +87,10 @@ class ArmEmitter {
 public:
     size_t pos() const { return buf.size(); }
     const std::vector<uint8_t>& bytes() const { return buf; }
+    void bytesRaw(const std::vector<uint8_t>& data) {
+        buf.insert(buf.end(), data.begin(), data.end());
+    }
+    void byteRaw(uint8_t b) { buf.push_back(b); }
     void patch32(size_t off, uint32_t w) {
         buf[off]=(uint8_t)(w&0xFF); buf[off+1]=(uint8_t)((w>>8)&0xFF);
         buf[off+2]=(uint8_t)((w>>16)&0xFF); buf[off+3]=(uint8_t)((w>>24)&0xFF);
@@ -116,6 +145,17 @@ public:
     void lsl_reg(R d, R n, R m) { emit32(0x9AC02000u | (rn(m)<<16) | (rn(n)<<5) | rn(d)); }
     void lsr_reg(R d, R n, R m) { emit32(0x9AC02400u | (rn(m)<<16) | (rn(n)<<5) | rn(d)); }
 
+    // ── scalar double-precision FP (V registers use the same 0..31 numbers) ──
+    void fmov_d_from_x(R d, R n) { emit32(0x9E670000u | (rn(n)<<5) | rn(d)); }
+    void fmov_x_from_d(R d, R n) { emit32(0x9E660000u | (rn(n)<<5) | rn(d)); }
+    void fadd_d(R d, R n, R m) { emit32(0x1E602800u | (rn(m)<<16) | (rn(n)<<5) | rn(d)); }
+    void fsub_d(R d, R n, R m) { emit32(0x1E603800u | (rn(m)<<16) | (rn(n)<<5) | rn(d)); }
+    void fmul_d(R d, R n, R m) { emit32(0x1E600800u | (rn(m)<<16) | (rn(n)<<5) | rn(d)); }
+    void fdiv_d(R d, R n, R m) { emit32(0x1E601800u | (rn(m)<<16) | (rn(n)<<5) | rn(d)); }
+    void fcmp_d(R n, R m) { emit32(0x1E602000u | (rn(m)<<16) | (rn(n)<<5)); }
+    void scvtf_d_x(R d, R n) { emit32(0x9E620000u | (rn(n)<<5) | rn(d)); }
+    void fcvtzs_x_d(R d, R n) { emit32(0x9E780000u | (rn(n)<<5) | rn(d)); }
+
     // ── comparison result → 0/1 integer ──
     void cset(R d, Cond c) {
         static const uint32_t base[6] = {
@@ -137,6 +177,7 @@ public:
     // Single-byte store, zero offset (Wt is the low 32 bits of the same-numbered X register —
     // verified base 0x39000000 | Rn<<5 | Rt against `strb w1,[x1]`).
     void strb0(R t, R n) { emit32(0x39000000u | (rn(n)<<5) | rn(t)); }
+    void ldrb0(R t, R n) { emit32(0x39400000u | (rn(n)<<5) | rn(t)); }
     // Escape hatch for fixup patching only — never used for first-pass emission.
     void word32(uint32_t w) { emit32(w); }
 
@@ -145,6 +186,7 @@ public:
     void ldp_x29_x30_postsp16() { emit32(0xA8C17BFDu); }  // ldp x29,x30,[sp],#16
     void mov_x29_sp()           { emit32(0x910003FDu); }  // mov x29, sp
     void ret()                  { emit32(0xD65F03C0u); }
+    void br(R n)                { emit32(0xD61F0000u | (rn(n)<<5)); }
 
     // ── branches (relative; label resolution is the caller's job — see LabelFixup below) ──
     void b_rel(int32_t imm26)     { emit32(0x14000000u | ((uint32_t)imm26 & 0x3FFFFFFu)); }
@@ -180,6 +222,164 @@ struct ElfPhdr {
 #pragma pack(pop)
 
 static const uint32_t EM_AARCH64 = 183;
+
+#pragma pack(push,1)
+struct Elf64Sym {
+    uint32_t st_name;
+    uint8_t  st_info, st_other;
+    uint16_t st_shndx;
+    uint64_t st_value, st_size;
+};
+struct Elf64Rela { uint64_t r_offset, r_info; int64_t r_addend; };
+struct Elf64Dyn { int64_t d_tag; uint64_t d_val; };
+#pragma pack(pop)
+
+struct ArmExternal {
+    std::string irName;
+    std::string exportName;
+    std::string library;
+    size_t stubImmOffset = 0;
+};
+
+struct ArmCompiledImage {
+    std::vector<uint8_t> text;
+    int slotCount = 0;
+    std::vector<ArmExternal> externals;
+    std::vector<std::pair<size_t,std::string>> externalCalls;
+};
+
+static bool armExternalName(const std::string& irName, std::string& exportName,
+                            std::string& library) {
+    static const std::map<std::string, std::pair<std::string,std::string>> exact = {
+        {"math.sin", {"ac_sin", "libacmath.so"}},
+        {"math.cos", {"ac_cos", "libacmath.so"}},
+        {"math.tan", {"ac_tan", "libacmath.so"}},
+        {"math.sqrt", {"ac_sqrt", "libacmath.so"}},
+        {"math.pow", {"ac_pow", "libacmath.so"}},
+        {"math.floor", {"ac_floor", "libacmath.so"}},
+        {"math.ceil", {"ac_ceil", "libacmath.so"}},
+        {"math.round", {"ac_round", "libacmath.so"}},
+        {"math.mod", {"ac_mod", "libacmath.so"}},
+        {"math.to_dec", {"ac_to_dec", "libacmath.so"}},
+        {"math.pi", {"ac_math_pi_const", "libacmath.so"}},
+        {"math.e", {"ac_math_e_const", "libacmath.so"}},
+        {"math.eval", {"ac_eval", "libacmath.so"}},
+        {"widgets.screen_dimensions", {"ac_widgets_screen_dimensions", "libacwidgets.so"}},
+        {"widgets.screen_mainloop", {"ac_widgets_screen_mainloop", "libacwidgets.so"}},
+        {"widgets.update", {"ac_widgets_screen_update", "libacwidgets.so"}},
+        {"widgets.destroy", {"ac_widgets_screen_destroy", "libacwidgets.so"}},
+        {"widgets.pack", {"ac_widgets_pack", "libacwidgets.so"}},
+        {"widgets.add", {"ac_widgets_add", "libacwidgets.so"}},
+        {"widgets.get", {"ac_widgets_get", "libacwidgets.so"}},
+        {"widgets.set", {"ac_widgets_set", "libacwidgets.so"}},
+        {"widgets.set_d", {"ac_widgets_set_d", "libacwidgets.so"}},
+        {"widgets.tabs_add_tab", {"ac_widgets_tabs_add_tab", "libacwidgets.so"}},
+        {"Screen", {"ac_widgets_screen_new", "libacwidgets.so"}},
+        {"display", {"ac_widgets_display_new", "libacwidgets.so"}},
+        {"ask", {"ac_widgets_ask_new", "libacwidgets.so"}},
+        {"btn", {"ac_widgets_btn_new", "libacwidgets.so"}},
+        {"ckbtn", {"ac_widgets_ckbtn_new", "libacwidgets.so"}},
+        {"radbtn", {"ac_widgets_ckbtn_new", "libacwidgets.so"}},
+        {"dropdown", {"ac_widgets_dropdown_new", "libacwidgets.so"}},
+        {"advance", {"ac_widgets_advance_new", "libacwidgets.so"}},
+        {"slider", {"ac_widgets_slider_new", "libacwidgets.so"}},
+        {"group", {"ac_widgets_group_new", "libacwidgets.so"}},
+        {"tabs", {"ac_widgets_tabs_new", "libacwidgets.so"}},
+        {"scroller", {"ac_widgets_scroller_new", "libacwidgets.so"}},
+        {"listbox", {"ac_widgets_listbox_new", "libacwidgets.so"}},
+        {"table", {"ac_widgets_table_new", "libacwidgets.so"}},
+        {"sketch", {"ac_widgets_sketch_new", "libacwidgets.so"}},
+        {"textbox", {"ac_widgets_textbox_new", "libacwidgets.so"}},
+        {"widgets.sketch_clear", {"ac_widgets_sketch_clear", "libacwidgets.so"}},
+        {"widgets.sketch_line", {"ac_widgets_sketch_line", "libacwidgets.so"}},
+        {"widgets.sketch_rect", {"ac_widgets_sketch_rect", "libacwidgets.so"}},
+        {"widgets.sketch_circle", {"ac_widgets_sketch_circle", "libacwidgets.so"}},
+        {"widgets.sketch_text", {"ac_widgets_sketch_text", "libacwidgets.so"}},
+        {"stringm.strip", {"ac_stringm_trim", "libacstringcheese.so"}},
+        {"stringm.strip_clause", {"ac_stringm_strip_clause", "libacstringcheese.so"}},
+        {"stringm.stripln", {"ac_stringm_stripln", "libacstringcheese.so"}},
+        {"stringm.trim", {"ac_stringm_trim", "libacstringcheese.so"}},
+        {"stringm.len", {"ac_stringm_len", "libacstringcheese.so"}},
+        {"stringm.length", {"ac_stringm_len", "libacstringcheese.so"}},
+        {"ml.tensor", {"ml_tensor", "libacml.so"}},
+        {"ml.grid", {"ml_grid", "libacml.so"}},
+        {"ml.gradient_track", {"ml_gradient_track", "libacml.so"}},
+        {"ml.backward", {"ml_backward", "libacml.so"}},
+        {"ml.grad_wipe", {"ml_grad_wipe", "libacml.so"}},
+        {"ml.weights", {"ml_weights", "libacml.so"}},
+        {"ml.take", {"ml_take", "libacml.so"}},
+        {"ml.optimize", {"ml_optimize", "libacml.so"}},
+        {"ml.add", {"ml_add", "libacml.so"}},
+        {"ml.multiply", {"ml_multiply", "libacml.so"}},
+        {"ml.relu", {"ml_relu", "libacml.so"}},
+        {"maudio.stop", {"ac_maudio_stop_all", "libacmachinaaudio.so"}},
+    };
+    auto it = exact.find(irName);
+    if (it != exact.end()) {
+        exportName = it->second.first;
+        library = it->second.second;
+        return true;
+    }
+    struct Prefix { const char* ir; const char* out; const char* lib; };
+    static const Prefix prefixes[] = {
+        {"math.", "ac_", "libacmath.so"},
+        {"stringm.", "ac_stringm_", "libacstringcheese.so"},
+        {"regex.", "ac_regex_", "libacregex.so"},
+        {"os.", "ac_os_", "libacoos.so"},
+        {"web.", "ac_web_", "libacweb.so"},
+        {"server.", "ac_server_", "libacserver.so"},
+        {"maudio.", "ac_maudio_", "libacmachinaaudio.so"},
+        {"ncpu.", "ac_ncpu_", "libacncpu.so"},
+        {"camera.", "ac_camera_", "libaccamera.so"},
+        {"widgets.", "ac_widgets_", "libacwidgets.so"},
+        {"dns.", "ac_dns_", "libacdns.so"},
+    };
+    for (const auto& p : prefixes) {
+        if (irName.rfind(p.ir, 0) == 0) {
+            exportName = p.out + irName.substr(std::strlen(p.ir));
+            std::replace(exportName.begin(), exportName.end(), '.', '_');
+            library = p.lib;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool armExternalReturnsString(const std::string& irName) {
+    return irName.rfind("stringm.", 0) == 0
+        || irName == "os.cwd"
+        || irName == "os.env"
+        || irName == "os.read"
+        || irName == "regex.search"
+        || irName == "regex.replace"
+        || irName == "regex.replace_all"
+        || irName.rfind("web.", 0) == 0
+        || irName == "dns.resolve" || irName == "dns.list"
+        || irName.rfind("server.", 0) == 0
+        || irName.rfind("maudio.", 0) == 0;
+}
+
+static bool armExternalReturnsFloat(const std::string& irName) {
+    if (irName.rfind("math.", 0) != 0) return false;
+    // "math.mod" (bare, no "_int" suffix) is a genuine exception: PY's own math_mod wrapper
+    // ("int-exact when operands and result are whole") always returns a real int for integer
+    // operands, since int-mod is unconditionally exact — unlike math.abs or true division,
+    // which stay float-returning even for whole results. This backend's CALL dispatch mirrors
+    // that by routing bare "math.abs"/non-int-operand math.mod through genuine float codegen and
+    // ONLY math.mod (both operands non-float) through compileIntegerMod — see that call site.
+    // Verified real bug this classifier alone closes: preScanFloatVars (a standalone scan, not
+    // routed through the CALL dispatch's own `break`-shielded special cases) classified bare
+    // "math.mod" as float using this function alone, wrongly marking is_armstrong's digit/
+    // accumulator as float and breaking its `total is n` integer comparison (153 vs 153.0's bit
+    // pattern never match). A SEPARATE, now-reverted attempt to also exempt "math.abs" here was
+    // itself a real bug: math.abs has no such int-exact wrapper on PY (always float, even for
+    // `math.abs(-5)` → `5.0`), so exempting it here diverged from PY on any non-constant call.
+    static const std::set<std::string> integerResults = {
+        "math.to_int", "math.abs_int", "math.mod_int", "math.mod",
+        "math.gcd", "math.lcm", "math.is_prime"
+    };
+    return integerResults.count(irName) == 0;
+}
 
 // ─── Branch fixups ──────────────────────────────────────────────────────────
 enum class FixKind { B, BL, CBZ, CBNZ, BCOND };
@@ -228,9 +428,92 @@ class ArmCompiler {
     std::map<int,size_t> labelOffsets;     // IR label id -> buffer offset
     std::vector<std::pair<size_t,std::string>> callFixups; // bufOff -> callee function name
     std::map<std::string,size_t> funcOffsets;              // function name -> buffer offset
+    std::map<std::string,size_t> externalStubOffsets_;
+    std::vector<ArmExternal> externals_;
+    std::vector<std::pair<size_t,std::string>> externalCalls_;
     std::map<std::string,int> slotOf;      // qualified key (see keyFor) -> slot index
-    int nextSlot = 0;
+    std::set<std::string> arrayRefs_;
+    std::set<std::string> dictRefs_;
+    std::set<std::string> dictStringKeys_;
+    std::set<std::string> arrayReturningFuncs_;
+    std::set<std::string> stringRefs_;
+    std::set<std::string> floatRefs_;
+    std::set<std::string> stringNames_;
+    std::set<std::string> stringReturningFuncs_;
+    std::set<std::string> mixedStringReturningFuncs_;
+    // Verified real bug this closes: a user function returning a float (e.g. `return s / length
+    // arr`) correctly computed the right IEEE-754 bit pattern, but nothing at the CALL site in
+    // the CALLER's scope knew the result was a float — arrayReturningFuncs_/stringReturningFuncs_
+    // already existed for exactly this purpose for arrays/strings, floats had no equivalent, so
+    // a later Term.display on the call's result fell through to the plain-int print routine and
+    // printed the raw bits as a huge integer (array_average.ac: 5.0 printed as
+    // 4617315517961601024). Computed in computeArrayReturningFuncs() alongside its siblings.
+    std::set<std::string> floatReturningFuncs_;
+    std::map<std::string,std::set<std::string>> stringParamHints_;
+    // Verified real bug this closes: a function parameter passed a literal float argument at
+    // some call site (`nsqrt(2.0)`) was never marked float-typed inside the function body at
+    // all — `x / 2.0` inside `nsqrt` then took the INTEGER division path, dividing the float's
+    // raw bit pattern by 2 as if it were a plain int64, printing a huge garbage "float" (the
+    // wrongly-halved bit pattern reinterpreted as a double) instead of the real quotient. Same
+    // call-site-scanning mechanism as stringParamHints_ just above, mirrored for floats.
+    std::map<std::string,std::set<std::string>> floatParamHints_;
+    // Bundle/class support (ported from BNY's identical design): a whole-program pre-scan finds
+    // every `self.field` STORE_VAR inside each class's methods and assigns each field a flat
+    // offset (8*index, first-seen order) — no header, no vtable, just a bump-allocated block of
+    // 8-byte slots. instanceClass_ tracks which class each constructed variable belongs to, set
+    // live as construction call sites are compiled, so a LATER `p.field`/`p.method()` on that
+    // same variable can resolve statically. currentClass_ is set while compiling a method body
+    // (from fn.classOwner) so a bare `self.field` inside it resolves against ITS class.
+    std::map<std::string, std::vector<std::string>> classFields_;
+    std::map<std::string, std::string> instanceClass_;
+    // A free function whose every `return` traces to a var directly constructed via
+    // `SomeClass()` earlier in that same function body — lets `q = f()` be treated exactly like
+    // a direct `q = ClassName()` construct for instanceClass_ purposes, even though the instance
+    // arrived across a function-return boundary (ported from BNY's identical mechanism).
+    std::map<std::string, std::string> classReturnFuncs_;
+    std::string currentClass_;
+    int fieldOffset(const std::string& cls, const std::string& field) const {
+        auto it = classFields_.find(cls);
+        if (it == classFields_.end()) return -1;
+        for (size_t i = 0; i < it->second.size(); i++)
+            if (it->second[i] == field) return (int)(8 * i);
+        return -1;
+    }
+    // A dotted VAR name ("self.hp", "p.x") is field access iff its base resolves to a known
+    // class (self -> currentClass_, else -> instanceClass_[base]). Returns false for an
+    // ordinary dotted name that isn't actually a field (lets the normal slot path handle it).
+    bool resolveFieldAccess(const std::string& name, std::string& base, int& offset) const {
+        auto dot = name.find('.');
+        if (dot == std::string::npos) return false;
+        base = name.substr(0, dot);
+        std::string field = name.substr(dot + 1);
+        std::string cls = (base == "self") ? currentClass_
+                         : (instanceClass_.count(base) ? instanceClass_.at(base) : std::string());
+        if (cls.empty()) return false;
+        offset = fieldOffset(cls, field);
+        return offset >= 0;
+    }
+    // Slot 0 of the globals page is reserved for the array-heap bump cursor (see
+    // emitAllocRoutine) — never assigned to a real var/temp, so slotFor's lazy allocation
+    // starts from 1. Mirrors BNY's own dedicated cursorSlot, just a fixed offset instead of
+    // going through BNY's general global-variable-slot allocator.
+    int nextGlobalSlot_ = 1;
+    int nextFuncSlot_ = 0;
+    // Reserved synthetic key for a method's `self` parameter — never a bare VAR in the IR (only
+    // ever fused into compound names like "self.hp", a completely separate symbol), so it can't
+    // be found via the normal name-matching scan every other parameter uses. Given its own fixed
+    // slot (0) in every method's frame, distinct from the ordinary per-symbol slot map.
+    static constexpr int SELF_SLOT = 0;
+    bool compilingMethod_ = false;
     const IRProgram& prog;
+    uint64_t codeVA_ = 0;
+    bool dynamicLink_ = false;
+    bool staticLink_ = false;
+    struct IfCtx { int elseLabel; int endLabel; bool sawElse; };
+    struct ForCtx { IRRef arrRef; IRRef idxRef; int startLabel; int endLabel; bool stringMode; };
+    std::vector<IfCtx> ifStack_;
+    std::vector<ForCtx> forStack_;
+    int nextHiddenTemp_ = -100000;
 
     // Which IRFunction (by name) is currently being compiled — "" while compiling the
     // mainloop. Real symbol (VAR) ids are globally unique across the whole program (the
@@ -240,6 +523,7 @@ class ArmCompiler {
     // alias the same memory slot without this qualifier. Same reasoning extends to VAR too, out
     // of caution, since nothing here re-derives the real SymbolTable scoping rules directly.
     std::string currentFuncName_;
+    std::set<std::string> currentFuncParamNames_;
 
     // Vars and temps share one key space here (qualified by function + kind so no two
     // different bindings can ever collide) — same "give everything a memory slot, no register
@@ -249,7 +533,7 @@ class ArmCompiler {
     // globals page, not a real per-call stack frame — so this does not yet support recursion
     // (a recursive call would overwrite its own in-flight locals). Real stack-frame-backed
     // locals are the natural next step once plain non-recursive calls are solid.
-    std::string keyFor(const IRRef& r) {
+    std::string keyFor(const IRRef& r) const {
         std::string kind = (r.kind == IRRef::Kind::VAR) ? "v" : "t";
         return currentFuncName_ + "#" + kind + std::to_string(r.id);
     }
@@ -257,9 +541,307 @@ class ArmCompiler {
         std::string k = keyFor(r);
         auto it = slotOf.find(k);
         if (it != slotOf.end()) return it->second;
-        int s = nextSlot++;
+        int s = currentFuncName_.empty() ? nextGlobalSlot_++ : nextFuncSlot_++;
         slotOf[k] = s;
         return s;
+    }
+    void markArrayRef(const IRRef& r) {
+        if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::TEMP) arrayRefs_.insert(keyFor(r));
+    }
+    void markDictRef(const IRRef& r) {
+        if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::TEMP) dictRefs_.insert(keyFor(r));
+    }
+    void markDictStringKey(const IRRef& r, const std::string& key) {
+        if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::TEMP)
+            dictStringKeys_.insert(keyFor(r) + "|" + key);
+    }
+    bool isDictRef(const IRRef& r) const {
+        if (r.kind != IRRef::Kind::VAR && r.kind != IRRef::Kind::TEMP) return false;
+        std::string kind = (r.kind == IRRef::Kind::VAR) ? "v" : "t";
+        return dictRefs_.count(currentFuncName_ + "#" + kind + std::to_string(r.id)) > 0;
+    }
+    bool isDictStringKey(const IRRef& r, const std::string& key) const {
+        if (r.kind != IRRef::Kind::VAR && r.kind != IRRef::Kind::TEMP) return false;
+        return dictStringKeys_.count(keyFor(r) + "|" + key) > 0;
+    }
+    void markStringRef(const IRRef& r) {
+        if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::TEMP) stringRefs_.insert(keyFor(r));
+        if (r.kind == IRRef::Kind::VAR && r.id >= 0)
+            stringNames_.insert(currentFuncName_ + "#" + prog.symbols.getName(r.id));
+    }
+    void markFloatRef(const IRRef& r) {
+        if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::TEMP) floatRefs_.insert(keyFor(r));
+    }
+    bool isArrayRef(const IRRef& r) const {
+        if (r.kind != IRRef::Kind::VAR && r.kind != IRRef::Kind::TEMP) return false;
+        std::string kind = (r.kind == IRRef::Kind::VAR) ? "v" : "t";
+        return arrayRefs_.count(currentFuncName_ + "#" + kind + std::to_string(r.id)) > 0;
+    }
+    bool isStringRef(const IRRef& r) const {
+        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING) return true;
+        if (r.kind != IRRef::Kind::VAR && r.kind != IRRef::Kind::TEMP) return false;
+        std::string kind = (r.kind == IRRef::Kind::VAR) ? "v" : "t";
+        if (r.kind == IRRef::Kind::VAR && r.id >= 0
+                && stringNames_.count(currentFuncName_ + "#" + prog.symbols.getName(r.id)) > 0)
+            return true;
+        return stringRefs_.count(currentFuncName_ + "#" + kind + std::to_string(r.id)) > 0;
+    }
+    bool isFloatRef(const IRRef& r) const {
+        if (r.kind == IRRef::Kind::CONST) return r.value.type == IRType::FLOAT;
+        if (r.kind != IRRef::Kind::VAR && r.kind != IRRef::Kind::TEMP) return false;
+        std::string kind = (r.kind == IRRef::Kind::VAR) ? "v" : "t";
+        return floatRefs_.count(currentFuncName_ + "#" + kind + std::to_string(r.id)) > 0;
+    }
+    static std::string refKeyRaw(const IRRef& r) {
+        if (r.kind == IRRef::Kind::VAR) return "v" + std::to_string(r.id);
+        if (r.kind == IRRef::Kind::TEMP) return "t" + std::to_string(r.id);
+        return "";
+    }
+    const IRFunction* findFunction(const std::string& name) const {
+        for (const auto& fn : prog.functions) {
+            if (fn.name == name) return &fn;
+        }
+        return nullptr;
+    }
+    void computeStringParamHintsFromLiteralCalls() {
+        stringParamHints_.clear();
+        floatParamHints_.clear();
+        auto scan = [&](const std::vector<IRInstruction>& instrs) {
+            for (const auto& ins : instrs) {
+                if ((ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL)
+                        || ins.typedOperands.empty()) continue;
+                std::string callee = callableName(ins.typedOperands[0]);
+                const IRFunction* fn = findFunction(callee);
+                if (!fn) continue;
+                for (size_t i = 1; i < ins.typedOperands.size() && i <= fn->parameters.size(); ++i) {
+                    const IRRef& arg = ins.typedOperands[i];
+                    if (arg.kind == IRRef::Kind::CONST && arg.value.type == IRType::STRING)
+                        stringParamHints_[callee].insert(fn->parameters[i - 1]);
+                    if (arg.kind == IRRef::Kind::CONST && arg.value.type == IRType::FLOAT)
+                        floatParamHints_[callee].insert(fn->parameters[i - 1]);
+                }
+            }
+        };
+        scan(prog.globalInit);
+        for (const auto& fn : prog.functions) scan(fn.instructions);
+    }
+    // Fixed-point pre-scan (ported from BNY's preScanFloats): marks every var/temp that is EVER
+    // assigned a float value anywhere in this instruction stream, run BEFORE any codegen for it.
+    // Verified real bug this closes: without it, float-ness was only ever recorded by "mark as
+    // you go" DURING codegen — fine for straight-line code, but a loop body is only compiled
+    // ONCE even though it runs many times, so a var that becomes float via a compound update
+    // inside a WHILST (`total = total + da`, da float) had its OWN left-operand load compiled
+    // BEFORE that same instruction's store got around to marking it float. The compiled load
+    // instruction is fixed forever at that point — every subsequent runtime iteration re-read
+    // `total`'s (by-then genuinely double) bits and wrongly `scvtf`'d them as if they were a
+    // plain integer (verified: `benchmark.ac`'s statsStress loop went from -0.79999... on
+    // iteration 1 — coincidentally correct, since 0 and 0.0 share a bit pattern — to a garbage
+    // 19-digit "float" by iteration 2, where the accumulator was no longer exactly zero).
+    void preScanFloatVars(const std::vector<IRInstruction>& instrs) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            auto markIfNew = [&](const IRRef& r) {
+                if (r.kind != IRRef::Kind::VAR && r.kind != IRRef::Kind::TEMP) return;
+                if (isFloatRef(r)) return;
+                markFloatRef(r);
+                changed = true;
+            };
+            for (const auto& ins : instrs) {
+                if (ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL
+                    || ins.opcode == IROpcode::LOAD_CONST) {
+                    bool hasResultForm = ins.result.isValid() && !ins.typedOperands.empty();
+                    IRRef src = hasResultForm ? ins.typedOperands[0]
+                              : (ins.typedOperands.size() >= 2 ? ins.typedOperands[1] : IRRef());
+                    bool srcFloat = (src.kind == IRRef::Kind::CONST && src.value.type == IRType::FLOAT)
+                                 || isFloatRef(src);
+                    // A STORE_VAR whose own resultType is a non-float integer-width qualifier means
+                    // the value is being coerced INTO that type at this store, not turning the var
+                    // float (mirrors BNY's identical guard — see its comment for the x=5;x=5.5 case).
+                    bool coercedNonFloat = ins.resultType != IRType::VOID
+                        && ins.resultType != IRType::FLOAT && irIntWidth(ins.resultType);
+                    if (srcFloat && !coercedNonFloat) {
+                        if (ins.result.isValid()) markIfNew(ins.result);
+                        else if (ins.typedOperands.size() >= 2) markIfNew(ins.typedOperands[0]);
+                    }
+                }
+                if (ins.opcode == IROpcode::TYPE_CAST && ins.resultType == IRType::FLOAT
+                    && ins.result.isValid())
+                    markIfNew(ins.result);
+                if ((ins.opcode == IROpcode::DIV || ins.opcode == IROpcode::FDIV) && ins.result.isValid())
+                    markIfNew(ins.result);
+                if ((ins.opcode == IROpcode::ADD || ins.opcode == IROpcode::SUB
+                  || ins.opcode == IROpcode::MUL || ins.opcode == IROpcode::PMUL)
+                    && ins.result.isValid() && ins.typedOperands.size() >= 2) {
+                    if (isFloatRef(ins.typedOperands[0]) || isFloatRef(ins.typedOperands[1]))
+                        markIfNew(ins.result);
+                }
+                if ((ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL)
+                    && ins.result.isValid() && !ins.typedOperands.empty()) {
+                    std::string callee = callableName(ins.typedOperands[0]);
+                    if (floatReturningFuncs_.count(callee) || armExternalReturnsFloat(callee))
+                        markIfNew(ins.result);
+                }
+            }
+        }
+    }
+
+    void computeArrayReturningFuncs() {
+        arrayReturningFuncs_.clear();
+        stringReturningFuncs_.clear();
+        mixedStringReturningFuncs_.clear();
+        floatReturningFuncs_.clear();
+        computeStringParamHintsFromLiteralCalls();
+        for (const auto& fn : prog.functions) {
+            std::set<std::string> arrays;
+            std::set<std::string> strings;
+            std::set<std::string> floats;
+            auto hit = stringParamHints_.find(fn.name);
+            if (hit != stringParamHints_.end()) {
+                for (const std::string& param : hit->second) {
+                    for (const auto& ins : fn.instructions) {
+                        auto seed = [&](const IRRef& r) {
+                            if (r.kind == IRRef::Kind::VAR && r.id >= 0
+                                    && prog.symbols.getName(r.id) == param)
+                                strings.insert(refKeyRaw(r));
+                        };
+                        seed(ins.result);
+                        for (const auto& op : ins.typedOperands) seed(op);
+                    }
+                }
+            }
+            auto floatHit = floatParamHints_.find(fn.name);
+            if (floatHit != floatParamHints_.end()) {
+                for (const std::string& param : floatHit->second) {
+                    for (const auto& ins : fn.instructions) {
+                        auto seed = [&](const IRRef& r) {
+                            if (r.kind == IRRef::Kind::VAR && r.id >= 0
+                                    && prog.symbols.getName(r.id) == param)
+                                floats.insert(refKeyRaw(r));
+                        };
+                        seed(ins.result);
+                        for (const auto& op : ins.typedOperands) seed(op);
+                    }
+                }
+            }
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (const auto& ins : fn.instructions) {
+                    auto addRef = [&](const IRRef& r) {
+                        std::string k = refKeyRaw(r);
+                        if (!k.empty() && arrays.insert(k).second) changed = true;
+                    };
+                    auto hasRef = [&](const IRRef& r) {
+                        std::string k = refKeyRaw(r);
+                        return !k.empty() && arrays.count(k) > 0;
+                    };
+                    auto addStrRef = [&](const IRRef& r) {
+                        std::string k = refKeyRaw(r);
+                        if (!k.empty() && strings.insert(k).second) changed = true;
+                    };
+                    auto hasStrRef = [&](const IRRef& r) {
+                        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING) return true;
+                        std::string k = refKeyRaw(r);
+                        return !k.empty() && strings.count(k) > 0;
+                    };
+                    auto addFloatRef2 = [&](const IRRef& r) {
+                        std::string k = refKeyRaw(r);
+                        if (!k.empty() && floats.insert(k).second) changed = true;
+                    };
+                    auto hasFloatRef2 = [&](const IRRef& r) {
+                        if (r.kind == IRRef::Kind::CONST) return r.value.type == IRType::FLOAT;
+                        std::string k = refKeyRaw(r);
+                        return !k.empty() && floats.count(k) > 0;
+                    };
+                    if (ins.opcode == IROpcode::ALLOC && !ins.typedOperands.empty()
+                            && ins.typedOperands[0].kind == IRRef::Kind::CONST
+                            && ins.typedOperands[0].value.type == IRType::STRING) {
+                        const std::string& t = std::get<std::string>(ins.typedOperands[0].value.data);
+                        if (t == "list" || t == "range" || t == "sequence") addRef(ins.result);
+                    } else if ((ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL
+                                || ins.opcode == IROpcode::LOAD_VAR)
+                            && !ins.typedOperands.empty() && hasRef(ins.typedOperands.back())) {
+                        addRef(ins.result);
+                        if (ins.opcode == IROpcode::STORE_VAR && !ins.typedOperands.empty()) addRef(ins.typedOperands[0]);
+                    }
+                    if ((ins.opcode == IROpcode::LOAD_CONST || ins.opcode == IROpcode::LOAD_VAR
+                                || ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL)
+                            && !ins.typedOperands.empty() && hasStrRef(ins.typedOperands.back())) {
+                        addStrRef(ins.result);
+                        if (ins.opcode == IROpcode::STORE_VAR && !ins.typedOperands.empty()) addStrRef(ins.typedOperands[0]);
+                    } else if (ins.opcode == IROpcode::ADD && ins.typedOperands.size() >= 2
+                            && (hasStrRef(ins.typedOperands[0]) || hasStrRef(ins.typedOperands[1]))) {
+                        if (ins.resultType == IRType::STRING) {
+                            if (hasStrRef(ins.typedOperands[0])) addStrRef(ins.typedOperands[1]);
+                            if (hasStrRef(ins.typedOperands[1])) addStrRef(ins.typedOperands[0]);
+                        }
+                        addStrRef(ins.result);
+                    } else if (ins.opcode == IROpcode::FOR_BEGIN && ins.typedOperands.size() >= 2
+                            && hasStrRef(ins.typedOperands[1])) {
+                        addStrRef(ins.typedOperands[0]);
+                    } else if (ins.opcode == IROpcode::LOAD_INDEX && ins.typedOperands.size() >= 2
+                            && ins.resultType == IRType::STRING) {
+                        addStrRef(ins.typedOperands[0]);
+                        addStrRef(ins.result);
+                    } else if (ins.opcode == IROpcode::CALL && !ins.typedOperands.empty()) {
+                        std::string cn = callableName(ins.typedOperands[0]);
+                        if (arrayReturningFuncs_.count(cn)) addRef(ins.result);
+                        if (stringReturningFuncs_.count(cn)) addStrRef(ins.result);
+                        if (floatReturningFuncs_.count(cn)) addFloatRef2(ins.result);
+                    }
+                    // Float tracking, mirroring the string rules just above — see
+                    // floatReturningFuncs_'s own comment for the bug this closes.
+                    if (ins.resultType == IRType::FLOAT) {
+                        addFloatRef2(ins.result);
+                    } else if ((ins.opcode == IROpcode::LOAD_CONST || ins.opcode == IROpcode::LOAD_VAR
+                                || ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL)
+                            && !ins.typedOperands.empty() && hasFloatRef2(ins.typedOperands.back())) {
+                        addFloatRef2(ins.result);
+                        if (ins.opcode == IROpcode::STORE_VAR) addFloatRef2(ins.typedOperands[0]);
+                    } else if ((ins.opcode == IROpcode::ADD || ins.opcode == IROpcode::SUB
+                                || ins.opcode == IROpcode::MUL || ins.opcode == IROpcode::DIV
+                                || ins.opcode == IROpcode::IDIV || ins.opcode == IROpcode::FDIV)
+                            && ins.typedOperands.size() >= 2
+                            && (hasFloatRef2(ins.typedOperands[0]) || hasFloatRef2(ins.typedOperands[1]))) {
+                        addFloatRef2(ins.result);
+                    } else if (ins.opcode == IROpcode::TYPE_CAST && ins.resultType == IRType::FLOAT) {
+                        addFloatRef2(ins.result);
+                    }
+                }
+            }
+            bool anyStringReturn = false;
+            bool anyNonStringReturn = false;
+            for (const auto& ins : fn.instructions) {
+                if (ins.opcode == IROpcode::RETURN && !ins.typedOperands.empty()) {
+                    if (arrays.count(refKeyRaw(ins.typedOperands[0]))) {
+                        arrayReturningFuncs_.insert(fn.name);
+                        break;
+                    }
+                }
+            }
+            for (const auto& ins : fn.instructions) {
+                if (ins.opcode == IROpcode::RETURN && !ins.typedOperands.empty()
+                        && floats.count(refKeyRaw(ins.typedOperands[0]))) {
+                    floatReturningFuncs_.insert(fn.name);
+                    break;
+                }
+            }
+            for (const auto& ins : fn.instructions) {
+                if (ins.opcode == IROpcode::RETURN && !ins.typedOperands.empty()) {
+                    if (hasStringLiteralOrRaw(strings, ins.typedOperands[0])) anyStringReturn = true;
+                    else anyNonStringReturn = true;
+                }
+            }
+            if (anyStringReturn && anyNonStringReturn) mixedStringReturningFuncs_.insert(fn.name);
+            else if (anyStringReturn) stringReturningFuncs_.insert(fn.name);
+        }
+    }
+
+    static bool hasStringLiteralOrRaw(const std::set<std::string>& strings, const IRRef& r) {
+        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING) return true;
+        std::string k = refKeyRaw(r);
+        return !k.empty() && strings.count(k) > 0;
     }
 
     static const R GLOBALS_BASE = R::X28; // pinned for the whole program (no calls to clobber it in v1)
@@ -289,6 +871,7 @@ class ArmCompiler {
     std::set<int> elidableTemps_;      // recomputed per scope by compileFunction/compile()
     int pendingTempId_ = -1;           // temp id currently pending, uncommitted to memory
     R pendingTempReg_ = S0;            // which register it's actually sitting in right now
+    int nextInternalLabel_ = -2000;
 
     // Safety net, not the common path: if computeElidableTemps' "used exactly once, by the very
     // next instruction" guarantee ever doesn't hold (a bug, or a future IR shape this scan
@@ -317,6 +900,33 @@ class ArmCompiler {
         }
     }
 
+    void loadStringLiteralPtr(R dst, const std::string& s) {
+        int strLabel = nextInternalLabel_--;
+        int afterLabel = nextInternalLabel_--;
+        emitBranch(FixKind::B, afterLabel);
+        emitLabel(strLabel);
+        std::vector<uint8_t> data(s.begin(), s.end());
+        data.push_back(0);
+        em.bytesRaw(data);
+        while (em.pos() % 4 != 0) em.byteRaw(0);
+        emitLabel(afterLabel);
+        auto it = labelOffsets.find(strLabel);
+        if (it == labelOffsets.end())
+            throw ACError::backend("ARM backend: internal string-label emission failed");
+        em.mov_imm64(dst, (int64_t)(codeVA_ + it->second));
+    }
+
+    // Loads a plain (non-field) variable NAME's value into `dst` — used to get the object
+    // pointer a field access needs to add its offset to (ported from BNY's identical helper).
+    void loadNamedVar(const std::string& name, R dst) {
+        if (name == "self") {
+            em.ldr_imm(dst, R::SP, (uint32_t)(SELF_SLOT * 8));
+            return;
+        }
+        int sid = prog.symbols.lookupAnyScope(name);
+        if (sid >= 0) { loadOperand(IRRef::var(sid), dst); return; }
+        em.mov_imm64(dst, 0);   // shouldn't happen — name wasn't a known var
+    }
     void loadOperand(const IRRef& r, R dst) {
         if (r.kind == IRRef::Kind::TEMP && r.id == pendingTempId_) {
             if (dst != pendingTempReg_) em.mov_reg(dst, pendingTempReg_);
@@ -324,10 +934,33 @@ class ArmCompiler {
             return;
         }
         protectPending(dst);
+        if (r.kind == IRRef::Kind::VAR && r.id >= 0) {
+            std::string fbase; int foff;
+            if (resolveFieldAccess(prog.symbols.getName(r.id), fbase, foff)) {
+                // self.field / instance.field — real pointer+offset access, not this var's own
+                // slot (see classFields_'s comment). Was completely disconnected before: this
+                // name would otherwise just get its own local slot like any unrelated plain
+                // variable, so a field WRITE would never reach the actual object.
+                loadNamedVar(fbase, dst);
+                if (foff != 0) em.add_imm(dst, dst, foff);
+                em.ldr_imm(dst, dst, 0);
+                return;
+            }
+        }
         if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::INT) {
             em.mov_imm64(dst, std::get<int64_t>(r.value.data));
         } else if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::BOOL) {
             em.mov_imm64(dst, std::get<bool>(r.value.data) ? 1 : 0);
+        } else if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING) {
+            loadStringLiteralPtr(dst, std::get<std::string>(r.value.data));
+        } else if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::FLOAT) {
+            uint64_t bits = 0;
+            double value = std::get<double>(r.value.data);
+            std::memcpy(&bits, &value, sizeof(bits));
+            em.mov_imm64(dst, (int64_t)bits);
+        } else if (r.kind == IRRef::Kind::CONST) {
+            throw ACError::backend("ARM backend: constant type " + std::to_string((int)r.value.type)
+                + " is not yet implemented as a runtime value");
         } else if (r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::TEMP) {
             int s = slotFor(r);
             if (!currentFuncName_.empty()) funcMaxSlot_ = std::max(funcMaxSlot_, s);
@@ -348,6 +981,16 @@ class ArmCompiler {
             return;
         }
         ensureSpilled();
+        if (r.kind == IRRef::Kind::VAR && r.id >= 0) {
+            std::string fbase; int foff;
+            if (resolveFieldAccess(prog.symbols.getName(r.id), fbase, foff)) {
+                R addr = (src == R::X16) ? R::X15 : R::X16;
+                loadNamedVar(fbase, addr);
+                if (foff != 0) em.add_imm(addr, addr, foff);
+                em.str_imm(src, addr, 0);
+                return;
+            }
+        }
         int s = slotFor(r);
         if (!currentFuncName_.empty()) funcMaxSlot_ = std::max(funcMaxSlot_, s);
         em.str_imm(src, currentBase(), (uint32_t)(s*8));
@@ -371,6 +1014,389 @@ class ArmCompiler {
 
     static int labelIdOf(const IRRef& r) { return r.id; }
 
+    std::string callableName(const IRRef& r) const {
+        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING)
+            return std::get<std::string>(r.value.data);
+        if ((r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::FUNCTION) && r.id >= 0)
+            return prog.symbols.getName(r.id);
+        return "";
+    }
+
+    std::string describeRef(const IRRef& r) const {
+        if (r.kind == IRRef::Kind::CONST) return r.toStringWithSymbols(const_cast<SymbolTable*>(&prog.symbols));
+        if ((r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::FUNCTION) && r.id >= 0)
+            return prog.symbols.getName(r.id);
+        return r.toStringWithSymbols(const_cast<SymbolTable*>(&prog.symbols));
+    }
+
+    std::string refKindKeyForMessage(const IRRef& r) const {
+        if (r.kind != IRRef::Kind::VAR && r.kind != IRRef::Kind::TEMP) return "";
+        std::string kind = (r.kind == IRRef::Kind::VAR) ? "v" : "t";
+        return currentFuncName_ + "#" + kind + std::to_string(r.id);
+    }
+
+    std::string refNameKeyForMessage(const IRRef& r) const {
+        if (r.kind != IRRef::Kind::VAR || r.id < 0) return "";
+        return currentFuncName_ + "#" + prog.symbols.getName(r.id);
+    }
+    bool isCurrentFunctionParam(const IRRef& r) const {
+        return r.kind == IRRef::Kind::VAR && r.id >= 0
+            && !currentFuncName_.empty()
+            && currentFuncParamNames_.count(prog.symbols.getName(r.id)) > 0;
+    }
+
+    void storeBoolFromCond(Cond c, const IRInstruction& ins) {
+        em.cset(S0, c);
+        storeResult(ins.result, S0);
+    }
+
+    void compileTruthNot(const IRInstruction& ins) {
+        loadOperand(ins.typedOperands[0], S0);
+        em.cmp_reg(S0, R::XZR);
+        storeBoolFromCond(Cond::EQ, ins);
+    }
+
+    void compileTruthBin(const IRInstruction& ins, IROpcode op) {
+        loadOperand(ins.typedOperands[0], S0);
+        em.cmp_reg(S0, R::XZR);
+        em.cset(S0, Cond::NE);
+        loadOperand(ins.typedOperands[1], S1);
+        em.cmp_reg(S1, R::XZR);
+        em.cset(S1, Cond::NE);
+        if (op == IROpcode::AND) em.and_reg(S0, S0, S1);
+        else if (op == IROpcode::OR) em.orr_reg(S0, S0, S1);
+        else {
+            em.eor_reg(S0, S0, S1);
+            if (op == IROpcode::XNOR) {
+                em.cmp_reg(S0, R::XZR);
+                em.cset(S0, Cond::EQ);
+            }
+        }
+        storeResult(ins.result, S0);
+    }
+
+    // AArch64's SDIV silently returns 0 on a zero divisor instead of trapping (unlike x86's IDIV,
+    // which raises SIGFPE — the behavior BNY's own zero-guard was written to catch). Verified real
+    // bug: with no guard at all, `5 / b` (b=0) printed garbage instead of erroring like PY's
+    // ZeroDivisionError does, and this was true even for FDIV/DIV (float division by 0.0 doesn't
+    // trap either — it silently yields +-inf/nan, which the print routine has no way to render).
+    // divisorReg holds either a plain int or the raw bit pattern of a float — 0 means zero either
+    // way, so one check covers both DIV's dispatch paths.
+    void emitDivZeroGuard(R divisorReg) {
+        int skip = nextInternalLabel_--;
+        emitBranch(FixKind::CBNZ, skip, Cond::EQ, divisorReg);
+        emitBranch(FixKind::BL, DIVZERO_LABEL);
+        emitLabel(skip);
+    }
+
+    void compileIntegerMod(const IRInstruction& ins, size_t lhsIdx, size_t rhsIdx) {
+        loadOperand(ins.typedOperands[lhsIdx], S0);
+        loadOperand(ins.typedOperands[rhsIdx], S1);
+        emitDivZeroGuard(S1);
+        em.sdiv(S2, S0, S1);
+        em.msub(S0, S2, S1, S0);
+        storeResult(ins.result, S0);
+    }
+
+    void compileIntegerAbs(const IRInstruction& ins, size_t argIdx) {
+        loadOperand(ins.typedOperands[argIdx], S0);
+        em.cmp_reg(S0, R::XZR);
+        int doneLabel = nextInternalLabel_--;
+        emitBranch(FixKind::BCOND, doneLabel, Cond::GE);
+        em.neg_reg(S0, S0);
+        emitLabel(doneLabel);
+        storeResult(ins.result, S0);
+    }
+
+    void compileWriteStringLiteral(const std::string& s, bool newline) {
+        int strLabel = nextInternalLabel_--;
+        int afterLabel = nextInternalLabel_--;
+        emitBranch(FixKind::B, afterLabel);
+        emitLabel(strLabel);
+        std::vector<uint8_t> data(s.begin(), s.end());
+        if (newline) data.push_back((uint8_t)'\n');
+        em.bytesRaw(data);
+        while (em.pos() % 4 != 0) em.byteRaw(0);
+        emitLabel(afterLabel);
+        auto it = labelOffsets.find(strLabel);
+        if (it == labelOffsets.end())
+            throw ACError::backend("ARM backend: internal string-label emission failed");
+        em.mov_imm64(R::X0, 1);
+        em.mov_imm64(R::X1, (int64_t)(codeVA_ + it->second));
+        em.mov_imm64(R::X2, (int64_t)data.size());
+        em.mov_imm64(R::X8, 64);
+        em.svc0();
+    }
+
+    void compilePrintStringLiteral(const std::string& s) {
+        compileWriteStringLiteral(s, true);
+    }
+
+    void compileInput(const IRInstruction& ins) {
+        if (!ins.typedOperands.empty()) {
+            const IRRef& prompt = ins.typedOperands[0];
+            if (prompt.kind == IRRef::Kind::CONST && prompt.value.type == IRType::STRING) {
+                compileWriteStringLiteral(std::get<std::string>(prompt.value.data), false);
+            } else if (isStringRef(prompt)) {
+                loadOperand(prompt, R::X0);
+                emitBranch(FixKind::BL, WRITE_CSTR_LABEL);
+            } else {
+                throw ACError::backend("ARM backend: Term.ask prompt must be a string");
+            }
+        }
+
+        em.mov_imm64(R::X0, 4096);
+        emitBranch(FixKind::BL, ALLOC_LABEL);
+        em.mov_reg(R::X9, R::X0);              // input buffer base
+        em.mov_reg(R::X10, R::X0);             // cursor
+        em.mov_imm64(R::X11, 0);               // chars accepted
+        em.mov_imm64(R::X12, 4095);            // leave room for NUL
+
+        int loopLabel = nextInternalLabel_--;
+        int doneLabel = nextInternalLabel_--;
+        emitLabel(loopLabel);
+        em.cmp_reg(R::X11, R::X12);
+        emitBranch(FixKind::BCOND, doneLabel, Cond::GE);
+        em.mov_imm64(R::X0, 0);                // stdin
+        em.mov_reg(R::X1, R::X10);             // read one byte at cursor
+        em.mov_imm64(R::X2, 1);
+        em.mov_imm64(R::X8, 63);               // read (AArch64 Linux syscall table)
+        em.svc0();
+        em.cmp_reg(R::X0, R::XZR);
+        emitBranch(FixKind::BCOND, doneLabel, Cond::LE);
+        em.ldrb0(R::X13, R::X10);
+        em.mov_imm64(R::X14, (int64_t)'\n');
+        em.cmp_reg(R::X13, R::X14);
+        emitBranch(FixKind::BCOND, doneLabel, Cond::EQ);
+        em.add_imm(R::X10, R::X10, 1);
+        em.add_imm(R::X11, R::X11, 1);
+        emitBranch(FixKind::B, loopLabel);
+
+        emitLabel(doneLabel);
+        em.mov_imm64(R::X13, 0);
+        em.strb0(R::X13, R::X10);
+        storeResult(ins.result, R::X9);
+        markStringRef(ins.result);
+    }
+
+    void compileRangeAlloc(const IRInstruction& ins, bool isRange) {
+        if (!ins.result.isValid())
+            throw ACError::backend("ARM backend: range/sequence ALLOC without a result");
+        if (isRange) {
+            em.mov_imm64(R::X12, 0);                         // start
+            if (ins.typedOperands.size() >= 2) loadOperand(ins.typedOperands[1], R::X13);
+            else em.mov_imm64(R::X13, 0);
+            em.mov_imm64(R::X14, 1);                         // step
+        } else {
+            if (ins.typedOperands.size() >= 2) loadOperand(ins.typedOperands[1], R::X12);
+            else em.mov_imm64(R::X12, 0);
+            loadOperand(ins.typedOperands.size() >= 3 ? ins.typedOperands[2] : ins.typedOperands[1], R::X13);
+            if (ins.typedOperands.size() >= 4) loadOperand(ins.typedOperands[3], R::X14);
+            else em.mov_imm64(R::X14, 1);
+        }
+
+        int countDone = nextInternalLabel_--;
+        int countLoopAsc = nextInternalLabel_--;
+        int countDesc = nextInternalLabel_--;
+        int countLoopDesc = nextInternalLabel_--;
+        int fillLoop = nextInternalLabel_--;
+        int fillDone = nextInternalLabel_--;
+
+        em.mov_imm64(R::X15, 0);                             // count
+        em.mov_reg(R::X11, R::X12);                          // iter
+        em.cmp_reg(R::X14, R::XZR);
+        emitBranch(FixKind::BCOND, countDone, Cond::EQ);
+        em.cmp_reg(R::X14, R::XZR);
+        emitBranch(FixKind::BCOND, countDesc, Cond::LT);
+        emitLabel(countLoopAsc);
+        em.cmp_reg(R::X11, R::X13);
+        emitBranch(FixKind::BCOND, countDone, Cond::GE);
+        em.add_imm(R::X15, R::X15, 1);
+        em.add_reg(R::X11, R::X11, R::X14);
+        emitBranch(FixKind::B, countLoopAsc);
+        emitLabel(countDesc);
+        emitLabel(countLoopDesc);
+        em.cmp_reg(R::X11, R::X13);
+        emitBranch(FixKind::BCOND, countDone, Cond::LE);
+        em.add_imm(R::X15, R::X15, 1);
+        em.add_reg(R::X11, R::X11, R::X14);
+        emitBranch(FixKind::B, countLoopDesc);
+        emitLabel(countDone);
+
+        em.add_imm(R::X0, R::X15, 2);
+        em.mov_imm64(R::X9, 8);
+        em.mul_reg(R::X0, R::X0, R::X9);
+        emitBranch(FixKind::BL, ALLOC_LABEL);
+        em.str_imm(R::X15, R::X0, 0);                        // raw[0] = cap
+        em.add_imm(R::X0, R::X0, 8);
+        em.str_imm(R::X15, R::X0, 0);                        // ptr[0] = len
+        em.mov_reg(R::X9, R::X0);                            // ptr
+        em.mov_imm64(R::X10, 0);                             // i
+        em.mov_reg(R::X11, R::X12);                          // iter
+        emitLabel(fillLoop);
+        em.cmp_reg(R::X10, R::X15);
+        emitBranch(FixKind::BCOND, fillDone, Cond::GE);
+        em.add_imm(R::X16, R::X10, 1);
+        em.mov_imm64(R::X17, 8);
+        em.mul_reg(R::X16, R::X16, R::X17);
+        em.add_reg(R::X17, R::X9, R::X16);
+        em.str_imm(R::X11, R::X17, 0);
+        em.add_reg(R::X11, R::X11, R::X14);
+        em.add_imm(R::X10, R::X10, 1);
+        emitBranch(FixKind::B, fillLoop);
+        emitLabel(fillDone);
+        storeResult(ins.result, R::X9);
+        markArrayRef(ins.result);
+    }
+
+    void preseedValueKinds(const std::vector<IRInstruction>& instrs) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            size_t arrBefore = arrayRefs_.size();
+            size_t strBefore = stringRefs_.size();
+            size_t floatBefore = floatRefs_.size();
+            for (const auto& ins : instrs) {
+                if (ins.opcode == IROpcode::ALLOC && !ins.typedOperands.empty()
+                        && ins.typedOperands[0].kind == IRRef::Kind::CONST
+                        && ins.typedOperands[0].value.type == IRType::STRING
+                        && std::get<std::string>(ins.typedOperands[0].value.data) == "dict") {
+                    markDictRef(ins.result);
+                    if (ins.typedOperands.size() >= 2 && ins.typedOperands[1].kind == IRRef::Kind::CONST
+                            && ins.typedOperands[1].value.type == IRType::STRING) {
+                        std::string content = std::get<std::string>(ins.typedOperands[1].value.data);
+                        size_t pos = 0;
+                        while (pos < content.size()) {
+                            size_t comma = content.find(',', pos);
+                            std::string pair = content.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                            size_t colon = pair.find(':');
+                            if (colon != std::string::npos) {
+                                std::string key = pair.substr(0, colon);
+                                size_t a = key.find_first_not_of(" \t"), b = key.find_last_not_of(" \t");
+                                if (a != std::string::npos) key = key.substr(a, b - a + 1);
+                                if (key.size() >= 2 && key.front() == '$' && key.back() == '$')
+                                    key = key.substr(1, key.size() - 2);
+                                std::string val = pair.substr(colon + 1);
+                                a = val.find_first_not_of(" \t"); b = val.find_last_not_of(" \t");
+                                if (a != std::string::npos) val = val.substr(a, b - a + 1);
+                                if (val.size() >= 2 && val.front() == '$' && val.back() == '$')
+                                    markDictStringKey(ins.result, key);
+                            }
+                            if (comma == std::string::npos) break;
+                            pos = comma + 1;
+                        }
+                    }
+                }
+                if (ins.opcode == IROpcode::ALLOC && !ins.typedOperands.empty()
+                        && ins.typedOperands[0].kind == IRRef::Kind::CONST
+                        && ins.typedOperands[0].value.type == IRType::STRING) {
+                    const std::string& t = std::get<std::string>(ins.typedOperands[0].value.data);
+                    if (t == "list" || t == "range" || t == "sequence") markArrayRef(ins.result);
+                }
+                if ((ins.opcode == IROpcode::LOAD_CONST || ins.opcode == IROpcode::LOAD_VAR
+                            || ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL)
+                        && !ins.typedOperands.empty()) {
+                    const IRRef& src = ins.typedOperands.back();
+                    if (isArrayRef(src)) {
+                        markArrayRef(ins.result);
+                        if (ins.opcode == IROpcode::STORE_VAR && !ins.typedOperands.empty()) markArrayRef(ins.typedOperands[0]);
+                    }
+                    if (isDictRef(src)) {
+                        markDictRef(ins.result);
+                        if (ins.opcode == IROpcode::STORE_VAR && !ins.typedOperands.empty()) markDictRef(ins.typedOperands[0]);
+                    }
+                    if (isStringRef(src)) {
+                        markStringRef(ins.result);
+                        if (ins.opcode == IROpcode::STORE_VAR && !ins.typedOperands.empty()) markStringRef(ins.typedOperands[0]);
+                    }
+                    if (ins.resultType == IRType::FLOAT || isFloatRef(src)) {
+                        markFloatRef(ins.result);
+                        if (ins.opcode == IROpcode::STORE_VAR && !ins.typedOperands.empty()) markFloatRef(ins.typedOperands[0]);
+                    }
+                    if (ins.opcode == IROpcode::STORE_VAR && !ins.typedOperands.empty()
+                            && isStringRef(ins.typedOperands[0])) {
+                        markStringRef(src);
+                    }
+                }
+                if ((ins.opcode == IROpcode::ADD || ins.opcode == IROpcode::SUB
+                            || ins.opcode == IROpcode::MUL || ins.opcode == IROpcode::DIV
+                            || ins.opcode == IROpcode::IDIV || ins.opcode == IROpcode::FDIV)
+                        && ins.resultType == IRType::FLOAT) {
+                    markFloatRef(ins.result);
+                    for (const auto& op : ins.typedOperands) if (isFloatRef(op)) markFloatRef(op);
+                }
+                if (ins.opcode == IROpcode::TYPE_CAST && ins.resultType == IRType::FLOAT)
+                    markFloatRef(ins.result);
+                if (ins.opcode == IROpcode::LOAD_INDEX && ins.typedOperands.size() >= 2
+                        && isDictRef(ins.typedOperands[0])) {
+                    markDictRef(ins.result);
+                    if (ins.typedOperands[1].kind == IRRef::Kind::CONST
+                            && ins.typedOperands[1].value.type == IRType::STRING) {
+                        std::string key = std::get<std::string>(ins.typedOperands[1].value.data);
+                        if (isDictStringKey(ins.typedOperands[0], key)) markStringRef(ins.result);
+                    }
+                }
+                if (ins.opcode == IROpcode::STORE_INDEX && ins.typedOperands.size() >= 3
+                        && isDictRef(ins.typedOperands[0])
+                        && ins.typedOperands[1].kind == IRRef::Kind::CONST
+                        && ins.typedOperands[1].value.type == IRType::STRING
+                        && isStringRef(ins.typedOperands[2])) {
+                    markDictStringKey(ins.typedOperands[0], std::get<std::string>(ins.typedOperands[1].value.data));
+                }
+                if (ins.opcode == IROpcode::ADD && ins.typedOperands.size() >= 2
+                        && (isStringRef(ins.typedOperands[0]) || isStringRef(ins.typedOperands[1]))) {
+                    if (ins.resultType == IRType::STRING) {
+                        if (isStringRef(ins.typedOperands[0])) markStringRef(ins.typedOperands[1]);
+                        if (isStringRef(ins.typedOperands[1])) markStringRef(ins.typedOperands[0]);
+                    }
+                    markStringRef(ins.result);
+                }
+                if (ins.opcode == IROpcode::FOR_BEGIN && ins.typedOperands.size() >= 2
+                        && (isStringRef(ins.typedOperands[1]) || !isArrayRef(ins.typedOperands[1]))) {
+                    markStringRef(ins.typedOperands[0]);
+                }
+                if (ins.opcode == IROpcode::LOAD_INDEX && ins.typedOperands.size() >= 2
+                        && (ins.resultType == IRType::STRING || isStringRef(ins.result))) {
+                    markStringRef(ins.typedOperands[0]);
+                    markStringRef(ins.result);
+                }
+                if (ins.opcode == IROpcode::CALL && !ins.typedOperands.empty()) {
+                    std::string cn = callableName(ins.typedOperands[0]);
+                    if (arrayReturningFuncs_.count(cn)) markArrayRef(ins.result);
+                    if (stringReturningFuncs_.count(cn)) markStringRef(ins.result);
+                    if (floatReturningFuncs_.count(cn)) markFloatRef(ins.result);
+                }
+            }
+            changed = arrayRefs_.size() != arrBefore || stringRefs_.size() != strBefore
+                   || floatRefs_.size() != floatBefore;
+        }
+    }
+
+    void loadFloatOperand(const IRRef& r, R d) {
+        loadOperand(r, R::X17);
+        em.fmov_d_from_x(d, R::X17);
+        if (!isFloatRef(r)) em.scvtf_d_x(d, R::X17);
+    }
+
+    void storeFloatResult(const IRRef& r, R d) {
+        em.fmov_x_from_d(R::X17, d);
+        storeResult(r, R::X17);
+        // Verified real bug: ADD/SUB/MUL/DIV's float branches all call this and then just
+        // `break` — none of them separately called markFloatRef(r), so a later PRINT (or any
+        // other isFloatRef-gated dispatch) on that var/temp couldn't tell it was float and fell
+        // through to the plain-int path, printing the raw IEEE-754 bit pattern as a huge
+        // integer (e.g. array_average.ac's `s / length arr` computed exactly 5.0/2.333... —
+        // the arithmetic was correct — but printed 4617315517961601024). Marking here once
+        // fixes every existing and future storeFloatResult call site at once.
+        markFloatRef(r);
+    }
+
+    bool isFloatOperation(const IRInstruction& ins) const {
+        if (ins.resultType == IRType::FLOAT) return true;
+        for (const auto& op : ins.typedOperands) if (isFloatRef(op)) return true;
+        return false;
+    }
+
     void compileCompare(Cond c, const IRInstruction& ins) {
         loadOperand(ins.typedOperands[0], S0);
         loadOperand(ins.typedOperands[1], S1);
@@ -389,11 +1415,12 @@ class ArmCompiler {
             // instead of the real value is exactly the "compiles clean, wrong at runtime"
             // failure mode this file no longer allows (see the default: case below).
             case IROpcode::LOAD_CONST:
-                if (ins.typedOperands[0].kind == IRRef::Kind::CONST
-                        && ins.typedOperands[0].value.type == IRType::FLOAT)
-                    throw ACError::backend("ARM backend: floating-point constants are not yet implemented");
+            case IROpcode::LOAD_VAR:
                 loadOperand(ins.typedOperands[0], S0);
                 storeResult(ins.result, S0);
+                if (ins.resultType == IRType::FLOAT || isFloatRef(ins.typedOperands[0])) markFloatRef(ins.result);
+                if (isStringRef(ins.typedOperands[0])) markStringRef(ins.result);
+                if (isArrayRef(ins.typedOperands[0])) markArrayRef(ins.result);
                 break;
             // Structural markers with no runtime semantics of their own — every real AC
             // program has at least a TAG_BEGIN/TAG_END pair around <mainloop> (verified:
@@ -403,6 +1430,108 @@ class ArmCompiler {
             case IROpcode::TAG_END:
             case IROpcode::NOP:
                 break;
+            // Structural markers only — a class body's real content is its methods (compiled as
+            // ordinary, separately-labeled IRFunctions, see compileFunction) and its field
+            // defaults (folded into the auto-synthesized `init` method by ir.cpp) — nothing here
+            // needs runtime code of its own, same reasoning as TAG_BEGIN/TAG_END above.
+            case IROpcode::CLASS_BEGIN:
+            case IROpcode::CLASS_END:
+                break;
+            case IROpcode::CONST_DECL:
+                if (!ins.typedOperands.empty()) {
+                    loadOperand(ins.typedOperands[0], S0);
+                    storeResult(ins.result, S0);
+                    if (isArrayRef(ins.typedOperands[0])) markArrayRef(ins.result);
+                    if (isStringRef(ins.typedOperands[0])) markStringRef(ins.result);
+                }
+                break;
+            case IROpcode::IF_BEGIN: {
+                IfCtx c{nextInternalLabel_--, nextInternalLabel_--, false};
+                if (!ins.typedOperands.empty()) loadOperand(ins.typedOperands[0], S0);
+                else em.mov_imm64(S0, 0);
+                emitBranch(FixKind::CBZ, c.elseLabel, Cond::EQ, S0);
+                ifStack_.push_back(c);
+                break;
+            }
+            case IROpcode::IF_ELSE:
+                if (ifStack_.empty())
+                    throw ACError::backend("ARM backend: IF_ELSE without IF_BEGIN");
+                emitBranch(FixKind::B, ifStack_.back().endLabel);
+                emitLabel(ifStack_.back().elseLabel);
+                ifStack_.back().sawElse = true;
+                break;
+            case IROpcode::IF_END: {
+                if (ifStack_.empty())
+                    throw ACError::backend("ARM backend: IF_END without IF_BEGIN");
+                auto c = ifStack_.back();
+                ifStack_.pop_back();
+                if (!c.sawElse) emitLabel(c.elseLabel);
+                emitLabel(c.endLabel);
+                break;
+            }
+            case IROpcode::FOR_BEGIN: {
+                if (ins.typedOperands.size() < 2)
+                    throw ACError::backend("ARM backend: malformed FOR_BEGIN");
+                bool stringMode = isStringRef(ins.typedOperands[1])
+                    || isStringRef(ins.typedOperands[0])
+                    || isCurrentFunctionParam(ins.typedOperands[1])
+                    || !isArrayRef(ins.typedOperands[1]);
+                ForCtx c{IRRef::temp(nextHiddenTemp_--), IRRef::temp(nextHiddenTemp_--),
+                    nextInternalLabel_--, nextInternalLabel_--, stringMode};
+                loadOperand(ins.typedOperands[1], S0);
+                storeResult(c.arrRef, S0);
+                if (c.stringMode) markStringRef(c.arrRef);
+                else markArrayRef(c.arrRef);
+                em.mov_imm64(S0, 0);
+                storeResult(c.idxRef, S0);
+                emitLabel(c.startLabel);
+                if (c.stringMode) {
+                    loadOperand(c.arrRef, R::X9);
+                    loadOperand(c.idxRef, R::X10);
+                    em.add_reg(R::X9, R::X9, R::X10);
+                    em.ldrb0(R::X11, R::X9);
+                    em.cmp_reg(R::X11, R::XZR);
+                    emitBranch(FixKind::BCOND, c.endLabel, Cond::EQ);
+                    IRRef charRef = IRRef::temp(nextHiddenTemp_--);
+                    storeResult(charRef, R::X11);
+                    em.mov_imm64(R::X0, 2);
+                    emitBranch(FixKind::BL, ALLOC_LABEL);
+                    loadOperand(charRef, R::X11);
+                    em.strb0(R::X11, R::X0);
+                    em.add_imm(R::X12, R::X0, 1);
+                    em.strb0(R::XZR, R::X12);
+                    storeResult(ins.typedOperands[0], R::X0);
+                    markStringRef(ins.typedOperands[0]);
+                } else {
+                    loadOperand(c.idxRef, S0);
+                    loadOperand(c.arrRef, S1);
+                    em.ldr_imm(S1, S1, 0);
+                    em.cmp_reg(S0, S1);
+                    emitBranch(FixKind::BCOND, c.endLabel, Cond::GE);
+                    loadOperand(c.arrRef, R::X9);
+                    loadOperand(c.idxRef, R::X10);
+                    em.add_imm(R::X10, R::X10, 1);
+                    em.mov_imm64(R::X11, 8);
+                    em.mul_reg(R::X10, R::X10, R::X11);
+                    em.add_reg(R::X9, R::X9, R::X10);
+                    em.ldr_imm(R::X9, R::X9, 0);
+                    storeResult(ins.typedOperands[0], R::X9);
+                }
+                forStack_.push_back(c);
+                break;
+            }
+            case IROpcode::FOR_END: {
+                if (forStack_.empty())
+                    throw ACError::backend("ARM backend: FOR_END without FOR_BEGIN");
+                auto c = forStack_.back();
+                forStack_.pop_back();
+                loadOperand(c.idxRef, S0);
+                em.add_imm(S0, S0, 1);
+                storeResult(c.idxRef, S0);
+                emitBranch(FixKind::B, c.startLabel);
+                emitLabel(c.endLabel);
+                break;
+            }
             case IROpcode::LABEL:
                 emitLabel(labelIdOf(ins.typedOperands[0]));
                 break;
@@ -423,34 +1552,110 @@ class ArmCompiler {
                 if (ins.typedOperands.size() >= 2) {
                     loadOperand(ins.typedOperands[1], S0);
                     storeResult(ins.typedOperands[0], S0);
+                    if (isArrayRef(ins.typedOperands[1])) markArrayRef(ins.typedOperands[0]);
+                    if (isStringRef(ins.typedOperands[1])) markStringRef(ins.typedOperands[0]);
                 } else if (!ins.typedOperands.empty()) {
                     loadOperand(ins.typedOperands[0], S0);
                     storeResult(ins.result, S0);
+                    if (isArrayRef(ins.typedOperands[0])) markArrayRef(ins.result);
+                    if (isStringRef(ins.typedOperands[0])) markStringRef(ins.result);
+                } else {
+                    throw ACError::backend("ARM backend: malformed STORE_VAR with no operands");
                 }
                 break;
             }
             case IROpcode::ADD:
+                if (ins.typedOperands.size() >= 2 && (isStringRef(ins.typedOperands[0]) || isStringRef(ins.typedOperands[1]))) {
+                    if (!isStringRef(ins.typedOperands[0]) || !isStringRef(ins.typedOperands[1]))
+                        throw ACError::backend("ARM backend: mixed string/non-string '+' needs to_string support (left="
+                            + describeRef(ins.typedOperands[0]) + (isStringRef(ins.typedOperands[0]) ? ":string" : ":non-string")
+                            + ", right=" + describeRef(ins.typedOperands[1]) + (isStringRef(ins.typedOperands[1]) ? ":string" : ":non-string")
+                            + ", scope=" + (currentFuncName_.empty() ? std::string("<mainloop>") : currentFuncName_)
+                            + ", left_key=" + refKindKeyForMessage(ins.typedOperands[0])
+                            + ", right_key=" + refKindKeyForMessage(ins.typedOperands[1])
+                            + ", left_name_key=" + refNameKeyForMessage(ins.typedOperands[0])
+                            + (stringNames_.count(refNameKeyForMessage(ins.typedOperands[0])) ? ":tagged" : ":untagged")
+                            + ", result_type=" + std::to_string((int)ins.resultType)
+                            + ")");
+                    loadOperand(ins.typedOperands[0], R::X0);
+                    loadOperand(ins.typedOperands[1], R::X1);
+                    emitBranch(FixKind::BL, CONCAT_LABEL);
+                    storeResult(ins.result, R::X0);
+                    markStringRef(ins.result);
+                    break;
+                }
+                if (isFloatOperation(ins)) {
+                    loadFloatOperand(ins.typedOperands[0], R::X0);
+                    loadFloatOperand(ins.typedOperands[1], R::X1);
+                    em.fadd_d(R::X0, R::X0, R::X1);
+                    storeFloatResult(ins.result, R::X0);
+                    break;
+                }
                 loadOperand(ins.typedOperands[0], S0); loadOperand(ins.typedOperands[1], S1);
                 em.add_reg(S0, S0, S1); storeResult(ins.result, S0);
                 break;
             case IROpcode::SUB:
+                if (isFloatOperation(ins)) {
+                    loadFloatOperand(ins.typedOperands[0], R::X0);
+                    loadFloatOperand(ins.typedOperands[1], R::X1);
+                    em.fsub_d(R::X0, R::X0, R::X1);
+                    storeFloatResult(ins.result, R::X0);
+                    break;
+                }
                 loadOperand(ins.typedOperands[0], S0); loadOperand(ins.typedOperands[1], S1);
                 em.sub_reg(S0, S0, S1); storeResult(ins.result, S0);
                 break;
             case IROpcode::MUL:
             case IROpcode::PMUL:
+                if (isFloatOperation(ins)) {
+                    loadFloatOperand(ins.typedOperands[0], R::X0);
+                    loadFloatOperand(ins.typedOperands[1], R::X1);
+                    em.fmul_d(R::X0, R::X0, R::X1);
+                    storeFloatResult(ins.result, R::X0);
+                    break;
+                }
                 loadOperand(ins.typedOperands[0], S0); loadOperand(ins.typedOperands[1], S1);
                 em.mul_reg(S0, S0, S1); storeResult(ins.result, S0);
                 break;
             case IROpcode::DIV:
             case IROpcode::IDIV:
+            case IROpcode::FDIV:
+                if (isFloatOperation(ins) || ins.opcode == IROpcode::FDIV) {
+                    loadFloatOperand(ins.typedOperands[0], R::X0);
+                    loadFloatOperand(ins.typedOperands[1], R::X1);
+                    em.fmov_x_from_d(R::X15, R::X1);
+                    emitDivZeroGuard(R::X15);
+                    em.fdiv_d(R::X0, R::X0, R::X1);
+                    storeFloatResult(ins.result, R::X0);
+                    break;
+                }
                 loadOperand(ins.typedOperands[0], S0); loadOperand(ins.typedOperands[1], S1);
+                emitDivZeroGuard(S1);
                 em.sdiv(S0, S0, S1); storeResult(ins.result, S0);
                 break;
             case IROpcode::MOD:
+                compileIntegerMod(ins, 0, 1);
+                break;
+            case IROpcode::AND:
+            case IROpcode::OR:
+            case IROpcode::XOR:
+            case IROpcode::XNOR:
+                compileTruthBin(ins, ins.opcode);
+                break;
+            case IROpcode::NOT:
+                compileTruthNot(ins);
+                break;
+            case IROpcode::XSUB:
                 loadOperand(ins.typedOperands[0], S0); loadOperand(ins.typedOperands[1], S1);
-                em.sdiv(S2, S0, S1);              // S2 = quotient
-                em.msub(S0, S2, S1, S0);           // S0 = S0 - S2*S1 = remainder
+                em.sub_reg(S0, S0, S1);
+                em.cmp_reg(S0, R::XZR);
+                {
+                    int doneLabel = nextInternalLabel_--;
+                    emitBranch(FixKind::BCOND, doneLabel, Cond::GE);
+                    em.neg_reg(S0, S0);
+                    emitLabel(doneLabel);
+                }
+                em.add_imm(S0, S0, 1);
                 storeResult(ins.result, S0);
                 break;
             case IROpcode::BAND:
@@ -477,26 +1682,716 @@ class ArmCompiler {
                 loadOperand(ins.typedOperands[0], S0); loadOperand(ins.typedOperands[1], S1);
                 em.lsr_reg(S0, S0, S1); storeResult(ins.result, S0);
                 break;
-            case IROpcode::EQ:  compileCompare(Cond::EQ, ins); break;
-            case IROpcode::NEQ: compileCompare(Cond::NE, ins); break;
-            case IROpcode::LT:  compileCompare(Cond::LT, ins); break;
-            case IROpcode::GT:  compileCompare(Cond::GT, ins); break;
-            case IROpcode::LTE: compileCompare(Cond::LE, ins); break;
-            case IROpcode::GTE: compileCompare(Cond::GE, ins); break;
+            case IROpcode::EQ:
+                if (ins.typedOperands.size() >= 2
+                        && isStringRef(ins.typedOperands[0]) && isStringRef(ins.typedOperands[1])) {
+                    loadOperand(ins.typedOperands[0], R::X0);
+                    loadOperand(ins.typedOperands[1], R::X1);
+                    emitBranch(FixKind::BL, STREQ_LABEL);
+                    storeResult(ins.result, R::X0);
+                    break;
+                }
+                if (isFloatOperation(ins)) {
+                    loadFloatOperand(ins.typedOperands[0], R::X0);
+                    loadFloatOperand(ins.typedOperands[1], R::X1);
+                    em.fcmp_d(R::X0, R::X1);
+                    em.cset(S0, Cond::EQ);
+                    storeResult(ins.result, S0);
+                    break;
+                }
+                compileCompare(Cond::EQ, ins);
+                break;
+            case IROpcode::NEQ:
+                if (ins.typedOperands.size() >= 2
+                        && isStringRef(ins.typedOperands[0]) && isStringRef(ins.typedOperands[1])) {
+                    loadOperand(ins.typedOperands[0], R::X0);
+                    loadOperand(ins.typedOperands[1], R::X1);
+                    emitBranch(FixKind::BL, STREQ_LABEL);
+                    em.cmp_reg(R::X0, R::XZR);
+                    storeBoolFromCond(Cond::EQ, ins);
+                    break;
+                }
+                if (isFloatOperation(ins)) {
+                    loadFloatOperand(ins.typedOperands[0], R::X0);
+                    loadFloatOperand(ins.typedOperands[1], R::X1);
+                    em.fcmp_d(R::X0, R::X1);
+                    em.cset(S0, Cond::NE);
+                    storeResult(ins.result, S0);
+                    break;
+                }
+                compileCompare(Cond::NE, ins);
+                break;
+            case IROpcode::LT:
+            case IROpcode::GT:
+            case IROpcode::LTE:
+            case IROpcode::GTE:
+                if (isFloatOperation(ins)) {
+                    loadFloatOperand(ins.typedOperands[0], R::X0);
+                    loadFloatOperand(ins.typedOperands[1], R::X1);
+                    em.fcmp_d(R::X0, R::X1);
+                    em.cset(S0, ins.opcode == IROpcode::LT ? Cond::LT
+                              : ins.opcode == IROpcode::GT ? Cond::GT
+                              : ins.opcode == IROpcode::LTE ? Cond::LE : Cond::GE);
+                    storeResult(ins.result, S0);
+                } else if (ins.opcode == IROpcode::LT) compileCompare(Cond::LT, ins);
+                else if (ins.opcode == IROpcode::GT) compileCompare(Cond::GT, ins);
+                else if (ins.opcode == IROpcode::LTE) compileCompare(Cond::LE, ins);
+                else compileCompare(Cond::GE, ins);
+                break;
             // AAPCS64: first 8 integer args in X0..X7, return value in X0. v1 caps calls at 8
             // args (register-passed only, no stack-passed overflow yet) — matches this file's
             // "get a real subset working end to end" scope; a 9th argument is a real gap, not
             // silently dropped (see the args.size()>8 check below).
-            case IROpcode::CALL: {
+            // arr.append(value): grow the receiver array in place (or reallocate, per
+            // __ac_append__'s own capacity check) and write the resulting pointer back into the
+            // receiver var. There's no dedicated APPEND opcode — ir.cpp lowers a plain
+            // `arr.append(x)` statement to a LIB_CALL (verified via --stop-after-ir:
+            // `lib_call arr.append, 40`, typedOperands[0] a VAR named "arr.append", not a CALL
+            // as BNY's own ".append" comment might suggest at a skim — BNY handles both CALL AND
+            // LIB_CALL through one shared emitLibCall-style dispatch, so this same suffix-match
+            // needs to run from both opcodes here too, not just one).
+            case IROpcode::CALL:
+            case IROpcode::LIB_CALL: {
+                std::string calleeName = callableName(ins.typedOperands[0]);
+                if (calleeName == "import") break;
+                if (calleeName == "foreign")
+                    throw ACError::fluencyInCPU();
+                if (mixedStringReturningFuncs_.count(calleeName))
+                    throw ACError::backend("ARM backend: function '" + calleeName
+                        + "' mixes string and non-string returns; tagged dynamic returns are not yet implemented");
+                if (calleeName == "ac_length" && ins.typedOperands.size() >= 2) {
+                    loadOperand(ins.typedOperands[1], R::X0);
+                    emitBranch(FixKind::BL, isStringRef(ins.typedOperands[1]) ? STRLEN_LABEL : LENGTH_LABEL);
+                    storeResult(ins.result, R::X0);
+                    break;
+                }
+                // Legacy widget constructor sugar such as dimensions(480x520) is compile-time
+                // metadata consumed by the following Screen call. It has no native runtime
+                // operation of its own, so preserve the value as a harmless zero handle.
+                if (calleeName == "dimensions") {
+                    if (ins.result.isValid()) storeResult(ins.result, R::XZR);
+                    break;
+                }
+                // ARM has no separate lightweight-thread runtime yet. Match the other
+                // synchronous backends by executing quickthread's target function normally;
+                // this preserves program behavior while making the keyword available.
+                if (calleeName == "quickthread" && ins.typedOperands.size() >= 2) {
+                    std::string target = callableName(ins.typedOperands[1]);
+                    const size_t nArgs = ins.typedOperands.size() - 2;
+                    if (nArgs > 8)
+                        throw ACError::backend("ARM backend: quickthread calls with more than 8 arguments are not implemented");
+                    static const R argRegs[8] = {R::X0,R::X1,R::X2,R::X3,R::X4,R::X5,R::X6,R::X7};
+                    for (size_t i = 0; i < nArgs; i++) loadOperand(ins.typedOperands[i + 2], argRegs[i]);
+                    callFixups.push_back({em.pos(), target});
+                    em.bl_rel(0);
+                    if (ins.result.isValid()) storeResult(ins.result, R::X0);
+                    break;
+                }
+                if ((calleeName == "math.mod_int" || calleeName == "math_mod_int")
+                        && ins.typedOperands.size() >= 3) {
+                    compileIntegerMod(ins, 1, 2);
+                    break;
+                }
+                if ((calleeName == "math.mod" || calleeName == "math_mod")
+                        && ins.typedOperands.size() >= 3) {
+                    if (!isFloatRef(ins.typedOperands[1]) && !isFloatRef(ins.typedOperands[2])) {
+                        // Integer modulo of two non-float operands is always exact — matches PY's
+                        // own math_mod wrapper ("int-exact when operands and result are whole"),
+                        // which always returns a genuine int for integer operands since int-mod
+                        // can never be fractional. See armExternalReturnsFloat's comment.
+                        compileIntegerMod(ins, 1, 2);
+                        break;
+                    }
+                    // At least one operand is float: genuine (possibly fractional) remainder,
+                    // C's fmod semantics: a - trunc(a/b)*b (result takes the sign of a).
+                    loadFloatOperand(ins.typedOperands[1], R::X0);
+                    loadFloatOperand(ins.typedOperands[2], R::X1);
+                    em.fmov_x_from_d(R::X15, R::X1);
+                    emitDivZeroGuard(R::X15);
+                    em.fdiv_d(R::X2, R::X0, R::X1);
+                    em.fcvtzs_x_d(R::X16, R::X2);      // truncate quotient toward zero
+                    em.scvtf_d_x(R::X2, R::X16);
+                    em.fmul_d(R::X2, R::X2, R::X1);
+                    em.fsub_d(R::X0, R::X0, R::X2);
+                    storeFloatResult(ins.result, R::X0);
+                    break;
+                }
+                if ((calleeName == "math.to_int" || calleeName == "math_to_int") && ins.typedOperands.size() >= 2) {
+                    loadOperand(ins.typedOperands[1], S0);
+                    storeResult(ins.result, S0);
+                    break;
+                }
+                if ((calleeName == "math.abs_int" || calleeName == "math_abs_int")
+                        && ins.typedOperands.size() >= 2) {
+                    compileIntegerAbs(ins, 1);
+                    break;
+                }
+                if ((calleeName == "math.abs" || calleeName == "math_abs")
+                        && ins.typedOperands.size() >= 2) {
+                    // Always float-returning (matches PY's plain `_d1('ac_abs')` wrapper — math.abs
+                    // has no smart int-when-exact shortcut the way math.mod's own wrapper does).
+                    // Verified real bug: this used to alias compileIntegerAbs (like math.abs_int),
+                    // which stores a raw int64 — a later float-typed read of the result would then
+                    // reinterpret those bits as garbage IEEE-754 instead of the real converted value.
+                    if (isFloatRef(ins.typedOperands[1])) {
+                        loadFloatOperand(ins.typedOperands[1], R::X0);
+                        em.fmov_x_from_d(R::X15, R::X0);
+                        em.mov_imm64(R::X16, 0x7FFFFFFFFFFFFFFFLL);
+                        em.and_reg(R::X15, R::X15, R::X16);   // clear sign bit
+                        em.fmov_d_from_x(R::X0, R::X15);
+                        storeFloatResult(ins.result, R::X0);
+                    } else {
+                        loadOperand(ins.typedOperands[1], S0);
+                        em.cmp_reg(S0, R::XZR);
+                        int doneLabel = nextInternalLabel_--;
+                        emitBranch(FixKind::BCOND, doneLabel, Cond::GE);
+                        em.neg_reg(S0, S0);
+                        emitLabel(doneLabel);
+                        em.scvtf_d_x(R::X0, S0);
+                        storeFloatResult(ins.result, R::X0);
+                    }
+                    break;
+                }
+                // AC's eval(expr) is the shared math library evaluator on native backends.
+                // The ARM ABI returns the double bits in X0, which is also the representation
+                // used by the backend's float slots.
+                if (calleeName == "eval" || calleeName == "math.eval") {
+                    if (ins.typedOperands.size() < 2)
+                        throw ACError::backend("ARM backend: eval requires an expression argument");
+                    loadOperand(ins.typedOperands[1], R::X0);
+                    callFixups.push_back({em.pos(), "math.eval"});
+                    em.bl_rel(0);
+                    storeResult(ins.result, R::X0);
+                    markFloatRef(ins.result);
+                    break;
+                }
+                // Widget methods are represented with the source variable name in the IR
+                // (for example root.dimensions), while the native symbol is stable.
+                if (calleeName.size() > 11
+                        && calleeName.compare(calleeName.size() - 11, 11, ".dimensions") == 0
+                        && ins.typedOperands.size() >= 3) {
+                    std::string receiver = calleeName.substr(0, calleeName.size() - 11);
+                    int receiverId = prog.symbols.lookupAnyScope(receiver);
+                    if (receiverId < 0)
+                        throw ACError::backend("ARM backend: widget receiver '" + receiver + "' is unresolved");
+                    loadOperand(IRRef::var(receiverId), R::X0);
+                    loadOperand(ins.typedOperands[1], R::X1);
+                    loadOperand(ins.typedOperands[2], R::X2);
+                    callFixups.push_back({em.pos(), "widgets.screen_dimensions"});
+                    em.bl_rel(0);
+                    break;
+                }
+                // Widget methods keep their source receiver in the callee name (for example
+                // pos_drop.add), while the C++ ilib exposes universal runtime-dispatch helpers.
+                // Resolve the receiver slot here and let the library inspect its actual widget
+                // kind; this covers dropdowns, listboxes, tables, labels, and textboxes without
+                // duplicating widget type tracking in the ARM backend.
+                auto widgetReceiver = [&](const std::string& name) -> int {
+                    auto dot = name.rfind('.');
+                    if (dot == std::string::npos || dot == 0) return -1;
+                    return prog.symbols.lookupAnyScope(name.substr(0, dot));
+                };
+                auto widgetCall = [&](const std::string& linkName, int receiverId,
+                                      size_t firstArg, bool returnsString) {
+                    loadOperand(IRRef::var(receiverId), R::X0);
+                    size_t nArgs = ins.typedOperands.size() > firstArg
+                        ? ins.typedOperands.size() - firstArg : 0;
+                    if (nArgs > 1)
+                        throw ACError::backend("ARM backend: widget method has too many arguments");
+                    if (nArgs) loadOperand(ins.typedOperands[firstArg], R::X1);
+                    callFixups.push_back({em.pos(), linkName});
+                    em.bl_rel(0);
+                    if (ins.result.isValid()) {
+                        storeResult(ins.result, R::X0);
+                        if (returnsString) markStringRef(ins.result);
+                    }
+                };
+                if (calleeName.size() > 4) {
+                    const std::string method = calleeName.substr(calleeName.rfind('.') + 1);
+                    int receiverId = widgetReceiver(calleeName);
+                    if (receiverId >= 0 && (method == "line" || method == "rect"
+                            || method == "circle" || method == "text_at")) {
+                        const size_t expected = method == "line" || method == "rect" ? 7
+                            : method == "circle" ? 6 : 6;
+                        if (ins.typedOperands.size() < expected + 1)
+                            throw ACError::backend("ARM backend: sketch." + method + " needs more arguments");
+                        loadOperand(IRRef::var(receiverId), R::X0);
+                        static const R argRegs[8] = {R::X0,R::X1,R::X2,R::X3,R::X4,R::X5,R::X6,R::X7};
+                        size_t floatArgs = method == "line" || method == "rect" ? 4
+                            : method == "circle" ? 3 : 2;
+                        for (size_t i = 0; i < expected; i++) {
+                            if (i < floatArgs) loadFloatOperand(ins.typedOperands[i + 1], argRegs[i + 1]);
+                            else loadOperand(ins.typedOperands[i + 1], argRegs[i + 1]);
+                        }
+                        callFixups.push_back({em.pos(), method == "line" ? "widgets.sketch_line"
+                            : method == "rect" ? "widgets.sketch_rect"
+                            : method == "circle" ? "widgets.sketch_circle" : "widgets.sketch_text"});
+                        em.bl_rel(0);
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "add" && ins.typedOperands.size() >= 2) {
+                        widgetCall("widgets.add", receiverId, 1, false);
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "pack") {
+                        widgetCall("widgets.pack", receiverId, 1, false);
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "get") {
+                        widgetCall("widgets.get", receiverId, 1, true);
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "set" && ins.typedOperands.size() >= 2) {
+                        bool numeric = ins.typedOperands[1].kind == IRRef::Kind::CONST
+                            && ins.typedOperands[1].value.type != IRType::STRING;
+                        if (numeric) {
+                            loadOperand(IRRef::var(receiverId), R::X0);
+                            loadFloatOperand(ins.typedOperands[1], R::X1);
+                            callFixups.push_back({em.pos(), "widgets.set_d"});
+                            em.bl_rel(0);
+                        } else {
+                            widgetCall("widgets.set", receiverId, 1, false);
+                        }
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "mainloop") {
+                        widgetCall("widgets.screen_mainloop", receiverId, 1, false);
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "update") {
+                        widgetCall("widgets.update", receiverId, 1, false);
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "destroy") {
+                        widgetCall("widgets.destroy", receiverId, 1, false);
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "clear") {
+                        widgetCall("widgets.sketch_clear", receiverId, 1, false);
+                        break;
+                    }
+                    if (receiverId >= 0 && method == "add_tab" && ins.typedOperands.size() >= 2) {
+                        widgetCall("widgets.tabs_add_tab", receiverId, 1, false);
+                        break;
+                    }
+                }
+                if (calleeName.size() > 7 && calleeName.compare(calleeName.size() - 7, 7, ".append") == 0
+                        && ins.typedOperands.size() >= 2) {
+                    std::string recv = calleeName.substr(0, calleeName.size() - 7);
+                    int symId = prog.symbols.lookupAnyScope(recv);
+                    if (symId >= 0) {
+                        IRRef arrRef = IRRef::var(symId);
+                        loadOperand(arrRef, R::X0);
+                        loadOperand(ins.typedOperands[1], R::X1);
+                        emitBranch(FixKind::BL, APPEND_LABEL);
+                        storeResult(arrRef, R::X0);
+                        break;
+                    }
+                }
+                // `p.method(args)` / `c.greet()` — instance method call on a var known (via
+                // instanceClass_) to hold a constructed bundle. Must run before the generic
+                // LIB_CALL/external-symbol dispatch below, which would otherwise reject it as an
+                // unknown ilib call (no function is ever literally named "p.method").
+                {
+                    auto dot = calleeName.find('.');
+                    if (dot != std::string::npos) {
+                        std::string recv = calleeName.substr(0, dot);
+                        std::string mname = calleeName.substr(dot + 1);
+                        auto instIt = instanceClass_.find(recv);
+                        if (instIt != instanceClass_.end()) {
+                            static const R argRegs[8] = {R::X0,R::X1,R::X2,R::X3,R::X4,R::X5,R::X6,R::X7};
+                            size_t nArgs = ins.typedOperands.size() - 1;
+                            if (nArgs > 7)
+                                throw ACError::backend("ARM backend: method calls with more than 7 arguments are not yet implemented");
+                            for (size_t ai = 0; ai < nArgs; ai++) loadOperand(ins.typedOperands[1 + ai], argRegs[ai + 1]);
+                            loadNamedVar(recv, R::X0);   // self, loaded last: args may use X0-adjacent scratch
+                            callFixups.push_back({em.pos(), instIt->second + "_" + mname});
+                            em.bl_rel(0);
+                            if (ins.result.isValid()) storeResult(ins.result, R::X0);
+                            break;
+                        }
+                    }
+                }
+                // `ClassName(args)` — bundle construction: allocate a flat 8-bytes-per-field
+                // block (no header, same bump allocator arrays use) and call the class's
+                // auto-synthesized `init` unconditionally (ir.cpp always emits one, even with no
+                // user-written `init` method, to run field-default initializers). Ported from
+                // BNY's identical design — see classFields_'s own comment.
+                if (classFields_.count(calleeName)) {
+                    int n = (int)classFields_[calleeName].size();
+                    em.mov_imm64(R::X0, 8 * (n > 0 ? n : 1));
+                    emitBranch(FixKind::BL, ALLOC_LABEL);
+                    IRRef selfTmp = IRRef::temp(nextHiddenTemp_--);
+                    storeResult(selfTmp, R::X0);   // stash the new object ptr across the init call
+                    static const R argRegs[8] = {R::X0,R::X1,R::X2,R::X3,R::X4,R::X5,R::X6,R::X7};
+                    size_t nArgs = ins.typedOperands.size() - 1;
+                    if (nArgs > 7)
+                        throw ACError::backend("ARM backend: constructors with more than 7 arguments are not yet implemented");
+                    for (size_t ai = 0; ai < nArgs; ai++) loadOperand(ins.typedOperands[1 + ai], argRegs[ai + 1]);
+                    loadOperand(selfTmp, R::X0);
+                    callFixups.push_back({em.pos(), calleeName + "_init"});
+                    em.bl_rel(0);
+                    loadOperand(selfTmp, R::X0);
+                    if (ins.result.isValid()) {
+                        storeResult(ins.result, R::X0);
+                        if (ins.result.kind == IRRef::Kind::VAR && ins.result.id >= 0)
+                            instanceClass_[prog.symbols.getName(ins.result.id)] = calleeName;
+                    }
+                    break;
+                }
+                // Native ilib calls use the same AArch64 ABI as ordinary calls. Previously all
+                // LIB_CALL instructions were rejected here even when armExternalName already
+                // had a valid mapping, making machine-audio and the other native ilibs dead code
+                // on ARM.
+                if (ins.opcode == IROpcode::LIB_CALL) {
+                    std::string exportName, library;
+                    if (armExternalName(calleeName, exportName, library)) {
+                        size_t nArgs = ins.typedOperands.size() - 1;
+                        if (nArgs > 8)
+                            throw ACError::backend("ARM backend: calls with more than 8 arguments are not yet implemented");
+                        static const R argRegs[8] = {R::X0,R::X1,R::X2,R::X3,R::X4,R::X5,R::X6,R::X7};
+                        for (size_t i = 0; i < nArgs; i++) loadOperand(ins.typedOperands[1+i], argRegs[i]);
+                        callFixups.push_back({em.pos(), calleeName});
+                        em.bl_rel(0);
+                        if (ins.result.isValid()) {
+                            storeResult(ins.result, R::X0);
+                            if (armExternalReturnsString(calleeName)) markStringRef(ins.result);
+                            if (armExternalReturnsFloat(calleeName)) markFloatRef(ins.result);
+                        }
+                        break;
+                    }
+                    // Not a real ilib/widget external symbol. ir.cpp also lowers an ORDINARY
+                    // user-function call to this same LIB_CALL shape whenever its result is
+                    // discarded (a bare statement call, e.g. `show(p1)` where `show` returns
+                    // void) — verified real bug: every such call was rejected here as "not yet
+                    // implemented" even though the function itself compiled fine, because this
+                    // branch never considered anything but the external-symbol case. Fall through
+                    // to the generic user-function dispatch below instead of rejecting it.
+                }
                 static const R argRegs[8] = {R::X0,R::X1,R::X2,R::X3,R::X4,R::X5,R::X6,R::X7};
                 size_t nArgs = ins.typedOperands.size() - 1;
                 if (nArgs > 8)
                     throw ACError::backend("ARM backend: calls with more than 8 arguments are not yet implemented");
                 for (size_t i = 0; i < nArgs; i++) loadOperand(ins.typedOperands[1+i], argRegs[i]);
-                std::string calleeName = prog.symbols.getName(ins.typedOperands[0].id);
-                callFixups.push_back({em.pos(), calleeName});
+                std::string linkName = calleeName;
+                if (calleeName == "stringm.strip" && nArgs == 3)
+                    linkName = "stringm.strip_clause";
+                callFixups.push_back({em.pos(), linkName});
                 em.bl_rel(0);
-                if (ins.result.kind != IRRef::Kind::NONE) storeResult(ins.result, R::X0);
+                if (ins.result.kind != IRRef::Kind::NONE) {
+                    storeResult(ins.result, R::X0);
+                    if (arrayReturningFuncs_.count(calleeName)) markArrayRef(ins.result);
+                    if (stringReturningFuncs_.count(calleeName)) markStringRef(ins.result);
+                    if (armExternalReturnsString(calleeName)) markStringRef(ins.result);
+                    if (armExternalReturnsFloat(calleeName)) markFloatRef(ins.result);
+                    if (floatReturningFuncs_.count(calleeName)) markFloatRef(ins.result);
+                    // `q = f()` where f always constructs+returns one bundle class
+                    // (classReturnFuncs_) — same treatment as a direct construct-call, even
+                    // though the instance arrived across a function-return boundary. Verified
+                    // real bug: without this, `q.x` after `q = f()` silently read a field offset
+                    // from whatever garbage/zeroed memory q's own (wrongly untracked) slot held.
+                    if (ins.result.kind == IRRef::Kind::VAR && ins.result.id >= 0) {
+                        auto crf = classReturnFuncs_.find(calleeName);
+                        if (crf != classReturnFuncs_.end())
+                            instanceClass_[prog.symbols.getName(ins.result.id)] = crf->second;
+                    }
+                }
+                break;
+            }
+            // arr = alloc "list", "e0,e1,..." -> heap block [cap][len][e0][e1]... (see
+            // emitAllocRoutine's header comment for the layout, ported from BNY's identical
+            // ALLOC "list" site in exp_bny.cpp). v1.2 scope: integer-literal elements and
+            // plain-variable-name elements (their CURRENT value, loaded at construction time)
+            // — function-pointer-array elements (`funcs = [f1, f2]`), like BNY supports, are
+            // not yet implemented here.
+            case IROpcode::ALLOC: {
+                const auto& opsA = ins.typedOperands;
+                if (opsA.empty() || opsA[0].kind != IRRef::Kind::CONST
+                        || opsA[0].value.type != IRType::STRING)
+                    throw ACError::backend("ARM backend: ALLOC of a non-constant/non-string type is not yet implemented");
+                const std::string& allocType = std::get<std::string>(opsA[0].value.data);
+                if (allocType == "dict") {
+                    struct Pair { std::string key; std::string value; };
+                    std::vector<Pair> pairs;
+                    if (opsA.size() >= 2 && opsA[1].kind == IRRef::Kind::CONST
+                            && opsA[1].value.type == IRType::STRING) {
+                        std::string content = std::get<std::string>(opsA[1].value.data);
+                        size_t pos = 0;
+                        while (pos < content.size()) {
+                            size_t comma = content.find(',', pos);
+                            std::string pair = content.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                            size_t colon = pair.find(':');
+                            if (colon != std::string::npos) {
+                                Pair p{pair.substr(0, colon), pair.substr(colon + 1)};
+                                auto trim = [](std::string& s) {
+                                    size_t a = s.find_first_not_of(" \t"), b = s.find_last_not_of(" \t");
+                                    s = a == std::string::npos ? "" : s.substr(a, b - a + 1);
+                                };
+                                trim(p.key); trim(p.value);
+                                if (p.key.size() >= 2 && p.key.front() == '$' && p.key.back() == '$')
+                                    p.key = p.key.substr(1, p.key.size() - 2);
+                                pairs.push_back(std::move(p));
+                            }
+                            if (comma == std::string::npos) break;
+                            pos = comma + 1;
+                        }
+                    }
+                    int64_t cap = std::max<int64_t>(8, (int64_t)pairs.size());
+                    em.mov_imm64(R::X0, (cap * 2 + 1) * 8 + 8);
+                    emitBranch(FixKind::BL, ALLOC_LABEL);
+                    em.mov_reg(R::X9, R::X0);
+                    em.mov_imm64(R::X10, cap);
+                    em.str_imm(R::X10, R::X9, 0);
+                    em.add_imm(R::X9, R::X9, 8);
+                    em.mov_imm64(R::X10, 0);
+                    em.str_imm(R::X10, R::X9, 0);
+                    storeResult(ins.result, R::X9);
+                    markDictRef(ins.result);
+                    for (const Pair& p : pairs) {
+                        loadOperand(ins.result, R::X0);
+                        loadStringLiteralPtr(R::X1, p.key);
+                        if (p.value.size() >= 2 && p.value.front() == '$' && p.value.back() == '$') {
+                            loadStringLiteralPtr(R::X2, p.value.substr(1, p.value.size() - 2));
+                            markDictStringKey(ins.result, p.key);
+                        } else {
+                            int64_t v = 0;
+                            try { size_t used = 0; v = std::stoll(p.value, &used); if (used != p.value.size()) v = 0; }
+                            catch (...) { v = 0; }
+                            em.mov_imm64(R::X2, v);
+                        }
+                        emitBranch(FixKind::BL, DICT_SET_LABEL);
+                        storeResult(ins.result, R::X0);
+                    }
+                    break;
+                }
+                if (allocType != "list")
+                {
+                    if ((allocType == "range" || allocType == "sequence")) {
+                        compileRangeAlloc(ins, allocType == "range");
+                        break;
+                    }
+                    throw ACError::backend("ARM backend: ALLOC \"" + allocType
+                        + "\" is not yet implemented (only \"list\" — plain arrays — so far)");
+                }
+                struct Elem { bool isVar; int64_t val; std::string varName; };
+                std::vector<Elem> elems;
+                if (opsA.size() >= 2 && opsA[1].kind == IRRef::Kind::CONST
+                        && opsA[1].value.type == IRType::STRING) {
+                    const std::string& s = std::get<std::string>(opsA[1].value.data);
+                    size_t i = 0;
+                    while (i < s.size()) {
+                        size_t j = s.find(',', i);
+                        std::string tok = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
+                        size_t a = tok.find_first_not_of(" \t");
+                        size_t b = tok.find_last_not_of(" \t");
+                        if (a != std::string::npos) {
+                            tok = tok.substr(a, b - a + 1);
+                            try {
+                                size_t consumed = 0;
+                                int64_t v = std::stoll(tok, &consumed);
+                                if (consumed == tok.size()) elems.push_back({false, v, ""});
+                                else elems.push_back({true, 0, tok});
+                            } catch (...) { elems.push_back({true, 0, tok}); }
+                        }
+                        if (j == std::string::npos) break;
+                        i = j + 1;
+                    }
+                }
+                int64_t N = (int64_t)elems.size();
+                int64_t CAP0 = N > 4 ? N : 4;
+                em.mov_imm64(R::X0, (CAP0 + 2) * 8);
+                emitBranch(FixKind::BL, ALLOC_LABEL);
+                em.mov_reg(R::X9, R::X0);              // X9 = raw block
+                em.mov_imm64(R::X10, CAP0);
+                em.str_imm(R::X10, R::X9, 0);          // raw[0] = cap
+                em.add_imm(R::X9, R::X9, 8);           // X9 = ptr (skip cap word)
+                em.mov_imm64(R::X10, N);
+                em.str_imm(R::X10, R::X9, 0);          // ptr[0] = length
+                for (int64_t k = 0; k < N; k++) {
+                    if (elems[k].isVar) {
+                        int symId = prog.symbols.lookupAnyScope(elems[k].varName);
+                        if (symId < 0)
+                            throw ACError::backend("ARM backend: array element '" + elems[k].varName
+                                + "' is not a known variable");
+                        loadOperand(IRRef::var(symId), R::X10);
+                    } else {
+                        em.mov_imm64(R::X10, elems[k].val);
+                    }
+                    em.str_imm(R::X10, R::X9, (uint32_t)(8 * (k + 1)));
+                }
+                if (ins.result.isValid()) {
+                    storeResult(ins.result, R::X9);
+                    markArrayRef(ins.result);
+                }
+                break;
+            }
+            case IROpcode::FREE:
+                break; // no-op — the bump allocator never frees, same as BNY
+            // `free x`/`bound x` (AC's free/bound scoping system) — a genuine no-op at the
+            // point of direct inline encounter everywhere else in the codebase too (see
+            // ir_codegen.cpp: "handled at function-begin time, not inline" — the real effect is
+            // a separate whole-function pre-pass that changes how OTHER instructions reference
+            // that variable, not a runtime action at this instruction's own position). At
+            // mainloop scope (currentFuncName_ empty) this is doubly moot: every mainloop var
+            // already lives in the flat globals page regardless of free/bound status. Real
+            // promotion of a `bound` var used INSIDE a function's own per-call stack frame isn't
+            // implemented yet — a separate, non-array-related gap from today's array work.
+            case IROpcode::FREE_DECL:
+                break;
+            case IROpcode::TYPE_CAST:
+                if (ins.typedOperands.empty())
+                    throw ACError::backend("ARM backend: malformed TYPE_CAST");
+                if (ins.resultType == IRType::FLOAT) {
+                    if (ins.typedOperands[0].kind == IRRef::Kind::CONST
+                            && ins.typedOperands[0].value.type == IRType::INT) {
+                        double value = (double)std::get<int64_t>(ins.typedOperands[0].value.data);
+                        uint64_t bits = 0;
+                        std::memcpy(&bits, &value, sizeof(bits));
+                        em.mov_imm64(R::X0, (int64_t)bits);
+                        storeResult(ins.result, R::X0);
+                    } else {
+                        if (isFloatRef(ins.typedOperands[0])) {
+                            loadFloatOperand(ins.typedOperands[0], R::X0);
+                        } else {
+                            loadOperand(ins.typedOperands[0], R::X0);
+                            em.scvtf_d_x(R::X0, R::X0);
+                        }
+                        storeFloatResult(ins.result, R::X0);
+                    }
+                    markFloatRef(ins.result);
+                    break;
+                }
+                if (ins.resultType == IRType::STRING) {
+                    if (isFloatRef(ins.typedOperands[0]))
+                        throw ACError::backend("ARM backend: float-to-string casts are not yet implemented");
+                    if (ins.typedOperands[0].kind == IRRef::Kind::CONST
+                            && ins.typedOperands[0].value.type == IRType::STRING) {
+                        loadOperand(ins.typedOperands[0], R::X0);
+                    } else {
+                        loadOperand(ins.typedOperands[0], R::X0);
+                        emitBranch(FixKind::BL, INT_TO_CSTR_LABEL);
+                    }
+                    storeResult(ins.result, R::X0);
+                    markStringRef(ins.result);
+                    break;
+                }
+                if (ins.resultType != IRType::BOOL && isStringRef(ins.typedOperands[0])) {
+                    loadOperand(ins.typedOperands[0], R::X0);
+                    emitBranch(FixKind::BL, CSTR_TO_INT_LABEL);
+                    storeResult(ins.result, R::X0);
+                    break;
+                }
+                if (ins.resultType == IRType::BOOL) {
+                    if (isStringRef(ins.typedOperands[0])) {
+                        loadOperand(ins.typedOperands[0], R::X0);
+                        emitBranch(FixKind::BL, CSTR_TO_INT_LABEL);
+                        em.cmp_reg(R::X0, R::XZR);
+                        em.cset(S0, Cond::NE);
+                        storeResult(ins.result, S0);
+                    } else if (isFloatRef(ins.typedOperands[0])) {
+                        loadFloatOperand(ins.typedOperands[0], R::X0);
+                        em.fmov_d_from_x(R::X1, R::XZR);
+                        em.fcmp_d(R::X0, R::X1);
+                        em.cset(S0, Cond::NE);
+                        storeResult(ins.result, S0);
+                    } else {
+                        loadOperand(ins.typedOperands[0], S0);
+                        em.cmp_reg(S0, R::XZR);
+                        storeBoolFromCond(Cond::NE, ins);
+                    }
+                } else {
+                    if (isFloatRef(ins.typedOperands[0])) {
+                        loadFloatOperand(ins.typedOperands[0], R::X0);
+                        em.fcvtzs_x_d(R::X0, R::X0);
+                        storeResult(ins.result, R::X0);
+                    } else {
+                        loadOperand(ins.typedOperands[0], S0);
+                        storeResult(ins.result, S0);
+                    }
+                }
+                break;
+            // arr[idx] (0-based in IR) -> block[1+idx]; special index "__len__" -> block[0].
+            // Strings share the same IR opcode: s["__len__"] lowers to strlen(s), while s[i]
+            // returns a heap-backed one-character string.
+            case IROpcode::LOAD_INDEX: {
+                const auto& opsA = ins.typedOperands;
+                if (!ins.result.isValid() || opsA.size() < 2)
+                    throw ACError::backend("ARM backend: malformed LOAD_INDEX");
+                bool isLen = opsA.size() >= 2 && opsA[1].kind == IRRef::Kind::CONST
+                          && opsA[1].value.type == IRType::STRING
+                          && std::get<std::string>(opsA[1].value.data) == "__len__";
+                bool stringIndex = isStringRef(opsA[0]) || ins.resultType == IRType::STRING;
+                if (!isLen && opsA.size() >= 2 && isDictRef(opsA[0])) {
+                    loadOperand(opsA[0], R::X0);
+                    if (opsA[1].kind == IRRef::Kind::CONST && opsA[1].value.type == IRType::STRING)
+                        loadStringLiteralPtr(R::X1, std::get<std::string>(opsA[1].value.data));
+                    else loadOperand(opsA[1], R::X1);
+                    emitBranch(FixKind::BL, DICT_GET_LABEL);
+                    storeResult(ins.result, R::X0);
+                    if (opsA[1].kind == IRRef::Kind::CONST && opsA[1].value.type == IRType::STRING
+                            && isDictStringKey(opsA[0], std::get<std::string>(opsA[1].value.data)))
+                        markStringRef(ins.result);
+                    break;
+                }
+                loadOperand(opsA[0], R::X9);
+                if (stringIndex && isLen) {
+                    em.mov_reg(R::X0, R::X9);
+                    emitBranch(FixKind::BL, STRLEN_LABEL);
+                    storeResult(ins.result, R::X0);
+                    break;
+                }
+                if (stringIndex) {
+                    loadOperand(opsA[1], R::X10);
+                    em.add_reg(R::X9, R::X9, R::X10);
+                    em.ldrb0(R::X11, R::X9);
+                    IRRef charRef = IRRef::temp(nextHiddenTemp_--);
+                    storeResult(charRef, R::X11);
+                    em.mov_imm64(R::X0, 2);
+                    emitBranch(FixKind::BL, ALLOC_LABEL);
+                    loadOperand(charRef, R::X11);
+                    em.strb0(R::X11, R::X0);
+                    em.add_imm(R::X12, R::X0, 1);
+                    em.strb0(R::XZR, R::X12);
+                    storeResult(ins.result, R::X0);
+                    markStringRef(ins.result);
+                    break;
+                }
+                if (isLen) {
+                    em.ldr_imm(R::X9, R::X9, 0);       // length = ptr[0]
+                } else if (opsA.size() >= 2) {
+                    loadOperand(opsA[1], R::X10);      // X10 = index (0-based)
+                    em.add_imm(R::X10, R::X10, 1);     // +1 (skip length header)
+                    em.mov_imm64(R::X11, 8);
+                    em.mul_reg(R::X10, R::X10, R::X11);
+                    em.add_reg(R::X9, R::X9, R::X10);
+                    em.ldr_imm(R::X9, R::X9, 0);       // element value
+                }
+                storeResult(ins.result, R::X9);
+                break;
+            }
+            // arr[idx] = val (0-based in IR) — same address math as LOAD_INDEX above.
+            case IROpcode::STORE_INDEX: {
+                const auto& opsA = ins.typedOperands;
+                if (opsA.size() < 3)
+                    throw ACError::backend("ARM backend: malformed STORE_INDEX");
+                if (isDictRef(opsA[0])) {
+                    loadOperand(opsA[0], R::X0);
+                    if (opsA[1].kind == IRRef::Kind::CONST && opsA[1].value.type == IRType::STRING)
+                        loadStringLiteralPtr(R::X1, std::get<std::string>(opsA[1].value.data));
+                    else loadOperand(opsA[1], R::X1);
+                    loadOperand(opsA[2], R::X2);
+                    emitBranch(FixKind::BL, DICT_SET_LABEL);
+                    storeResult(opsA[0], R::X0);
+                    break;
+                }
+                loadOperand(opsA[0], R::X9);           // X9 = array ptr
+                loadOperand(opsA[1], R::X10);          // X10 = index (0-based)
+                em.add_imm(R::X10, R::X10, 1);
+                em.mov_imm64(R::X11, 8);
+                em.mul_reg(R::X10, R::X10, R::X11);
+                em.add_reg(R::X9, R::X9, R::X10);
+                loadOperand(opsA[2], R::X12);          // X12 = value
+                em.str_imm(R::X12, R::X9, 0);
                 break;
             }
             case IROpcode::RETURN:
@@ -512,7 +2407,30 @@ class ArmCompiler {
                 em.ldp_x29_x30_postsp16();
                 em.ret();
                 break;
+            case IROpcode::INPUT:
+                compileInput(ins);
+                break;
             case IROpcode::PRINT:
+                if (ins.typedOperands[0].kind == IRRef::Kind::CONST
+                        && ins.typedOperands[0].value.type == IRType::STRING) {
+                    compilePrintStringLiteral(std::get<std::string>(ins.typedOperands[0].value.data));
+                    break;
+                }
+                if (isStringRef(ins.typedOperands[0])) {
+                    loadOperand(ins.typedOperands[0], R::X0);
+                    emitBranch(FixKind::BL, PRINT_CSTR_LABEL);
+                    break;
+                }
+                if (isArrayRef(ins.typedOperands[0])) {
+                    loadOperand(ins.typedOperands[0], R::X0);
+                    emitBranch(FixKind::BL, PRINT_ARR_LABEL);
+                    break;
+                }
+                if (isFloatRef(ins.typedOperands[0])) {
+                    loadFloatOperand(ins.typedOperands[0], R::X0);
+                    emitBranch(FixKind::BL, PRINT_FLOAT_LABEL);
+                    break;
+                }
                 loadOperand(ins.typedOperands[0], R::X0);
                 emitBranch(FixKind::BL, PRINT_INT_LABEL);
                 break;
@@ -528,6 +2446,16 @@ class ArmCompiler {
                 em.mov_imm64(R::X8, 129);
                 em.svc0();
                 break;
+            case IROpcode::EVAL: {
+                if (ins.typedOperands.empty())
+                    throw ACError::backend("ARM backend: eval requires an expression argument");
+                loadOperand(ins.typedOperands[0], R::X0);
+                callFixups.push_back({em.pos(), "math.eval"});
+                em.bl_rel(0);
+                storeResult(ins.result, R::X0);
+                markFloatRef(ins.result);
+                break;
+            }
             case IROpcode::SOFT_HALT:
                 em.mov_imm64(R::X0, 0);
                 em.mov_imm64(R::X8, 94); // exit_group (AArch64 Linux syscall table)
@@ -550,7 +2478,64 @@ class ArmCompiler {
     static const int PRINT_POS_LABEL = -1001;
     static const int PRINT_LOOP_LABEL = -1002;
     static const int PRINT_NOSIGN_LABEL = -1003;
-
+    static const int ALLOC_LABEL = -1004;
+    static const int ALLOC_HAVE_LABEL = -1005;
+    static const int APPEND_LABEL = -1006;
+    static const int APPEND_FAST_LABEL = -1007;
+    static const int APPEND_COPY_LABEL = -1008;
+    static const int APPEND_COPYDONE_LABEL = -1009;
+    static const int APPEND_DONE_LABEL = -1010;
+    static const int IPOW_LOOP_LABEL = -1011;
+    static const int IPOW_DONE_LABEL = -1012;
+    static const int PRINT_RAW_LABEL = -1013;
+    static const int PRINT_RAW_POS_LABEL = -1014;
+    static const int PRINT_RAW_LOOP_LABEL = -1015;
+    static const int PRINT_RAW_NOSIGN_LABEL = -1016;
+    static const int PRINT_ARR_LABEL = -1017;
+    static const int PRINT_ARR_LOOP_LABEL = -1018;
+    static const int PRINT_ARR_ELEM_LABEL = -1019;
+    static const int PRINT_ARR_DONE_LABEL = -1020;
+    static const int STRLEN_LABEL = -1021;
+    static const int STRLEN_LOOP_LABEL = -1022;
+    static const int STRLEN_DONE_LABEL = -1023;
+    static const int PRINT_CSTR_LABEL = -1024;
+    static const int CONCAT_LABEL = -1025;
+    static const int CONCAT_COPY_LEFT_LABEL = -1026;
+    static const int CONCAT_LEFT_DONE_LABEL = -1027;
+    static const int CONCAT_COPY_RIGHT_LABEL = -1028;
+    static const int CONCAT_RIGHT_DONE_LABEL = -1029;
+    static const int LENGTH_LABEL = -1030;
+    static const int WRITE_CSTR_LABEL = -1031;
+    static const int STREQ_LABEL = -1032;
+    static const int STREQ_LOOP_LABEL = -1033;
+    static const int STREQ_FALSE_LABEL = -1034;
+    static const int STREQ_TRUE_LABEL = -1035;
+    static const int STREQ_DONE_LABEL = -1036;
+    static const int PRINT_FLOAT_LABEL = -1037;
+    // (the old naive fixed-6-decimal print routine's sibling labels lived here — replaced by
+    // emitPrintFloatRoutine's %.16g-equivalent port, which allocates its internal control-flow
+    // labels dynamically via nextInternalLabel_ instead, same as every other multi-branch
+    // synthetic routine added after this one.)
+    static const int INT_TO_CSTR_LABEL = -1042;
+    static const int INT_TO_CSTR_POS_LABEL = -1043;
+    static const int INT_TO_CSTR_LOOP_LABEL = -1044;
+    static const int INT_TO_CSTR_NOSIGN_LABEL = -1045;
+    static const int CSTR_TO_INT_LABEL = -1046;
+    static const int CSTR_TO_INT_SIGN_LABEL = -1047;
+    static const int CSTR_TO_INT_LOOP_LABEL = -1048;
+    static const int CSTR_TO_INT_DONE_LABEL = -1049;
+    static const int DICT_GET_LABEL = -1050;
+    static const int DICT_GET_LOOP_LABEL = -1051;
+    static const int DICT_GET_NEXT_LABEL = -1052;
+    static const int DICT_GET_MISS_LABEL = -1053;
+    static const int DICT_GET_DONE_LABEL = -1059;
+    static const int DICT_SET_LABEL = -1054;
+    static const int DICT_SET_LOOP_LABEL = -1055;
+    static const int DICT_SET_NEXT_LABEL = -1056;
+    static const int DICT_SET_FULL_LABEL = -1057;
+    static const int DICT_SET_DONE_LABEL = -1058;
+    static const int DICT_SET_CAPERR_LABEL = -1060;
+    static const int DIVZERO_LABEL = -1061;
     // __ac_print_int__: X0 = value (signed). Writes decimal digits + '\n' via write(2), no
     // libc. Same divide-by-10-from-the-back algorithm as BNY's own emitPrintIntCore
     // (exp_bny.cpp), re-expressed in AArch64 registers/instructions — SDIV+MSUB gives
@@ -611,8 +2596,1007 @@ class ArmCompiler {
         em.ret();
     }
 
+    void emitPrintIntRawRoutine() {
+        emitLabel(PRINT_RAW_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 32);
+        em.mov_reg(R::X12, R::X0);
+        em.mov_imm64(R::X13, 0);
+        em.cmp_reg(R::X12, R::XZR);
+        emitBranch(FixKind::BCOND, PRINT_RAW_POS_LABEL, Cond::GE);
+        em.mov_imm64(R::X13, 1);
+        em.neg_reg(R::X12, R::X12);
+        emitLabel(PRINT_RAW_POS_LABEL);
+        em.mov_from_sp(R::X14);
+        em.add_imm(R::X14, R::X14, 30);
+        em.mov_imm64(R::X15, 10);
+        emitLabel(PRINT_RAW_LOOP_LABEL);
+        em.sdiv(R::X0, R::X12, R::X15);
+        em.msub(R::X1, R::X0, R::X15, R::X12);
+        em.add_imm(R::X1, R::X1, (uint32_t)'0');
+        em.strb0(R::X1, R::X14);
+        em.sub_imm(R::X14, R::X14, 1);
+        em.mov_reg(R::X12, R::X0);
+        emitBranch(FixKind::CBNZ, PRINT_RAW_LOOP_LABEL, Cond::EQ, R::X12);
+        em.cmp_reg(R::X13, R::XZR);
+        emitBranch(FixKind::BCOND, PRINT_RAW_NOSIGN_LABEL, Cond::EQ);
+        em.mov_imm64(R::X1, (int64_t)'-');
+        em.strb0(R::X1, R::X14);
+        em.sub_imm(R::X14, R::X14, 1);
+        emitLabel(PRINT_RAW_NOSIGN_LABEL);
+        em.add_imm(R::X14, R::X14, 1);
+        em.mov_from_sp(R::X1);
+        em.add_imm(R::X1, R::X1, 31);
+        em.sub_reg(R::X2, R::X1, R::X14);
+        em.mov_reg(R::X1, R::X14);
+        em.mov_imm64(R::X0, 1);
+        em.mov_imm64(R::X8, 64);
+        em.svc0();
+        em.add_imm(R::SP, R::SP, 32);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    // Prints a double the same way every OTHER backend in this project does: up to 16
+    // significant decimal digits, correctly rounded, trailing zeros stripped, whole-valued
+    // floats get an explicit ".0" — glibc's `%.16g` convention, unified across all 12 backends
+    // earlier this session. Direct port of BNY's `emitPrintDoubleLinux`/`ac_print_double`
+    // (exp_bny.cpp) — same algorithm, re-expressed in AArch64 registers/instructions. Ported
+    // because the previous version here (fixed 6 fractional digits, no trimming, no ".0") was a
+    // real, confirmed bug: array_average.ac printed "5.000000"/"2.333333" instead of PY's
+    // "5.0"/"2.333333333333333".
+    //
+    // AArch64 gives 9 clean caller-saved scratch registers (X9-X17, all "may be clobbered by a
+    // call" under AAPCS64) — enough to hold every value BNY's x86-64 version needed push/pop
+    // save/restore for (rbx/r12-r15 are callee-saved on x86-64 SysV, this routine's x86
+    // counterpart has to preserve them), so this port needs no register spilling at all:
+    //   X0/D0 = value in (mutates into the fractional part, matching BNY's xmm0 reuse)
+    //   D1    = scratch double
+    //   X9    = output buffer write cursor      (BNY: r12)
+    //   X10   = integer part / |integer part| / final rounded integer value (BNY: r13 then rbx)
+    //   X11   = sign flag, 0/1                  (BNY: a stack byte, kept in a register here
+    //                                             since there's a free one)
+    //   X12   = multi-phase scratch cursor      (BNY: r14)
+    //   X13   = fracKeep (significant-digit budget, 0-16, kept in a register — BNY: [rbp-124])
+    //   X14   = scaled fraction (frac * 2^52, exact integer)  (BNY: r15)
+    //   X15,X16 = loop/arithmetic scratch
+    //   X17   = fixed SP snapshot, read once, never mutated — buffer addresses are computed
+    //           from this rather than from X9 (which moves as output chars are written)
+    // Buffers, all byte-addressed (see strb0/ldrb0's own zero-offset-only convention, matching
+    // this file's existing digit-buffer idiom in emitPrintIntRoutine): outBuf at X17+0 (32
+    // bytes), fracBuf (raw 0-9 digit VALUES, MSB-first, 17 slots = 16 kept + 1 guard) at X17+32.
+    // No integer-digit reverse buffer is needed the way BNY's is (x86 has no data-dependent
+    // instruction count concern here) — the ARM version below reverses in place using the
+    // output buffer itself as scratch, extracting into it end-first then rotating: WRONG, so
+    // instead this port keeps a 20-byte reverse buffer too, exactly like BNY's, at X17+64, for
+    // the same reason BNY has one (digit count isn't known ahead of the extraction loop).
+    // Frame layout (all offsets from X17, the fixed SP-derived base):
+    //   outBuf     : X17+0   .. X17+111  (112 bytes)
+    //   fracBuf    : X17+112 .. X17+153  (42 bytes: 25 leading-zero slots + 16 significant + 1 guard)
+    //   reverseBuf : X17+154 .. X17+177  (24 bytes, fills downward from the X17+178 boundary)
+    static const int32_t OUTBUF_OFF = 0;
+    static const int32_t FRACBUF_OFF = 112;
+    static const int32_t FRACBUF_LEN = 42;
+    static const int32_t REVBUF_END_OFF = 178;
+    static const int32_t PRINT_FLOAT_FRAME = 192;
+
+    void emitPrintFloatRoutine() {
+        emitLabel(PRINT_FLOAT_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, PRINT_FLOAT_FRAME);
+        em.mov_from_sp(R::X17);                // fixed base for all three buffers
+        em.mov_reg(R::X9, R::X17);              // output buffer write cursor starts at outBuf[0]
+
+        // ---- Integer part + sign (sign from the ORIGINAL value, not the truncated int, which
+        // loses sign entirely for |value|<1 — e.g. -0.25 truncates to 0) ----
+        em.fcvtzs_x_d(R::X10, R::X0);           // X10 = trunc(value)
+        em.mov_imm64(R::X15, 0);
+        em.fmov_d_from_x(R::X1, R::X15);        // D1 = 0.0
+        em.fcmp_d(R::X0, R::X1);
+        em.cset(R::X11, Cond::LT);              // X11 = 1 if value<0 else 0
+
+        em.scvtf_d_x(R::X1, R::X10);            // D1 = (double)X10
+        em.fsub_d(R::X0, R::X0, R::X1);         // D0 = fractional part (negative when value<0)
+        {
+            int posLabel = nextInternalLabel_--;
+            em.cmp_reg(R::X11, R::XZR);
+            emitBranch(FixKind::BCOND, posLabel, Cond::EQ);
+            em.mov_imm64(R::X15, (int64_t)0xBFF0000000000000LL); // -1.0 bits
+            em.fmov_d_from_x(R::X1, R::X15);
+            em.fmul_d(R::X0, R::X0, R::X1);     // D0 = -fractional part (now positive)
+            emitLabel(posLabel);
+        }
+        {
+            int absDoneLabel = nextInternalLabel_--;
+            em.cmp_reg(R::X11, R::XZR);
+            emitBranch(FixKind::BCOND, absDoneLabel, Cond::EQ);
+            em.neg_reg(R::X10, R::X10);         // X10 = |integer part|
+            emitLabel(absDoneLabel);
+        }
+
+        // ---- significant-digit budget: count |intpart|'s own decimal digits (min 1, even for
+        // 0), so the fraction only keeps 16-minus-that-many digits — matches %.16g's convention
+        // of counting significant digits from the integer part's first digit, not the decimal
+        // point (see BNY's own comment on this for the exact bug this avoids). ----
+        {
+            em.mov_reg(R::X15, R::X10);
+            em.mov_imm64(R::X13, 0);
+            int cntLoop = nextInternalLabel_--;
+            emitLabel(cntLoop);
+            em.mov_imm64(R::X16, 10);
+            em.sdiv(R::X15, R::X15, R::X16);
+            em.add_imm(R::X13, R::X13, 1);
+            em.cmp_reg(R::X15, R::XZR);
+            emitBranch(FixKind::BCOND, cntLoop, Cond::NE); // do-while: 0 itself counts as 1 digit
+            em.mov_imm64(R::X15, 16);
+            em.sub_reg(R::X13, R::X15, R::X13);     // X13 = 16 - digitcount
+            int okLabel = nextInternalLabel_--;
+            em.cmp_reg(R::X13, R::XZR);
+            emitBranch(FixKind::BCOND, okLabel, Cond::GE);
+            em.mov_imm64(R::X13, 0);
+            emitLabel(okLabel);
+        }
+
+        // ---- Exact fixed-point scale, derived from frac's OWN IEEE-754 exponent/mantissa bits,
+        // not a fixed frac*2^52 multiply. The fixed-2^52 approach silently loses precision for
+        // ANY frac<0.5 (every binary exponent below -1 needs more than 52 bits of scale to be
+        // exact) — verified real bug: 2/7's frac has exponent -2, so frac*2^52 lands on an exact
+        // half-integer (1286742750677284.5), and fcvtzs's truncation of that half-unit compounded
+        // through the digit-extraction loop into a wrong final rounding decision:
+        // "0.2857142857142856" instead of the correct "...142857". Fix: pull frac's raw 53-bit
+        // mantissa (with the implicit leading 1) straight out of its bit pattern as M, and its
+        // true binary exponent E; frac == M * 2^(E-52) EXACTLY (no multiply, no rounding — just
+        // reading bits IEEE-754 already stores). Scaling by SH = 52-E instead of a fixed 52 makes
+        // M itself the exact "scaled fraction" for any frac down to about 2^-8 before SH would
+        // make the loop's *10 step overflow 64 bits; smaller fracs than that (|value| under
+        // ~0.0039) fall back to the old approximate path rather than reach for 128-bit arithmetic
+        // this routine has nowhere to put.
+        em.fmov_x_from_d(R::X5, R::X0);           // X5 = raw bits of frac
+        em.mov_imm64(R::X16, 52);
+        em.lsr_reg(R::X6, R::X5, R::X16);
+        em.mov_imm64(R::X16, 0x7FF);
+        em.and_reg(R::X6, R::X6, R::X16);         // X6 = biased exponent (0 for subnormal/zero)
+        em.mov_imm64(R::X16, 0xFFFFFFFFFFFFFLL);  // (1<<52)-1
+        em.and_reg(R::X7, R::X5, R::X16);         // X7 = raw mantissa bits
+        em.mov_imm64(R::X16, 0x10000000000000LL); // 1<<52 (implicit leading bit)
+        em.orr_reg(R::X7, R::X7, R::X16);         // X7 = M (53-bit exact mantissa)
+        em.mov_imm64(R::X16, 1075);
+        em.sub_reg(R::X8, R::X16, R::X6);         // X8 = SH = 1075 - biased_exponent = 52 - E
+        em.mov_imm64(R::X16, 60);
+        em.cmp_reg(R::X8, R::X16);
+        {
+            int exactPath = nextInternalLabel_--;
+            int scaleDone = nextInternalLabel_--;
+            emitBranch(FixKind::BCOND, exactPath, Cond::LE);
+            // Fallback: frac too small for a single-register exact scale — old approximate path.
+            em.mov_imm64(R::X15, (int64_t)0x4330000000000000LL); // 2^52 as a double
+            em.fmov_d_from_x(R::X1, R::X15);
+            em.fmul_d(R::X0, R::X0, R::X1);
+            em.fcvtzs_x_d(R::X14, R::X0);
+            em.mov_imm64(R::X8, 52);
+            emitBranch(FixKind::B, scaleDone);
+            emitLabel(exactPath);
+            em.mov_reg(R::X14, R::X7);            // X14 = M (exact scaled fraction, no truncation)
+            emitLabel(scaleDone);
+        }
+        em.mov_imm64(R::X6, 1);
+        em.lsl_reg(R::X6, R::X6, R::X8);
+        em.sub_imm(R::X6, R::X6, 1);              // X6 = mask = (1<<SH)-1
+
+        // Extract FRACBUF_LEN raw digit values into fracBuf (X17+112), MSB-first: scaled*=10;
+        // digit=scaled>>SH; scaled&=mask. Extracting far more than the 16-significant+1-guard
+        // minimum lets the budget step below correctly skip past leading zeros in the fraction
+        // (see that step's own comment for the bug this fixes) instead of hard-capping at 17.
+        em.add_imm(R::X12, R::X17, FRACBUF_OFF); // X12 = fracBuf write cursor
+        em.mov_imm64(R::X15, FRACBUF_LEN);      // loop counter
+        {
+            int fdigLoop = nextInternalLabel_--;
+            emitLabel(fdigLoop);
+            em.mov_imm64(R::X16, 10);
+            em.mul_reg(R::X14, R::X14, R::X16);         // X14 *= 10 (safe: X14<2^SH<=2^60, *10<2^64)
+            em.mov_reg(R::X0, R::X14);
+            em.lsr_reg(R::X0, R::X0, R::X8);            // X0 = top digit (0-9), shift = SH
+            em.strb0(R::X0, R::X12);
+            em.add_imm(R::X12, R::X12, 1);
+            em.and_reg(R::X14, R::X14, R::X6);          // X14 &= mask
+            em.sub_imm(R::X15, R::X15, 1);
+            em.cmp_reg(R::X15, R::XZR);
+            emitBranch(FixKind::BCOND, fdigLoop, Cond::NE);
+        }
+
+        // ---- Leading-zero budget override (intpart==0 only). The digit-count step above always
+        // reserves 1 significant-digit slot for the integer part, even when that part is "0" —
+        // correct when intpart!=0, but %.16g does NOT count a leading "0." as a significant digit,
+        // so for |value|<1 that reservation is one digit too many. Worse, every leading zero the
+        // fraction itself has (0.0001... has 3) also needs to NOT count against the 16-digit
+        // budget, or those digits get silently dropped. Verified real bugs this fixes: 2/7 printed
+        // "0.285714285714286" (15 digits, correct is "...142857", 16) and 0.0001234567890123456
+        // printed "0.000123456789012" (lost 4 trailing digits) — both because fracKeep was capped
+        // at 15 regardless of how many of the extracted digits were non-significant leading zeros.
+        // Fix: when intpart==0, scan the already-extracted fracBuf for the first nonzero digit at
+        // index k, then fracKeep = k+16 (every leading zero is kept+printed, then 16 real
+        // significant digits after it) instead of the flat 15. Clamped so fracKeep+1 (the guard
+        // digit) stays inside the 42-byte buffer; an all-zero buffer means nothing survives at
+        // this precision at all, so fracKeep=0 (prints ".0"), matching the existing strip-to-zero
+        // path used for whole numbers.
+        {
+            int fkSkip = nextInternalLabel_--;
+            em.cmp_reg(R::X10, R::XZR);
+            emitBranch(FixKind::BCOND, fkSkip, Cond::NE);   // intpart != 0 -> keep tentative fracKeep
+
+            em.add_imm(R::X3, R::X17, FRACBUF_OFF);         // X3 = scan cursor
+            em.mov_imm64(R::X4, 0);                         // X4 = k
+            int fkScan = nextInternalLabel_--;
+            int fkFound = nextInternalLabel_--;
+            int fkNone = nextInternalLabel_--;
+            emitLabel(fkScan);
+            em.ldrb0(R::X15, R::X3);
+            em.cmp_reg(R::X15, R::XZR);
+            emitBranch(FixKind::BCOND, fkFound, Cond::NE);
+            em.add_imm(R::X3, R::X3, 1);
+            em.add_imm(R::X4, R::X4, 1);
+            em.mov_imm64(R::X16, FRACBUF_LEN);
+            em.cmp_reg(R::X4, R::X16);
+            emitBranch(FixKind::BCOND, fkScan, Cond::LT);
+            emitBranch(FixKind::B, fkNone);                 // scanned the whole buffer, all zero
+            emitLabel(fkFound);
+            {
+                int fkClampOk = nextInternalLabel_--;
+                em.mov_imm64(R::X16, FRACBUF_LEN - 17);     // max k so k+16+1(guard) <= FRACBUF_LEN
+                em.cmp_reg(R::X4, R::X16);
+                emitBranch(FixKind::BCOND, fkClampOk, Cond::LE);
+                em.mov_imm64(R::X4, FRACBUF_LEN - 17);
+                emitLabel(fkClampOk);
+            }
+            em.add_imm(R::X13, R::X4, 16);                  // fracKeep = k + 16
+            emitBranch(FixKind::B, fkSkip);
+            emitLabel(fkNone);
+            em.mov_imm64(R::X13, 0);
+            emitLabel(fkSkip);
+        }
+
+        // ---- Round-half-up using the guard digit at fracBuf[fracKeep], carrying leftward
+        // through the fracKeep kept digits; a carry that escapes past digit 0 (or fracKeep==0,
+        // meaning there's no fractional digit to carry through at all) bumps X10 (the integer
+        // part) by 1 before the integer-digit loop below runs. ----
+        int noRound = nextInternalLabel_--;
+        {
+            em.add_imm(R::X12, R::X17, FRACBUF_OFF);
+            em.add_reg(R::X12, R::X12, R::X13);     // &fracBuf[fracKeep] (the guard digit)
+            em.ldrb0(R::X15, R::X12);
+            em.mov_imm64(R::X16, 5);
+            em.cmp_reg(R::X15, R::X16);
+            emitBranch(FixKind::BCOND, noRound, Cond::LT);
+            int haveFrac = nextInternalLabel_--;
+            em.cmp_reg(R::X13, R::XZR);
+            emitBranch(FixKind::BCOND, haveFrac, Cond::NE);
+            em.add_imm(R::X10, R::X10, 1);          // fracKeep==0: bump integer part directly
+            emitBranch(FixKind::B, noRound);
+            emitLabel(haveFrac);
+            em.add_imm(R::X12, R::X17, FRACBUF_OFF);
+            em.add_reg(R::X12, R::X12, R::X13);
+            em.sub_imm(R::X12, R::X12, 1);          // &fracBuf[fracKeep-1] (last kept digit)
+            int carryLoop = nextInternalLabel_--;
+            emitLabel(carryLoop);
+            em.ldrb0(R::X15, R::X12);
+            em.add_imm(R::X15, R::X15, 1);
+            em.mov_imm64(R::X16, 10);
+            em.cmp_reg(R::X15, R::X16);
+            int noOverflow = nextInternalLabel_--;
+            emitBranch(FixKind::BCOND, noOverflow, Cond::LT);
+            em.mov_imm64(R::X15, 0);
+            em.strb0(R::X15, R::X12);
+            {
+                int cont = nextInternalLabel_--;
+                em.sub_imm(R::X12, R::X12, 1);
+                em.add_imm(R::X16, R::X17, FRACBUF_OFF - 1);     // &fracBuf[-1] boundary check
+                em.cmp_reg(R::X12, R::X16);
+                emitBranch(FixKind::BCOND, cont, Cond::NE);
+                em.add_imm(R::X10, R::X10, 1);       // carry escaped past digit 0
+                emitBranch(FixKind::B, noRound);
+                emitLabel(cont);
+            }
+            emitBranch(FixKind::B, carryLoop);
+            emitLabel(noOverflow);
+            em.strb0(R::X15, R::X12);
+        }
+        emitLabel(noRound);
+
+        // ---- Sign character (X10 now holds the FINAL, possibly rounding-bumped integer value)
+        // ----
+        {
+            int noSign = nextInternalLabel_--;
+            em.cmp_reg(R::X11, R::XZR);
+            emitBranch(FixKind::BCOND, noSign, Cond::EQ);
+            em.mov_imm64(R::X15, (int64_t)'-');
+            em.strb0(R::X15, R::X9);
+            em.add_imm(R::X9, R::X9, 1);
+            emitLabel(noSign);
+        }
+
+        // ---- Integer digits: reverse-extract X10 into the reverse buffer (X17+64, 20 bytes),
+        // then copy forward into outBuf ----
+        em.add_imm(R::X12, R::X17, REVBUF_END_OFF);         // one past the end of the reverse-digit area
+        {
+            int idigLoop = nextInternalLabel_--;
+            emitLabel(idigLoop);
+            em.mov_imm64(R::X16, 10);
+            em.sdiv(R::X15, R::X10, R::X16);
+            em.msub(R::X0, R::X15, R::X16, R::X10);  // X0 = X10 % 10
+            em.add_imm(R::X0, R::X0, (uint32_t)'0');
+            em.sub_imm(R::X12, R::X12, 1);
+            em.strb0(R::X0, R::X12);
+            em.mov_reg(R::X10, R::X15);
+            em.cmp_reg(R::X10, R::XZR);
+            emitBranch(FixKind::BCOND, idigLoop, Cond::NE);
+        }
+        {
+            // Verified real bug: this was `X17+64` (the reverse buffer's START) instead of its
+            // END (X17+84) — X12 already starts >= X17+64 after extraction (it only ever
+            // decrements down to wherever the most-significant digit landed, never below the
+            // buffer's start), so "loop while X12 < X17+64" was false on the very first check
+            // and the do-while body ran exactly once: every multi-digit integer part printed as
+            // just its single most-significant digit (12345.5 -> "1.5").
+            em.add_imm(R::X16, R::X17, REVBUF_END_OFF);         // one past the reverse buffer's last digit
+
+            int icpy = nextInternalLabel_--;
+            emitLabel(icpy);
+            em.ldrb0(R::X0, R::X12);
+            em.strb0(R::X0, R::X9);
+            em.add_imm(R::X9, R::X9, 1);
+            em.add_imm(R::X12, R::X12, 1);
+            em.cmp_reg(R::X12, R::X16);
+            emitBranch(FixKind::BCOND, icpy, Cond::LT);
+        }
+
+        // ---- Fractional digits: strip trailing zeros from the (rounded, fracKeep-digit)
+        // buffer. X13 = count of digits still kept, shrinks while the last is 0. ----
+        {
+            int stripLoop = nextInternalLabel_--;
+            int stripDone = nextInternalLabel_--;
+            emitLabel(stripLoop);
+            em.cmp_reg(R::X13, R::XZR);
+            emitBranch(FixKind::BCOND, stripDone, Cond::EQ);
+            em.add_imm(R::X12, R::X17, FRACBUF_OFF);
+            em.add_reg(R::X12, R::X12, R::X13);
+            em.sub_imm(R::X12, R::X12, 1);          // &fracBuf[fracKeep-1]
+            em.ldrb0(R::X15, R::X12);
+            em.cmp_reg(R::X15, R::XZR);
+            emitBranch(FixKind::BCOND, stripDone, Cond::NE);
+            em.sub_imm(R::X13, R::X13, 1);
+            emitBranch(FixKind::B, stripLoop);
+            emitLabel(stripDone);
+        }
+
+        // ---- Print '.' + kept fractional digits, or ".0" if none survived stripping ----
+        {
+            int dotZero = nextInternalLabel_--;
+            int afterFrac = nextInternalLabel_--;
+            em.cmp_reg(R::X13, R::XZR);
+            emitBranch(FixKind::BCOND, dotZero, Cond::EQ);
+            em.mov_imm64(R::X15, (int64_t)'.');
+            em.strb0(R::X15, R::X9);
+            em.add_imm(R::X9, R::X9, 1);
+            em.add_imm(R::X12, R::X17, FRACBUF_OFF);         // fracBuf cursor, index 0 first
+            em.mov_reg(R::X16, R::X13);             // remaining count
+            {
+                int fcpy = nextInternalLabel_--;
+                emitLabel(fcpy);
+                em.ldrb0(R::X15, R::X12);
+                em.add_imm(R::X15, R::X15, (uint32_t)'0');
+                em.strb0(R::X15, R::X9);
+                em.add_imm(R::X9, R::X9, 1);
+                em.add_imm(R::X12, R::X12, 1);
+                em.sub_imm(R::X16, R::X16, 1);
+                em.cmp_reg(R::X16, R::XZR);
+                emitBranch(FixKind::BCOND, fcpy, Cond::NE);
+            }
+            emitBranch(FixKind::B, afterFrac);
+            emitLabel(dotZero);
+            em.mov_imm64(R::X15, (int64_t)'.');
+            em.strb0(R::X15, R::X9);
+            em.add_imm(R::X9, R::X9, 1);
+            em.mov_imm64(R::X15, (int64_t)'0');
+            em.strb0(R::X15, R::X9);
+            em.add_imm(R::X9, R::X9, 1);
+            emitLabel(afterFrac);
+        }
+
+        // ---- Newline + write(1, outBuf, X9-outBuf) ----
+        em.mov_imm64(R::X15, (int64_t)'\n');
+        em.strb0(R::X15, R::X9);
+        em.add_imm(R::X9, R::X9, 1);
+        em.sub_reg(R::X2, R::X9, R::X17);
+        em.mov_reg(R::X1, R::X17);
+        em.mov_imm64(R::X0, 1);
+        em.mov_imm64(R::X8, 64);
+        em.svc0();
+
+        em.add_imm(R::SP, R::SP, PRINT_FLOAT_FRAME);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    // Integer-to-string cast used by the core coercion examples. The result points into a
+    // fresh 32-byte bump-allocated block and is NUL-terminated.
+    void emitIntToCstrRoutine() {
+        emitLabel(INT_TO_CSTR_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 16);
+        em.str_imm(R::X19, R::SP, 0);
+        em.mov_reg(R::X19, R::X0);
+        em.mov_imm64(R::X0, 32);
+        emitBranch(FixKind::BL, ALLOC_LABEL);
+        em.mov_reg(R::X9, R::X0);
+        em.add_imm(R::X10, R::X0, 30);
+        em.mov_reg(R::X12, R::X19);
+        em.mov_imm64(R::X13, 0);
+        em.cmp_reg(R::X12, R::XZR);
+        emitBranch(FixKind::BCOND, INT_TO_CSTR_POS_LABEL, Cond::GE);
+        em.mov_imm64(R::X13, 1);
+        em.neg_reg(R::X12, R::X12);
+        emitLabel(INT_TO_CSTR_POS_LABEL);
+        em.mov_imm64(R::X14, 10);
+        emitLabel(INT_TO_CSTR_LOOP_LABEL);
+        em.sdiv(R::X0, R::X12, R::X14);
+        em.msub(R::X1, R::X0, R::X14, R::X12);
+        em.add_imm(R::X1, R::X1, (uint32_t)'0');
+        em.strb0(R::X1, R::X10);
+        em.sub_imm(R::X10, R::X10, 1);
+        em.mov_reg(R::X12, R::X0);
+        emitBranch(FixKind::CBNZ, INT_TO_CSTR_LOOP_LABEL, Cond::EQ, R::X12);
+        em.cmp_reg(R::X13, R::XZR);
+        emitBranch(FixKind::BCOND, INT_TO_CSTR_NOSIGN_LABEL, Cond::EQ);
+        em.mov_imm64(R::X1, (int64_t)'-');
+        em.strb0(R::X1, R::X10);
+        em.sub_imm(R::X10, R::X10, 1);
+        emitLabel(INT_TO_CSTR_NOSIGN_LABEL);
+        em.add_imm(R::X10, R::X10, 1);
+        em.mov_imm64(R::X1, 0);
+        em.strb0(R::X1, R::X9);
+        em.mov_reg(R::X0, R::X10);
+        em.ldr_imm(R::X19, R::SP, 0);
+        em.add_imm(R::SP, R::SP, 16);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    void emitCstrToIntRoutine() {
+        emitLabel(CSTR_TO_INT_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.mov_reg(R::X9, R::X0);
+        em.mov_imm64(R::X10, 0);
+        em.mov_imm64(R::X11, 1);
+        em.ldrb0(R::X12, R::X9);
+        em.mov_imm64(R::X13, (int64_t)'-');
+        em.cmp_reg(R::X12, R::X13);
+        emitBranch(FixKind::BCOND, CSTR_TO_INT_SIGN_LABEL, Cond::EQ);
+        emitBranch(FixKind::B, CSTR_TO_INT_LOOP_LABEL);
+        emitLabel(CSTR_TO_INT_SIGN_LABEL);
+        em.mov_imm64(R::X11, -1);
+        em.add_imm(R::X9, R::X9, 1);
+        emitLabel(CSTR_TO_INT_LOOP_LABEL);
+        em.ldrb0(R::X12, R::X9);
+        em.cmp_reg(R::X12, R::XZR);
+        emitBranch(FixKind::BCOND, CSTR_TO_INT_DONE_LABEL, Cond::EQ);
+        em.sub_imm(R::X12, R::X12, (uint32_t)'0');
+        em.mov_imm64(R::X13, 10);
+        em.mul_reg(R::X10, R::X10, R::X13);
+        em.add_reg(R::X10, R::X10, R::X12);
+        em.add_imm(R::X9, R::X9, 1);
+        emitBranch(FixKind::B, CSTR_TO_INT_LOOP_LABEL);
+        emitLabel(CSTR_TO_INT_DONE_LABEL);
+        em.cmp_reg(R::X11, R::XZR);
+        int positive = nextInternalLabel_--;
+        emitBranch(FixKind::BCOND, positive, Cond::GE);
+        em.neg_reg(R::X10, R::X10);
+        emitLabel(positive);
+        em.mov_reg(R::X0, R::X10);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    void emitDictGetRoutine() {
+        emitLabel(DICT_GET_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 32);
+        em.str_imm(R::X19, R::SP, 0);
+        em.str_imm(R::X20, R::SP, 8);
+        em.str_imm(R::X21, R::SP, 16);
+        em.mov_reg(R::X19, R::X0); // dict pointer
+        em.mov_reg(R::X20, R::X1); // key pointer
+        em.mov_imm64(R::X21, 0);   // pair index
+        emitLabel(DICT_GET_LOOP_LABEL);
+        em.ldr_imm(R::X0, R::X19, 0); // count
+        em.cmp_reg(R::X21, R::X0);
+        emitBranch(FixKind::BCOND, DICT_GET_MISS_LABEL, Cond::GE);
+        em.mov_reg(R::X12, R::X21);
+        em.mov_imm64(R::X13, 16);
+        em.mul_reg(R::X12, R::X12, R::X13);
+        em.add_reg(R::X14, R::X19, R::X12);
+        em.add_imm(R::X14, R::X14, 8);
+        em.ldr_imm(R::X0, R::X14, 0);
+        em.mov_reg(R::X1, R::X20);
+        emitBranch(FixKind::BL, STREQ_LABEL);
+        em.cmp_reg(R::X0, R::XZR);
+        emitBranch(FixKind::BCOND, DICT_GET_NEXT_LABEL, Cond::EQ);
+        em.add_imm(R::X14, R::X14, 8);
+        em.ldr_imm(R::X0, R::X14, 0);
+        emitBranch(FixKind::B, DICT_GET_DONE_LABEL);
+        emitLabel(DICT_GET_NEXT_LABEL);
+        em.add_imm(R::X21, R::X21, 1);
+        emitBranch(FixKind::B, DICT_GET_LOOP_LABEL);
+        emitLabel(DICT_GET_MISS_LABEL);
+        loadStringLiteralPtr(R::X0, "Preposterous: KeyError: key not found");
+        emitBranch(FixKind::BL, PRINT_CSTR_LABEL);
+        em.mov_imm64(R::X0, 0);
+        emitLabel(DICT_GET_DONE_LABEL);
+        em.ldr_imm(R::X19, R::SP, 0);
+        em.ldr_imm(R::X20, R::SP, 8);
+        em.ldr_imm(R::X21, R::SP, 16);
+        em.add_imm(R::SP, R::SP, 32);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    void emitDictSetRoutine() {
+        emitLabel(DICT_SET_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 32);
+        em.str_imm(R::X19, R::SP, 0);
+        em.str_imm(R::X20, R::SP, 8);
+        em.str_imm(R::X21, R::SP, 16);
+        em.str_imm(R::X22, R::SP, 24);
+        em.mov_reg(R::X19, R::X0); // dict pointer
+        em.mov_reg(R::X20, R::X1); // key pointer
+        em.mov_reg(R::X21, R::X2); // value
+        em.mov_imm64(R::X22, 0);   // pair index
+        emitLabel(DICT_SET_LOOP_LABEL);
+        em.ldr_imm(R::X0, R::X19, 0);
+        em.cmp_reg(R::X22, R::X0);
+        emitBranch(FixKind::BCOND, DICT_SET_FULL_LABEL, Cond::GE);
+        em.mov_reg(R::X12, R::X22);
+        em.mov_imm64(R::X13, 16);
+        em.mul_reg(R::X12, R::X12, R::X13);
+        em.add_reg(R::X14, R::X19, R::X12);
+        em.add_imm(R::X14, R::X14, 8);
+        em.ldr_imm(R::X0, R::X14, 0);
+        em.mov_reg(R::X1, R::X20);
+        emitBranch(FixKind::BL, STREQ_LABEL);
+        em.cmp_reg(R::X0, R::XZR);
+        emitBranch(FixKind::BCOND, DICT_SET_NEXT_LABEL, Cond::EQ);
+        em.add_imm(R::X14, R::X14, 8);
+        em.str_imm(R::X21, R::X14, 0);
+        emitBranch(FixKind::B, DICT_SET_DONE_LABEL);
+        emitLabel(DICT_SET_NEXT_LABEL);
+        em.add_imm(R::X22, R::X22, 1);
+        emitBranch(FixKind::B, DICT_SET_LOOP_LABEL);
+        emitLabel(DICT_SET_FULL_LABEL);
+        em.sub_reg(R::X12, R::X19, R::XZR);
+        em.sub_imm(R::X12, R::X12, 8);
+        em.ldr_imm(R::X13, R::X12, 0);
+        em.cmp_reg(R::X22, R::X13);
+        emitBranch(FixKind::BCOND, DICT_SET_CAPERR_LABEL, Cond::GE);
+        em.mov_reg(R::X12, R::X22);
+        em.mov_imm64(R::X13, 16);
+        em.mul_reg(R::X12, R::X12, R::X13);
+        em.add_reg(R::X14, R::X19, R::X12);
+        em.add_imm(R::X14, R::X14, 8);
+        em.str_imm(R::X20, R::X14, 0);
+        em.add_imm(R::X14, R::X14, 8);
+        em.str_imm(R::X21, R::X14, 0);
+        em.add_imm(R::X22, R::X22, 1);
+        em.str_imm(R::X22, R::X19, 0);
+        emitBranch(FixKind::B, DICT_SET_DONE_LABEL);
+        emitLabel(DICT_SET_CAPERR_LABEL);
+        loadStringLiteralPtr(R::X0, "Preposterous: DictError: dictionary capacity exceeded");
+        emitBranch(FixKind::BL, PRINT_CSTR_LABEL);
+        emitLabel(DICT_SET_DONE_LABEL);
+        em.mov_reg(R::X0, R::X19);
+        em.ldr_imm(R::X19, R::SP, 0);
+        em.ldr_imm(R::X20, R::SP, 8);
+        em.ldr_imm(R::X21, R::SP, 16);
+        em.ldr_imm(R::X22, R::SP, 24);
+        em.add_imm(R::SP, R::SP, 32);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    void emitPrintArrayRoutine() {
+        emitLabel(PRINT_ARR_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 48);
+        em.str_imm(R::X19, R::SP, 0);
+        em.str_imm(R::X20, R::SP, 8);
+        em.str_imm(R::X21, R::SP, 16);
+        em.mov_reg(R::X19, R::X0);             // ptr
+        em.ldr_imm(R::X20, R::X19, 0);         // len
+        em.mov_imm64(R::X21, 1);               // word index, 1..len
+        em.mov_from_sp(R::X1);
+        em.add_imm(R::X1, R::X1, 40);
+        em.mov_imm64(R::X2, (int64_t)'[');
+        em.strb0(R::X2, R::X1);
+        em.mov_imm64(R::X0, 1);
+        em.mov_imm64(R::X2, 1);
+        em.mov_imm64(R::X8, 64);
+        em.svc0();
+
+        emitLabel(PRINT_ARR_LOOP_LABEL);
+        em.cmp_reg(R::X21, R::X20);
+        emitBranch(FixKind::BCOND, PRINT_ARR_DONE_LABEL, Cond::GT);
+        em.cmp_reg(R::X21, R::XZR);
+        em.mov_imm64(R::X9, 1);
+        em.cmp_reg(R::X21, R::X9);
+        emitBranch(FixKind::BCOND, PRINT_ARR_ELEM_LABEL, Cond::EQ);
+        em.mov_from_sp(R::X1);
+        em.add_imm(R::X1, R::X1, 40);
+        em.mov_imm64(R::X2, (int64_t)',');
+        em.strb0(R::X2, R::X1);
+        em.add_imm(R::X1, R::X1, 1);
+        em.mov_imm64(R::X2, (int64_t)' ');
+        em.strb0(R::X2, R::X1);
+        em.sub_imm(R::X1, R::X1, 1);
+        em.mov_imm64(R::X0, 1);
+        em.mov_imm64(R::X2, 2);
+        em.mov_imm64(R::X8, 64);
+        em.svc0();
+
+        emitLabel(PRINT_ARR_ELEM_LABEL);
+        em.mov_imm64(R::X9, 8);
+        em.mul_reg(R::X10, R::X21, R::X9);
+        em.add_reg(R::X10, R::X19, R::X10);
+        em.ldr_imm(R::X0, R::X10, 0);
+        emitBranch(FixKind::BL, PRINT_RAW_LABEL);
+        em.add_imm(R::X21, R::X21, 1);
+        emitBranch(FixKind::B, PRINT_ARR_LOOP_LABEL);
+
+        emitLabel(PRINT_ARR_DONE_LABEL);
+        em.mov_from_sp(R::X1);
+        em.add_imm(R::X1, R::X1, 40);
+        em.mov_imm64(R::X2, (int64_t)']');
+        em.strb0(R::X2, R::X1);
+        em.add_imm(R::X1, R::X1, 1);
+        em.mov_imm64(R::X2, (int64_t)'\n');
+        em.strb0(R::X2, R::X1);
+        em.sub_imm(R::X1, R::X1, 1);
+        em.mov_imm64(R::X0, 1);
+        em.mov_imm64(R::X2, 2);
+        em.mov_imm64(R::X8, 64);
+        em.svc0();
+        em.ldr_imm(R::X19, R::SP, 0);
+        em.ldr_imm(R::X20, R::SP, 8);
+        em.ldr_imm(R::X21, R::SP, 16);
+        em.add_imm(R::SP, R::SP, 48);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    void emitStrlenRoutine() {
+        emitLabel(STRLEN_LABEL);
+        em.mov_reg(R::X9, R::X0);              // cursor
+        em.mov_imm64(R::X0, 0);                // length
+        emitLabel(STRLEN_LOOP_LABEL);
+        em.ldrb0(R::X10, R::X9);
+        em.cmp_reg(R::X10, R::XZR);
+        emitBranch(FixKind::BCOND, STRLEN_DONE_LABEL, Cond::EQ);
+        em.add_imm(R::X0, R::X0, 1);
+        em.add_imm(R::X9, R::X9, 1);
+        emitBranch(FixKind::B, STRLEN_LOOP_LABEL);
+        emitLabel(STRLEN_DONE_LABEL);
+        em.ret();
+    }
+
+    void emitPrintCstrRoutine() {
+        emitLabel(PRINT_CSTR_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 16);
+        emitBranch(FixKind::BL, WRITE_CSTR_LABEL);
+        em.mov_from_sp(R::X1);
+        em.mov_imm64(R::X2, (int64_t)'\n');
+        em.strb0(R::X2, R::X1);
+        em.mov_imm64(R::X0, 1);
+        em.mov_imm64(R::X2, 1);
+        em.mov_imm64(R::X8, 64);
+        em.svc0();
+        em.add_imm(R::SP, R::SP, 16);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    void emitWriteCstrRoutine() {
+        emitLabel(WRITE_CSTR_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 32);
+        em.str_imm(R::X19, R::SP, 0);
+        em.mov_reg(R::X19, R::X0);
+        emitBranch(FixKind::BL, STRLEN_LABEL);
+        em.mov_reg(R::X2, R::X0);
+        em.mov_imm64(R::X0, 1);
+        em.mov_reg(R::X1, R::X19);
+        em.mov_imm64(R::X8, 64);
+        em.svc0();
+        em.ldr_imm(R::X19, R::SP, 0);
+        em.add_imm(R::SP, R::SP, 32);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    void emitStrEqRoutine() {
+        emitLabel(STREQ_LABEL);
+        emitLabel(STREQ_LOOP_LABEL);
+        em.ldrb0(R::X9, R::X0);
+        em.ldrb0(R::X10, R::X1);
+        em.cmp_reg(R::X9, R::X10);
+        emitBranch(FixKind::BCOND, STREQ_FALSE_LABEL, Cond::NE);
+        em.cmp_reg(R::X9, R::XZR);
+        emitBranch(FixKind::BCOND, STREQ_TRUE_LABEL, Cond::EQ);
+        em.add_imm(R::X0, R::X0, 1);
+        em.add_imm(R::X1, R::X1, 1);
+        emitBranch(FixKind::B, STREQ_LOOP_LABEL);
+        emitLabel(STREQ_TRUE_LABEL);
+        em.mov_imm64(R::X0, 1);
+        emitBranch(FixKind::B, STREQ_DONE_LABEL);
+        emitLabel(STREQ_FALSE_LABEL);
+        em.mov_imm64(R::X0, 0);
+        emitLabel(STREQ_DONE_LABEL);
+        em.ret();
+    }
+
+    void emitConcatRoutine() {
+        emitLabel(CONCAT_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 64);
+        em.str_imm(R::X19, R::SP, 0);
+        em.str_imm(R::X20, R::SP, 8);
+        em.str_imm(R::X21, R::SP, 16);
+        em.str_imm(R::X22, R::SP, 24);
+        em.str_imm(R::X23, R::SP, 32);
+        em.str_imm(R::X24, R::SP, 40);
+        em.mov_reg(R::X19, R::X0);             // left
+        em.mov_reg(R::X20, R::X1);             // right
+        emitBranch(FixKind::BL, STRLEN_LABEL);
+        em.mov_reg(R::X21, R::X0);             // left length
+        em.mov_reg(R::X0, R::X20);
+        emitBranch(FixKind::BL, STRLEN_LABEL);
+        em.mov_reg(R::X22, R::X0);             // right length
+        em.add_reg(R::X0, R::X21, R::X22);
+        em.add_imm(R::X0, R::X0, 1);           // NUL terminator
+        emitBranch(FixKind::BL, ALLOC_LABEL);
+        em.mov_reg(R::X23, R::X0);             // dest base
+        em.mov_reg(R::X24, R::X0);             // dest cursor
+
+        em.mov_reg(R::X9, R::X19);             // src cursor
+        em.mov_reg(R::X10, R::X21);            // bytes left
+        emitLabel(CONCAT_COPY_LEFT_LABEL);
+        em.cmp_reg(R::X10, R::XZR);
+        emitBranch(FixKind::BCOND, CONCAT_LEFT_DONE_LABEL, Cond::EQ);
+        em.ldrb0(R::X11, R::X9);
+        em.strb0(R::X11, R::X24);
+        em.add_imm(R::X9, R::X9, 1);
+        em.add_imm(R::X24, R::X24, 1);
+        em.sub_imm(R::X10, R::X10, 1);
+        emitBranch(FixKind::B, CONCAT_COPY_LEFT_LABEL);
+        emitLabel(CONCAT_LEFT_DONE_LABEL);
+
+        em.mov_reg(R::X9, R::X20);
+        em.mov_reg(R::X10, R::X22);
+        emitLabel(CONCAT_COPY_RIGHT_LABEL);
+        em.cmp_reg(R::X10, R::XZR);
+        emitBranch(FixKind::BCOND, CONCAT_RIGHT_DONE_LABEL, Cond::EQ);
+        em.ldrb0(R::X11, R::X9);
+        em.strb0(R::X11, R::X24);
+        em.add_imm(R::X9, R::X9, 1);
+        em.add_imm(R::X24, R::X24, 1);
+        em.sub_imm(R::X10, R::X10, 1);
+        emitBranch(FixKind::B, CONCAT_COPY_RIGHT_LABEL);
+        emitLabel(CONCAT_RIGHT_DONE_LABEL);
+        em.mov_imm64(R::X11, 0);
+        em.strb0(R::X11, R::X24);
+        em.mov_reg(R::X0, R::X23);
+        em.ldr_imm(R::X19, R::SP, 0);
+        em.ldr_imm(R::X20, R::SP, 8);
+        em.ldr_imm(R::X21, R::SP, 16);
+        em.ldr_imm(R::X22, R::SP, 24);
+        em.ldr_imm(R::X23, R::SP, 32);
+        em.ldr_imm(R::X24, R::SP, 40);
+        em.add_imm(R::SP, R::SP, 64);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    // __ac_alloc__: X0 = bytes requested -> X0 = pointer. Bump allocator over a single
+    // lazily-mmap'd 16 MB region, ported straight from BNY's own emitAllocLinux (exp_bny.cpp)
+    // — same algorithm (mmap once, bump a cursor forever, never free), re-expressed in AArch64
+    // registers. The cursor lives at globals-page offset 0 (slot 0, reserved — see nextSlot's
+    // own comment) instead of BNY's own dedicated global slot, otherwise identical.
+    //
+    // X9/X10 hold "bytes requested" / "cursor value" across the mmap syscall rather than
+    // spilling to the stack the way BNY's x86-64 version does (it pushes rdi/rcx specifically
+    // because the x86-64 `syscall` instruction is DOCUMENTED to clobber rcx and r11) — AArch64's
+    // `svc` has no such documented clobber beyond X0 (return value) and X8 (syscall number),
+    // so any register outside the six argument registers (X0-X5) and X8 survives a syscall
+    // untouched; verified this holds in practice via a real qemu-aarch64 run before trusting it.
+    void emitAllocRoutine() {
+        emitLabel(ALLOC_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.mov_reg(R::X9, R::X0);              // X9 = bytes requested
+        em.ldr_imm(R::X10, GLOBALS_BASE, 0);   // X10 = cursor (0 on the very first call)
+        emitBranch(FixKind::CBNZ, ALLOC_HAVE_LABEL, Cond::EQ, R::X10);
+        // First call: mmap(NULL, 16MB, PROT_READ|WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+        em.mov_imm64(R::X0, 0);
+        em.mov_imm64(R::X1, 0x1000000);        // 16 MB
+        em.mov_imm64(R::X2, 3);                // PROT_READ|PROT_WRITE
+        em.mov_imm64(R::X3, 0x22);             // MAP_PRIVATE|MAP_ANONYMOUS
+        em.mov_imm64(R::X4, -1);               // fd
+        em.mov_imm64(R::X5, 0);                // offset
+        em.mov_imm64(R::X8, 222);              // mmap (AArch64 Linux syscall table)
+        em.svc0();
+        em.mov_reg(R::X10, R::X0);             // X10 = cursor = mmap base
+        em.str_imm(R::X10, GLOBALS_BASE, 0);   // persist it
+        emitLabel(ALLOC_HAVE_LABEL);
+        em.add_reg(R::X11, R::X10, R::X9);     // X11 = new cursor = old + bytes
+        em.str_imm(R::X11, GLOBALS_BASE, 0);
+        em.mov_reg(R::X0, R::X10);             // return the OLD cursor (start of this allocation)
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    // __ac_append__: X0 = ptr, X1 = value -> X0 = new ptr (same pointer whenever capacity
+    // already allows — O(1) amortized). Ported from BNY's emitAppendLinux (exp_bny.cpp),
+    // same [cap@ptr-8][len@ptr+0][e0][e1]... layout, same capacity-doubling algorithm.
+    // X19-X22 are AAPCS64 callee-saved, so a real caller expects them preserved across this
+    // call — spilled to the stack around the body exactly like BNY spills rbx/r12/r13/r14.
+    void emitAppendRoutine() {
+        emitLabel(APPEND_LABEL);
+        em.stp_x29_x30_presp16();
+        em.mov_x29_sp();
+        em.sub_imm(R::SP, R::SP, 32);
+        em.str_imm(R::X19, R::SP, 0);
+        em.str_imm(R::X20, R::SP, 8);
+        em.str_imm(R::X21, R::SP, 16);
+        em.str_imm(R::X22, R::SP, 24);
+        em.mov_reg(R::X19, R::X0);             // X19 = ptr
+        em.mov_reg(R::X20, R::X1);             // X20 = value
+        em.ldr_imm(R::X21, R::X19, 0);         // X21 = len = ptr[0]
+        em.sub_imm(R::X9, R::X19, 8);
+        em.ldr_imm(R::X22, R::X9, 0);          // X22 = cap = ptr[-8]
+        em.cmp_reg(R::X21, R::X22);
+        emitBranch(FixKind::BCOND, APPEND_FAST_LABEL, Cond::LT);
+
+        // ---- slow path: capacity exhausted — double and copy, O(len), amortized O(1) ----
+        em.add_reg(R::X22, R::X22, R::X22);    // X22 = newcap = cap*2
+        em.add_imm(R::X0, R::X22, 2);
+        em.mov_imm64(R::X9, 8);
+        em.mul_reg(R::X0, R::X0, R::X9);       // X0 = (newcap+2)*8 bytes
+        emitBranch(FixKind::BL, ALLOC_LABEL);
+        em.str_imm(R::X22, R::X0, 0);          // new_raw[0] = newcap
+        em.add_imm(R::X0, R::X0, 8);           // X0 = new ptr (skip cap word)
+        em.str_imm(R::X21, R::X0, 0);          // new_ptr[0] = len (temporary)
+        em.mov_imm64(R::X9, 1);                // X9 = copy index i
+        emitLabel(APPEND_COPY_LABEL);
+        em.cmp_reg(R::X9, R::X21);
+        emitBranch(FixKind::BCOND, APPEND_COPYDONE_LABEL, Cond::GT);
+        em.mov_imm64(R::X10, 8);
+        em.mul_reg(R::X10, R::X9, R::X10);     // X10 = i*8
+        em.add_reg(R::X11, R::X19, R::X10);
+        em.ldr_imm(R::X12, R::X11, 0);         // X12 = old[i]
+        em.add_reg(R::X11, R::X0, R::X10);
+        em.str_imm(R::X12, R::X11, 0);         // new[i] = old[i]
+        em.add_imm(R::X9, R::X9, 1);
+        emitBranch(FixKind::B, APPEND_COPY_LABEL);
+        emitLabel(APPEND_COPYDONE_LABEL);
+        em.add_imm(R::X9, R::X21, 1);          // len+1
+        em.mov_imm64(R::X10, 8);
+        em.mul_reg(R::X10, R::X9, R::X10);
+        em.add_reg(R::X11, R::X0, R::X10);
+        em.str_imm(R::X20, R::X11, 0);         // new[len+1] = value
+        em.str_imm(R::X9, R::X0, 0);           // new[0] = len+1
+        emitBranch(FixKind::B, APPEND_DONE_LABEL);
+
+        // ---- fast path: len < cap — write in place, O(1), zero allocation/copy ----
+        emitLabel(APPEND_FAST_LABEL);
+        em.add_imm(R::X9, R::X21, 1);          // len+1
+        em.mov_imm64(R::X10, 8);
+        em.mul_reg(R::X10, R::X9, R::X10);
+        em.add_reg(R::X11, R::X19, R::X10);
+        em.str_imm(R::X20, R::X11, 0);         // ptr[len+1] = value
+        em.str_imm(R::X9, R::X19, 0);          // ptr[0] = len+1
+        em.mov_reg(R::X0, R::X19);             // return same ptr — nothing moved
+
+        emitLabel(APPEND_DONE_LABEL);
+        em.ldr_imm(R::X19, R::SP, 0);
+        em.ldr_imm(R::X20, R::SP, 8);
+        em.ldr_imm(R::X21, R::SP, 16);
+        em.ldr_imm(R::X22, R::SP, 24);
+        em.add_imm(R::SP, R::SP, 32);
+        em.ldp_x29_x30_postsp16();
+        em.ret();
+    }
+
+    // `length arr` doesn't lower to LOAD_INDEX+"__len__" the way this file's own LOAD_INDEX
+    // case might suggest — ir.cpp instead emits a plain CALL to a function literally named
+    // "ac_length" (comment there: "each backend has ac_length"), so every backend must supply
+    // its own. Registered directly in funcOffsets (not via the emitBranch/label-fixup path
+    // emitAllocRoutine/emitAppendRoutine use) since CALL's own resolution looks callees up
+    // there specifically. BNY's version (exp_bny.cpp) also handles a STRING receiver via
+    // __ac_strlen__ — not reachable here yet since ARM has no string support at all.
+    void emitLengthRoutine() {
+        emitLabel(LENGTH_LABEL);
+        funcOffsets["ac_length"] = em.pos();
+        em.ldr_imm(R::X0, R::X0, 0);  // length = ptr[0]
+        em.ret();
+    }
+
+    // Reached only when a divisor was 0 (see emitDivZeroGuard) — no try/catch exists on ARM yet
+    // (that's Phase 5), so this always terminates, matching BNY's own "no active try" fallback
+    // path exactly (same message, same stderr+exit(1) shape).
+    void emitDivZeroTrapRoutine() {
+        emitLabel(DIVZERO_LABEL);
+        static const char msg[] = "Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\n";
+        std::vector<uint8_t> data(msg, msg + sizeof(msg) - 1);
+        int strLabel = nextInternalLabel_--;
+        int afterLabel = nextInternalLabel_--;
+        emitBranch(FixKind::B, afterLabel);
+        emitLabel(strLabel);
+        em.bytesRaw(data);
+        while (em.pos() % 4 != 0) em.byteRaw(0);
+        emitLabel(afterLabel);
+        auto it = labelOffsets.find(strLabel);
+        if (it == labelOffsets.end())
+            throw ACError::backend("ARM backend: internal string-label emission failed");
+        em.mov_imm64(R::X0, 2);                              // stderr
+        em.mov_imm64(R::X1, (int64_t)(codeVA_ + it->second));
+        em.mov_imm64(R::X2, (int64_t)data.size());
+        em.mov_imm64(R::X8, 64);                             // write
+        em.svc0();
+        em.mov_imm64(R::X0, 1);
+        em.mov_imm64(R::X8, 94);                             // exit_group
+        em.svc0();
+    }
+
+    // ac_ipow(base, exp): integer exponentiation helper emitted by IR for `^` whenever
+    // constexpr folding cannot reduce it away. Negative exponents intentionally collapse to
+    // 1 here, matching the simple integer helper used by the typed backends.
+    void emitIpowRoutine() {
+        funcOffsets["ac_ipow"] = em.pos();
+        em.mov_reg(R::X10, R::X0);             // base
+        em.mov_reg(R::X11, R::X1);             // exponent
+        em.mov_imm64(R::X9, 1);                // result
+        emitLabel(IPOW_LOOP_LABEL);
+        em.cmp_reg(R::X11, R::XZR);
+        emitBranch(FixKind::BCOND, IPOW_DONE_LABEL, Cond::LE);
+        em.mul_reg(R::X9, R::X9, R::X10);
+        em.sub_imm(R::X11, R::X11, 1);
+        emitBranch(FixKind::B, IPOW_LOOP_LABEL);
+        emitLabel(IPOW_DONE_LABEL);
+        em.mov_reg(R::X0, R::X9);
+        em.ret();
+    }
+
 public:
-    explicit ArmCompiler(const IRProgram& p) : prog(p) {}
+    ArmCompiler(const IRProgram& p, uint64_t codeVA, bool dynamicLink, bool staticLink)
+        : prog(p), codeVA_(codeVA), dynamicLink_(dynamicLink), staticLink_(staticLink) {}
+
+    void emitExternalStub(const std::string& name, const std::string& exportName,
+                          const std::string& library) {
+        ArmExternal ext{name, exportName, library, em.pos()};
+        externalStubOffsets_[name] = em.pos();
+        em.mov_imm64(R::X16, 0); // patched to this symbol's GOT slot by the ELF writer
+        em.ldr_imm(R::X17, R::X16, 0);
+        em.br(R::X17);
+        externals_.push_back(std::move(ext));
+    }
 
     // Free functions only for v1.1 — a bundle/class method (fn.classOwner non-empty) needs a
     // real `self` receiver convention this file doesn't have yet; skipped with a hard error at
@@ -626,15 +3610,46 @@ public:
     // rather than a matching `add sp,sp,#N` — correct regardless of N, and means no return site
     // needs its own separate fixup.
     void compileFunction(const IRFunction& fn) {
-        if (!fn.classOwner.empty()) return; // methods: not yet supported, see comment above
-        funcOffsets[fn.name] = em.pos();
-        currentFuncName_ = fn.name;
-        funcMaxSlot_ = -1;
+        // Bundle methods need a class-qualified label ("Critter_greet") — no function is ever
+        // literally named just "greet" from a call site's point of view (construction/method
+        // dispatch, see the CALL case, always resolve to this qualified form).
+        std::string label = fn.classOwner.empty() ? fn.name : fn.classOwner + "_" + fn.name;
+        currentClass_ = fn.classOwner;
+        compilingMethod_ = !fn.classOwner.empty();
+        funcOffsets[label] = em.pos();
+        currentFuncName_ = label;
+        currentFuncParamNames_ = std::set<std::string>(fn.parameters.begin(), fn.parameters.end());
+        // Slot 0 is reserved for `self` in a method's frame (see SELF_SLOT) — never handed out
+        // by the ordinary per-symbol slot allocator, so ordinary locals start at 1 instead of 0.
+        // Verified real bug: SELF_SLOT is written directly (bypassing slotFor, which is the only
+        // thing that ever bumps funcMaxSlot_), so a method whose body never happens to reference
+        // any OTHER var/temp (e.g. a zero-arg constructor doing only `self.f = 0`) left
+        // funcMaxSlot_ at -1 — a 0-byte frame — while still writing self's incoming pointer to
+        // slot 0. That write landed squarely on the just-pushed saved x29/x30 (the frame the
+        // `stp x29,x30,[sp,#-16]!` prologue had JUST written there), corrupting the caller's
+        // frame pointer the moment that method was called from inside another function (harmless
+        // garbage at the top-level mainloop, where nothing downstream reads the stale x29, but a
+        // real segfault one call deeper — verified via a qemu instruction trace).
+        funcMaxSlot_ = compilingMethod_ ? SELF_SLOT : -1;
+        nextFuncSlot_ = compilingMethod_ ? 1 : 0;
+        preScanFloatVars(fn.instructions);
+        for (const std::string& param : stringParamHints_[fn.name]) {
+            for (const auto& ins : fn.instructions) {
+                auto markIfParam = [&](const IRRef& r) {
+                    if (r.kind == IRRef::Kind::VAR && r.id >= 0
+                            && prog.symbols.getName(r.id) == param)
+                        markStringRef(r);
+                };
+                markIfParam(ins.result);
+                for (const auto& op : ins.typedOperands) markIfParam(op);
+            }
+        }
         // Recomputed per function, not once for the whole program: temp ids restart at 0 in
         // each IRFunction (same reason keyFor is function-qualified — see its own comment), so
         // reusing one elidableTemps_ set across functions would let function B's temp 0 wrongly
         // inherit function A's temp 0's elision eligibility.
         elidableTemps_ = computeElidableTemps(fn.instructions);
+        preseedValueKinds(fn.instructions);
         pendingTempId_ = -1;
         em.stp_x29_x30_presp16();
         em.mov_x29_sp();
@@ -659,9 +3674,26 @@ public:
                 for (auto& op : ins.typedOperands) check(op);
                 if (symId >= 0) break;
             }
+            // A bundle/tuple-instance parameter referenced ONLY via dotted field access
+            // ("p.x"/"p.y", each its own separate symbol) never appears as a bare "p" VAR
+            // anywhere in fn.instructions — the scan above can't find it — even though
+            // ir.cpp already interned the real symbol id for the plain parameter name. Ported
+            // from BNY's identical fix: look it up directly instead of leaving the incoming
+            // pointer with nowhere to land (verified real segfault without this: resolveFieldAccess
+            // correctly knew `p` was a Point via computeClassParamTypes, but `loadNamedVar("p",...)`
+            // read an unwritten/garbage slot instead of the real incoming pointer).
+            if (symId < 0 && instanceClass_.count(fn.parameters[i]))
+                symId = prog.symbols.lookupAnyScope(fn.parameters[i]);
             if (symId >= 0) {
                 IRRef pref = IRRef::var(symId);
+                if (stringParamHints_[fn.name].count(fn.parameters[i])) markStringRef(pref);
+                if (floatParamHints_[fn.name].count(fn.parameters[i])) markFloatRef(pref);
                 storeResult(pref, argRegs[i]);
+            } else if (i == 0 && compilingMethod_ && fn.parameters[i] == "self") {
+                // `self` is never a bare VAR anywhere in the IR — only ever fused into compound
+                // names like "self.hp" (a completely separate symbol) — so the scan above can
+                // never find it. Store its incoming pointer into the dedicated self slot instead.
+                em.str_imm(argRegs[i], R::SP, (uint32_t)(SELF_SLOT * 8));
             }
             // A parameter never referenced in the body at all needs no slot — nothing to do.
         }
@@ -683,10 +3715,130 @@ public:
                 + "' needs more local-frame space than this v1.1 slice's 12-bit immediate encoding supports");
         em.patch32(subSpOff, 0xD1000000u | (frameBytes<<10) | (rn(R::SP)<<5) | rn(R::SP));
         currentFuncName_.clear();
+        currentFuncParamNames_.clear();
+        currentClass_.clear();
+        compilingMethod_ = false;
     }
 
     // Returns {machine code bytes, data-slot count needed}.
-    std::pair<std::vector<uint8_t>,int> compile(uint64_t globalsVA) {
+    // Whole-program field-order pre-scan (ported from BNY's identical design): every
+    // `self.field` STORE_VAR/TYPE_CAST across a class's methods (in first-seen order) becomes
+    // that field's slot, offset = 8*index. A class with zero self.field writes still gets an
+    // entry (matches BNY's own "always present, possibly empty" convention).
+    void computeClassFields() {
+        classFields_.clear();
+        for (auto& fn : prog.functions) {
+            if (fn.classOwner.empty()) continue;
+            auto& fields = classFields_[fn.classOwner];
+            for (auto& ins : fn.instructions) {
+                if (ins.opcode != IROpcode::STORE_VAR && ins.opcode != IROpcode::TYPE_CAST) continue;
+                IRRef tgt;
+                if (ins.opcode == IROpcode::TYPE_CAST) tgt = ins.result;
+                else if (ins.typedOperands.size() >= 2) tgt = ins.typedOperands[0];
+                else if (ins.result.isValid()) tgt = ins.result;
+                if (tgt.kind != IRRef::Kind::VAR || tgt.id < 0) continue;
+                std::string nm = prog.symbols.getName(tgt.id);
+                if (nm.rfind("self.", 0) != 0) continue;
+                std::string field = nm.substr(5);
+                if (std::find(fields.begin(), fields.end(), field) == fields.end())
+                    fields.push_back(field);
+            }
+        }
+        for (auto& fn : prog.functions)
+            if (!fn.classOwner.empty()) classFields_[fn.classOwner];
+    }
+
+    // Ported from BNY's identical two-part discovery (see its own comment for the full
+    // rationale): (1) classReturnFuncs_ — a free function that always returns a var directly
+    // constructed via `SomeClass()`, so `q = f()` gets the same instanceClass_ treatment as
+    // `q = SomeClass()`. (2) classParamTypes — for every CALL/LIB_CALL site passing a
+    // known-instance variable as an argument, record which parameter position of the callee
+    // receives it, then seed instanceClass_ with that callee's REAL parameter name. Without
+    // this, a free function's bundle-typed parameter (`Make show func(p): p.x`) has no way to
+    // know `p` is an instance at all — `p.x` would resolve as an ordinary (wrong, uninitialized)
+    // local instead of a real field access.
+    void computeClassParamTypes() {
+        classReturnFuncs_.clear();
+        for (auto& fn : prog.functions) {
+            if (!fn.classOwner.empty()) continue;
+            std::map<std::string, std::string> varClass;
+            for (auto& ins : fn.instructions) {
+                if (ins.opcode == IROpcode::CALL && ins.result.kind == IRRef::Kind::VAR
+                        && ins.result.id >= 0 && !ins.typedOperands.empty()
+                        && ins.typedOperands[0].kind == IRRef::Kind::VAR
+                        && ins.typedOperands[0].id >= 0) {
+                    std::string callee = prog.symbols.getName(ins.typedOperands[0].id);
+                    if (classFields_.count(callee))
+                        varClass[prog.symbols.getName(ins.result.id)] = callee;
+                }
+            }
+            std::string retClass; bool any = false, consistent = true;
+            for (auto& ins : fn.instructions) {
+                if (ins.opcode != IROpcode::RETURN || ins.typedOperands.empty()) continue;
+                const auto& rv = ins.typedOperands[0];
+                if (rv.kind != IRRef::Kind::VAR || rv.id < 0) { consistent = false; break; }
+                auto it = varClass.find(prog.symbols.getName(rv.id));
+                if (it == varClass.end()) { consistent = false; break; }
+                if (!any) { retClass = it->second; any = true; }
+                else if (retClass != it->second) { consistent = false; break; }
+            }
+            if (any && consistent) classReturnFuncs_[fn.name] = retClass;
+        }
+
+        std::map<std::string, std::string> varClassGlobal;
+        auto scanConstructs = [&](const std::vector<IRInstruction>& instrs) {
+            for (auto& ins : instrs) {
+                if (ins.opcode != IROpcode::CALL || ins.result.kind != IRRef::Kind::VAR
+                        || ins.result.id < 0 || ins.typedOperands.empty()
+                        || ins.typedOperands[0].kind != IRRef::Kind::VAR
+                        || ins.typedOperands[0].id < 0) continue;
+                std::string callee = prog.symbols.getName(ins.typedOperands[0].id);
+                if (classFields_.count(callee))
+                    varClassGlobal[prog.symbols.getName(ins.result.id)] = callee;
+                else if (classReturnFuncs_.count(callee))
+                    varClassGlobal[prog.symbols.getName(ins.result.id)] = classReturnFuncs_[callee];
+            }
+        };
+        for (auto& fn : prog.functions) scanConstructs(fn.instructions);
+        scanConstructs(prog.globalInit);
+
+        std::map<std::string, std::map<int, std::string>> classParamTypes;
+        auto scanCalls = [&](const std::vector<IRInstruction>& instrs) {
+            for (auto& ins : instrs) {
+                if ((ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL)
+                        || ins.typedOperands.empty()
+                        || ins.typedOperands[0].kind != IRRef::Kind::VAR) continue;
+                std::string calleeName = prog.symbols.getName(ins.typedOperands[0].id);
+                for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
+                    const IRRef& arg = ins.typedOperands[ai];
+                    if (arg.kind != IRRef::Kind::VAR) continue;
+                    auto vc = varClassGlobal.find(prog.symbols.getName(arg.id));
+                    if (vc != varClassGlobal.end())
+                        classParamTypes[calleeName][(int)(ai - 1)] = vc->second;
+                }
+            }
+        };
+        for (auto& fn : prog.functions) scanCalls(fn.instructions);
+        scanCalls(prog.globalInit);
+
+        // Free functions only — a method's fn.parameters has an extra leading "self" the caller
+        // never writes, which would shift every index by one; out of scope for this fix, same as
+        // BNY's own.
+        for (auto& fn : prog.functions) {
+            if (!fn.classOwner.empty()) continue;
+            auto cpIt = classParamTypes.find(fn.name);
+            if (cpIt == classParamTypes.end()) continue;
+            for (auto& [idx, cls] : cpIt->second) {
+                if (idx < 0 || (size_t)idx >= fn.parameters.size()) continue;
+                instanceClass_[fn.parameters[(size_t)idx]] = cls;
+            }
+        }
+    }
+
+    ArmCompiledImage compile(uint64_t globalsVA) {
+        computeArrayReturningFuncs();
+        computeClassFields();
+        computeClassParamTypes();
         // Pin X28 = globals base address once, at program start.
         em.mov_imm64(GLOBALS_BASE, (int64_t)globalsVA);
         // globalInit already IS data+main combined (see IRProgram's own comment on the field) —
@@ -694,7 +3846,9 @@ public:
         // caught it via a byte-for-byte objdump read of the very first test binary, which
         // showed the store/print/halt sequence duplicated even though --stop-after-ir's LIR
         // dump only shows it once, since the dump reads a different view).
+        preScanFloatVars(prog.globalInit);
         elidableTemps_ = computeElidableTemps(prog.globalInit);
+        preseedValueKinds(prog.globalInit);
         pendingTempId_ = -1;
         for (auto& ins : prog.globalInit) compileInstr(ins);
         ensureSpilled(); // in case the mainloop's last instruction left something uncommitted
@@ -704,12 +3858,56 @@ public:
         em.svc0();
         for (auto& fn : prog.functions) compileFunction(fn);
         emitPrintIntRoutine();
+        emitPrintIntRawRoutine();
+        emitPrintFloatRoutine();
+        emitIntToCstrRoutine();
+        emitCstrToIntRoutine();
+        emitDictGetRoutine();
+        emitDictSetRoutine();
+        emitPrintArrayRoutine();
+        emitStrlenRoutine();
+        emitPrintCstrRoutine();
+        emitWriteCstrRoutine();
+        emitStrEqRoutine();
+        emitAllocRoutine();
+        emitConcatRoutine();
+        emitAppendRoutine();
+        emitLengthRoutine();
+        emitIpowRoutine();
+        emitDivZeroTrapRoutine();
+
+        if (dynamicLink_) {
+            std::set<std::string> seen;
+            for (const auto& [unusedOffset, calleeName] : callFixups) {
+                if (funcOffsets.count(calleeName) || !seen.insert(calleeName).second) continue;
+                std::string exportName, library;
+                if (!armExternalName(calleeName, exportName, library)) continue;
+                emitExternalStub(calleeName, exportName, library);
+            }
+        } else if (staticLink_) {
+            std::set<std::string> seen;
+            for (const auto& [unusedOffset, calleeName] : callFixups) {
+                if (funcOffsets.count(calleeName) || !seen.insert(calleeName).second) continue;
+                std::string exportName, library;
+                if (armExternalName(calleeName, exportName, library))
+                    externals_.push_back({calleeName, exportName, library, 0});
+            }
+        }
 
         for (auto& fx : fixups) {
             auto it = labelOffsets.find(fx.labelId);
-            if (it == labelOffsets.end()) continue; // dangling — skip rather than crash
+            if (it == labelOffsets.end())
+                throw ACError::backend("ARM backend: unresolved branch label " + std::to_string(fx.labelId));
             int64_t delta = (int64_t)it->second - (int64_t)fx.bufOff;
+            if ((delta % 4) != 0)
+                throw ACError::backend("ARM backend: unaligned branch target " + std::to_string(fx.labelId));
             int32_t words = (int32_t)(delta / 4);
+            if ((fx.kind == FixKind::B || fx.kind == FixKind::BL)
+                    && (words < -(1<<25) || words >= (1<<25)))
+                throw ACError::backend("ARM backend: branch target out of range");
+            if ((fx.kind == FixKind::CBZ || fx.kind == FixKind::CBNZ || fx.kind == FixKind::BCOND)
+                    && (words < -(1<<18) || words >= (1<<18)))
+                throw ACError::backend("ARM backend: conditional branch target out of range");
             switch (fx.kind) {
                 case FixKind::B:     em.patch32(fx.bufOff, 0x14000000u | ((uint32_t)words & 0x3FFFFFFu)); break;
                 case FixKind::BL:    em.patch32(fx.bufOff, 0x94000000u | ((uint32_t)words & 0x3FFFFFFu)); break;
@@ -720,16 +3918,268 @@ public:
         }
         for (auto& [bufOff, calleeName] : callFixups) {
             auto it = funcOffsets.find(calleeName);
-            if (it == funcOffsets.end())
+            if (it == funcOffsets.end()) {
+                auto ext = externalStubOffsets_.find(calleeName);
+                if (ext != externalStubOffsets_.end()) {
+                    int64_t delta = (int64_t)ext->second - (int64_t)bufOff;
+                    if ((delta % 4) != 0)
+                        throw ACError::backend("ARM backend: unaligned external call target '" + calleeName + "'");
+                    int32_t words = (int32_t)(delta / 4);
+                    if (words < -(1<<25) || words >= (1<<25))
+                        throw ACError::backend("ARM backend: external call target out of range for '" + calleeName + "'");
+                    em.patch32(bufOff, 0x94000000u | ((uint32_t)words & 0x3FFFFFFu));
+                    continue;
+                }
+                if (staticLink_) {
+                    std::string exportName, library;
+                    if (armExternalName(calleeName, exportName, library)) {
+                        externalCalls_.push_back({bufOff, calleeName});
+                        em.patch32(bufOff, 0x94000000u); // R_AARCH64_CALL26 filled by ld
+                        continue;
+                    }
+                }
+                if (calleeName.find('.') != std::string::npos)
+                    throw ACError::backend("ARM backend: ilib call '" + calleeName
+                        + "' requires ARM library linking; no ARM library mapping exists yet");
                 throw ACError::backend("ARM backend: call to unresolved function '" + calleeName
                     + "' (bundle methods and forward-declared-only functions are not yet implemented)");
+            }
             int64_t delta = (int64_t)it->second - (int64_t)bufOff;
+            if ((delta % 4) != 0)
+                throw ACError::backend("ARM backend: unaligned call target '" + calleeName + "'");
             int32_t words = (int32_t)(delta / 4);
+            if (words < -(1<<25) || words >= (1<<25))
+                throw ACError::backend("ARM backend: call target out of range for '" + calleeName + "'");
             em.patch32(bufOff, 0x94000000u | ((uint32_t)words & 0x3FFFFFFu));
         }
-        return {em.bytes(), nextSlot};
+        return {em.bytes(), nextGlobalSlot_, externals_, externalCalls_};
     }
 };
+
+static void patchArmMovImm64(std::vector<uint8_t>& text, size_t off, uint64_t value) {
+    for (int hw = 0; hw < 4; hw++) {
+        uint32_t w = (hw == 0 ? 0xD2800000u : 0xF2800000u)
+                   | ((uint32_t)hw << 21)
+                   | (uint32_t)(((value >> (16 * hw)) & 0xFFFFu) << 5)
+                   | (uint32_t)R::X16;
+        text[off + hw*4 + 0] = (uint8_t)w;
+        text[off + hw*4 + 1] = (uint8_t)(w >> 8);
+        text[off + hw*4 + 2] = (uint8_t)(w >> 16);
+        text[off + hw*4 + 3] = (uint8_t)(w >> 24);
+    }
+}
+
+static std::string armShellQuote(const std::string& s) {
+    std::string q = "'";
+    for (char c : s) {
+        if (c == '\'') q += "'\\''";
+        else q += c;
+    }
+    return q + "'";
+}
+
+static std::string armAsmQuote(const std::string& s) {
+    std::string q = "\"";
+    for (char c : s) {
+        if (c == '\\' || c == '"') q += '\\';
+        q += c;
+    }
+    return q + "\"";
+}
+
+static bool writeArmStaticELF(const std::string& path, const ArmCompiledImage& image,
+                              const std::string& libraryPaths) {
+    const std::string asmPath = path + ".static.s";
+    const std::string scriptPath = path + ".static.ld";
+    {
+        std::ofstream asmFile(asmPath);
+        std::ofstream script(scriptPath);
+        if (!asmFile || !script) return false;
+        asmFile << ".section .ac_text,\"ax\"\n.global ac_entry\n.type ac_entry,%function\nac_entry:\n";
+        asmFile << ".incbin " << armAsmQuote(path + ".static.text") << "\n";
+        for (const auto& [off, name] : image.externalCalls) {
+            std::string exportName, library;
+            if (!armExternalName(name, exportName, library)) return false;
+            asmFile << ".reloc ac_entry + " << off << ", R_AARCH64_CALL26, "
+                    << exportName << "\n";
+        }
+        asmFile << ".size ac_entry, .-ac_entry\n.section .text\n"
+                << ".global main\n.type main,%function\nmain:\n"
+                << "  bl ac_entry\n  mov w0, #0\n  ret\n.size main, .-main\n";
+        // Keep the cross-linker's normal static startup/program headers.  Only insert the
+        // fixed AC pages before the toolchain's .text output; a complete replacement script
+        // breaks glibc's early aux-vector setup before ac_entry is reached.
+        script << "SECTIONS\n{\n"
+               << "  . = 0x401000;\n  .ac_bss (NOLOAD) : { . += 0x1000; }\n"
+               << "  . = 0x402000;\n  .ac_text : { KEEP(*(.ac_text)) }\n"
+               << "}\nINSERT BEFORE .text\n";
+    }
+    {
+        std::ofstream raw(path + ".static.text", std::ios::binary);
+        if (!raw) return false;
+        raw.write((const char*)image.text.data(), (std::streamsize)image.text.size());
+    }
+
+    std::string cmd = "aarch64-linux-gnu-g++ -static -no-pie -Wl,-z,max-page-size=0x1000 -Wl,-T," + armShellQuote(scriptPath)
+                    + " -o " + armShellQuote(path) + " " + armShellQuote(asmPath);
+    std::set<std::string> seenPaths;
+    size_t begin = 0;
+    while (begin <= libraryPaths.size()) {
+        size_t end = libraryPaths.find(':', begin);
+        std::string dir = libraryPaths.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (!dir.empty() && seenPaths.insert(dir).second) cmd += " -L" + armShellQuote(dir);
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    std::set<std::string> linkedLibs;
+    for (const auto& ext : image.externals) {
+        if (!linkedLibs.insert(ext.library).second) continue;
+        std::string lib = ext.library;
+        if (lib.rfind("lib", 0) == 0) lib.erase(0, 3);
+        size_t dot = lib.find(".so");
+        if (dot != std::string::npos) lib.erase(dot);
+        cmd += " -Wl,--whole-archive -l" + lib + " -Wl,--no-whole-archive";
+    }
+    cmd += " -lstdc++ -lc -lgcc -lgcc_eh -lpthread -lm";
+    int rc = std::system(cmd.c_str());
+    std::remove(asmPath.c_str());
+    std::remove(scriptPath.c_str());
+    std::remove((path + ".static.text").c_str());
+    if (rc != 0) {
+        std::remove(path.c_str());
+        throw ACError::backend("ARM backend: static linker failed");
+    }
+    chmod(path.c_str(), 0755);
+    return true;
+}
+
+static bool writeArmDynamicELF(const std::string& path, ArmCompiledImage image,
+                               const std::string& runpath) {
+    const uint64_t BASE = 0x400000ULL, PGSZ = 0x1000ULL;
+    const uint64_t textOff = 2 * PGSZ; // preserves exp_arm's fixed string/code addresses
+    const char INTERP[] = "/lib/ld-linux-aarch64.so.1";
+    const int n = (int)image.externals.size();
+
+    std::vector<uint8_t> dynstr(1, 0);
+    auto addStr = [&](const std::string& s) -> uint32_t {
+        uint32_t off = (uint32_t)dynstr.size();
+        dynstr.insert(dynstr.end(), s.begin(), s.end());
+        dynstr.push_back(0);
+        return off;
+    };
+    std::vector<uint32_t> symNames;
+    for (const auto& e : image.externals) symNames.push_back(addStr(e.exportName));
+    std::vector<std::string> libs;
+    std::vector<uint32_t> libNames;
+    for (const auto& e : image.externals) {
+        if (std::find(libs.begin(), libs.end(), e.library) == libs.end()) {
+            libs.push_back(e.library);
+            libNames.push_back(addStr(e.library));
+        }
+    }
+    uint32_t runpathName = 0;
+    if (!runpath.empty()) runpathName = addStr(runpath);
+
+    std::vector<uint32_t> hash = {1u, (uint32_t)(n + 1), n ? 1u : 0u, 0u};
+    for (int i = 1; i <= n; i++) hash.push_back(i == n ? 0u : (uint32_t)(i + 1));
+    std::vector<Elf64Sym> syms((size_t)n + 1);
+    for (int i = 0; i < n; i++) {
+        syms[i + 1].st_name = symNames[i];
+        syms[i + 1].st_info = 0x12; // STB_GLOBAL | STT_FUNC
+        syms[i + 1].st_shndx = 0;    // undefined; resolved from DT_NEEDED objects
+    }
+    std::vector<Elf64Rela> relas((size_t)n);
+
+    const size_t hdrBytes = sizeof(ElfEhdr) + 4 * sizeof(ElfPhdr);
+    const uint64_t interpOff = hdrBytes;
+    const uint64_t hashOff = interpOff + sizeof(INTERP);
+    const uint64_t symOff = hashOff + hash.size() * sizeof(uint32_t);
+    const uint64_t strOff = symOff + syms.size() * sizeof(Elf64Sym);
+    const uint64_t relaOff = strOff + dynstr.size();
+    if (relaOff + relas.size() * sizeof(Elf64Rela) > textOff)
+        throw ACError::backend("ARM backend: dynamic ELF metadata exceeds fixed code-page offset");
+
+    const uint64_t textVA = BASE + textOff;
+    const uint64_t textEnd = textOff + image.text.size();
+    const uint64_t seg2Off = (textEnd + PGSZ - 1) & ~(PGSZ - 1);
+    const uint64_t seg2VA = BASE + seg2Off;
+    const uint64_t gotOff = seg2Off;
+    const uint64_t gotVA = BASE + gotOff;
+    const size_t gotSize = (size_t)n * 8;
+
+    std::vector<Elf64Dyn> dyn;
+    auto addDyn = [&](int64_t tag, uint64_t val) { dyn.push_back({tag, val}); };
+    for (uint32_t off : libNames) addDyn(1, off);       // DT_NEEDED
+    if (!runpath.empty()) addDyn(29, runpathName);       // DT_RUNPATH
+    addDyn(4, BASE + hashOff);                          // DT_HASH
+    addDyn(5, BASE + strOff);                           // DT_STRTAB
+    addDyn(6, BASE + symOff);                           // DT_SYMTAB
+    addDyn(10, dynstr.size());                          // DT_STRSZ
+    addDyn(11, sizeof(Elf64Sym));                       // DT_SYMENT
+    addDyn(7, BASE + relaOff);                          // DT_RELA
+    addDyn(8, relas.size() * sizeof(Elf64Rela));        // DT_RELASZ
+    addDyn(9, sizeof(Elf64Rela));                       // DT_RELAENT
+    addDyn(2, relas.size() * sizeof(Elf64Rela));        // DT_PLTRELSZ
+    addDyn(20, 7);                                      // DT_PLTREL = DT_RELA
+    addDyn(23, BASE + relaOff);                         // DT_JMPREL
+    addDyn(30, 8);                                      // DF_BIND_NOW
+    addDyn(0, 0);
+    const uint64_t dynamicOff = gotOff + gotSize;
+    const uint64_t dynamicVA = BASE + dynamicOff;
+    addDyn(3, gotVA);                                   // DT_PLTGOT
+
+    // DT_PLTGOT is optional for eager binding, but keep it before DT_NULL in the table.
+    // Rebuild the table with the tag in the correct pre-NULL position.
+    dyn.pop_back();
+    dyn.pop_back();
+    addDyn(3, gotVA);
+    addDyn(0, 0);
+
+    for (int i = 0; i < n; i++) {
+        relas[i].r_offset = gotVA + (uint64_t)i * 8;
+        relas[i].r_info = ((uint64_t)(i + 1) << 32) | 1026u; // R_AARCH64_JUMP_SLOT
+        relas[i].r_addend = 0;
+        patchArmMovImm64(image.text, image.externals[i].stubImmOffset, gotVA + (uint64_t)i * 8);
+    }
+
+    const uint64_t dynamicSize = dyn.size() * sizeof(Elf64Dyn);
+    const uint64_t seg2Size = gotSize + dynamicSize;
+    ElfEhdr eh{};
+    eh.e_ident[0]=0x7f; eh.e_ident[1]='E'; eh.e_ident[2]='L'; eh.e_ident[3]='F';
+    eh.e_ident[4]=2; eh.e_ident[5]=1; eh.e_ident[6]=1;
+    eh.e_type=2; eh.e_machine=EM_AARCH64; eh.e_version=1;
+    eh.e_entry=textVA; eh.e_phoff=sizeof(ElfEhdr); eh.e_ehsize=sizeof(ElfEhdr);
+    eh.e_phentsize=sizeof(ElfPhdr); eh.e_phnum=4;
+    ElfPhdr interp{}, rx{}, rw{}, dp{};
+    interp.p_type=3; interp.p_flags=4; interp.p_offset=interpOff;
+    interp.p_vaddr=BASE+interpOff; interp.p_paddr=interp.p_vaddr;
+    interp.p_filesz=sizeof(INTERP); interp.p_memsz=sizeof(INTERP); interp.p_align=1;
+    rx.p_type=1; rx.p_flags=5; rx.p_offset=0; rx.p_vaddr=BASE; rx.p_paddr=BASE;
+    rx.p_filesz=textEnd; rx.p_memsz=textEnd; rx.p_align=PGSZ;
+    rw.p_type=1; rw.p_flags=6; rw.p_offset=seg2Off; rw.p_vaddr=seg2VA; rw.p_paddr=seg2VA;
+    rw.p_filesz=seg2Size; rw.p_memsz=seg2Size; rw.p_align=PGSZ;
+    dp.p_type=2; dp.p_flags=6; dp.p_offset=dynamicOff; dp.p_vaddr=dynamicVA; dp.p_paddr=dynamicVA;
+    dp.p_filesz=dynamicSize; dp.p_memsz=dynamicSize; dp.p_align=8;
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.write((char*)&eh, sizeof(eh)); f.write((char*)&interp, sizeof(interp));
+    f.write((char*)&rx, sizeof(rx)); f.write((char*)&rw, sizeof(rw)); f.write((char*)&dp, sizeof(dp));
+    auto padTo = [&](uint64_t off) {
+        uint64_t cur = (uint64_t)f.tellp();
+        if (cur < off) { std::vector<uint8_t> z((size_t)(off-cur)); f.write((char*)z.data(), z.size()); }
+    };
+    padTo(interpOff); f.write(INTERP, sizeof(INTERP));
+    padTo(hashOff); f.write((char*)hash.data(), hash.size()*sizeof(uint32_t));
+    padTo(symOff); f.write((char*)syms.data(), syms.size()*sizeof(Elf64Sym));
+    padTo(strOff); f.write((char*)dynstr.data(), dynstr.size());
+    padTo(relaOff); f.write((char*)relas.data(), relas.size()*sizeof(Elf64Rela));
+    padTo(textOff); f.write((char*)image.text.data(), image.text.size());
+    padTo(seg2Off); f.write((char*)relas.data(), 0); // keep the write cursor at the RW segment
+    std::vector<uint64_t> got((size_t)n, 0); f.write((char*)got.data(), got.size()*sizeof(uint64_t));
+    f.write((char*)dyn.data(), dyn.size()*sizeof(Elf64Dyn));
+    f.close(); chmod(path.c_str(), 0755); return true;
+}
 
 static bool writeArmELF(const std::string& path, const std::vector<uint8_t>& text) {
     const uint64_t BASE   = 0x400000ULL;
@@ -774,11 +4224,21 @@ static bool writeArmELF(const std::string& path, const std::vector<uint8_t>& tex
 
 } // namespace AC_ArmGen
 
-bool generateArmBinaryFromIR(const AC_IR::IRProgram& ir, const std::string& outputFile) {
+bool generateArmBinaryFromIR(const AC_IR::IRProgram& ir, const std::string& outputFile,
+                             bool staticLink) {
     using namespace AC_ArmGen;
-    ArmCompiler compiler(ir);
-    const uint64_t BASE = 0x400000ULL, PGSZ = 0x1000ULL, dataVA = BASE + PGSZ;
-    auto [bytes, slotCount] = compiler.compile(dataVA);
-    if ((size_t)slotCount * 8 > PGSZ) return false; // v1 fixed-page limit — see header comment
-    return writeArmELF(outputFile, bytes);
+    const uint64_t BASE = 0x400000ULL, PGSZ = 0x1000ULL;
+    const uint64_t dataVA = BASE + PGSZ, codeVA = BASE + 2*PGSZ;
+    ArmCompiler compiler(ir, codeVA, !staticLink, staticLink);
+    ArmCompiledImage image = compiler.compile(dataVA);
+    if ((size_t)image.slotCount * 8 > PGSZ) return false; // fixed-page limit
+    if (staticLink && !image.externals.empty()) {
+        const char* lp = std::getenv("AC_ARM_ILIB_PATH");
+        return writeArmStaticELF(outputFile, image, lp ? lp : "");
+    }
+    if (!image.externals.empty()) {
+        const char* rp = std::getenv("AC_ARM_ILIB_PATH");
+        return writeArmDynamicELF(outputFile, std::move(image), rp ? rp : "");
+    }
+    return writeArmELF(outputFile, image.text);
 }

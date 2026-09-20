@@ -381,7 +381,7 @@ private:
         // below already allowed it) but not READ as a value here, an asymmetry with its
         // sibling soft keywords (`Term.display programLoop` was a hard parse error).
         if (at(TokenType::IDENTIFIER) || at(TokenType::KW_VALUE) || at(TokenType::KW_RULE) ||
-            at(TokenType::KW_PROGRAM_LOOP)) {
+            at(TokenType::KW_PROGRAM_LOOP) || at(TokenType::KW_AFTER)) {
             auto tok = advance();
 
             // Trailing wildcard: `p%` (starts-with pattern — `_wmatch` in the gl ilib's C++/JS/

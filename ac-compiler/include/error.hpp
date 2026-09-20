@@ -52,8 +52,8 @@ public:
     // ─────────────────────────────────────────────────────────────────────────
 
     // Roasts keep their own prefix (Toxic:) — no "Preposterous: <Type>" wrapper.
-    static ACError fluencyInCPU() {          // foreign { … } block targeting the native (BNY) backend
-        return ACError("Toxic: User attempts fluency in CPU");
+    static ACError fluencyInCPU() {          // foreign { … } block targeting a raw native backend
+        return ACError("Preposterous: User has attempted fluency in CPU");
     }
 
     // Type / semantic / backend compiler errors (routed through the standard formatter).

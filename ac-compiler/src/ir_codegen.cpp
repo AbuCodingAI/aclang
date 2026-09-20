@@ -1881,6 +1881,20 @@ protected:
     // (silently makes a float look like an int in the program's actual output).
     std::set<std::string> floatVars_;
 
+    // Whole-program set of user-defined AC functions that return a float, pushed in via
+    // setFloatReturnFuncs (see BackendStrategy's own comment — every static backend already
+    // overrides this; JS/HTML never did). Verified real bug this closes: JS has no static
+    // return-type declarations to fall back on the way C/CPP do, so a call to a float-returning
+    // function (`mean(arr)`) never got floatVars_-marked at all — only one hardcoded special
+    // case (aczip.get_ratio) existed. `Term.display mean([2,4,6,8])` printed the raw JS
+    // `Number` via `_acp` (plain "5") instead of `_acpf` ("5.0"), and non-terminating floats
+    // came out in JS's own shortest-round-trip notation instead of this project's `%.16g`
+    // convention (e.g. temperature.ac's 98.6 printed as "98.6" instead of "98.59999999999999")
+    // — silently wrong output, not just a missing trailing zero.
+    std::set<std::string> userFloatFuncs_;
+    void setFloatReturnFuncs(const std::set<std::string>& s) override { userFloatFuncs_ = s; }
+    bool isUserFloatReturningFunc(const std::string& fn) const { return userFloatFuncs_.count(fn) > 0; }
+
     // `short`/`mini` (fixed-width 32/16-bit int) and `atomic` var support: real inlined
     // WASM instead of either silently doing nothing (short/mini — JS numbers never wrap)
     // or relying only on JS's single-threaded run-to-completion execution (atomic — still
@@ -2259,6 +2273,7 @@ private:
         // `_acp` formatter instead of `_acpf`'s forced ".0".
         if (!res.empty() && (func == "aczip.get_ratio" || func == "aczip_get_ratio"))
             floatVars_.insert(res);
+        if (!res.empty() && isUserFloatReturningFunc(func)) floatVars_.insert(res);
         emit(out, indent, res.empty() ? call + ";" : decl(res, call));
     }
     void emitReturn(std::ostringstream &out, int &indent, const std::string &val) override
@@ -19001,7 +19016,15 @@ class UnifiedIRCodeGen
                 // "maudio.stop" reaching emitCall, invalid syntax on any backend without real
                 // dot-call support (verified: C, "maudio.stop();" — undeclared identifier).
                 // formatCallName is a no-op on every backend that doesn't need flattening.
-                std::string func = strategy->formatCallName(stripQuotes(method));
+                std::string callName = stripQuotes(method);
+                // stringm.strip has two intentional forms: one argument means the historical
+                // whitespace trim, while (before|after, clause, value) is a clause operation.
+                // Give the latter a distinct C/C++ symbol so the old one-argument ABI remains
+                // source-compatible.
+                if ((ir.backend == "C" || ir.backend == "CPP")
+                        && callName == "stringm.strip" && i.typedOperands.size() == 4)
+                    callName = "stringm.strip_clause";
+                std::string func = strategy->formatCallName(callName);
                 std::string args;
                 for (size_t j = 1; j < i.typedOperands.size(); j++)
                 {

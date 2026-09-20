@@ -70,6 +70,10 @@ void BackendRegistry::initializeStandardBackends() {
     registerBackend("BNY", ".acb", dummyGenerator,
         [](const std::string& outFile) { return outFile; });  // Direct execution of binary
 
+    // Explicit x86 selector. This is the direct BNY emitter without BNY's host check.
+    registerBackend("x86", ".acb", dummyGenerator,
+        [](const std::string& outFile) { return outFile; });
+
     // ARM (AArch64) raw ELF64 — see exp_arm.cpp. Host is x86-64 during development, so the
     // default run step goes through qemu-aarch64 (user-mode emulation); on real ARM64
     // hardware this would just be `outFile` directly, same as BNY above. main.cpp's actual

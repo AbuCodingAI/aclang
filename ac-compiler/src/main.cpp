@@ -336,7 +336,7 @@ static void printUsage() {
     std::cerr << "Usage: ac <file.ac> [options]\n"
               << "\n"
               << "Options:\n"
-              << "  --target <backend>    Specify backend (PY, JS, C, CPP, Java, RS, GO, V, ASM, BNY, ARM, RISC, LIB)\n"
+              << "  --target <backend>    Specify backend (PY, JS, C, CPP, Java, RS, GO, V, ASM, BNY, x86, ARM, RISC, LIB)\n"
               << "  --backend <backend>   Same as --target\n"
               << "  --all, -all           Compile to all registered backends at once\n"
               << "  --output, -o <file>   Rename the generated output file\n"
@@ -858,6 +858,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Keep the source/header spelling `x86` canonical while accepting the usual
+    // all-caps CLI spelling as well.
+    if (backend == "X86") backend = "x86";
+
     if (!outputOverride.empty() && compileAll)
         std::cerr << Toxic::outputIgnoredWithAll() << "\n";
 
@@ -1077,7 +1081,7 @@ int main(int argc, char* argv[]) {
                 static const AC_IR::LibLowering& lowering = [] () -> const AC_IR::LibLowering& {
                     static AC_IR::LibLowering lw;
                     std::string libRoot = acLibRoot();
-                    const char* acls[] = {"gl","math","camera","machine-audio","widgets","regex",
+                    const char* acls[] = {"math","camera","machine-audio","widgets","regex",
                                           "os","string-cheese","native-cpu","web","web-server","ml"};
                     for (const char* a : acls) lw.load(libRoot + "/ilib/" + a + "/" + a + ".acl");
                     return lw;
@@ -1128,7 +1132,23 @@ int main(int argc, char* argv[]) {
             // by "BNY"/"ASM" auto-detecting the host and routing to them instead of hardcoding
             // x86-64 — see the tgt=="BNY"/"ASM" isARM branches below.
             auto runArmBinary = [&](const std::string& outFile) -> bool {
-                if (!generateArmBinaryFromIR(irProg, outFile)) {
+                // The ARM dynamic ELF writer embeds this as DT_RUNPATH. Keep the normal ilib
+                // layout automatic, while allowing cross-development builds to point at a
+                // separate ARM artifact tree (AC_ARM_ILIB_PATH=/path/to/build/arm/ilib/...).
+#ifndef _WIN32
+                if (!getenv("AC_ARM_ILIB_PATH")) {
+                    std::string lr = acLibRoot();
+                    const char* dirs[] = {"math","camera","os","regex","string-cheese","web",
+                                          "web-server","machine-audio","native-cpu","ml","widgets","aczip"};
+                    std::string armRunpath;
+                    for (const char* d : dirs) {
+                        if (!armRunpath.empty()) armRunpath += ":";
+                        armRunpath += lr + "/ilib/" + d;
+                    }
+                    setenv("AC_ARM_ILIB_PATH", armRunpath.c_str(), 0);
+                }
+#endif
+                if (!generateArmBinaryFromIR(irProg, outFile, staticLink)) {
                     std::cerr << "Preposterous: BackendError: Binary generation failed for ARM (AArch64 Linux ELF64 only)\n";
                     return false;
                 }
@@ -1185,6 +1205,60 @@ int main(int argc, char* argv[]) {
                 return true;
             };
 
+            // Explicit x86 target: use the direct BNY emitter regardless of the host.
+            // Unlike AC->BNY, this must never auto-select ARM or route through C.
+            auto runX86Binary = [&](const std::string& outFile) -> bool {
+                std::string bnyRunpath;
+                {
+                    std::string lr = acLibRoot();
+                    const char* dirs[] = {"math","camera","os","regex","string-cheese","web",
+                                          "machine-audio","widgets","native-cpu","ml","web-server",
+                                          "aczip"};
+                    for (const char* d : dirs) {
+                        if (!bnyRunpath.empty()) bnyRunpath += ":";
+                        bnyRunpath += lr + "/ilib/" + d;
+                    }
+                }
+                if (!generateBinaryFromIR(irProg, outFile, debugInfo, inputFile, bnyRunpath,
+                                          staticLink, targetWindows)) {
+                    std::cerr << "Preposterous: BackendError: Binary generation failed for x86 (x86-64 Linux only)\n";
+                    return false;
+                }
+                std::cout << "Generated: " << outFile << " [exp_bny, explicit x86]\n";
+#ifndef _WIN32
+                chmod(outFile.c_str(), 0755);
+#endif
+                if (runAfterCompile && !compileAll) {
+                    bool hostIsX86 = false;
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                    hostIsX86 = true;
+#endif
+                    if (hostIsX86) {
+                        std::string libRoot = acLibRoot();
+#ifndef _WIN32
+                        if (!doTime) {
+                            std::string newLdPath = libRoot + "/ilib/math:" + libRoot + "/ilib/camera:" +
+                                libRoot + "/ilib/os:" + libRoot + "/ilib/regex:" +
+                                libRoot + "/ilib/string-cheese:" + libRoot + "/ilib/web";
+                            const char* existing = getenv("LD_LIBRARY_PATH");
+                            if (existing && strlen(existing)) newLdPath += std::string(":") + existing;
+                            setenv("LD_LIBRARY_PATH", newLdPath.c_str(), 1);
+                            char* argv0 = const_cast<char*>(outFile.c_str());
+                            char* const exec_argv[] = { argv0, nullptr };
+                            execv(outFile.c_str(), exec_argv);
+                        }
+#endif
+                        timedRunArgv({execPath(outFile)},
+                            {{"LD_LIBRARY_PATH", ldLibPath({"math","camera","os","regex","string-cheese","web","web-server"})}});
+                    } else {
+                        // Cross-run explicit x86 binaries through user-mode emulation.
+                        timedRunArgv({"qemu-x86_64", outFile});
+                    }
+                }
+                printTiming();
+                return true;
+            };
+
             if (tgt == "BNY") {
                 std::string outFile = (!outputOverride.empty() && !compileAll)
                                       ? outputOverride : base + info.extension;
@@ -1214,7 +1288,7 @@ int main(int argc, char* argv[]) {
                         static const AC_IR::LibLowering& lowering = [] () -> const AC_IR::LibLowering& {
                             static AC_IR::LibLowering lw;
                             std::string libRoot = acLibRoot();
-                            const char* acls[] = {"gl","math","camera","machine-audio","widgets","regex",
+                            const char* acls[] = {"math","camera","machine-audio","widgets","regex",
                                                   "os","string-cheese","native-cpu","web","web-server","ml"};
                             for (const char* a : acls) lw.load(libRoot + "/ilib/" + a + "/" + a + ".acl");
                             return lw;
@@ -1265,54 +1339,14 @@ int main(int argc, char* argv[]) {
                     printTiming();
                     return true;
                 }
-                // Always pass the ilib dirs: the dynamic path embeds them as DT_RUNPATH so the binary
-                // finds its .so deps standalone, and --static-link uses them to locate the freestanding
-                // objects to splice. With --static-link the splice path emits NO DT_RUNPATH (it needs no
-                // .so); if a used ilib fn has no freestanding impl yet, it falls back to a working
-                // dynamic binary WITH the runpath (better than the old "drop runpath → broken binary").
-                std::string bnyRunpath;
-                {
-                    std::string lr = acLibRoot();
-                    const char* dirs[] = {"math","camera","os","regex","string-cheese","web",
-                                          "machine-audio","widgets","native-cpu","ml","web-server",
-                                          "aczip"};
-                    for (const char* d : dirs) {
-                        if (!bnyRunpath.empty()) bnyRunpath += ":";
-                        bnyRunpath += lr + "/ilib/" + d;
-                    }
-                }
-                if (!generateBinaryFromIR(irProg, outFile, debugInfo, inputFile, bnyRunpath, staticLink, targetWindows)) {
-                    std::cerr << "Preposterous: BackendError: Binary generation failed for BNY (Linux x86-64 only)\n";
-                    return false;
-                }
-                std::cout << "Generated: " << outFile << " [exp_bny]\n";
-#ifndef _WIN32
-                chmod(outFile.c_str(), 0755);
-#endif
-                if (runAfterCompile && !compileAll) {
-                    // Locate AC library root (shared resolver: $AC_PATH, else binary-relative)
-                    std::string libRoot = acLibRoot();
-#ifndef _WIN32
-                    if (!doTime) {
-                        // Replace the ac process with the compiled binary directly.
-                        // This propagates the exit code and keeps the process tree clean.
-                        std::string newLdPath = libRoot + "/ilib/math:" + libRoot + "/ilib/camera:" + libRoot + "/ilib/os:" + libRoot + "/ilib/regex:" + libRoot + "/ilib/string-cheese:" + libRoot + "/ilib/web";
-                        const char* existing = getenv("LD_LIBRARY_PATH");
-                        if (existing && strlen(existing)) newLdPath += std::string(":") + existing;
-                        setenv("LD_LIBRARY_PATH", newLdPath.c_str(), 1);
-                        char* argv0 = const_cast<char*>(outFile.c_str());
-                        char* const exec_argv[] = { argv0, nullptr };
-                        execv(outFile.c_str(), exec_argv);
-                        // execv only returns on error — fall through to the argv-based
-                        // timedRunArgv() below (stale comment: this used to fall through to a
-                        // real system() call before the shell-free hardening pass).
-                    }
-#endif
-                    timedRunArgv({outFile},
-                        {{"LD_LIBRARY_PATH", ldLibPath({"math","camera","os","regex","string-cheese","web","web-server"})}});
-                }
-                printTiming();
-                return true;
+                return runX86Binary(outFile);
+            }
+
+            if (tgt == "x86") {
+                std::string outFile = (!outputOverride.empty() && !compileAll)
+                                      ? outputOverride
+                                      : base + (compileAll ? ".x86" : "") + info.extension;
+                return runX86Binary(outFile);
             }
 
             if (tgt == "ARM") {
@@ -1395,7 +1429,7 @@ int main(int argc, char* argv[]) {
                 // file's own class). Reserved list mirrors every ilib with this shim shape.
                 static const std::set<std::string> javaReservedShimNames = {
                     "math", "os", "regex", "stringm", "ncpu", "maudio",
-                    "gl", "widgets", "camera", "server",
+                    "widgets", "camera", "server",
                 };
                 if (javaReservedShimNames.count(stem)) stem += "_ac";
                 std::string dir = (jSlash == std::string::npos) ? "" : javaBase.substr(0, jSlash + 1);
@@ -1751,14 +1785,14 @@ int main(int argc, char* argv[]) {
                 if (content.find("#[link(name = \"acml\")]") != std::string::npos)
                     libFlags += " -L \"" + libRoot + "/ilib/ml\" -l acml -C link-arg=-Wl,-rpath,\"" + libRoot + "/ilib/ml\"";
                 // This list was originally only math/camera/widgets/regex/ml — every OTHER ilib
-                // with a real Rust FFI (gl, machine-audio, os, string-cheese, native-cpu, web,
+                // with a real Rust FFI (machine-audio, os, string-cheese, native-cpu, web,
                 // web-server, aczip) hit a hard "-lacX: No such file" LINKER error the moment
-                // any .ac file actually used one on Rust (verified: gl_bounce.ac / "-lacgl"),
+                // any .ac file actually used one on Rust,
                 // despite the .rs source itself compiling perfectly cleanly — the .so was simply
                 // never told where to look. Same link-name convention already used by the
                 // C/C++/Go/BNY sides of this same lookup (see libForSym/soLinkFlags).
                 static const std::vector<std::pair<std::string,std::string>> otherIlibs = {
-                    {"gl", "acgl"}, {"machine-audio", "acmachinaaudio"}, {"os", "acoos"},
+                    {"machine-audio", "acmachinaaudio"}, {"os", "acoos"},
                     {"string-cheese", "acstringcheese"}, {"native-cpu", "acncpu"},
                     {"web", "acweb"}, {"web-server", "acserver"},
                     // aczip's name already reads as "AC Zip" — the real file is libaczip.so,
@@ -1803,7 +1837,7 @@ int main(int argc, char* argv[]) {
                     if (doRun)
                         timedRunArgv({execPath(binFile)},
                             {{"LD_LIBRARY_PATH", ldLibPath({"math","camera","widgets","regex","web-server",
-                                                             "gl","machine-audio","os","string-cheese",
+                                                             "machine-audio","os","string-cheese",
                                                              "native-cpu","web","ml","aczip"})}});
                 } else {
                     std::cerr << Toxic::rustcOpinions(rc) << "\n";
@@ -1819,7 +1853,18 @@ int main(int argc, char* argv[]) {
                 std::string javaDir = ".";
                 size_t sl = outFile.rfind('/');
                 if (sl != std::string::npos) javaDir = outFile.substr(0, sl);
-                int rc = run_argv({"javac","--enable-preview","--release","21",outFile});
+                // Verified real bug: `--enable-preview` was pinned alongside `--release 21`
+                // for whatever preview-stage language feature this codegen needed back when
+                // JDK 21 was current. `--enable-preview` requires `--release` to match the
+                // COMPILER's own major version (javac refuses "invalid source release 21 with
+                // --enable-preview... only supported for release 26" on a JDK 26 install) — so
+                // this hard-broke on any newer JDK the moment the installed javac's version
+                // moved past 21. Confirmed by direct testing that the generated source compiles
+                // and runs clean with plain `--release 21` (no preview flag) on JDK 26 — whatever
+                // feature needed preview mode back then has since stabilized, so the flag is
+                // just dropped rather than chasing the "match release to installed javac" tail
+                // forever.
+                int rc = run_argv({"javac","--release","21",outFile});
                 if (rc == 0) {
                     std::cout << "Compiled:  " << stem << ".class [javac]\n";
                     if (doRun) {
@@ -1832,7 +1877,7 @@ int main(int argc, char* argv[]) {
                         std::string lr = acLibRoot();
                         std::string projRoot = lr.size() > 8 && lr.compare(lr.size()-8, 8, "/library") == 0
                             ? lr.substr(0, lr.size()-8) : lr;
-                        timedRunArgv({"java","--enable-preview","-cp",javaDir,stem}, {{"AC_PATH", projRoot}});
+                        timedRunArgv({"java","-cp",javaDir,stem}, {{"AC_PATH", projRoot}});
                     }
                 } else {
                     std::cerr << Toxic::javacNotHavingIt(rc) << "\n";

@@ -1919,8 +1919,18 @@ class IRGenerator {
                 // Function call: lib.func(args) → translated to lib_func in codegen
                 IRRef dst = mkTemp();
                 std::vector<IRRef> ops = {mkVar(mname)};
-                for (auto& arg : expr.children)
-                    ops.push_back(lowerExprNode(*arg));
+                for (size_t ai = 0; ai < expr.children.size(); ++ai) {
+                    auto& arg = expr.children[ai];
+                    // `before` and `after` are strip's mode words, not variable reads. They
+                    // are lexer keywords/identifiers in ordinary expressions, so normalize
+                    // them only in this explicit stringm.strip call shape.
+                    if (mname == "stringm.strip" && ai == 0 && arg
+                            && arg->type == NodeType::Identifier
+                            && (arg->value == "before" || arg->value == "after"))
+                        ops.push_back(mkConst(arg->value));
+                    else
+                        ops.push_back(lowerExprNode(*arg));
+                }
                 IRInstruction i(IROpcode::CALL, dst, ops);
                 emit(std::move(i));
                 return dst;
@@ -5921,9 +5931,11 @@ class IRGenerator {
         }
 
         case NodeType::ForeignBlock: {
-            if (prog.backend == "BNY") {
+            // Raw foreign blocks cannot be embedded in the hand-emitted native binaries:
+            // BNY/x86 and ARM have no text-editor/compiler stage that can consume the payload.
+            // Source backends may still pass the block through in their native syntax.
+            if (prog.backend == "BNY" || prog.backend == "x86" || prog.backend == "ARM")
                 throw ACError::fluencyInCPU();
-            }
             if (!g_allow_foreign) {
                 throw ACError::foreignDisabled();
             }
