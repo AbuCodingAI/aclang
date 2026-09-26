@@ -784,7 +784,7 @@ static bool isIntReturningMathCall(const std::string& irName) {
 // otherwise the pointer prints as an integer (the classic stack-address output).
 static bool returnsCString(const std::string& irName) {
     static const std::set<std::string> cstr = {
-        "os.cwd", "os.env", "os.bash", "os.sbash", "os.read_from",
+        "os.cwd", "os.env", "os.read",
         "regex.search", "regex.replace", "regex.escape",
         "stringm.upper", "stringm.lower", "stringm.strip", "stringm.strip_clause", "stringm.stripln", "stringm.trim",
         "stringm.replace", "stringm.b", "stringm.f", "stringm.t", "stringm.format", "stringm.getline",
@@ -6404,6 +6404,7 @@ static std::string normalizeExtSym(const std::string& irName) {
 // its exports checked against math_c.h-style headers, the way library/ilib/math's was.
 static std::string dllNameFor(const std::string& soName) {
     if (soName == "libacmath.so") return "acmath.dll";
+    if (soName == "libacoos.so")  return "acoos.dll";
     return "";
 }
 

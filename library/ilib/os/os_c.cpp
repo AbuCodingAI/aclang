@@ -5,13 +5,21 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#include <direct.h>
+#include <unordered_map>
+#else
 #include <unistd.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#endif
 #include <errno.h>
 #include <fstream>
 #include <string>
 #include <sstream>
+#include <vector>
 
 static thread_local char _os_buf[65536];
 
@@ -37,6 +45,24 @@ static int _sbash_check(const char* cmd) {
     return 1;
 }
 
+#ifdef _WIN32
+static int _rmdir_r(const char* path) {
+    std::string pattern = std::string(path) + "/*";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        std::string child = std::string(path) + "/" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            _rmdir_r(child.c_str());
+        else
+            DeleteFileA(child.c_str());
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return RemoveDirectoryA(path) ? 0 : -1;
+}
+#else
 static int _rmdir_r(const char* path) {
     DIR* d = opendir(path);
     if (!d) return -1;
@@ -53,9 +79,42 @@ static int _rmdir_r(const char* path) {
     closedir(d);
     return rmdir(path);
 }
+#endif
 
 extern "C" {
 
+#ifdef _WIN32
+// fork()+exec() has no Windows equivalent; CreateProcess gives back a HANDLE, not the
+// pid alone, so ac_os_wait needs somewhere to find it again by pid — this registry is
+// that (a fork/waitpid pair never needed one, since waitpid works from the pid alone).
+static std::unordered_map<DWORD, HANDLE> _win_procs;
+
+int ac_os_bash(const char* cmd) {
+    if (!cmd) return -1;
+    std::string full = std::string("cmd.exe /c ") + cmd;
+    std::vector<char> buf(full.begin(), full.end());
+    buf.push_back('\0');
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(NULL, buf.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+        return -1;
+    CloseHandle(pi.hThread);
+    _win_procs[pi.dwProcessId] = pi.hProcess;
+    return (int)pi.dwProcessId;
+}
+
+int ac_os_wait(int pid) {
+    if (pid <= 0) return -1;
+    auto it = _win_procs.find((DWORD)pid);
+    if (it == _win_procs.end()) return -1;
+    WaitForSingleObject(it->second, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(it->second, &code);
+    CloseHandle(it->second);
+    _win_procs.erase(it);
+    return (int)code;
+}
+#else
 int ac_os_bash(const char* cmd) {
     if (!cmd) return -1;
     pid_t pid = fork();
@@ -73,6 +132,7 @@ int ac_os_wait(int pid) {
     if (waitpid((pid_t)pid, &status, 0) < 0) return -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+#endif
 
 int ac_os_sbash(const char* cmd) {
     if (!cmd || !_sbash_check(cmd)) {
@@ -82,6 +142,15 @@ int ac_os_sbash(const char* cmd) {
     return system(cmd);
 }
 
+#ifdef _WIN32
+int ac_os_app_open(const char* app) {
+    if (!app) return -1;
+    // ShellExecute hands the launch to whatever the OS has registered for this file/URL/
+    // app — the same role xdg-open/open play on Linux/macOS, minus the manual probing.
+    HINSTANCE r = ShellExecuteA(NULL, "open", app, NULL, NULL, SW_SHOWNORMAL);
+    return ((INT_PTR)r > 32) ? 0 : -1;
+}
+#else
 int ac_os_app_open(const char* app) {
     if (!app) return -1;
     // Detect an opener via FIXED-string probes (no injection possible).
@@ -100,6 +169,7 @@ int ac_os_app_open(const char* app) {
     }
     return 0;  // launched
 }
+#endif
 
 int ac_os_mkfile(const char* path) {
     if (!path) return -1;
@@ -110,10 +180,18 @@ int ac_os_mkfile(const char* path) {
 }
 
 int ac_os_rmfile(const char* path) {
+    // remove() is plain ISO C — identical behavior to unlink() for a regular file on
+    // POSIX, and the one call that actually exists on both platforms.
     if (!path) return -1;
-    if (unlink(path) != 0) { fprintf(stderr, "[os.rmfile] %s: %s\n", path, strerror(errno)); return -1; }
+    if (remove(path) != 0) { fprintf(stderr, "[os.rmfile] %s: %s\n", path, strerror(errno)); return -1; }
     return 0;
 }
+
+#ifdef _WIN32
+static int _mkdir_one(const char* p) { return _mkdir(p); }
+#else
+static int _mkdir_one(const char* p) { return mkdir(p, 0755); }
+#endif
 
 int ac_os_mkdir(const char* path) {
     if (!path) return -1;
@@ -121,11 +199,11 @@ int ac_os_mkdir(const char* path) {
     for (size_t i = 1; i < p.size(); i++) {
         if (p[i] == '/') {
             p[i] = '\0';
-            mkdir(p.c_str(), 0755);
+            _mkdir_one(p.c_str());
             p[i] = '/';
         }
     }
-    if (mkdir(p.c_str(), 0755) != 0 && errno != EEXIST) {
+    if (_mkdir_one(p.c_str()) != 0 && errno != EEXIST) {
         fprintf(stderr, "[os.mkdir] %s: %s\n", path, strerror(errno)); return -1;
     }
     return 0;
@@ -149,7 +227,11 @@ int ac_os_pid(int status) {
 
 const char* ac_os_cwd() {
     char buf[4096] = {};
+#ifdef _WIN32
+    _getcwd(buf, sizeof(buf));
+#else
     getcwd(buf, sizeof(buf));
+#endif
     return _ret(buf);
 }
 

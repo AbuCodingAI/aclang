@@ -16,7 +16,7 @@ libacoos.so: $(SRC) os_c.h
 windows: acoos.dll
 
 acoos.dll: $(SRC) os_c.h
-	$(MINGW) $(CXXFLAGS) -shared -static-libgcc -static-libstdc++ -o $@ $(SRC)
+	$(MINGW) $(CXXFLAGS) -shared -static-libgcc -static-libstdc++ -o $@ $(SRC) -lshell32
 	@echo "Built: acoos.dll"
 
 clean:
