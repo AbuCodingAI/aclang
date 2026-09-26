@@ -58,6 +58,15 @@ fn stringm_format(t: &str) -> String { t.to_string() }
 // at the compiler/IR level; the runtime is a passthrough (mirrors ac_stringm_b/f/t in
 // string_cheese_c.h — identity for a Rust `&str`/`String`).
 fn stringm_b(s: &str) -> String { s.to_string() }
+// bytes -> integer, "little" or "big" endian (first 8 bytes, wrapped to signed 64-bit like the C ilib)
+fn stringm_endian(s: &str, order: &str) -> i64 {
+    let b = s.as_bytes();
+    let n = b.len().min(8);
+    let little = order.is_empty() || order.starts_with('l') || order.starts_with('L');
+    let mut v: u64 = 0;
+    for i in 0..n { v = (v << 8) | b[if little { n - 1 - i } else { i }] as u64; }
+    v as i64
+}
 fn stringm_f(s: &str) -> String { s.to_string() }
 fn stringm_t(s: &str) -> String { s.to_string() }
 
@@ -113,6 +122,7 @@ impl _StringmNS {
     fn count(&self, s: &str, sub: &str) -> i64 { stringm_count(s, sub) }
     fn format(&self, t: &str) -> String     { stringm_format(t) }
     fn b(&self, s: &str) -> String { stringm_b(s) }
+    fn endian(&self, s: &str, order: &str) -> i64 { stringm_endian(s, order) }
     fn f(&self, s: &str) -> String { stringm_f(s) }
     fn t(&self, s: &str) -> String { stringm_t(s) }
     fn ischar(&self, s: &str) -> i64 { stringm_ischar(s) }

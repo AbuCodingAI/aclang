@@ -9,6 +9,15 @@ function _isWs(s) { return s === _WS; }
 function stringm_f(template, ...args)  { return String(template); }   // f-string (compiler interpolates {})
 function stringm_t(template, ...args)  { return String(template); }   // t-string (template, resolved at IR level)
 function stringm_b(s)                  { return Buffer.from(String(s), 'utf8'); }
+// bytes -> integer, 'little' or 'big' endian (first 8 bytes, wrapped to signed 64-bit like the C ilib)
+function stringm_endian(b, order) {
+    const buf = Buffer.isBuffer(b) ? b : Buffer.from(String(b), 'utf8');
+    const little = !order || String(order).toLowerCase().startsWith('l');
+    const n = Math.min(buf.length, 8);
+    let v = 0n;
+    for (let i = 0; i < n; i++) v = (v << 8n) | BigInt(buf[little ? (n - 1 - i) : i]);
+    return Number(BigInt.asIntN(64, v));
+}
 function stringm_upper(s)              { return String(s).toUpperCase(); }
 function stringm_lower(s)              { return String(s).toLowerCase(); }
 function stringm_find(s, pattern) {
@@ -43,7 +52,7 @@ function stringm_count(s, sub) {
 }
 
 const stringm = {
-    f: stringm_f, t: stringm_t, b: stringm_b,
+    f: stringm_f, t: stringm_t, b: stringm_b, endian: stringm_endian,
     upper: stringm_upper, lower: stringm_lower,
     find: stringm_find, strip: stringm_strip,
     replace: stringm_replace, split: stringm_split,

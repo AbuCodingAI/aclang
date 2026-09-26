@@ -29,6 +29,7 @@ fn C.ac_stringm_upper(s &char) &char
 fn C.ac_stringm_trim(s &char) &char
 fn C.ac_stringm_strip(s &char, chars &char) &char
 fn C.ac_stringm_find(s &char, pattern &char) int
+fn C.ac_stringm_endian(bytes &char, order &char) i64
 fn C.ac_stringm_replace(s &char, old_sub &char, new_sub &char) &char
 fn C.ac_stringm_split_nth(s &char, sep &char, n int) &char
 fn C.ac_stringm_len(s &char) i64
@@ -60,6 +61,7 @@ fn stringm_format(t string) string { return unsafe { cstring_to_vstring(C.ac_str
 // the compiler/IR level; the runtime is a passthrough (mirrors ac_stringm_b/f/t in
 // string_cheese_c.h — identity for a V string).
 fn stringm_b(s string) string { return s }
+fn stringm_endian(s string, order string) i64 { return C.ac_stringm_endian(s.str, order.str) }
 fn stringm_f(s string) string { return s }
 fn stringm_t(s string) string { return s }
 
@@ -135,6 +137,7 @@ fn (n AcStringmNS) endswith(s string, p string) bool   { return stringm_endswith
 fn (n AcStringmNS) count(s string, sub string) int { return stringm_count(s, sub) }
 fn (n AcStringmNS) format(t string) string      { return stringm_format(t) }
 fn (n AcStringmNS) b(s string) string           { return stringm_b(s) }
+fn (n AcStringmNS) endian(s string, order string) i64 { return stringm_endian(s, order) }
 fn (n AcStringmNS) f(s string) string           { return stringm_f(s) }
 fn (n AcStringmNS) t(s string) string           { return stringm_t(s) }
 fn (n AcStringmNS) ischar(s string) bool        { return stringm_ischar(s) }

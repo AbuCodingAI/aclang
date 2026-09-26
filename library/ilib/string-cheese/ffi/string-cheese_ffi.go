@@ -132,6 +132,25 @@ func Format(t string) string {
 // f-string and t-string interpolate at the compiler/IR level; the runtime helpers are
 // passthroughs (mirrors ac_stringm_b/f/t in string_cheese_c.h — identity for a Go string).
 func B(s string) string { return s }
+
+// Endian - bytes -> integer, "little" or "big" endian (first 8 bytes, wrapped to signed 64-bit
+// like ac_stringm_endian in string_cheese_c.cpp).
+func Endian(s string, order string) int64 {
+	n := len(s)
+	if n > 8 {
+		n = 8
+	}
+	little := order == "" || order[0] == 'l' || order[0] == 'L'
+	var v uint64
+	for i := 0; i < n; i++ {
+		idx := i
+		if little {
+			idx = n - 1 - i
+		}
+		v = (v << 8) | uint64(s[idx])
+	}
+	return int64(v)
+}
 func F(s string) string { return s }
 func T(s string) string { return s }
 
@@ -212,6 +231,7 @@ func (_AcStringmNS) strip(s string, chars ...string) string {
 // int64 on the Go backend, matching the `_b(bool) int64` helper it emits for the same
 // purpose elsewhere. Returning a Go `bool` here would be a hard type error at the call site.
 func (_AcStringmNS) find(s string, pattern string) int64 { return int64(Find(s, pattern)) }
+func (_AcStringmNS) endian(s string, order string) int64  { return Endian(s, order) }
 func (_AcStringmNS) replace(s string, old string, new string) string { return Replace(s, old, new) }
 func (_AcStringmNS) split(s string, sep string) []string          { return Split(s, sep) }
 func (_AcStringmNS) split_nth(s string, sep string, n int) string { return SplitNth(s, sep, n) }

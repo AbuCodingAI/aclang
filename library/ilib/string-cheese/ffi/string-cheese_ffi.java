@@ -50,6 +50,16 @@ class StringCheese {
     /**
      * stringm_find - Find pattern position
      */
+    /** bytes -> integer, "little" or "big" endian (first 8 bytes, wrapped to signed 64-bit like the C ilib) */
+    public static long endian(String s, String order) {
+        byte[] b = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int n = Math.min(b.length, 8);
+        boolean little = order == null || order.isEmpty() || order.charAt(0) == 'l' || order.charAt(0) == 'L';
+        long v = 0;
+        for (int i = 0; i < n; i++) v = (v << 8) | (b[little ? (n - 1 - i) : i] & 0xFFL);
+        return v;
+    }
+
     public static long find(String s, String pattern) {
         if (s == null || pattern == null) return -1;
 
@@ -221,7 +231,8 @@ class StringCheese {
 // the real StringCheese implementation but no dispatcher exposing it under the AC-level name).
 // Names/arities mirror string-cheese.acl's stringm:* -> stringm.* mapping.
 class stringm {
-    public static String b(String s)                       { return StringCheese.trim(s); }
+    public static String b(String s)                       { return s; }   // bytes prefix: identity (was trim(s), which altered the text)
+    public static long   endian(String s, String order)    { return StringCheese.endian(s, order); }
     public static String upper(String s)                   { return StringCheese.upper(s); }
     public static String lower(String s)                   { return StringCheese.lower(s); }
     public static long   find(String s, String pattern)    { return StringCheese.find(s, pattern); }
