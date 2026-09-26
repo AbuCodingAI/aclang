@@ -5,7 +5,7 @@
 enum class TokenType {
     // Literals
     STRING,         // $...$
-    DQUOTE_STRING,  // "..." — only valid inside fn expressions
+    DQUOTE_STRING,  // "..." — lexed only so the parser can reject it with a clear error (AC strings are $...$)
     NUMBER,
     IDENTIFIER,
 
@@ -17,7 +17,7 @@ enum class TokenType {
     MULTIPLY,       // * NuMeric Multiply
     AT,             // @ (default multiplication operator)
     AMPERSAND,      // & (bitwise AND)
-    DOUBLE_AMPERSAND, // && (method chaining with different args)
+    DOUBLE_AMPERSAND, // &&
     DOT,            // .
     SLASH,          // /
     DOUBLE_SLASH,   // // integer division
@@ -35,7 +35,7 @@ enum class TokenType {
     SEMICOLON,      // ; — MID-LINE only (e.g. tuple type-annotation separator, `(1,2;int)`).
                     // A trailing end-of-line ';' (C muscle memory) is still silently dropped by
                     // the lexer with a one-time roast, never reaches the parser as this token.
-    KW_FN,          // fn (enables *, &, &&, and "..." with quotes)
+    KW_FN,          // fn name(args)=expr — single-line function declaration
     PLUS_EQUAL,     // +=
     MINUS_EQUAL,    // -=
     MULTIPLY_EQUAL, // *=

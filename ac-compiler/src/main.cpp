@@ -1,3 +1,4 @@
+#include "../include/selfpath.hpp"
 #include "../include/ac.hpp"
 #include "acc_cache.hpp"
 #include "ir_cache.hpp"
@@ -33,6 +34,30 @@
 #else
   #define ac_mkdir(path) mkdir(path, 0755)
 #endif
+
+#ifdef __COSMOPOLITAN__
+// A Cosmopolitan (APE) binary is one artifact that runs natively on Linux, Windows, and
+// macOS, so the _WIN32 compile-time macro can't tell us which OS actually launched this
+// process — ask the Cosmopolitan runtime instead. `IsWindows()` in cosmo's own <libc/dce.h>
+// is a MACRO (`SupportsWindows() && (__hostos & _HOSTWINDOWS)`), not a linkable symbol — an
+// `extern "C" int IsWindows(void)` hand-declaration (the shape that works for
+// GetProgramExecutableName in selfpath.hpp) fails to link ("undefined reference to
+// `IsWindows'"). `__hostos` itself IS a real exported symbol (verified via `nm` on cosmocc's
+// libc: `B __hostos`, 8 bytes) — read it directly and inline the same bitmask the macro uses
+// (_HOSTWINDOWS = 4, from dce.h) rather than including <cosmopolitan.h>, which defines a
+// global `SymbolTable` that collides with AC_IR::SymbolTable (same reason selfpath.hpp gives).
+extern "C" long __hostos;
+static bool hostIsActuallyWindows() { return (__hostos & 4L) != 0; }
+#else
+static bool hostIsActuallyWindows() {
+#ifdef _WIN32
+    return true;
+#else
+    return false;
+#endif
+}
+#endif
+
 #include <utility>
 #include <map>
 
@@ -147,6 +172,9 @@ namespace AC_IR {
 std::string generateFromIR(const AC_IR::IRProgram& ir, const std::string& stem = "Main",
                            const std::string& outputBase = "");
 
+// Rejects (hard error) a variable whose type cycles inside a loop on a backend with no tagged values (ir_codegen.cpp).
+void rejectTypeCyclingVars(const AC_IR::IRProgram& ir, const std::string& backend);
+
 // Gating flag for <Foreign> raw-passthrough blocks.
 bool g_allow_foreign = false;
 
@@ -155,7 +183,17 @@ static std::string readFile(const std::string& path) {
     if (!f) throw FILE_ERROR("open", path);
     std::ostringstream ss;
     ss << f.rdbuf();
-    return ss.str();
+    std::string content = ss.str();
+    // Strip a UTF-8 BOM: several common Windows tools (Windows PowerShell's
+    // `Set-Content -Encoding utf8`, legacy Notepad) write one, and the lexer
+    // has no other reason to see EF BB BF at position 0.
+    if (content.size() >= 3 &&
+        (unsigned char)content[0] == 0xEF &&
+        (unsigned char)content[1] == 0xBB &&
+        (unsigned char)content[2] == 0xBF) {
+        content.erase(0, 3);
+    }
+    return content;
 }
 
 static void writeFile(const std::string& path, const std::string& content) {
@@ -384,7 +422,7 @@ static std::string acLibRoot() {
     }
 #ifndef _WIN32
     char exeBuf[4096] = {};
-    ssize_t elen = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf)-1);
+    ssize_t elen = acSelfExe(exeBuf, sizeof(exeBuf)-1);
     if (elen > 0) {
         exeBuf[elen] = '\0';
         std::string bd(exeBuf);
@@ -1093,6 +1131,8 @@ int main(int argc, char* argv[]) {
 
             // Save human-readable LIR — only for low-level backends (BNY/ASM) where it aids debugging
             // Higher-level backends (PY, JS, C++, etc.) don't benefit from the LIR text dump
+            if (tgt == "BNY" || tgt == "ASM" || tgt == "ARM" || tgt == "RISC")
+                rejectTypeCyclingVars(irProg, tgt);
             bool saveLir = (tgt == "BNY" || tgt == "ASM" || tgt == "ARM" || tgt == "RISC");
             if (!lirFile.empty() && saveLir)
                 writeFile(lirFile, AC_IR::generateIRText(irProg));
@@ -1341,6 +1381,12 @@ int main(int argc, char* argv[]) {
                     printTiming();
                     return true;
                 }
+                // AC->BNY means "run natively on whatever this is". For the x86-64 case that
+                // means picking PE32+ vs ELF64 by the actual host OS, not by whether --windows
+                // was passed — that flag exists for cross-compiling BNY output from a different
+                // host, but here the compiler and its target are the same machine. The explicit
+                // "x86" target below intentionally skips this and always stays Linux/ELF.
+                if (hostIsActuallyWindows()) targetWindows = true;
                 return runX86Binary(outFile);
             }
 

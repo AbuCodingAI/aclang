@@ -3985,10 +3985,6 @@ class IRGenerator {
                 // Legacy sequence with string
                 IRInstruction i(IROpcode::ALLOC, dst, {mkConst("sequence"), mkConst(raw.substr(12))});
                 emit(std::move(i));
-            } else if (raw.substr(0, 6) == "__fn__") {
-                IRRef src = lowerExpr(raw.substr(6));
-                IRInstruction i(IROpcode::STORE_VAR, dst, {src});
-                emit(std::move(i));
             } else {
                 // Plain `x = <expr>` (e.g. `x = x + 1`, the un-sugared form of `x += 1`,
                 // already handled via emitCompoundRef above). If `x` is atomic, bracket
@@ -5644,7 +5640,9 @@ class IRGenerator {
                 IRRef arr = mkVar(n.value);
                 IRRef rawIdx = lowerExpr(n.attrs[0]);
                 IRRef idx = adjustIndex(rawIdx);
-                IRRef val = lowerExpr(n.attrs[1]);
+                IRRef val = (!n.children.empty() && n.children[0])
+                                ? lowerExprNode(*n.children[0])      // structured RHS from the parser
+                                : lowerExpr(n.attrs[1]);             // glued-token fallback
                 IRInstruction i(IROpcode::STORE_INDEX);
                 i.typedOperands = {arr, idx, val};
                 emit(std::move(i));
@@ -7252,8 +7250,13 @@ static void runOptPasses(IRProgram& prog) {
                     }
                 }
                 for (const auto& op : ins.typedOperands) {
-                    if (op.kind == IRRef::Kind::VAR && op.id >= 0)
+                    if (op.kind == IRRef::Kind::VAR && op.id >= 0) {
                         readVarsPre.insert(prog.symbols.getName(op.id));
+                        // a function NAME used as a value anywhere (stored in a list slot, copied to
+                        // a variable, returned...) is referenced, not dead
+                        if (prog.findFunction(prog.symbols.getName(op.id)))
+                            calledFnsPre.insert(prog.symbols.getName(op.id));
+                    }
                 }
                 if (ins.opcode == IROpcode::STORE_VAR) {
                     std::string v;
@@ -7779,8 +7782,11 @@ IRProgram generateIR(const ASTNode& ast, const std::string& backend, bool runtim
                         }
                     }
                     for (const auto& op : ins.typedOperands)
-                        if (op.kind == IRRef::Kind::VAR && op.id >= 0)
+                        if (op.kind == IRRef::Kind::VAR && op.id >= 0) {
                             readVarsPre.insert(prog.symbols.getName(op.id));
+                            if (prog.findFunction(prog.symbols.getName(op.id)))   // function used as a value
+                                calledFnsPre.insert(prog.symbols.getName(op.id));
+                        }
                     if (ins.opcode == IROpcode::STORE_VAR) {
                         std::string v;
                         if (ins.typedOperands.size() >= 2 && ins.typedOperands[0].kind == IRRef::Kind::VAR)

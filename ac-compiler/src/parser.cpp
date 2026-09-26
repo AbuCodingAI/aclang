@@ -338,10 +338,10 @@ private:
             return node;
         }
 
-        // "..." outside fn — hard error
+        // "..." is not an AC string — hard error
         if (at(TokenType::DQUOTE_STRING)) {
             auto t = peek();
-            throw SYNTAX_ERROR("\"...\" strings are only valid inside fn expressions; use $...$ here", t.line, t.col);
+            throw SYNTAX_ERROR("AC strings are written $...$, not \"...\"", t.line, t.col);
         }
 
         // Boolean literals
@@ -1721,9 +1721,9 @@ private:
             return std::make_unique<ASTNode>(NodeType::BinaryExpr, val);
         }
 
-        // fn expr*(expr)fn  — multiply expression as a statement/value
+        // fn name(args)=expr — single-line function declaration
         if (at(TokenType::KW_FN)) {
-            return parseFnExpr();
+            return parseFnDecl();
         }
 
         // list literal [$...$]
@@ -2002,96 +2002,47 @@ private:
         return node;
     }
 
-    // fn expr*(expr) — fn applies to the whole line, no closing fn needed
-    NodePtr parseFnExpr() {
+    // fn name(a, b) = expr — a single-line function declaration; exactly `Make name func(a, b)` whose body is
+    // one `return expr`. (`fn` used to be the "multiply / method-chain line" prefix — that form is gone.)
+    NodePtr parseFnDecl() {
+        int line = peek().line, col = peek().col;
         advance(); // consume fn
-        
-        // Check if this is a method chain (Term.method ... & Term.method ...)
-        if (at(TokenType::IDENTIFIER)) {
-            size_t savedPos = pos;
-            
-            // Try to parse as method chain
-            std::string name = advance().value;
-            if (at(TokenType::DOT)) {
+        std::string name;
+        if (at(TokenType::KW_VALUE) || at(TokenType::KW_RULE)) name = advance().value;
+        else if (at(TokenType::IDENTIFIER)) name = advance().value;
+        else throw SYNTAX_ERROR("Expected a function name after fn  (fn name(args)=expr)", peek().line, peek().col);
+        expect(TokenType::LPAREN, "Expected ( after the function name  (fn name(args)=expr)");
+        std::vector<std::string> args;
+        while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE) && !at(TokenType::NEWLINE)) {
+            if (at(TokenType::IDENTIFIER) || at(TokenType::KW_VALUE) || at(TokenType::KW_RULE)) args.push_back(advance().value);
+            else if (at(TokenType::COMMA)) advance();
+            else throw SYNTAX_ERROR("Expected parameter name in function argument list", peek().line, peek().col);
+        }
+        expect(TokenType::RPAREN, "Expected ) after the parameters");
+        if (!at(TokenType::ASSIGN))
+            throw SYNTAX_ERROR("Expected = after fn " + name + "(...)  — a single-line function is  fn " + name + "(args)=expr", peek().line, peek().col);
+        advance(); // consume =
+        auto body = parseExpression(0);
+        if (!body) throw SYNTAX_ERROR("Expected an expression after = in fn " + name, line, col);
+        // a trailing `, y` makes a tuple return, same as `return x, y`
+        if (at(TokenType::COMMA)) {
+            auto tup = std::make_unique<ASTNode>(NodeType::TupleLiteral, "");
+            tup->children.push_back(std::move(body));
+            while (at(TokenType::COMMA)) {
                 advance();
-                std::string prop = advance().value;
-                
-                // Collect arguments first
-                std::string tail;
-                while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE) &&
-                       !at(TokenType::AMPERSAND) && !at(TokenType::DOUBLE_AMPERSAND)) {
-                    if (at(TokenType::STRING) || at(TokenType::DQUOTE_STRING)) {
-                        tail += "$" + advance().value + "$";
-                    } else {
-                        tail += advance().value;
-                    }
-                    if (!at(TokenType::NEWLINE) && !at(TokenType::AMPERSAND) && !at(TokenType::DOUBLE_AMPERSAND))
-                        tail += " ";
-                }
-
-                // Check if there's a method chain
-                if (at(TokenType::AMPERSAND) || at(TokenType::DOUBLE_AMPERSAND)) {
-                    // This is a method chain - parse it properly
-                    auto node = std::make_unique<ASTNode>(NodeType::MethodCall, name + "." + prop);
-                    if (!tail.empty()) node->attrs.push_back(tail);
-
-                    // Create chain node
-                    auto chainNode = std::make_unique<ASTNode>(NodeType::MethodChain);
-                    chainNode->children.push_back(std::move(node));
-
-                    // Parse remaining chained calls
-                    while (at(TokenType::AMPERSAND) || at(TokenType::DOUBLE_AMPERSAND)) {
-                        bool isSameArg = at(TokenType::DOUBLE_AMPERSAND);
-                        advance(); // consume & or &&
-
-                        if (at(TokenType::IDENTIFIER)) {
-                            std::string nextName = advance().value;
-                            if (at(TokenType::DOT)) {
-                                advance();
-                                std::string nextProp = advance().value;
-                                auto nextNode = std::make_unique<ASTNode>(NodeType::MethodCall, nextName + "." + nextProp);
-
-                                // For &&, use the same argument as the first call
-                                if (isSameArg) {
-                                    nextNode->attrs.push_back(tail);
-                                } else {
-                                    // For &, collect different arguments
-                                    std::string nextTail;
-                                    while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE) &&
-                                           !at(TokenType::AMPERSAND) && !at(TokenType::DOUBLE_AMPERSAND)) {
-                                        if (at(TokenType::STRING) || at(TokenType::DQUOTE_STRING)) {
-                                            nextTail += "$" + advance().value + "$";
-                                        } else {
-                                            nextTail += advance().value;
-                                        }
-                                        if (!at(TokenType::NEWLINE) && !at(TokenType::AMPERSAND) && !at(TokenType::DOUBLE_AMPERSAND))
-                                            nextTail += " ";
-                                    }
-                                    if (!nextTail.empty()) nextNode->attrs.push_back(nextTail);
-                                }
-                                
-                                chainNode->children.push_back(std::move(nextNode));
-                            }
-                        }
-                    }
-                    return chainNode;
-                }
+                auto next = parseExpression(0);
+                if (next) tup->children.push_back(std::move(next));
             }
-            
-            // Not a method chain, reset and capture as string
-            pos = savedPos;
+            body = std::move(tup);
         }
-        
-        // Fallback: capture entire line as string
-        std::string expr;
-        while (!at(TokenType::END_OF_FILE) && !at(TokenType::NEWLINE)) {
-            if (at(TokenType::STRING)) {
-                expr += "$" + advance().value + "$";
-            } else {
-                expr += advance().value;
-            }
-        }
-        return std::make_unique<ASTNode>(NodeType::BinaryExpr, expr);
+        auto ret = std::make_unique<ASTNode>(NodeType::ReturnStmt, "");
+        ret->children.push_back(std::move(body));
+        auto block = std::make_unique<ASTNode>(NodeType::Block);
+        block->children.push_back(std::move(ret));
+        auto node = std::make_unique<ASTNode>(NodeType::FuncDef, name);
+        for (auto& a : args) node->attrs.push_back(a);
+        node->children.push_back(std::move(block));
+        return node;
     }
 
     // [$item1, item2$]  — contents between [ and ] as a comma-split string.
@@ -2726,6 +2677,7 @@ private:
             if (at(TokenType::ASSIGN)) {
                 advance();
                 std::string val;
+                std::unique_ptr<ASTNode> rhsNode;
                 if (at(TokenType::STRING)) { val = "$" + advance().value + "$"; }
                 else if (at(TokenType::KW_TRUE) || at(TokenType::KW_FALSE)) {
                     // AC lists are i64 — store bool flags as 1/0 so `prime[i] = False` fits
@@ -2734,14 +2686,27 @@ private:
                     advance();
                     val = isTrue ? "1" : "0";
                 } else {
-                    while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                        if (at(TokenType::STRING)) val += "$" + advance().value + "$";
-                        else val += advance().value;
+                    // Parse the RHS as a real expression first: the token-glued string below has no
+                    // spaces, so a word operator (`arr[i] = arr[i] bxor 17` -> "arr[i]bxor17") could
+                    // never be split back apart and reached the backend as raw text. The glued
+                    // string is kept as the fallback for anything the expression parser rejects.
+                    size_t rhsStart = pos;
+                    try {
+                        rhsNode = parseExpression(0);
+                        if (!(at(TokenType::NEWLINE) || at(TokenType::END_OF_FILE))) rhsNode.reset();
+                    } catch (...) { rhsNode.reset(); }
+                    if (!rhsNode) {
+                        pos = rhsStart;
+                        while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
+                            if (at(TokenType::STRING)) val += "$" + advance().value + "$";
+                            else val += advance().value;
+                        }
                     }
                 }
                 auto node = std::make_unique<ASTNode>(NodeType::IndexExpr, name);
                 node->attrs.push_back(indexExpr);
                 node->attrs.push_back(val);
+                if (rhsNode) node->children.push_back(std::move(rhsNode));   // structured RHS wins in the IR
                 return node;
             } else if (at(TokenType::LPAREN)) {
                 // Indexed CALL as a statement: funcs[i](args). Build the same indirect-call
@@ -2822,13 +2787,6 @@ private:
                 } else {
                     node->attrs.push_back("__list__" + literalNode->value);
                 }
-                return node;
-            }
-            // fn multiply expr
-            if (at(TokenType::KW_FN)) {
-                auto fnNode = parseFnExpr();
-                auto node = std::make_unique<ASTNode>(NodeType::AssignStmt, name);
-                node->attrs.push_back("__fn__" + fnNode->value);
                 return node;
             }
             // range N / sequence(x,y[,step]) as an assignment RHS: these used to have their

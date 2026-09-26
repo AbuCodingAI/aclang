@@ -252,7 +252,7 @@ public:
                 continue;
             }
 
-            // String: "..." (supports escape sequences with fn prefix)
+            // String: "..." — not an AC string; lexed so the parser can reject it with a clear message
             if (src[pos] == '"') {
                 int sc = col; pos++; col++;
                 std::string s;

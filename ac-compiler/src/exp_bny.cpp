@@ -1397,8 +1397,8 @@ private:
         em.mov_ri64_str(R::RSI, sid);
         em.mov_ri32(R::RDI, 2);
         em.mov_ri32(R::RDX, (int32_t)msg.size());
-        em.mov_ri32(R::RAX, 1); em.syscall();      // write(2, msg)
-        em.mov_ri32(R::RAX, 231); em.mov_ri32(R::RDI, 1); em.syscall(); // exit(1)
+        em.call("__ac_sys_write__");      // write(2, msg)
+        em.mov_ri32(R::RDI, 1); em.call("__ac_sys_exit__"); // exit(1)
     }
     // floatFuncs_ moved to public section above
 
@@ -1552,6 +1552,10 @@ private:
                 em.mov_r_ptr(scratch, scratch);
                 return scratch;
             }
+            // A user FUNCTION used as a value (`funcs=[f1,f2]`, passed as an argument): its value is the
+            // address of its code — a later indirect CALL (callee = a TEMP) jumps through it.
+            for (auto& f : prog.functions)
+                if (f.classOwner.empty() && f.name == nm) { em.lea_r_label(scratch, nm); return scratch; }
             int gs = gvarSlotOf(nm);
             if (gs >= 0) {                          // promoted free var: load from global slot
                 em.mov_ri64_gvar(scratch, gs);      // scratch = &slot
@@ -1625,6 +1629,17 @@ private:
             em.xor_rr(R::RDI, R::RDI);
             em.syscall();
         }
+    }
+
+    // A call to an EXTERNAL (ilib/.so or .dll) symbol — as opposed to a label for BNY's own
+    // generated code. Linux: a plain E8 call to the PLT stub emitPLTStub() built for it (or the
+    // spliced-in freestanding code, for --static-link). Windows: no PLT/GOT exists at all here —
+    // the label IS the IAT slot (see the Windows import-binding block, which defineLabelAt()s
+    // every extSyms entry the exact same way it already does for GetStdHandle/WriteFile/etc.),
+    // so the call must be the FF15 indirect form (call_rip_rel), not a direct E8 to that address.
+    void emitExtCall(const std::string& name) {
+        if (g_bnyTargetWindows) em.call_rip_rel(name);
+        else                    em.call(name);
     }
 
     void emitLibCall(const AC_IR::IRInstruction& ins) {
@@ -1757,7 +1772,7 @@ private:
             } else {
                 load(ins.typedOperands[1], R::RDI);
             }
-            em.call("math." + fname);  // PLT stub label = irName
+            emitExtCall("math." + fname);  // PLT stub label = irName (Linux) / IAT slot (Windows)
             em.mov_rr(R::RDI, R::RAX);
             em.call("__ac_print_int__");
             return;
@@ -1785,7 +1800,7 @@ private:
                 if (isFloatRef(ins.typedOperands[1])) em.movq_xmm0_from_gpr(R::RAX);
                 else                                  em.cvtsi2sd_xmm0_from_gpr(R::RAX);
                 load(ins.typedOperands[2], R::RDI);
-                em.call(method);
+                emitExtCall(method);
                 if (ins.result.isValid()) store(ins.result, R::RAX);
                 return;
             }
@@ -1811,7 +1826,7 @@ private:
                     intIdx++;
                 }
             }
-            em.call(method);
+            emitExtCall(method);
             if (isFloatReturningCall(method)) {
                 em.movq_gpr_from_xmm0(R::RAX);
                 if (ins.result.isValid()) {
@@ -2570,7 +2585,7 @@ private:
                 if (isFloatRef(ops[1])) em.movq_xmm0_from_gpr(R::RAX);
                 else                    em.cvtsi2sd_xmm0_from_gpr(R::RAX);
                 load(ops[2], R::RDI);
-                em.call(fn);
+                emitExtCall(fn);
                 if (ins.result.isValid()) store(ins.result, R::RAX);
                 break;
             }
@@ -2585,7 +2600,7 @@ private:
                 if (isFloatRef(ops[1 + ai])) em.movq_xmmN_from_gpr(ai, arg);
                 else                         em.cvtsi2sd_xmmN_from_gpr(ai, arg);
             }
-            em.call(fn);
+            if (fn.find('.') != std::string::npos) emitExtCall(fn); else em.call(fn);
             // Float-returning calls put result in XMM0 per System V ABI — move to GPR for storage
             if (floatReturn) {
                 em.movq_gpr_from_xmm0(R::RAX);
@@ -2820,9 +2835,9 @@ private:
 
         // ── #29: these were silently DROPPED (no case → try+catch both ran, /stop ignored) ──
         case IROpcode::SOFT_HALT:            // /stop — graceful exit(0)
-            em.mov_ri32(R::RAX, 231);
             em.xor_rr(R::RDI, R::RDI);
-            em.syscall();
+            em.call("__ac_sys_exit__");
+
             break;
 
         case IROpcode::SLEEP: {              // /halt n — nanosleep(n seconds)
@@ -2833,19 +2848,32 @@ private:
                 else if (v.type == AC_IR::IRType::FLOAT) secs = (long long)std::get<double>(v.data);
                 else if (v.type == AC_IR::IRType::STRING) { try { secs = std::stoll(std::get<std::string>(v.data)); } catch (...) {} }
             }
-            // timespec {tv_sec, tv_nsec} on the stack (16 bytes, kept 16-aligned)
-            em.sub_rsp_i32(16);
-            em.mov_ri64(R::RAX, secs);
-            em.mov_ptr_r(R::RSP, R::RAX);            // tv_sec
-            em.mov_rr(R::RDI, R::RSP);
-            em.add_ri32(R::RDI, 8);
-            em.xor_rr(R::RAX, R::RAX);
-            em.mov_ptr_r(R::RDI, R::RAX);            // tv_nsec = 0
-            em.mov_rr(R::RDI, R::RSP);               // rdi = &timespec
-            em.xor_rr(R::RSI, R::RSI);               // rem = NULL
-            em.mov_ri32(R::RAX, 35);                 // sys_nanosleep
-            em.syscall();
-            em.add_rsp_i32(16);
+            if (g_bnyTargetWindows) {
+                // Sleep(dwMilliseconds) — one call, no timespec struct needed. `secs` is a
+                // compile-time constant here (the only form `/halt n` supports), so the *1000
+                // conversion happens at compile time too, same as the Linux branch bakes `secs`
+                // straight into the timespec.
+                em.mov_ri32(R::RCX, (int32_t)(secs * 1000));
+                em.sub_rsp_i32(32);           // Win64 shadow space (ambient RSP is 16-aligned
+                                              // here, same assumption every other em.call() site
+                                              // in this codegen already relies on)
+                em.call_rip_rel("Sleep");
+                em.add_rsp_i32(32);
+            } else {
+                // timespec {tv_sec, tv_nsec} on the stack (16 bytes, kept 16-aligned)
+                em.sub_rsp_i32(16);
+                em.mov_ri64(R::RAX, secs);
+                em.mov_ptr_r(R::RSP, R::RAX);            // tv_sec
+                em.mov_rr(R::RDI, R::RSP);
+                em.add_ri32(R::RDI, 8);
+                em.xor_rr(R::RAX, R::RAX);
+                em.mov_ptr_r(R::RDI, R::RAX);            // tv_nsec = 0
+                em.mov_rr(R::RDI, R::RSP);               // rdi = &timespec
+                em.xor_rr(R::RSI, R::RSI);               // rem = NULL
+                em.mov_ri32(R::RAX, 35);                 // sys_nanosleep
+                em.syscall();
+                em.add_rsp_i32(16);
+            }
             break;
         }
 
@@ -2862,8 +2890,8 @@ private:
             em.mov_ri64_str(R::RSI, sid);
             em.mov_ri32(R::RDI, 2);                  // stderr
             em.mov_ri32(R::RDX, (int32_t)line.size());
-            em.mov_ri32(R::RAX, 1);                  // sys_write
-            em.syscall();
+            em.call("__ac_sys_write__");                // sys_write
+
             // `raise Clause(...)` is non-fatal on EVERY other backend (and PY, the reference) —
             // it prints "Clause: msg" to stderr and execution continues, regardless of whether
             // the clause is hint/toxic/praise or a custom name. This exit(1) for anything else
@@ -3889,6 +3917,77 @@ public:
 
 // ─── Array Heap Allocator (Linux) ─────────────────────────────────────────────
 // Bump allocator over a single lazily-mmap'd 16 MB region. The bump cursor lives in a
+// ── Windows OS primitives ────────────────────────────────────────────────────────────────────
+// Every routine in this file was written once, for Linux, as a raw `syscall` — `g_bnyTargetWindows`
+// only ever changed the OUTER container (PE vs ELF) and the ExitProcess-only success exit in
+// emitHalt(); every OTHER syscall site (print, panic messages, heap growth) still emitted the
+// exact same Linux syscall on a "Windows" build. `syscall` on real Windows does not mean "write" —
+// it dispatches into NT's own internal, version-specific, undocumented syscall table, so a
+// compiled program calling `Term.display` on Windows would execute an arbitrary, wrong-ABI kernel
+// routine the moment it tried to print (verified: disassembled a real cross-compiled binary and
+// found precisely this — `mov eax,1; syscall` sitting inside valid PE32+ headers). These two
+// shared primitives are the ONE place that decides Linux-syscall vs real Win32 API, so every
+// caller below (print/panic/alloc) just calls them and stays target-agnostic. Uses the same
+// `call_rip_rel("Name")` + `defineLabelAt` IAT-indirection already proven for ExitProcess in
+// emitHalt() — NOT `em.call()` (a direct E8 call), which would jump into the IAT's raw pointer
+// bytes as if they were code.
+//
+//   __ac_sys_write__(rdi = fd [1 or 2], rsi = buf, rdx = len): write `len` bytes from `buf` to
+//   stdout/stderr. Windows: GetStdHandle(-10-fd) → WriteFile(handle, buf, len, &_, NULL). Every
+//   value that must survive across the two WinAPI calls (Win64 ABI: RAX/RCX/RDX/R8/R9/R10/R11
+//   are caller-saved) is spilled to a fixed RBP-relative slot rather than relying on any
+//   register surviving a call into code this file doesn't control.
+static void emitSysWrite(X64Emitter& em) {
+    em.label("__ac_sys_write__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    if (g_bnyTargetWindows) {
+        // Frame: [rsp,rsp+32) is shadow space for whichever WinAPI call is active (RSP never
+        // moves again after this sub, so the same 32 bytes serve every call); rbp-8/-16/-24
+        // are named scratch, safely above the shadow-space window; rbp-32..-29 is a spare
+        // DWORD for WriteFile's mandatory (non-NULL) lpNumberOfBytesWritten out-param.
+        em.sub_rsp_i32(48);
+        em.mov_rbp_r(-8, R::RSI);          // save buf
+        em.mov_rbp_r(-16, R::RDX);         // save len
+        em.mov_rr(R::RAX, R::RDI);
+        em.neg_r(R::RAX);
+        em.sub_r_i32(R::RAX, 10);          // nStdHandle = -10-fd  (fd=1 -> STD_OUTPUT(-11), fd=2 -> STD_ERROR(-12))
+        em.mov_rr(R::RCX, R::RAX);
+        em.call_rip_rel("GetStdHandle");
+        em.mov_rbp_r(-24, R::RAX);         // save handle
+        em.mov_r_rbp(R::RCX, -24);         // hFile
+        em.mov_r_rbp(R::RDX, -8);          // lpBuffer
+        em.mov_r_rbp(R::R8, -16);          // nNumberOfBytesToWrite
+        em.lea_r_rbp8(R::R9, -32);         // lpNumberOfBytesWritten (scratch DWORD, value unused)
+        em.xor_rr(R::R10, R::R10);
+        em.mov_based_r(R::RSP, 32, R::R10); // 5th arg (lpOverlapped = NULL) on the stack
+        em.call_rip_rel("WriteFile");
+    } else {
+        em.mov_ri32(R::RAX, 1);
+        em.syscall();
+    }
+    em.mov_rr(R::RSP, R::RBP);
+    em.pop_rbp();
+    em.ret();
+}
+
+//   __ac_sys_exit__(rdi = exit code): terminate the process. Windows: ExitProcess(code) via the
+//   same IAT-indirect call emitHalt() already uses for its own (code-0-only) case — this is the
+//   generalized form every panic/fatal-error site (previously a hardcoded Linux exit_group(1))
+//   now shares with it.
+static void emitSysExit(X64Emitter& em) {
+    em.label("__ac_sys_exit__");
+    if (g_bnyTargetWindows) {
+        em.mov_rr(R::RCX, R::RDI);
+        em.and_rsp_align16();       // never returns — safe to realign destructively, same as emitHalt()
+        em.sub_rsp_i32(32);
+        em.call_rip_rel("ExitProcess");
+    } else {
+        // rdi already holds the exit code from the caller — exit_group(rdi)
+        em.mov_ri32(R::RAX, 231);
+        em.syscall();
+    }
+}
+
 // global slot (__heap_cursor). No free — adequate for AC array/list programs.
 //   __ac_alloc__(rdi = bytes) -> rax = pointer
 static void emitAllocLinux(X64Emitter& em, int cursorSlot) {
@@ -3898,17 +3997,30 @@ static void emitAllocLinux(X64Emitter& em, int cursorSlot) {
     em.mov_r_ptr(R::RAX, R::RCX);           // rax = *cursor
     em.test_rr(R::RAX, R::RAX);
     em.jne("__ac_alloc_have__");
-    // First call: mmap(NULL, 16MB, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0)
+    // First call: reserve+commit 16MB of fresh zeroed pages. RSP is 16-aligned here (only the
+    // push_rbp prologue so far), so both branches below keep it aligned at their own call/syscall.
     em.push_r(R::RDI);                       // save requested bytes
-    em.push_r(R::RCX);                       // save &cursor (syscall clobbers rcx)
-    em.mov_ri32(R::RDI, 0);
-    em.mov_ri32(R::RSI, 0x1000000);          // 16 MB
-    em.mov_ri32(R::RDX, 3);                  // PROT_READ|PROT_WRITE
-    em.mov_ri32(R::R10, 0x22);               // MAP_PRIVATE|MAP_ANONYMOUS
-    em.mov_ri32(R::R8,  -1);                 // fd
-    em.mov_ri32(R::R9,  0);                  // offset
-    em.mov_ri32(R::RAX, 9);                  // sys_mmap
-    em.syscall();                            // rax = base
+    em.push_r(R::RCX);                       // save &cursor (clobbered by the call/syscall below)
+    if (g_bnyTargetWindows) {
+        // VirtualAlloc(NULL, 16MB, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) -> base in rax
+        em.mov_ri32(R::RCX, 0);
+        em.mov_ri32(R::RDX, 0x1000000);      // 16 MB
+        em.mov_ri32(R::R8,  0x3000);         // MEM_COMMIT(0x1000)|MEM_RESERVE(0x2000)
+        em.mov_ri32(R::R9,  0x04);           // PAGE_READWRITE
+        em.sub_rsp_i32(32);                  // Win64 shadow space
+        em.call_rip_rel("VirtualAlloc");
+        em.add_rsp_i32(32);
+    } else {
+        // mmap(NULL, 16MB, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0) -> base in rax
+        em.mov_ri32(R::RDI, 0);
+        em.mov_ri32(R::RSI, 0x1000000);      // 16 MB
+        em.mov_ri32(R::RDX, 3);              // PROT_READ|PROT_WRITE
+        em.mov_ri32(R::R10, 0x22);           // MAP_PRIVATE|MAP_ANONYMOUS
+        em.mov_ri32(R::R8,  -1);             // fd
+        em.mov_ri32(R::R9,  0);              // offset
+        em.mov_ri32(R::RAX, 9);              // sys_mmap
+        em.syscall();                        // rax = base
+    }
     em.pop_r(R::RCX);                        // &cursor
     em.pop_r(R::RDI);                        // bytes
     em.mov_ptr_r(R::RCX, R::RAX);            // *cursor = base
@@ -4268,8 +4380,8 @@ static void emitDictLinux(X64Emitter& em, StringPool& sp) {
         em.mov_ri64_str(R::RSI, sid);
         em.mov_ri32(R::RDI, 2);
         em.mov_ri32(R::RDX, (int32_t)msg.size());
-        em.mov_ri32(R::RAX, 1); em.syscall();
-        em.mov_ri32(R::RAX, 231); em.mov_ri32(R::RDI, 1); em.syscall();
+        em.call("__ac_sys_write__");
+        em.mov_ri32(R::RDI, 1); em.call("__ac_sys_exit__");
     }
 }
 
@@ -4534,8 +4646,8 @@ static void emitPrintIntCore(X64Emitter& em, const std::string& name, bool newli
     // sys_write(1, r10, rdx)
     em.mov_rr(R::RSI, R::R10);
     em.mov_ri32(R::RDI, 1);
-    em.mov_ri32(R::RAX, 1);
-    em.syscall();
+
+    em.call("__ac_sys_write__");
 
     em.add_rsp_i32(32);
     em.pop_r(R::R13);
@@ -4561,7 +4673,7 @@ static void emitPrintArrLinux(X64Emitter& em) {
     // emit '['
     em.mov_rbp8_imm8(-33, '[');
     em.lea_r_rbp8(R::RSI, -33); em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RDX, 1);
-    em.mov_ri32(R::RAX, 1); em.syscall();
+    em.call("__ac_sys_write__");
     em.label("__ac_parr_loop__");
     em.cmp_rr(R::R13, R::R12);
     em.jg("__ac_parr_done__");
@@ -4570,7 +4682,7 @@ static void emitPrintArrLinux(X64Emitter& em) {
     em.je("__ac_parr_elem__");
     em.mov_rbp8_imm8(-33, ','); em.mov_rbp8_imm8(-32, ' ');
     em.lea_r_rbp8(R::RSI, -33); em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RDX, 2);
-    em.mov_ri32(R::RAX, 1); em.syscall();
+    em.call("__ac_sys_write__");
     em.label("__ac_parr_elem__");
     em.mov_rr(R::RCX, R::R13); em.mov_ri32(R::RDX, 8); em.imul_rr(R::RCX, R::RDX);
     em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX);
@@ -4581,7 +4693,7 @@ static void emitPrintArrLinux(X64Emitter& em) {
     em.label("__ac_parr_done__");
     em.mov_rbp8_imm8(-33, ']'); em.mov_rbp8_imm8(-32, '\n');
     em.lea_r_rbp8(R::RSI, -33); em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RDX, 2);
-    em.mov_ri32(R::RAX, 1); em.syscall();
+    em.call("__ac_sys_write__");
     em.add_rsp_i32(24);
     em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
@@ -4603,16 +4715,16 @@ static void emitPrintStrLinux(X64Emitter& em) {
     em.mov_rr(R::RSI, R::R12);
     em.mov_rr(R::RDX, R::R13);
     em.mov_ri32(R::RDI, 1);
-    em.mov_ri32(R::RAX, 1);
-    em.syscall();
+
+    em.call("__ac_sys_write__");
 
     // Write newline: store '\n' at [rbp-17] (outside the two 8-byte saved regs)
     em.mov_rbp8_imm8(-17, '\n');
     em.lea_r_rbp8(R::RSI, -17);
     em.mov_ri32(R::RDX, 1);
     em.mov_ri32(R::RDI, 1);
-    em.mov_ri32(R::RAX, 1);
-    em.syscall();
+
+    em.call("__ac_sys_write__");
 
     em.add_rsp_i32(16);
     em.pop_r(R::R13);
@@ -4649,16 +4761,16 @@ static void emitPrintCStrLinux(X64Emitter& em) {
     em.mov_rr(R::RSI, R::R12);
     em.mov_rr(R::RDX, R::R13);
     em.mov_ri32(R::RDI, 1);
-    em.mov_ri32(R::RAX, 1);
-    em.syscall();
+
+    em.call("__ac_sys_write__");
 
     // newline
     em.mov_rbp8_imm8(-17, '\n');
     em.lea_r_rbp8(R::RSI, -17);
     em.mov_ri32(R::RDX, 1);
     em.mov_ri32(R::RDI, 1);
-    em.mov_ri32(R::RAX, 1);
-    em.syscall();
+
+    em.call("__ac_sys_write__");
 
     em.add_rsp_i32(16);
     em.pop_r(R::R13);
@@ -5007,7 +5119,7 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.lea_r_rbp32(R::RSI, -180);        // buf start
     em.sub_rr(R::R12, R::RSI);
     em.mov_rr(R::RDX, R::R12);
-    em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RAX, 1); em.syscall();
+    em.mov_ri32(R::RDI, 1); em.call("__ac_sys_write__");
     em.jmp("__acd_epi__");
 
     // to-string mode: r12 = end of the formatted text (no newline). Copy len bytes into a fresh
@@ -5231,32 +5343,78 @@ static void emitSaveFileLinux(X64Emitter& em, int bufPtrSlot, int bufLenSlot) {
     em.label("__ac_save_file__");        // rdi = NUL-terminated path ptr
     em.push_rbp(); em.mov_rbp_rsp();
     em.push_r(R::RBX); em.push_r(R::R12);
-    em.mov_rr(R::R12, R::RDI);           // save path ptr across syscalls
+    em.mov_rr(R::R12, R::RDI);           // save path ptr across syscalls/WinAPI calls
 
-    // open(path, O_WRONLY|O_CREAT|O_TRUNC = 0x241, 0644)
-    em.mov_rr(R::RDI, R::R12);
-    em.mov_ri32(R::RSI, 0x241);
-    em.mov_ri32(R::RDX, 0644);
-    em.mov_ri32(R::RAX, 2);              // sys_open
-    em.syscall();
-    em.mov_rr(R::RBX, R::RAX);           // rbx = fd (or negative errno)
-    em.test_rr(R::RBX, R::RBX);
-    em.jl("__acsf_done__");              // couldn't open — silently skip, matches other backends'
-                                          // "if (_f) {...}" guard rather than crashing the program
+    if (g_bnyTargetWindows) {
+        // Fixed frame for the whole Windows branch: RSP never moves again after this, so
+        // [rsp,rsp+32) always serves as shadow space and CreateFileA's 3 stack args
+        // ([rsp+32]/[rsp+40]/[rsp+48]) always land in the same place regardless of which call
+        // is active; rbp-8 (well above that window) is a named scratch dword for WriteFile's
+        // mandatory (non-NULL) lpNumberOfBytesWritten out-param. RSP is 16-aligned here (same
+        // ambient-invariant every other em.call() site in this codegen relies on), and 80 is a
+        // multiple of 16, so it stays aligned throughout.
+        em.sub_rsp_i32(80);
+        // Preload buf ptr/len into non-volatile r13/r14 before CreateFileA clobbers rcx/rdx/etc.
+        em.push_r(R::R13); em.push_r(R::R14);   // preserve for OUR OWN caller (SysV callee-saved)
+        em.mov_ri64_gvar(R::RCX, bufPtrSlot);
+        em.mov_r_ptr(R::R13, R::RCX);
+        em.mov_ri64_gvar(R::RCX, bufLenSlot);
+        em.mov_r_ptr(R::R14, R::RCX);
 
-    em.mov_ri64_gvar(R::RCX, bufPtrSlot);
-    em.mov_r_ptr(R::RSI, R::RCX);        // rsi = buf ptr
-    em.mov_ri64_gvar(R::RCX, bufLenSlot);
-    em.mov_r_ptr(R::RDX, R::RCX);        // rdx = buf len
-    em.mov_rr(R::RDI, R::RBX);
-    em.mov_ri32(R::RAX, 1);              // sys_write
-    em.syscall();
+        // CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+        em.mov_rr(R::RCX, R::R12);
+        em.mov_ri32(R::RDX, (int32_t)0x40000000);   // GENERIC_WRITE
+        em.mov_ri32(R::R8, 0);                      // dwShareMode
+        em.mov_ri32(R::R9, 0);                      // lpSecurityAttributes
+        em.mov_ri32(R::R10, 2);   em.mov_based_r(R::RSP, 32, R::R10);  // CREATE_ALWAYS
+        em.mov_ri32(R::R10, 0x80); em.mov_based_r(R::RSP, 40, R::R10); // FILE_ATTRIBUTE_NORMAL
+        em.xor_rr(R::R10, R::R10); em.mov_based_r(R::RSP, 48, R::R10); // hTemplateFile = NULL
+        em.call_rip_rel("CreateFileA");
+        em.mov_rr(R::RBX, R::RAX);            // rbx = handle (or INVALID_HANDLE_VALUE = -1)
+        em.cmp_r_i32(R::RBX, -1);
+        em.je("__acsf_win_done__");           // couldn't open — same silent-skip as Linux branch
 
-    em.mov_rr(R::RDI, R::RBX);
-    em.mov_ri32(R::RAX, 3);              // sys_close
-    em.syscall();
+        // WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, &scratch, NULL)
+        em.mov_rr(R::RCX, R::RBX);
+        em.mov_rr(R::RDX, R::R13);
+        em.mov_rr(R::R8, R::R14);
+        em.lea_r_rbp8(R::R9, -8);
+        em.xor_rr(R::R10, R::R10); em.mov_based_r(R::RSP, 32, R::R10); // lpOverlapped = NULL
+        em.call_rip_rel("WriteFile");
 
-    em.label("__acsf_done__");
+        // CloseHandle(hFile)
+        em.mov_rr(R::RCX, R::RBX);
+        em.call_rip_rel("CloseHandle");
+
+        em.label("__acsf_win_done__");
+        em.pop_r(R::R14); em.pop_r(R::R13);
+        em.add_rsp_i32(80);
+    } else {
+        // open(path, O_WRONLY|O_CREAT|O_TRUNC = 0x241, 0644)
+        em.mov_rr(R::RDI, R::R12);
+        em.mov_ri32(R::RSI, 0x241);
+        em.mov_ri32(R::RDX, 0644);
+        em.mov_ri32(R::RAX, 2);              // sys_open
+        em.syscall();
+        em.mov_rr(R::RBX, R::RAX);           // rbx = fd (or negative errno)
+        em.test_rr(R::RBX, R::RBX);
+        em.jl("__acsf_done__");              // couldn't open — silently skip, matches other
+                                              // backends' "if (_f) {...}" guard, not a crash
+
+        em.mov_ri64_gvar(R::RCX, bufPtrSlot);
+        em.mov_r_ptr(R::RSI, R::RCX);        // rsi = buf ptr
+        em.mov_ri64_gvar(R::RCX, bufLenSlot);
+        em.mov_r_ptr(R::RDX, R::RCX);        // rdx = buf len
+        em.mov_rr(R::RDI, R::RBX);
+        em.mov_ri32(R::RAX, 1);              // sys_write
+        em.syscall();
+
+        em.mov_rr(R::RDI, R::RBX);
+        em.mov_ri32(R::RAX, 3);              // sys_close
+        em.syscall();
+
+        em.label("__acsf_done__");
+    }
     em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
 }
@@ -5266,17 +5424,38 @@ static void emitInputIntLinux(X64Emitter& em) {
     em.label("__ac_input_int__");
     em.push_rbp(); em.mov_rbp_rsp();
     em.push_r(R::R12); em.push_r(R::R13);
-    em.sub_rsp_i32(64);  // buffer for input (at [rbp-64])
+    // Windows needs extra room BELOW the input buffer for shadow space + ReadFile's 5th stack
+    // arg + a scratch DWORD (lpNumberOfBytesRead) — none of which may overlap [rbp-64,rbp-1),
+    // the buffer every later instruction in this function already addresses via that exact
+    // offset. Layout (Windows): [rbp-112,rbp-80) shadow, [rbp-80,rbp-72) 5th arg, [rbp-72,rbp-64)
+    // scratch dword, [rbp-64,rbp-1) buffer (unchanged). 112 keeps RSP 16-aligned throughout.
+    em.sub_rsp_i32(g_bnyTargetWindows ? 112 : 64);
 
-    // Syscall: read(0, buffer, 64) - read up to 64 bytes from stdin
-    em.lea_r_rbp32(R::RSI, -64);  // buffer address
-    em.mov_ri32(R::RDI, 0);        // fd = 0 (stdin)
-    em.mov_ri32(R::RDX, 64);       // count = 64
-    em.mov_ri32(R::RAX, 0);        // syscall 0 = read
-    em.syscall();
-
-    // RAX now has bytes read; save to R13
-    em.mov_rr(R::R13, R::RAX);
+    if (g_bnyTargetWindows) {
+        em.xor_rr(R::R11, R::R11);
+        em.mov_rbp_r(-72, R::R11);            // zero the scratch qword — ReadFile only writes
+                                              // the low 4 bytes, and we read all 8 back below
+        em.mov_ri32(R::RCX, -10);             // STD_INPUT_HANDLE
+        em.sub_rsp_i32(32);
+        em.call_rip_rel("GetStdHandle");
+        em.add_rsp_i32(32);
+        em.mov_rr(R::RCX, R::RAX);             // hFile
+        em.lea_r_rbp32(R::RDX, -64);           // lpBuffer (same address the parser below uses)
+        em.mov_ri32(R::R8, 64);                // nNumberOfBytesToRead
+        em.lea_r_rbp8(R::R9, -72);             // lpNumberOfBytesRead
+        em.xor_rr(R::R10, R::R10);
+        em.mov_based_r(R::RSP, 32, R::R10);    // lpOverlapped = NULL
+        em.call_rip_rel("ReadFile");
+        em.mov_r_rbp(R::R13, -72);             // r13 = bytes read (upper 32 bits pre-zeroed)
+    } else {
+        // Syscall: read(0, buffer, 64) - read up to 64 bytes from stdin
+        em.lea_r_rbp32(R::RSI, -64);  // buffer address
+        em.mov_ri32(R::RDI, 0);        // fd = 0 (stdin)
+        em.mov_ri32(R::RDX, 64);       // count = 64
+        em.mov_ri32(R::RAX, 0);        // syscall 0 = read
+        em.syscall();
+        em.mov_rr(R::R13, R::RAX);     // rax has bytes read; save to r13
+    }
 
     // Parse integer from buffer [rbp-64]
     // Start with result = 0 in RAX
@@ -5318,7 +5497,7 @@ static void emitInputIntLinux(X64Emitter& em) {
     em.label("__read_done__");
     // RAX now contains the parsed integer
 
-    em.add_rsp_i32(64);
+    em.add_rsp_i32(g_bnyTargetWindows ? 112 : 64);   // must match the entry sub above
     em.pop_r(R::R13); em.pop_r(R::R12);
     em.pop_rbp();
     em.ret();
@@ -5331,21 +5510,42 @@ static void emitInputStrLinux(X64Emitter& em, StringPool& sp) {
     em.push_r(R::RBX);
     em.push_r(R::R12);
     em.push_r(R::R13);
+    em.push_r(R::R14);
     int emptySid = sp.add("");
+
+    // Fixed reservation for the whole function (Windows only): [rsp,rsp+32) shadow space +
+    // [rsp+32,rsp+40) ReadFile's 5th arg + [rsp+40,rsp+48) a scratch DWORD for
+    // lpNumberOfBytesRead, all reused every loop iteration rather than churned per call.
+    if (g_bnyTargetWindows) em.sub_rsp_i32(48);
 
     // Allocate stable storage for the returned string. Returning a stack pointer here
     // corrupts Term.ask as soon as this helper returns.
-    em.mov_ri32(R::RDI, 0);         // addr = NULL
-    em.mov_ri32(R::RSI, 4096);      // length
-    em.mov_ri32(R::RDX, 3);         // PROT_READ | PROT_WRITE
-    em.mov_ri32(R::R10, 0x22);      // MAP_PRIVATE | MAP_ANONYMOUS
-    em.mov_ri32(R::R8, -1);         // fd
-    em.mov_ri32(R::R9, 0);          // offset
-    em.mov_ri32(R::RAX, 9);         // sys_mmap
-    em.syscall();
-    em.cmp_r_i32(R::RAX, 0);
-    em.jl("__ac_input_str_fail__");
-    em.mov_rr(R::RBX, R::RAX);      // RBX = stable input buffer
+    if (g_bnyTargetWindows) {
+        em.mov_ri32(R::RCX, 0);          // lpAddress = NULL
+        em.mov_ri32(R::RDX, 4096);       // dwSize
+        em.mov_ri32(R::R8, 0x3000);      // MEM_COMMIT|MEM_RESERVE
+        em.mov_ri32(R::R9, 0x04);        // PAGE_READWRITE
+        em.call_rip_rel("VirtualAlloc");
+        em.test_rr(R::RAX, R::RAX);
+        em.je("__ac_input_str_fail__");
+        em.mov_rr(R::RBX, R::RAX);       // RBX = stable input buffer
+
+        em.mov_ri32(R::RCX, -10);        // STD_INPUT_HANDLE
+        em.call_rip_rel("GetStdHandle");
+        em.mov_rr(R::R14, R::RAX);       // R14 = stdin handle, kept for the whole read loop
+    } else {
+        em.mov_ri32(R::RDI, 0);         // addr = NULL
+        em.mov_ri32(R::RSI, 4096);      // length
+        em.mov_ri32(R::RDX, 3);         // PROT_READ | PROT_WRITE
+        em.mov_ri32(R::R10, 0x22);      // MAP_PRIVATE | MAP_ANONYMOUS
+        em.mov_ri32(R::R8, -1);         // fd
+        em.mov_ri32(R::R9, 0);          // offset
+        em.mov_ri32(R::RAX, 9);         // sys_mmap
+        em.syscall();
+        em.cmp_r_i32(R::RAX, 0);
+        em.jl("__ac_input_str_fail__");
+        em.mov_rr(R::RBX, R::RAX);      // RBX = stable input buffer
+    }
 
     em.mov_rr(R::R13, R::RBX);      // R13 = cursor
     em.mov_ri32(R::R12, 4095);      // remaining capacity before NUL
@@ -5355,13 +5555,30 @@ static void emitInputStrLinux(X64Emitter& em, StringPool& sp) {
     em.je("__ac_input_str_term__");
 
     // Read one byte at a time so one Term.ask consumes exactly one line.
-    em.mov_ri32(R::RDI, 0);
-    em.mov_rr(R::RSI, R::R13);
-    em.mov_ri32(R::RDX, 1);
-    em.mov_ri32(R::RAX, 0);
-    em.syscall();
-    em.cmp_r_i32(R::RAX, 1);
-    em.jne("__ac_input_str_term__");
+    if (g_bnyTargetWindows) {
+        em.xor_rr(R::R11, R::R11);
+        // Scratch dword lives at rbp-40 (inside the [rbp-80,rbp-32) region sub_rsp_i32(48)
+        // reserved above) — NOT rbp-8, which is where push_r(RBX) put the caller's saved RBX.
+        em.mov_rbp_r(-40, R::R11);           // zero the scratch qword (ReadFile writes only 4 bytes)
+        em.mov_rr(R::RCX, R::R14);           // hFile
+        em.mov_rr(R::RDX, R::R13);           // lpBuffer = cursor
+        em.mov_ri32(R::R8, 1);               // nNumberOfBytesToRead
+        em.lea_r_rbp8(R::R9, -40);           // lpNumberOfBytesRead
+        em.xor_rr(R::R10, R::R10);
+        em.mov_based_r(R::RSP, 32, R::R10);  // lpOverlapped = NULL
+        em.call_rip_rel("ReadFile");
+        em.mov_r_rbp(R::RAX, -40);           // rax = bytes read (0 or 1)
+        em.cmp_r_i32(R::RAX, 1);
+        em.jne("__ac_input_str_term__");
+    } else {
+        em.mov_ri32(R::RDI, 0);
+        em.mov_rr(R::RSI, R::R13);
+        em.mov_ri32(R::RDX, 1);
+        em.mov_ri32(R::RAX, 0);
+        em.syscall();
+        em.cmp_r_i32(R::RAX, 1);
+        em.jne("__ac_input_str_term__");
+    }
 
     em.movzx_r64_ptr8(R::RCX, R::R13);
     em.cmp_r_i32(R::RCX, '\n');
@@ -5382,6 +5599,8 @@ static void emitInputStrLinux(X64Emitter& em, StringPool& sp) {
     em.mov_ri64_str(R::RAX, emptySid);
 
     em.label("__ac_input_str_return__");
+    if (g_bnyTargetWindows) em.add_rsp_i32(48);   // must match the entry sub above
+    em.pop_r(R::R14);
     em.pop_r(R::R13);
     em.pop_r(R::R12);
     em.pop_r(R::RBX);
@@ -5658,6 +5877,12 @@ struct PEImport { std::string dll; std::string func; };
 static constexpr uint32_t PE_SECT_ALIGN = 0x1000;
 static constexpr uint32_t PE_TEXT_RVA   = PE_SECT_ALIGN;
 static constexpr uint32_t PE_IDATA_RVA  = 2 * PE_SECT_ALIGN;
+// Third, read-write section for string-pool bytes + NA->free global slots — the exact same
+// `rodata` blob the ELF path already builds (see applyStringFixups/applyGVarFixups' shared
+// caller). Without this, every `$string literal$` and every free/bound global (including the
+// heap bump-allocator's own __heap_cursor slot) had nowhere valid to point to on Windows.
+static constexpr uint32_t PE_DATA_RVA   = 3 * PE_SECT_ALIGN;
+static constexpr uint64_t PE_IMAGE_BASE = 0x140000000ULL;
 
 // Shared layout for the .idata section: [descriptors][ILT per dll][IAT per dll]
 // [hint/name per import][dll name strings]. Computed once, consumed both to bind
@@ -5713,7 +5938,8 @@ static PEImportLayout layoutPEImports(const std::vector<PEImport>& imports) {
 static bool writePE(const std::string& path,
                      std::vector<uint8_t> text,
                      const std::vector<PEImport>& imports,
-                     uint32_t entryOffset) {
+                     uint32_t entryOffset,
+                     std::vector<uint8_t> data = {}) {
     const uint32_t SECT_ALIGN = PE_SECT_ALIGN;
     const uint32_t FILE_ALIGN = 0x200;
 
@@ -5750,7 +5976,7 @@ static bool writePE(const std::string& path,
     }
     // Final descriptor slot stays zeroed (terminator).
 
-    uint32_t numSections = imports.empty() ? 1 : 2;
+    uint32_t numSections = 1 + (imports.empty() ? 0 : 1) + (data.empty() ? 0 : 1);
     uint32_t hdrSize = sizeof(PEDosHeader) + sizeof(PECoffHeader) + sizeof(PEOptionalHeader64)
                        + numSections * sizeof(PESectionHeader);
     uint32_t sizeOfHeaders = peAlignUp(hdrSize, FILE_ALIGN);
@@ -5759,10 +5985,15 @@ static bool writePE(const std::string& path,
     uint32_t textRawSize = peAlignUp((uint32_t)text.size(), FILE_ALIGN);
     uint32_t idataRawOff  = textRawOff + textRawSize;
     uint32_t idataRawSize = peAlignUp((uint32_t)idata.size(), FILE_ALIGN);
+    uint32_t dataRVA     = PE_DATA_RVA;
+    uint32_t dataRawOff  = idataRawOff + idataRawSize;
+    uint32_t dataRawSize = peAlignUp((uint32_t)data.size(), FILE_ALIGN);
 
-    uint32_t sizeOfImage = imports.empty()
-        ? peAlignUp(textRVA + (uint32_t)text.size(), SECT_ALIGN)
-        : peAlignUp(idataRVA + (uint32_t)idata.size(), SECT_ALIGN);
+    uint32_t sizeOfImage = !data.empty()
+        ? peAlignUp(dataRVA + (uint32_t)data.size(), SECT_ALIGN)
+        : imports.empty()
+            ? peAlignUp(textRVA + (uint32_t)text.size(), SECT_ALIGN)
+            : peAlignUp(idataRVA + (uint32_t)idata.size(), SECT_ALIGN);
 
     PEDosHeader dos{};
     dos.e_lfanew = sizeof(PEDosHeader);
@@ -5775,7 +6006,7 @@ static bool writePE(const std::string& path,
     opt.AddressOfEntryPoint = textRVA + entryOffset;
     opt.BaseOfCode = textRVA;
     opt.SizeOfCode = textRawSize;
-    opt.SizeOfInitializedData = idataRawSize;
+    opt.SizeOfInitializedData = idataRawSize + dataRawSize;
     opt.SizeOfImage = sizeOfImage;
     opt.SizeOfHeaders = sizeOfHeaders;
     if (!imports.empty()) {
@@ -5809,6 +6040,17 @@ static bool writePE(const std::string& path,
         f.write((char*)&shIdata, sizeof(shIdata));
     }
 
+    if (!data.empty()) {
+        PESectionHeader shData{};
+        std::memcpy(shData.Name, ".data", 5);
+        shData.VirtualSize = (uint32_t)data.size();
+        shData.VirtualAddress = dataRVA;
+        shData.SizeOfRawData = dataRawSize;
+        shData.PointerToRawData = dataRawOff;
+        shData.Characteristics = 0xC0000040; // INITIALIZED_DATA|READ|WRITE (string pool + NA->free globals)
+        f.write((char*)&shData, sizeof(shData));
+    }
+
     std::vector<uint8_t> pad(sizeOfHeaders - hdrSize, 0);
     f.write((char*)pad.data(), pad.size());
 
@@ -5818,6 +6060,10 @@ static bool writePE(const std::string& path,
     if (!imports.empty()) {
         idata.resize(idataRawSize, 0);
         f.write((char*)idata.data(), idata.size());
+    }
+    if (!data.empty()) {
+        data.resize(dataRawSize, 0);
+        f.write((char*)data.data(), data.size());
     }
     f.close();
     return true;
@@ -6150,6 +6396,15 @@ static std::string normalizeExtSym(const std::string& irName) {
     // same as the dotted case above just without a '.' to replace.
     if (isNativeCpuPtrSym(irName)) return "ac_ncpu_" + irName;
     return irName;
+}
+
+// Which ilibs have a real, verified Windows .dll build so far — everything else still refuses
+// at compile time (see the g_bnyTargetWindows dynamic-linking check) rather than pretending. Add
+// an entry here only once that ilib's own `windows` Makefile target has actually been built and
+// its exports checked against math_c.h-style headers, the way library/ilib/math's was.
+static std::string dllNameFor(const std::string& soName) {
+    if (soName == "libacmath.so") return "acmath.dll";
+    return "";
 }
 
 static std::string libForSym(const std::string& exportName) {
@@ -6540,13 +6795,14 @@ class BinaryCompiler {
             return (r.kind == IRRef::Kind::VAR && r.id >= 0) ? prog.symbols.getName(r.id) : "";
         };
         std::set<std::string> freeVarSet;
+        std::set<int> freeVarIds;      // symbol ids of those vars — a same-named function LOCAL has a different id
         int depth = 0;
         for (auto& ins : prog.globalInit) {
             if (ins.opcode == IROpcode::WHILE_BEGIN || ins.opcode == IROpcode::FOR_BEGIN) depth++;
             else if (ins.opcode == IROpcode::WHILE_END || ins.opcode == IROpcode::FOR_END) depth--;
             else if (depth == 0 && ins.result.kind == IRRef::Kind::VAR) {
                 std::string n = nameOf(ins.result);
-                if (!n.empty() && n.rfind("_ac_", 0) != 0) freeVarSet.insert(n);
+                if (!n.empty() && n.rfind("_ac_", 0) != 0) { freeVarSet.insert(n); freeVarIds.insert(ins.result.id); }
             }
         }
         for (auto& fn : prog.functions) {
@@ -6555,6 +6811,15 @@ class BinaryCompiler {
                 if (ins.result.kind == IRRef::Kind::VAR) {
                     std::string n = nameOf(ins.result);
                     if (!n.empty() && !params.count(n) && freeVarSet.count(n))
+                        promotedGlobals_.insert(n);
+                }
+                // A function that only READS a mainloop var (`funcs[k](x)`, `return table[i]`) must see the same
+                // shared value the mainloop wrote — every other backend promotes reads too (see ir_codegen's
+                // "extended to READS" NA->free rule); reading the per-frame local instead gave a zeroed slot.
+                for (auto& op : ins.typedOperands) {
+                    if (op.kind != IRRef::Kind::VAR || op.id < 0) continue;
+                    std::string n = nameOf(op);
+                    if (!n.empty() && !params.count(n) && freeVarSet.count(n) && freeVarIds.count(op.id))
                         promotedGlobals_.insert(n);
                 }
                 // `free x[, y…]` inside a fn binds those names to the free scope → promote.
@@ -7343,12 +7608,18 @@ public:
         scanUsing(prog.globalInit);
         for (auto& fn : prog.functions) scanUsing(fn.instructions);
 
-        // Collect external symbols before emitting any code. ELF-specific (ilib .so
-        // DT_NEEDED deps) — the Windows path uses a completely separate mechanism
-        // (PE import table, wired further down) since ilibs aren't built for Windows
-        // at all yet; that's real follow-up work, not something to fake here.
-        std::vector<ExtSym> extSyms;
-        if (!g_bnyTargetWindows) extSyms = collectExternalSymbols();
+        // Collect external symbols before emitting any code. `collectExternalSymbols()` itself
+        // is a pure query (what does this program call that lives outside it) — always run it,
+        // even for Windows, purely so `dynamic` below is computed correctly and the hard-refuse
+        // just past it can actually detect "this program needs an ilib" instead of silently
+        // reporting `dynamic=false` no matter what. The ELF-specific CONSUMERS of extSyms (PLT
+        // stubs, GOT, dynstr — DT_NEEDED .so deps) are further down, past the Windows early
+        // return below, and stay untouched: ilibs aren't built for Windows at all yet, and that
+        // real follow-up work isn't faked here. (Was previously skipped entirely for Windows —
+        // verified real bug: a non-foldable `use ilib math` call on --windows crashed with a raw
+        // "undefined label" backend error instead of the intended clear refuse message, since
+        // `extSyms` stayed empty and `dynamic` was always false regardless of the program.)
+        std::vector<ExtSym> extSyms = collectExternalSymbols();
         // --static-link: can we SPLICE freestanding ilib code instead of dynamic-linking .so's?
         // Load every freestanding object under the program's ilib dirs and check it defines each
         // needed external symbol. If ALL are covered (and none carry relocations we can't yet apply),
@@ -7375,11 +7646,32 @@ public:
         }
         bool dynamic = !extSyms.empty() && !willSplice;
 
+        // Windows: refuse rather than silently emit wrong code for whichever ilib the program
+        // needs that hasn't been ported to a real Windows .dll yet. Most ilibs are still Linux
+        // .so only (some, like widgets/GTK3 or machine-audio/ALSA, wrap APIs that don't exist
+        // on Windows at all and need real porting, not just a recompile) — `dllNameFor()` is the
+        // one allowlist of what's actually been built and verified so far (currently: math,
+        // see library/ilib/math's `windows` Makefile target). Matches the existing
+        // rejectTypeCyclingVars precedent (main.cpp/ir_codegen.cpp): a clear compile-time error
+        // naming the real gap, never a binary that does something undefined when run.
+        if (g_bnyTargetWindows && dynamic) {
+            for (auto& es : extSyms) {
+                if (dllNameFor(es.lib).empty())
+                    throw ACError::backend("this program uses '" + es.irName + "' from " + es.lib +
+                                           ", which has no Windows build yet — use another backend");
+            }
+        }
+
         // Decide promoted free-var slots AND whether the heap is needed — must run before
         // emitting the allocator helper (which depends on usesArrays_ / __heap_cursor slot).
         computePromotedGlobals();
         computeStringParamHints();
         computeFloatParamHints();
+
+        // Windows OS primitives (write/exit) — unconditional, same as the print helpers just
+        // below: cheap, and every one of those helpers now calls into these two by label.
+        emitSysWrite(em);
+        emitSysExit(em);
 
         // Emit print helpers
         emitPrintIntLinux(em);
@@ -7502,26 +7794,51 @@ public:
             }
         }
 
-        // Windows: bind every Win32 API call (currently just ExitProcess, from
-        // emitHalt()) to its IAT slot BEFORE applyFixups(), exactly like the
-        // --static-link splice above binds ilib calls to spliced code — same
-        // generic fixup engine, just pointed at a different kind of target.
+        // Windows: bind every Win32 API call to its IAT slot BEFORE applyFixups(), exactly like
+        // the --static-link splice above binds ilib calls to spliced code — same generic fixup
+        // engine, just pointed at a different kind of target. All four cover every raw syscall
+        // BNY's codegen can emit for a plain (no ilib) program: write (print/panic messages),
+        // heap growth (__ac_alloc__), and process exit — see emitSysWrite/emitSysExit/
+        // emitAllocLinux's Windows branches, which call_rip_rel() into these exact labels.
         std::vector<PEImport> peImports;
         if (g_bnyTargetWindows) {
+            peImports.push_back({"KERNEL32.DLL", "GetStdHandle"});
+            peImports.push_back({"KERNEL32.DLL", "WriteFile"});
+            peImports.push_back({"KERNEL32.DLL", "ReadFile"});
+            peImports.push_back({"KERNEL32.DLL", "VirtualAlloc"});
             peImports.push_back({"KERNEL32.DLL", "ExitProcess"});
+            peImports.push_back({"KERNEL32.DLL", "Sleep"});
+            peImports.push_back({"KERNEL32.DLL", "CreateFileA"});
+            peImports.push_back({"KERNEL32.DLL", "CloseHandle"});
+            // Ported ilibs (currently just math — see dllNameFor): each needed external symbol
+            // gets its own IAT slot, keyed by irName ("math.sqrt") since that's the exact string
+            // emitExtCall()/emitLibCall() pass to call_rip_rel() at the actual call sites — NOT
+            // exportName ("ac_sqrt"), which would collide across ilibs that happen to reuse it.
+            // (The refuse check just above already guarantees every extSyms entry here has a
+            // real dllNameFor() by the time we reach this point.)
+            for (auto& es : extSyms)
+                peImports.push_back({dllNameFor(es.lib), es.exportName});
             PEImportLayout L = layoutPEImports(peImports);
-            em.defineLabelAt("ExitProcess", L.iatSlotRVA(0, peImports) - PE_TEXT_RVA);
+            for (size_t i = 0; i < peImports.size(); i++) {
+                std::string label = i < 8 ? peImports[i].func : extSyms[i - 8].irName;
+                em.defineLabelAt(label, L.iatSlotRVA(i, peImports) - PE_TEXT_RVA);
+            }
+        }
+
+        if (g_bnyTargetWindows) {
+            // String literals ($...$) and NA->free globals (including __ac_alloc__'s own
+            // __heap_cursor slot) — same `rodata` blob + fixup calls the ELF path uses below,
+            // just aimed at the PE's own .data section instead of an ELF PT_LOAD segment.
+            em.applyStringFixups(PE_IMAGE_BASE + PE_DATA_RVA, rodata, strOffsets);
+            em.applyGVarFixups(PE_IMAGE_BASE + PE_DATA_RVA, gvarOffsets);
         }
 
         em.applyFixups();
 
         if (g_bnyTargetWindows) {
-            // No string/gvar fixups yet — this path targets the trivial (no
-            // print, no NA->free globals) case first; that's real follow-up work
-            // (needs GetStdHandle/WriteFile imports), not faked here.
             std::vector<uint8_t> text = em.code();
             uint32_t entryOff = (uint32_t)em.getLabelOffset("_start");
-            return writePE(outPath, text, peImports, entryOff);
+            return writePE(outPath, text, peImports, entryOff, rodata);
         }
 
         // Platform-specific binary generation:

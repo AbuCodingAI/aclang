@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <vector>
 #include <cstring>
+#include <cstdint>
 #include <string>
 
 namespace ac_math {

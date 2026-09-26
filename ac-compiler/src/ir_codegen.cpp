@@ -1,3 +1,4 @@
+#include "../include/selfpath.hpp"
 #include "../include/ac.hpp"
 #include "../include/wasm_blobs.hpp"
 #include <sstream>
@@ -10,11 +11,15 @@
 #include <string>
 #include <memory>
 #include <functional>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #ifdef _WIN32
 #include <direct.h>
+#include <sys/stat.h>
+// Declared by hand instead of including <windows.h> (its macros — min/max/ERROR/... — collide with this file).
+extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void*, char*, unsigned long);
 #define ac_getcwd _getcwd
 #else
 #include <unistd.h>
@@ -68,7 +73,7 @@ static std::string readFFIFile(const std::string &libName, const std::string &ex
 #ifndef _WIN32
     // 2. binary-relative: <bindir>/../ (works when "ac" is run from any directory)
     char exeBuf[4096] = {};
-    ssize_t len = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf) - 1);
+    ssize_t len = acSelfExe(exeBuf, sizeof(exeBuf) - 1);
     if (len > 0) {
         exeBuf[len] = '\0';
         std::string binDir(exeBuf);
@@ -93,9 +98,14 @@ static std::string resolveIlibDir(const std::string& libName) {
         char buf[4096] = {};
         return realpath(raw.c_str(), buf) ? std::string(buf) : raw;
 #else
-        // Windows: just return the path if it exists (simplified check)
+        // Windows: resolve to a full path, and (like the POSIX branch) only accept a directory that EXISTS —
+        // this used to return the path unchecked, so the `.` (cwd) candidate always won and ac.exe emitted
+        // `#include "<cwd>\library\ilib\math/..."` for a library that lives next to the exe instead.
         char buf[4096] = {};
-        return _fullpath(buf, raw.c_str(), sizeof(buf)) ? std::string(buf) : raw;
+        std::string full = _fullpath(buf, raw.c_str(), sizeof(buf)) ? std::string(buf) : raw;
+        struct stat st{};
+        if (::stat(full.c_str(), &st) != 0 || !(st.st_mode & S_IFDIR)) return "";
+        return full;
 #endif
     };
     if (const char* acp = getenv("AC_PATH")) {
@@ -106,10 +116,18 @@ static std::string resolveIlibDir(const std::string& libName) {
     if (!r.empty()) return r;
 #ifndef _WIN32
     char exeBuf[4096] = {};
-    ssize_t len = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf)-1);
+    ssize_t len = acSelfExe(exeBuf, sizeof(exeBuf)-1);
     if (len > 0) {
         std::string bd(exeBuf, len);
         auto sl = bd.rfind('/'); if (sl != std::string::npos) bd = bd.substr(0, sl);
+        r = tryBase(bd + "/..");
+        if (!r.empty()) return r;
+    }
+#else
+    char exeBufW[4096] = {};
+    if (GetModuleFileNameA(NULL, exeBufW, sizeof(exeBufW) - 1) > 0) {   // <exe dir>/../library, like acLibRoot()
+        std::string bd(exeBufW);
+        auto sl = bd.find_last_of("/\\"); if (sl != std::string::npos) bd = bd.substr(0, sl);
         r = tryBase(bd + "/..");
         if (!r.empty()) return r;
     }
@@ -897,6 +915,26 @@ public:
     // on it — everyone else keeps today's behavior unchanged.
     std::set<std::string> boxedVars_;
     virtual void setBoxedVars(const std::set<std::string>& s) { boxedVars_ = s; }
+    // User functions whose returned value is a boxed (AcDynVal) var — they return the tagged value
+    // itself, and their call results are boxed. Only backends that return true from
+    // supportsBoxedReturn() implement this; the driver computes the set only for them.
+    std::set<std::string> boxedRetFuncs_;
+    virtual void setBoxedRetFuncs(const std::set<std::string>& s) { boxedRetFuncs_ = s; }
+    virtual bool supportsBoxedReturn() const { return false; }
+
+    // Function values stored in list slots on backends that can't keep a function ADDRESS in an integer
+    // slot (Java/Rust/Go/V): each such function gets a small integer id, the list holds the id, and a
+    // per-arity `ac_callfn<N>(id, args...)` switch dispatches the call. (C/C++ store the address itself.)
+    // Only int -> int functions qualify — the driver rejects anything else with a clear error.
+    struct FuncValueEntry { std::string name; int arity; };
+    std::vector<FuncValueEntry> funcValueTable_;
+    std::map<std::string, int> funcValueIds_;
+    virtual bool usesFuncIds() const { return false; }
+    virtual void setFuncValueTable(const std::vector<FuncValueEntry>& t) {
+        funcValueTable_ = t; funcValueIds_.clear();
+        for (size_t k = 0; k < t.size(); k++) funcValueIds_[t[k].name] = (int)k;
+    }
+    virtual void emitFuncValueDispatch(std::ostringstream & /*out*/, int & /*indent*/) {}
 
     // Dict variables (string-keyed maps) — set at emitAlloc("dict"), consulted by index emission.
     std::set<std::string> dictVars_;      // all dicts
@@ -960,6 +998,49 @@ public:
     // When a user function is passed as an argument value, how to refer to it.
     // Default: just the function name. Java overrides to emit ClassName::method.
     virtual std::string funcArgRef(const std::string &name) { return name; }
+
+    // Function values stored in list slots (`funcs=[f1,f2]`, `funcs[k](x)`): the C/C++ list is a
+    // plain array of 64-bit ints, so a function is stored as its address and cast back to
+    // `int (*)(int, ...)` at the call — the same all-int signature convention already used for
+    // function-typed parameters. Number of comma-separated call args (commas inside string
+    // literals and nested parens don't count).
+    static int callArgCount(const std::string &args) {
+        if (args.find_first_not_of(' ') == std::string::npos) return 0;
+        int n = 1, depth = 0; bool inStr = false;
+        for (size_t k = 0; k < args.size(); k++) {
+            char c = args[k];
+            if (c == '"' && (k == 0 || args[k-1] != '\\')) inStr = !inStr;
+            else if (inStr) continue;
+            else if (c == '(' || c == '[') depth++;
+            else if (c == ')' || c == ']') depth--;
+            else if (c == ',' && depth == 0) n++;
+        }
+        return n;
+    }
+
+    // True when none of a call's comma-separated args is a float (per the backend's own isFloatVal).
+    // `math.mod` is type-preserving (int args -> int result, like PY's dynamic behavior): backends
+    // whose ilib returns a double must route int args through the int variant so the result can be
+    // used as an array index / bitwise operand / int parameter.
+    static bool callArgsAllInt(const std::string &args, const std::function<bool(const std::string&)> &isFloat) {
+        std::string cur; int depth = 0; bool inStr = false;
+        auto chk = [&](std::string t) {
+            size_t a = t.find_first_not_of(' '), b = t.find_last_not_of(' ');
+            if (a == std::string::npos) return true;
+            return !isFloat(t.substr(a, b - a + 1));
+        };
+        for (size_t k = 0; k < args.size(); k++) {
+            char c = args[k];
+            if (c == '"' && (k == 0 || args[k-1] != '\\')) inStr = !inStr;
+            if (!inStr) {
+                if (c == '(' || c == '[') depth++;
+                else if (c == ')' || c == ']') depth--;
+                else if (c == ',' && depth == 0) { if (!chk(cur)) return false; cur.clear(); continue; }
+            }
+            cur += c;
+        }
+        return chk(cur);
+    }
 
     // How an ilib (LIB_CALL) argument is passed. C++ overrides: std::string → .c_str()
     // (ilib ABI surfaces are const char*; #C5).
@@ -1332,6 +1413,19 @@ class PythonStrategy : public BackendStrategy
         for (auto& [k, v] : varCastTypes_) if (v == IRType::ATOMIC) return true;
         return false;
     }
+    int intWidthVar(const std::string& var) const {
+        auto it = varCastTypes_.find(var);
+        return it != varCastTypes_.end() ? irIntWidth(it->second) : 0;
+    }
+    // Python ints are arbitrary-precision, so `short`/`mini` need an explicit two's-complement
+    // wrap to match every other backend's native fixed-width overflow (C/C++/Java/Rust/Go cast,
+    // JS's real WASM i32/i16 wrap — see JavaScriptStrategy::emitTypedStoreVar). `(expr + mid) %
+    // m - mid` stays correct for negative expr because Python's `%` always returns a
+    // non-negative result against a positive modulus.
+    static std::string pyWrapInt(int width, const std::string& expr) {
+        long long m = 1LL << width, mid = m / 2;
+        return "((" + expr + " + " + std::to_string(mid) + ") % " + std::to_string(m) + " - " + std::to_string(mid) + ")";
+    }
 
     void emit(std::ostringstream &out, int indent, const std::string &line) override
     {
@@ -1514,9 +1608,11 @@ class PythonStrategy : public BackendStrategy
                       const std::string &var, const std::string &src, IRType t) override
     {
         if      (t == IRType::FLOAT)  emit(out, indent, var + " = float(" + src + ")");
-        // Python has no fixed-width int type, so short/mini are plain ints (width is advisory here).
-        else if (t == IRType::INT || t == IRType::SHORT || t == IRType::MINI)
-                                      emit(out, indent, var + " = int(" + src + ")");
+        else if (t == IRType::INT)   emit(out, indent, var + " = int(" + src + ")");
+        // Python has no fixed-width int type — wrap by hand so overflow matches every other
+        // backend's native truncation (see pyWrapInt's comment).
+        else if (t == IRType::SHORT || t == IRType::MINI)
+                                      emit(out, indent, var + " = " + pyWrapInt(irIntWidth(t), "int(" + src + ")"));
         else if (t == IRType::ATOMIC) emit(out, indent, "with _ac_atomic_lock: " + var + " = int(" + src + ")");
         else if (t == IRType::STRING)
             emit(out, indent, var + " = " + (smartPrint_ ? "_ac_smartfmt(" + src + ")"
@@ -1542,6 +1638,8 @@ class PythonStrategy : public BackendStrategy
         // would happily let x silently become a float otherwise, which is why this was
         // the one backend where the bug was invisible without a matching fix.
         std::string rhs = (isAtomicVar(var) && looksFloat(val)) ? "int(" + val + ")" : val;
+        int w = intWidthVar(var);
+        if (w) rhs = pyWrapInt(w, rhs);
         emit(out, indent, var + " = " + rhs);
     }
     void emitLockBegin(std::ostringstream &out, int &indent) override {
@@ -3387,6 +3485,9 @@ private:
     std::unordered_map<std::string, std::string> rangeOf_;
     std::unordered_map<std::string, std::pair<std::string,std::string>> seqOf_;
     std::map<std::string, int> funcTypedParams_; // param → arity
+    std::map<std::string, int> protoRetKind_;    // user fn → retKind (0 int,1 float,2 list,3 string,4 void)
+    bool curFuncReturnsDyn_ = false;             // current function returns a boxed AcDynVal
+    bool supportsBoxedReturn() const override { return true; }
     bool returnIsFloat_ = false;
 
     void setVarCastTypes(const std::map<std::string, IRType>& m) override { varCastTypes_ = m; }
@@ -3499,31 +3600,38 @@ private:
         // these helpers explicitly instead of relying on `x + 3` just working. Emitted
         // unconditionally (cheap; boxedVars_ itself is computed per-function, after emitHeader
         // has already run, so there's no cheap whole-program precheck to gate this on).
-        emitRaw(out, "typedef struct { int tag; long long i; double d; const char* s; } AcDynVal;");
-        emitRaw(out, "static AcDynVal ac_dyn_i(long long v) { AcDynVal r; r.tag=0; r.i=v; r.d=0; r.s=0; return r; }");
-        emitRaw(out, "static AcDynVal ac_dyn_f(double v) { AcDynVal r; r.tag=1; r.i=0; r.d=v; r.s=0; return r; }");
-        emitRaw(out, "static AcDynVal ac_dyn_s(const char* v) { AcDynVal r; r.tag=2; r.i=0; r.d=0; r.s=v?v:\"\"; return r; }");
-        emitRaw(out, "static AcDynVal ac_dyn_b(long long v) { AcDynVal r; r.tag=3; r.i=v?1:0; r.d=0; r.s=0; return r; }");
+        emitRaw(out, "typedef struct { int tag; long long i; double d; const char* s; int sm; } AcDynVal;");
+        emitRaw(out, "static AcDynVal ac_dyn_i(long long v) { AcDynVal r; r.tag=0; r.i=v; r.d=0; r.s=0; r.sm=0; return r; }");
+        emitRaw(out, "static AcDynVal ac_dyn_f(double v) { AcDynVal r; r.tag=1; r.i=0; r.d=v; r.s=0; r.sm=0; return r; }");
+        emitRaw(out, "static AcDynVal ac_dyn_s(const char* v) { AcDynVal r; r.tag=2; r.i=0; r.d=0; r.s=v?v:\"\"; r.sm=0; return r; }");
+        emitRaw(out, "static AcDynVal ac_dyn_b(long long v) { AcDynVal r; r.tag=3; r.i=v?1:0; r.d=0; r.s=0; r.sm=0; return r; }");
         emitRaw(out, "static double ac_dyn_asd(AcDynVal v) { return v.tag==1?v.d : (double)v.i; }");
         emitRaw(out, "static long long ac_dyn_asi(AcDynVal v) { return v.tag==1?(long long)v.d : v.i; }");
+        // A float carries `sm` = it came from smart division `/` (a whole value displays as an int);
+        // arithmetic keeps that only while no operand is a HARD float (literal / `///` / float math) —
+        // the same NONE/SMART/HARD join SmartPass applies to statically-typed values.
+        emitRaw(out, "static int ac_dyn_smok(AcDynVal v) { return !(v.tag==1 && !v.sm); }");
+        emitRaw(out, "static AcDynVal ac_dyn_fr(double d, AcDynVal a, AcDynVal b) { AcDynVal r = ac_dyn_f(d); r.sm = ac_dyn_smok(a) && ac_dyn_smok(b); return r; }");
         emitRaw(out, "static char* ac_dyn_str(AcDynVal v) {");
         emitRaw(out, "    char* r;");
         emitRaw(out, "    if (v.tag==2) { r = malloc(strlen(v.s)+1); strcpy(r, v.s); return r; }");
         emitRaw(out, "    if (v.tag==3) { r = malloc(6); strcpy(r, v.i ? \"true\" : \"false\"); return r; }");
-        emitRaw(out, "    r = malloc(32);");
-        emitRaw(out, "    if (v.tag==0) { snprintf(r, 32, \"%lld\", v.i); return r; }");
-        emitRaw(out, "    { long long xi=(long long)v.d; if ((double)xi==v.d) snprintf(r,32,\"%lld\",xi); else snprintf(r,32,\"%.17g\",v.d); }");
+        emitRaw(out, "    r = malloc(64);");
+        emitRaw(out, "    if (v.tag==0) { snprintf(r, 64, \"%lld\", v.i); return r; }");
+        emitRaw(out, "    if (v.sm && v.d > -9.2e18 && v.d < 9.2e18 && v.d == (double)(long long)v.d) { snprintf(r,64,\"%lld\",(long long)v.d); return r; }");
+        emitRaw(out, "    snprintf(r, 64, \"%.16g\", v.d);");
+        emitRaw(out, "    if (!strpbrk(r, \".eEnN\")) strcat(r, \".0\");");
         emitRaw(out, "    return r;");
         emitRaw(out, "}");
         emitRaw(out, "static void ac_dyn_print(AcDynVal v) { char* s = ac_dyn_str(v); printf(\"%s\\n\", s); free(s); }");
         emitRaw(out, "static AcDynVal ac_dyn_add(AcDynVal a, AcDynVal b) {");
         emitRaw(out, "    if (a.tag==2 || b.tag==2) { char* as=ac_dyn_str(a); char* bs=ac_dyn_str(b); char* r=malloc(strlen(as)+strlen(bs)+1); strcpy(r,as); strcat(r,bs); free(as); free(bs); return ac_dyn_s(r); }");
-        emitRaw(out, "    if (a.tag==1 || b.tag==1) return ac_dyn_f(ac_dyn_asd(a)+ac_dyn_asd(b));");
+        emitRaw(out, "    if (a.tag==1 || b.tag==1) return ac_dyn_fr(ac_dyn_asd(a)+ac_dyn_asd(b), a, b);");
         emitRaw(out, "    return ac_dyn_i(ac_dyn_asi(a)+ac_dyn_asi(b));");
         emitRaw(out, "}");
-        emitRaw(out, "static AcDynVal ac_dyn_sub(AcDynVal a, AcDynVal b) { return (a.tag==1||b.tag==1) ? ac_dyn_f(ac_dyn_asd(a)-ac_dyn_asd(b)) : ac_dyn_i(ac_dyn_asi(a)-ac_dyn_asi(b)); }");
-        emitRaw(out, "static AcDynVal ac_dyn_mul(AcDynVal a, AcDynVal b) { return (a.tag==1||b.tag==1) ? ac_dyn_f(ac_dyn_asd(a)*ac_dyn_asd(b)) : ac_dyn_i(ac_dyn_asi(a)*ac_dyn_asi(b)); }");
-        emitRaw(out, "static AcDynVal ac_dyn_div(AcDynVal a, AcDynVal b) { return ac_dyn_f(ac_dyn_asd(a)/ac_dyn_asd(b)); }");
+        emitRaw(out, "static AcDynVal ac_dyn_sub(AcDynVal a, AcDynVal b) { return (a.tag==1||b.tag==1) ? ac_dyn_fr(ac_dyn_asd(a)-ac_dyn_asd(b), a, b) : ac_dyn_i(ac_dyn_asi(a)-ac_dyn_asi(b)); }");
+        emitRaw(out, "static AcDynVal ac_dyn_mul(AcDynVal a, AcDynVal b) { return (a.tag==1||b.tag==1) ? ac_dyn_fr(ac_dyn_asd(a)*ac_dyn_asd(b), a, b) : ac_dyn_i(ac_dyn_asi(a)*ac_dyn_asi(b)); }");
+        emitRaw(out, "static AcDynVal ac_dyn_div(AcDynVal a, AcDynVal b) { AcDynVal r = ac_dyn_f(ac_dyn_asd(a)/ac_dyn_asd(b)); r.sm = 1; return r; }");
         emitRaw(out, "static long long ac_dyn_eq(AcDynVal a, AcDynVal b) { return (a.tag==2||b.tag==2) ? (strcmp(ac_dyn_str(a),ac_dyn_str(b))==0) : (ac_dyn_asd(a)==ac_dyn_asd(b)); }");
         emitRaw(out, "static long long ac_dyn_lt(AcDynVal a, AcDynVal b) { return (a.tag==2||b.tag==2) ? (strcmp(ac_dyn_str(a),ac_dyn_str(b))<0) : (ac_dyn_asd(a)<ac_dyn_asd(b)); }");
         emitRaw(out, "static long long ac_dyn_gt(AcDynVal a, AcDynVal b) { return (a.tag==2||b.tag==2) ? (strcmp(ac_dyn_str(a),ac_dyn_str(b))>0) : (ac_dyn_asd(a)>ac_dyn_asd(b)); }");
@@ -4139,8 +4247,14 @@ private:
         // explicitly call the right ac_dyn_* helper and wrap any non-boxed operand (a plain
         // literal or ordinary var) via boxWrap — see AcDynVal's comment in emitHeader. Must run
         // BEFORE the string-forcing branch below (ac_concat has no AcDynVal overload).
+        const bool bitwiseOp = op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>";
         if (boxedVars_.count(lhs) || boxedVars_.count(rhs)) {
             std::string l = boxWrap(lhs), r = boxWrap(rhs);
+            if (bitwiseOp) {   // bitwise ops work on the integer value of the tagged operands
+                emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = ac_dyn_i(ac_dyn_asi(" + l + ") "
+                                  + op + " ac_dyn_asi(" + r + "));");
+                return;
+            }
             std::string fn = op=="+" ? "ac_dyn_add" : op=="-" ? "ac_dyn_sub" : (op=="*"||op=="@") ? "ac_dyn_mul" : "ac_dyn_div";
             emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + fn + "(" + l + ", " + r + ");");
             return;
@@ -4154,6 +4268,15 @@ private:
             std::string expr = "ac_concat(" + lhs + ", " + rhs + ")";
             bool isNew = declared.insert(res).second;
             emit(out, indent, (isNew ? "ac_str " : "") + res + " = " + expr + ";");
+            return;
+        }
+        if (bitwiseOp && (isFloatVal(lhs) || isFloatVal(rhs))) {
+            // `&`, `|`, `^`, shifts are integer operations: a float operand (e.g. a math.mod result, or a
+            // folded 1e12) is truncated to an integer first, and the result is an integer.
+            std::string l = isFloatVal(lhs) ? "(ac_int)(" + lhs + ")" : lhs;
+            std::string r = isFloatVal(rhs) ? "(ac_int)(" + rhs + ")" : rhs;
+            bool isNewB = declared.insert(res).second;
+            emit(out, indent, (isNewB ? "ac_int " : "") + res + " = " + l + " " + op + " " + r + ";");
             return;
         }
         bool isFloat = isFloatVal(lhs) || isFloatVal(rhs);
@@ -4513,6 +4636,11 @@ private:
     {
         if (cWidgetCtor(out, indent, res, func, args)) return;
         if (cWidgetMethod(out, indent, res, func, args)) return;
+        if ((func == "math_mod" || func == "math.mod") && !res.empty()
+            && callArgsAllInt(args, [&](const std::string &t) { return isFloatVal(t); })) {
+            emitCall(out, indent, res, "math_mod_int", args);   // int args -> int result (type-preserving)
+            return;
+        }
         if (func == "ac_length" && !res.empty()) {
             std::string pre = declared.insert(res).second ? "ac_int " : "";  // register! (a later
             // `res = res - 1` must NOT re-declare/shadow — that was UB + an infinite loop)
@@ -4543,6 +4671,11 @@ private:
             }
         }
         std::string call = func + "(" + args + ")";
+        // The callee itself returns a tagged value: the result is already an AcDynVal, no wrapping.
+        if (!res.empty() && boxedRetFuncs_.count(func)) {
+            emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + call + ";");
+            return;
+        }
         // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
         // see AcDynVal's comment in emitHeader.
         if (!res.empty() && boxedVars_.count(res)) {
@@ -4594,7 +4727,7 @@ private:
             }
             return;
         }
-        if (!val.empty()) emit(out, indent, "return " + val + ";");
+        if (!val.empty()) emit(out, indent, "return " + (curFuncReturnsDyn_ ? boxWrap(val) : val) + ";");
     }
     void emitIntDiv(std::ostringstream &out, int &indent, const std::string &res,
                     const std::string &lhs, const std::string &rhs) override
@@ -4922,7 +5055,8 @@ private:
             emit(out, indent, "char " + result + "[2] = { " + arr + "[" + idx + "], 0 };");
             return;
         }
-        emit(out, indent, decl(result, arr + "[" + idx + "]"));
+        // math.mod / float arithmetic yields a `double` temp; a C array subscript must be an integer.
+        emit(out, indent, decl(result, arr + "[" + (floatVars.count(idx) ? "(ac_int)(" + idx + ")" : idx) + "]"));
     }
     void emitStoreIndex(std::ostringstream &out, int &indent,
                         const std::string &arr, const std::string &idx,
@@ -4935,7 +5069,19 @@ private:
                 emit(out, indent, "ac_dict_set(" + arr + ", " + idx + ", " + val + ");");
             return;
         }
-        emit(out, indent, arr + "[" + idx + "] = " + val + ";");
+        std::string sidx = floatVars.count(idx) ? "(ac_int)(" + idx + ")" : idx;
+        std::string sval = val;
+        auto pf = protoRetKind_.find(val);
+        if (pf != protoRetKind_.end() && !declared.count(val)) {
+            // a user function stored as a value (`funcs=[f1,f2]`): keep its address in the int slot
+            if (pf->second != 0)
+                throw ACError::backend("function '" + val + "' can't be stored in a list: function values "
+                                       "held in a list must take and return integers (it returns a "
+                                       + std::string(pf->second == 1 ? "float" : pf->second == 3 ? "string"
+                                                     : pf->second == 2 ? "list" : "nothing") + ")");
+            sval = "(ac_int)(intptr_t)" + val;
+        }
+        emit(out, indent, arr + "[" + sidx + "] = " + sval + ";");
     }
     void emitInput(std::ostringstream &out, int &indent,
                    const std::string &result, const std::string &prompt) override
@@ -5039,8 +5185,10 @@ private:
     void emitFunctionPrototype(std::ostringstream &out, const std::string &name,
                                const std::string &params, int retKind) override
     {
+        protoRetKind_[name] = retKind;   // emitStoreIndex: only int-returning functions fit a list slot
         auto cf = classReturnFuncs_.find(name);
         std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
+                         : boxedRetFuncs_.count(name) ? "AcDynVal "
                          : retKind == 4 ? "void " : retKind == 2 ? "ac_int* " : retKind == 3 ? "ac_str " : retKind == 1 ? "double " : "ac_int ";
         emit(out, 0, ret + name + "(" + typedParamListC(params, name) + ");");
     }
@@ -5163,6 +5311,8 @@ private:
         // entirely, since none of those scans know about bundle classes.
         auto classRetIt = classReturnFuncs_.find(name);
         if (classRetIt != classReturnFuncs_.end()) retT = classRetIt->second;
+        curFuncReturnsDyn_ = classOwner.empty() && boxedRetFuncs_.count(name) > 0;
+        if (curFuncReturnsDyn_) retT = "AcDynVal";   // returns a var whose type cycles (see detectBoxedVars)
         returnIsFloat_ = false; returnIsList_ = false; baseReturnIsString_ = false; returnIsVoid_ = false;
         emit(out, indent, retT + " " + cName + "(" + tparams + ") {");
         indent++;
@@ -5170,7 +5320,8 @@ private:
         for (const auto& [v, t] : hoistVars_) {
             if (declared.count(v)) continue;
             std::string line;
-            if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
+            if      (boxedVars_.count(v))  line = "AcDynVal " + v + " = ac_dyn_i(0);";
+            else if (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
             else if (t == IRType::STRING)   line = "const char* " + v + " = 0;";
             else if (t == IRType::LIST)     line = "ac_int* " + v + " = 0;";
             else if (isNarrowInt(t))        line = std::string(acIntTy(t)) + " " + v + " = 0;";
@@ -5231,6 +5382,13 @@ private:
             }
         }
         std::string call = func + "(" + args + ")";
+        // A callee that isn't a function-typed parameter is a function VALUE loaded out of an int
+        // list slot (`funcs[k](x)`): cast the address back to `ac_int (*)(ac_int, ...)`.
+        if (func.rfind("t_", 0) == 0) {   // a temp callee = a function VALUE out of a list (a parameter callee keeps its own type)
+            std::string sig;
+            for (int k = 0; k < callArgCount(args); k++) sig += (k ? ", ac_int" : "ac_int");
+            call = "((ac_int (*)(" + (sig.empty() ? std::string("void") : sig) + "))" + func + ")(" + args + ")";
+        }
         if (res.empty())
             emit(out, indent, call + ";");
         else
@@ -5306,6 +5464,27 @@ private:
         // is not otherwise hoisted, so a bare assignment left it undeclared. Guarded by `declared`,
         // so hoisted vars (already in the set) get a plain assignment instead (no double-declare).
         bool isNew = declared.insert(var).second;
+        // Casting a BOXED source (`to_string(x)` where x is a tagged value): read out of the tag —
+        // ac_to_str/atoll on an AcDynVal struct would be a hard type error.
+        if (boxedVars_.count(src)) {
+            std::string conv = (t == IRType::STRING) ? "ac_dyn_str(" + src + ")"
+                             : (t == IRType::FLOAT)  ? "ac_dyn_asd(" + src + ")"
+                             :                          "ac_dyn_asi(" + src + ")";
+            if (boxedVars_.count(var)) {
+                std::string wrap = (t == IRType::STRING) ? "ac_dyn_s(" + conv + ")"
+                                 : (t == IRType::FLOAT)  ? "ac_dyn_f(" + conv + ")" : "ac_dyn_i(" + conv + ")";
+                emit(out, indent, (isNew ? "AcDynVal " : "") + var + " = " + wrap + ";");
+            } else if (t == IRType::STRING) {
+                emit(out, indent, (isNew ? "ac_str " : "") + var + " = " + conv + ";");
+                if (isNew) strVars.insert(var);
+            } else if (t == IRType::FLOAT) {
+                floatVars.insert(var);
+                emit(out, indent, (isNew ? "double " : "") + var + " = " + conv + ";");
+            } else {
+                emit(out, indent, (isNew ? "ac_int " : "") + var + " = (ac_int)" + conv + ";");
+            }
+            return;
+        }
         // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point. `src` is
         // already a well-typed C expression for `t`; box it directly rather than running any of
         // the branches below (which all assume a single, ALREADY-consistent declared type).
@@ -5461,6 +5640,9 @@ protected:
     std::unordered_map<std::string, std::string> rangeOf_;
     std::unordered_map<std::string, std::pair<std::string,std::string>> seqOf_;
     std::map<std::string, int> funcTypedParams_;
+    std::map<std::string, int> protoRetKind_;    // user fn -> retKind (0 int,1 float,2 list,3 string,4 void)
+    bool curFuncReturnsDyn_ = false;             // current function returns a boxed AcDynVal
+    bool supportsBoxedReturn() const override { return true; }
     bool returnIsFloat_ = false;
     bool returnIsList_ = false;
     bool returnIsVoid_ = false;
@@ -5595,7 +5777,7 @@ protected:
         // emitHeader has already run.
         emitRaw(out, "struct AcDynVal {");
         emitRaw(out, "    enum Tag { T_INT, T_FLOAT, T_STRING, T_BOOL } tag;");
-        emitRaw(out, "    long long i; double d; std::string s; bool b;");
+        emitRaw(out, "    long long i; double d; std::string s; bool b; bool sm = false;");   // sm: float from smart `/`
         emitRaw(out, "    AcDynVal() : tag(T_INT), i(0), d(0), b(false) {}");
         emitRaw(out, "    AcDynVal(int v) : tag(T_INT), i(v), d(0), b(false) {}");
         emitRaw(out, "    AcDynVal(long long v) : tag(T_INT), i(v), d(0), b(false) {}");
@@ -5610,17 +5792,21 @@ protected:
         emitRaw(out, "        if (tag == T_STRING) return s;");
         emitRaw(out, "        if (tag == T_BOOL) return b ? \"true\" : \"false\";");
         emitRaw(out, "        if (tag == T_INT) return std::to_string(i);");
-        emitRaw(out, "        long long xi = (long long)d; if ((double)xi == d) return std::to_string(xi);");
-        emitRaw(out, "        char buf[32]; std::snprintf(buf, sizeof(buf), \"%.17g\", d); return buf;");
+        emitRaw(out, "        if (sm && d > -9.2e18 && d < 9.2e18 && d == (double)(long long)d) return std::to_string((long long)d);");
+        emitRaw(out, "        char buf[64]; std::snprintf(buf, sizeof(buf), \"%.16g\", d);");
+        emitRaw(out, "        if (!std::strpbrk(buf, \".eEnN\")) std::strcat(buf, \".0\");");
+        emitRaw(out, "        return buf;");
         emitRaw(out, "    }");
         emitRaw(out, "    AcDynVal operator+(const AcDynVal& o) const {");
         emitRaw(out, "        if (tag == T_STRING || o.tag == T_STRING) return AcDynVal(asStr() + o.asStr());");
-        emitRaw(out, "        if (tag == T_FLOAT || o.tag == T_FLOAT) return AcDynVal(asDouble() + o.asDouble());");
+        emitRaw(out, "        if (tag == T_FLOAT || o.tag == T_FLOAT) return fr(asDouble() + o.asDouble(), *this, o);");
         emitRaw(out, "        return AcDynVal(asLL() + o.asLL());");
         emitRaw(out, "    }");
-        emitRaw(out, "    AcDynVal operator-(const AcDynVal& o) const { return (tag==T_FLOAT||o.tag==T_FLOAT) ? AcDynVal(asDouble()-o.asDouble()) : AcDynVal(asLL()-o.asLL()); }");
-        emitRaw(out, "    AcDynVal operator*(const AcDynVal& o) const { return (tag==T_FLOAT||o.tag==T_FLOAT) ? AcDynVal(asDouble()*o.asDouble()) : AcDynVal(asLL()*o.asLL()); }");
-        emitRaw(out, "    AcDynVal operator/(const AcDynVal& o) const { return AcDynVal(asDouble()/o.asDouble()); }");
+        emitRaw(out, "    bool smOk() const { return !(tag == T_FLOAT && !sm); }   // int / smart float: keeps smart display");
+        emitRaw(out, "    static AcDynVal fr(double v, const AcDynVal& a, const AcDynVal& b) { AcDynVal r(v); r.sm = a.smOk() && b.smOk(); return r; }");
+        emitRaw(out, "    AcDynVal operator-(const AcDynVal& o) const { return (tag==T_FLOAT||o.tag==T_FLOAT) ? fr(asDouble()-o.asDouble(), *this, o) : AcDynVal(asLL()-o.asLL()); }");
+        emitRaw(out, "    AcDynVal operator*(const AcDynVal& o) const { return (tag==T_FLOAT||o.tag==T_FLOAT) ? fr(asDouble()*o.asDouble(), *this, o) : AcDynVal(asLL()*o.asLL()); }");
+        emitRaw(out, "    AcDynVal operator/(const AcDynVal& o) const { AcDynVal r(asDouble()/o.asDouble()); r.sm = true; return r; }");
         emitRaw(out, "    bool operator==(const AcDynVal& o) const { return (tag==T_STRING||o.tag==T_STRING) ? asStr()==o.asStr() : asDouble()==o.asDouble(); }");
         emitRaw(out, "    bool operator!=(const AcDynVal& o) const { return !(*this == o); }");
         emitRaw(out, "    bool operator<(const AcDynVal& o) const { return (tag==T_STRING||o.tag==T_STRING) ? asStr()<o.asStr() : asDouble()<o.asDouble(); }");
@@ -6153,6 +6339,21 @@ protected:
         // operator+/-/*// that already does the right runtime-tag-dispatched thing; `auto res =
         // lhs op rhs;` further down lets AcDynVal's own operators drive `res`'s deduced type.
         bool anyBoxed = boxedVars_.count(lhs) || boxedVars_.count(rhs);
+        if (op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+            // integer operations: a boxed operand contributes its integer value, a float operand (a math.mod
+            // result, a folded 1e12) is truncated first; the result is always an integer.
+            // Always cast: a `double` temp declared via `auto` (a math.mod result) isn't in floatVars, so
+            // isFloatVal alone can't be trusted to catch every float operand — and for an int the cast is free.
+            auto asInt = [&](const std::string &v) {
+                return boxedVars_.count(v) ? v + ".asLL()" : "(long long)(" + v + ")";
+            };
+            {
+                bool isNewB = declared.insert(res).second;
+                std::string e = "(long long)(" + asInt(lhs) + " " + op + " " + asInt(rhs) + ")";
+                emit(out, indent, (isNewB ? std::string(anyBoxed ? "AcDynVal " : "long long ") : std::string()) + res + " = " + e + ";");
+                return;
+            }
+        }
         if (op == "+" && !anyBoxed) {
             bool lStr = looksString(lhs) || isStringVar(lhs);
             bool rStr = looksString(rhs) || isStringVar(rhs);
@@ -6166,7 +6367,7 @@ protected:
                 return;
             }
         }
-        bool isFloat = isFloatVal(lhs) || isFloatVal(rhs);
+        bool isFloat = (isFloatVal(lhs) || isFloatVal(rhs)) && !anyBoxed;   // a boxed operand's own operators pick the type
         std::string expr = lhs + " " + op + " " + rhs;
         bool isNew = declared.insert(res).second;
         if (isNew && isFloat)  { floatVars.insert(res); emit(out, indent, "double " + res + " = " + expr + ";"); }
@@ -6200,6 +6401,15 @@ protected:
         if (func == "ac_length" && !res.empty()) {
             std::string lenExpr = looksString(args) ? ("strlen(" + args + ")") : ("(" + args + ").size()");
             emit(out, indent, decl(res, "(long long)" + lenExpr));
+            return;
+        }
+        if ((func == "math_mod" || func == "math.mod") && !res.empty()
+            && callArgsAllInt(args, [&](const std::string &t) { return isFloatVal(t); })) {
+            emitCall(out, indent, res, "math_mod_int", args);   // int args -> int result (type-preserving)
+            return;
+        }
+        if (!res.empty() && boxedRetFuncs_.count(func)) {   // callee returns a tagged value: keep it boxed
+            emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + func + "(" + args + ");");
             return;
         }
         std::string cfunc = func;
@@ -6278,6 +6488,7 @@ protected:
             // in function returning 'void'") — was NEVER checked before, verified: any AC void
             // function with no explicit return failed to compile on CPP.
             if (curFuncReturnIsVoid_) { emit(out, indent, "return;"); return; }
+            if (curFuncReturnsDyn_) { emit(out, indent, "return AcDynVal();"); return; }
             // A class-returning function's IMPLICIT trailing return (unreachable after the
             // real `return p;`, but C++ — unlike javac — never complains about unreachable
             // code, so it still has to COMPILE, just never execute) needs a real default-
@@ -6290,7 +6501,7 @@ protected:
                           :                          "return 0;";
             emit(out, indent, z);
         }
-        else emit(out, indent, "return " + val + ";");
+        else emit(out, indent, "return " + (curFuncReturnsDyn_ ? "AcDynVal(" + val + ")" : val) + ";");
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
@@ -6492,7 +6703,8 @@ protected:
             thread_local int rngC = 0;
             std::string iv = "_ac_rng_i_" + std::to_string(rngC++);
             cppListVars_.insert(var);
-            emit(out, indent, "std::vector<long long> " + var + ";");
+            emit(out, indent, promotedGlobals_.count(var) ? var + ".clear();"       // file-scope global: reuse it
+                                                          : "std::vector<long long> " + var + ";");
             if (step.empty()) {
                 emit(out, indent, "for (long long " + iv + " = (" + a + "); " + iv + " < (" + b + "); " + iv + "++) "
                                  + var + ".push_back(" + iv + ");");
@@ -6533,7 +6745,11 @@ protected:
                 return;
             }
             cppListVars_.insert(var);
-            emit(out, indent, "std::vector<long long> " + var + " = {" + content + "};");
+            // A promoted (NA->free) list is a FILE-SCOPE global already declared `std::vector<long long> v;`
+            // — declaring it again here made a local that shadowed it, so every function that read the
+            // global saw an empty vector (verified: segfault indexing `funcs` from inside a function).
+            emit(out, indent, std::string(promotedGlobals_.count(var) ? "" : "std::vector<long long> ")
+                              + var + " = {" + content + "};");
             declared.insert(var);
         }
     }
@@ -6566,7 +6782,18 @@ protected:
                         const std::string &arr, const std::string &idx,
                         const std::string &val) override
     {
-        emit(out, indent, arr + "[" + idx + "] = " + val + ";");
+        std::string sval = val;
+        auto pf = protoRetKind_.find(val);
+        if (pf != protoRetKind_.end() && !declared.count(val)) {
+            // a user function stored as a value (`funcs=[f1,f2]`): keep its address in the int slot
+            if (pf->second != 0)
+                throw ACError::backend("function '" + val + "' can't be stored in a list: function values "
+                                       "held in a list must take and return integers (it returns a "
+                                       + std::string(pf->second == 1 ? "float" : pf->second == 3 ? "string"
+                                                     : pf->second == 2 ? "list" : "nothing") + ")");
+            sval = "(long long)(intptr_t)" + val;
+        }
+        emit(out, indent, arr + "[" + idx + "] = " + sval + ";");
     }
     void emitInput(std::ostringstream &out, int &indent,
                    const std::string &result, const std::string &prompt) override
@@ -6655,8 +6882,10 @@ protected:
     void emitFunctionPrototype(std::ostringstream &out, const std::string &name,
                                const std::string &params, int retKind) override
     {
+        protoRetKind_[name] = retKind;
         auto cf = classReturnFuncs_.find(name);
         std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
+                        : boxedRetFuncs_.count(name) ? "AcDynVal "
                         : retKind == 4 ? "void "
                         : retKind == 2 ? "std::vector<long long> "
                         : retKind == 3 ? "std::string "
@@ -6814,6 +7043,8 @@ protected:
             curFuncReturnClass_ = classRetIt != classReturnFuncs_.end() ? classRetIt->second : "";
             if (classRetIt != classReturnFuncs_.end()) retType = classRetIt->second + " ";
         }
+        curFuncReturnsDyn_ = classOwner.empty() && boxedRetFuncs_.count(name) > 0;
+        if (curFuncReturnsDyn_) retType = "AcDynVal ";   // returns a var whose type cycles (see detectBoxedVars)
         returnIsFloat_ = false; returnIsList_ = false; baseReturnIsString_ = false; returnIsVoid_ = false;
         emit(out, indent, retType + cppName + "(" + tparams + ") {");
         indent++;
@@ -6822,7 +7053,8 @@ protected:
         for (const auto& [v, t] : hoistVars_) {
             if (declared.count(v)) continue;
             std::string line;
-            if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double "  + v + " = 0;"; }
+            if      (boxedVars_.count(v))  line = "AcDynVal " + v + ";";
+            else if (t == IRType::FLOAT)  { floatVars.insert(v); line = "double "  + v + " = 0;"; }
             else if (t == IRType::STRING)   line = "std::string " + v + ";";
             else if (t == IRType::LIST)     line = "std::vector<long long> " + v + ";";
             else                            line = "long long "  + v + " = 0;";
@@ -6878,6 +7110,12 @@ protected:
                           const std::string &args) override
     {
         std::string call = func + "(" + args + ")";
+        // callee that isn't a function-typed parameter = a function VALUE loaded from an int list slot
+        if (func.rfind("t_", 0) == 0) {   // a temp callee = a function VALUE out of a list (a parameter callee keeps its own type)
+            std::string sig;
+            for (int k = 0; k < callArgCount(args); k++) sig += (k ? ", long long" : "long long");
+            call = "((long long (*)(" + (sig.empty() ? std::string("void") : sig) + "))" + func + ")(" + args + ")";
+        }
         if (res.empty())
             emit(out, indent, call + ";");
         else
@@ -6932,6 +7170,21 @@ protected:
         // check still works without any extra help from floatVars here.
         bool isNew = declared.insert(var).second;
         bool srcIsStr = (!src.empty() && src.front() == '"') || isStringVar(src);
+        // Casting a BOXED source (`to_string(x)` where x is tagged): read the value out of the tag.
+        if (boxedVars_.count(src)) {
+            std::string conv = (t == IRType::STRING) ? src + ".asStr()" : (t == IRType::FLOAT) ? src + ".asDouble()" : src + ".asLL()";
+            if (boxedVars_.count(var))
+                emit(out, indent, (isNew ? "AcDynVal " : "") + var + " = " + conv + ";");
+            else if (t == IRType::STRING) {
+                emit(out, indent, (isNew ? "std::string " : "") + var + " = " + conv + ";");
+                if (isNew) stringVars_.insert(var);
+            } else if (t == IRType::FLOAT) {
+                floatVars.insert(var);
+                emit(out, indent, (isNew ? "double " : "") + var + " = " + conv + ";");
+            } else
+                emit(out, indent, (isNew ? "long long " : "") + var + " = " + conv + ";");
+            return;
+        }
         // Boxed var (see AcDynVal's comment in emitHeader): this IS the actual retype point —
         // build the same well-typed RHS expression the branches below already know how to build
         // for each target type, then let AcDynVal's constructor box it. No redeclare needed
@@ -7426,6 +7679,10 @@ public:
 
 class JavaStrategy : public BackendStrategy
 {
+    bool curFuncReturnsDyn_ = false;   // current function returns a boxed AcDynVal
+    std::map<std::string, std::string> listGlobalTypes_;   // promoted (NA->free) list global -> element type (Long/String)
+    bool supportsBoxedReturn() const override { return true; }
+    bool usesFuncIds() const override { return true; }
     std::set<std::string> declared;
     std::set<std::string> userStringFuncs_;
     void setStringReturnFuncs(const std::set<std::string>& s) override { userStringFuncs_ = s; }
@@ -7807,7 +8064,7 @@ class JavaStrategy : public BackendStrategy
         // explicitly instead of `x + 3` just working. Emitted unconditionally (cheap).
         emitRaw(out, "final class AcDynVal {");
         emitRaw(out, "    static final int T_INT=0, T_FLOAT=1, T_STRING=2, T_BOOL=3;");
-        emitRaw(out, "    int tag; long i; double d; String s; boolean b;");
+        emitRaw(out, "    int tag; long i; double d; String s; boolean b; boolean sm;   // sm: float from smart `/` (whole value shows as an int)");
         emitRaw(out, "    static AcDynVal ofInt(long v) { AcDynVal r=new AcDynVal(); r.tag=T_INT; r.i=v; return r; }");
         emitRaw(out, "    static AcDynVal ofFloat(double v) { AcDynVal r=new AcDynVal(); r.tag=T_FLOAT; r.d=v; return r; }");
         emitRaw(out, "    static AcDynVal ofString(String v) { AcDynVal r=new AcDynVal(); r.tag=T_STRING; r.s=v==null?\"\":v; return r; }");
@@ -7818,16 +8075,18 @@ class JavaStrategy : public BackendStrategy
         emitRaw(out, "        if (tag==T_STRING) return s;");
         emitRaw(out, "        if (tag==T_BOOL) return b?\"true\":\"false\";");
         emitRaw(out, "        if (tag==T_INT) return Long.toString(i);");
-        emitRaw(out, "        long xi=(long)d; return ((double)xi==d) ? Long.toString(xi) : Double.toString(d);");
+        emitRaw(out, "        return sm ? _AcFmtG.smart(d) : _AcFmtG.fmt(d);");
         emitRaw(out, "    }");
         emitRaw(out, "    AcDynVal add(AcDynVal o) {");
         emitRaw(out, "        if (tag==T_STRING||o.tag==T_STRING) return ofString(toString()+o.toString());");
-        emitRaw(out, "        if (tag==T_FLOAT||o.tag==T_FLOAT) return ofFloat(asD()+o.asD());");
+        emitRaw(out, "        if (tag==T_FLOAT||o.tag==T_FLOAT) return fr(asD()+o.asD(), o);");
         emitRaw(out, "        return ofInt(asL()+o.asL());");
         emitRaw(out, "    }");
-        emitRaw(out, "    AcDynVal sub(AcDynVal o) { return (tag==T_FLOAT||o.tag==T_FLOAT) ? ofFloat(asD()-o.asD()) : ofInt(asL()-o.asL()); }");
-        emitRaw(out, "    AcDynVal mul(AcDynVal o) { return (tag==T_FLOAT||o.tag==T_FLOAT) ? ofFloat(asD()*o.asD()) : ofInt(asL()*o.asL()); }");
-        emitRaw(out, "    AcDynVal div(AcDynVal o) { return ofFloat(asD()/o.asD()); }");
+        emitRaw(out, "    boolean smOk() { return !(tag==T_FLOAT && !sm); }");
+        emitRaw(out, "    AcDynVal fr(double v, AcDynVal o) { AcDynVal r=ofFloat(v); r.sm = smOk() && o.smOk(); return r; }");
+        emitRaw(out, "    AcDynVal sub(AcDynVal o) { return (tag==T_FLOAT||o.tag==T_FLOAT) ? fr(asD()-o.asD(), o) : ofInt(asL()-o.asL()); }");
+        emitRaw(out, "    AcDynVal mul(AcDynVal o) { return (tag==T_FLOAT||o.tag==T_FLOAT) ? fr(asD()*o.asD(), o) : ofInt(asL()*o.asL()); }");
+        emitRaw(out, "    AcDynVal div(AcDynVal o) { AcDynVal r=ofFloat(asD()/o.asD()); r.sm=true; return r; }");
         emitRaw(out, "    boolean eq(AcDynVal o) { return (tag==T_STRING||o.tag==T_STRING) ? toString().equals(o.toString()) : asD()==o.asD(); }");
         emitRaw(out, "    boolean lt(AcDynVal o) { return (tag==T_STRING||o.tag==T_STRING) ? toString().compareTo(o.toString())<0 : asD()<o.asD(); }");
         emitRaw(out, "    boolean gt(AcDynVal o) { return (tag==T_STRING||o.tag==T_STRING) ? toString().compareTo(o.toString())>0 : asD()>o.asD(); }");
@@ -8076,6 +8335,8 @@ class JavaStrategy : public BackendStrategy
             if (sit != structGlobals_.end()) {
                 std::string cls = widgetJavaClass(sit->second);
                 emitRaw(out, "    static " + (cls.empty() ? "long" : cls) + " " + v + (cls.empty() ? " = 0;" : " = null;"));
+            } else if (listGlobalTypes_.count(v)) {   // a promoted LIST: a class-level ArrayList the mainloop fills
+                emitRaw(out, "    static java.util.ArrayList<" + listGlobalTypes_[v] + "> " + v + " = new java.util.ArrayList<>();");
             } else {
                 emitRaw(out, "    static long " + v + " = 0;");
             }
@@ -8336,6 +8597,18 @@ class JavaStrategy : public BackendStrategy
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        const bool bitwiseOp = op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>";
+        if (bitwiseOp && (boxedVars_.count(lhs) || boxedVars_.count(rhs) || isFloatVal(lhs) || isFloatVal(rhs))) {
+            // integer operations: a boxed operand contributes its integer value, a float operand is
+            // truncated first; the result is an integer (boxed if an operand was)
+            bool anyB = boxedVars_.count(lhs) || boxedVars_.count(rhs);
+            auto asL = [&](const std::string &v) { return boxedVars_.count(v) ? v + ".asL()" : "(long)(" + v + ")"; };
+            std::string e = asL(lhs) + " " + op + " " + asL(rhs);
+            bool isNewB = declared.insert(res).second;
+            if (anyB) emit(out, indent, (isNewB ? "AcDynVal " : "") + res + " = AcDynVal.ofInt(" + e + ");");
+            else      emit(out, indent, (isNewB ? "long " : "") + res + " = " + e + ";");
+            return;
+        }
         // Boxed operand — see AcDynVal's comment in emitHeader; must run before the string
         // branch below (Java's native `+` on a String and an AcDynVal doesn't compile).
         if (boxedVars_.count(lhs) || boxedVars_.count(rhs)) {
@@ -8704,6 +8977,11 @@ class JavaStrategy : public BackendStrategy
             }
         }
         std::string call = actualFunc + "(" + castArgs + ")";
+        // The callee itself returns a tagged value: the result is already an AcDynVal, no wrapping.
+        if (!res.empty() && boxedRetFuncs_.count(actualFunc)) {
+            emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + call + ";");
+            return;
+        }
         // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
         // see AcDynVal's comment in emitHeader.
         if (!res.empty() && boxedVars_.count(res)) {
@@ -8796,6 +9074,7 @@ class JavaStrategy : public BackendStrategy
         // non-string branch's return value needs coercing via String.valueOf() (verified:
         // examples/leap_year.ac's trailing `return 0` — "incompatible types: long cannot be
         // converted to String").
+        if (curFuncReturnsDyn_) { emit(out, indent, "return " + boxWrap(val) + ";"); return; }
         bool needsStringify = curFuncReturnIsString_ && !looksString(val) && !isStringVar(val);
         std::string v = needsStringify ? "String.valueOf(" + val + ")" : val;
         emit(out, indent, "return " + v + ";");
@@ -8808,6 +9087,7 @@ class JavaStrategy : public BackendStrategy
         // to pick). Cast disambiguates to the String overload, which prints "null" as text —
         // matches every other backend's null/nil text representation.
         if (val == "null") emit(out, indent, "System.out.println((String) null);");
+        else if (boxedVars_.count(val)) emit(out, indent, "System.out.println(" + val + ");");   // AcDynVal.toString() prints its current tag
         else if (smartPrint_) emit(out, indent, "System.out.println(_AcFmtG.smart(" + val + "));");
         else if (isFloatVal(val)) emit(out, indent, "System.out.println(_AcFmtG.fmt(" + val + "));");
         else emit(out, indent, "System.out.println(" + val + ");");
@@ -8957,6 +9237,22 @@ class JavaStrategy : public BackendStrategy
     void emitForBegin(std::ostringstream &out, int &indent,
                       const std::string &iterVar, const std::string &collection) override
     {
+        // The loop variable is ALREADY a declared local in this scope (an earlier loop left it behind, e.g.
+        // the stream loop's counter): Java forbids redeclaring it in the `for` header — iterate with a fresh
+        // name and assign the existing variable inside the body.
+        if (declared.count(iterVar) && !isStringVar(collection)) {
+            std::string tmp = iterVar + "__it";
+            if (rangeOf_.count(collection))
+                emit(out, indent, "for (long " + tmp + " = 0; " + tmp + " < (" + rangeOf_[collection] + "); ++" + tmp + ") {");
+            else if (seqOf_.count(collection))
+                emit(out, indent, "for (long " + tmp + " = (" + seqOf_[collection].first + "); " + tmp + " < (" + seqOf_[collection].second + "); ++" + tmp + ") {");
+            else
+                emit(out, indent, "for (long " + tmp + " : " + collection + ") {");
+            indent++;
+            emit(out, indent, iterVar + " = " + tmp + ";");
+            forVarStack_.push_back("");   // nothing to un-declare at loop end: the variable predates the loop
+            return;
+        }
         if (rangeOf_.count(collection)) {
             emit(out, indent, "for (long " + iterVar + " = 0; " + iterVar + " < (" + rangeOf_[collection] + "); ++" + iterVar + ") {");
             declared.insert(iterVar); forVarStack_.push_back(iterVar);
@@ -9006,7 +9302,8 @@ class JavaStrategy : public BackendStrategy
             thread_local int rngC = 0;
             std::string iv = "_ac_rng_i_" + std::to_string(rngC++);
             listVars.insert(var); declared.insert(var);
-            emit(out, indent, "java.util.ArrayList<Long> " + var + " = new java.util.ArrayList<>();");
+            if (promotedGlobals_.count(var)) { listGlobalTypes_[var] = "Long"; emit(out, indent, var + " = new java.util.ArrayList<>();"); }
+            else emit(out, indent, "java.util.ArrayList<Long> " + var + " = new java.util.ArrayList<>();");
             if (step.empty()) {
                 emit(out, indent, "for (long " + iv + " = (" + a + "); " + iv + " < (" + b + "); " + iv + "++) "
                                  + var + ".add(" + iv + ");");
@@ -9055,7 +9352,11 @@ class JavaStrategy : public BackendStrategy
                 stringListVars_.insert(var); declared.insert(var);
                 std::string elems = convertListContent(content,
                     [](const std::string& s) { return "\"" + escapeStr(s) + "\""; });
-                emit(out, indent, "java.util.ArrayList<String> " + var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + elems + "));");
+                if (promotedGlobals_.count(var)) {
+                    listGlobalTypes_[var] = "String";
+                    emit(out, indent, var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + elems + "));");
+                } else
+                    emit(out, indent, "java.util.ArrayList<String> " + var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + elems + "));");
                 return;
             }
             listVars.insert(var); declared.insert(var);
@@ -9071,7 +9372,12 @@ class JavaStrategy : public BackendStrategy
                     first = false;
                 }
             }
-            emit(out, indent, "java.util.ArrayList<Long> " + var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Long[0]" : elems) + "));");
+            if (promotedGlobals_.count(var)) {
+                // file-scope (class-level) global already declared by the footer: assign, don't shadow it
+                listGlobalTypes_[var] = "Long";
+                emit(out, indent, var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Long[0]" : elems) + "));");
+            } else
+                emit(out, indent, "java.util.ArrayList<Long> " + var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Long[0]" : elems) + "));");
         }
     }
     void emitLoadIndex(std::ostringstream &out, int &indent,
@@ -9110,7 +9416,33 @@ class JavaStrategy : public BackendStrategy
             emit(out, indent, arr + ".put(" + idx + ", " + (dictStrVals_.count(arr) ? val : "(long)(" + val + ")") + ");");
             return;
         }
-        emit(out, indent, arr + ".set((int)(" + idx + "), (long)(" + val + "));");   // #23
+        auto fv = funcValueIds_.find(val);   // a user function stored as a value: keep its integer id
+        emit(out, indent, arr + ".set((int)(" + idx + "), " + (fv != funcValueIds_.end() ? std::to_string(fv->second) + "L"
+                                                                                       : "(long)(" + val + ")") + ");");   // #23
+    }
+    // Function values held in lists are integer ids; ac_callfn<N>(id, args) switches to the real function.
+    void emitFuncValueDispatch(std::ostringstream &out, int &indent) override
+    {
+        std::set<int> arities;
+        for (const auto &e : funcValueTable_) arities.insert(e.arity);
+        for (int n : arities) {
+            std::string sig = "long id", call;
+            for (int k = 0; k < n; k++) sig += ", long a" + std::to_string(k);
+            emit(out, indent, "static long ac_callfn" + std::to_string(n) + "(" + sig + ") {");
+            indent++;
+            emit(out, indent, "switch ((int)id) {");
+            for (size_t k = 0; k < funcValueTable_.size(); k++) {
+                if (funcValueTable_[k].arity != n) continue;
+                std::string a;
+                for (int q = 0; q < n; q++) a += (q ? ", a" : "a") + std::to_string(q);
+                emit(out, indent, "case " + std::to_string(k) + ": return " + funcValueTable_[k].name + "(" + a + ");");
+            }
+            emit(out, indent, "default: throw new RuntimeException(\"call through an invalid function value\");");
+            emit(out, indent, "}");
+            indent--;
+            emit(out, indent, "}");
+        }
+        emitRaw(out, "");
     }
     void emitInput(std::ostringstream &out, int &indent,
                    const std::string &result, const std::string &prompt) override
@@ -9275,6 +9607,8 @@ class JavaStrategy : public BackendStrategy
             auto classRetIt = classReturnFuncs_.find(name);
             if (classRetIt != classReturnFuncs_.end()) retT = classRetIt->second;
         }
+        curFuncReturnsDyn_ = classOwner.empty() && boxedRetFuncs_.count(name) > 0;
+        if (curFuncReturnsDyn_) retT = "AcDynVal";   // returns a var whose type cycles (see detectBoxedVars)
         curFuncReturnIsString_ = baseReturnIsString_;
         returnIsList_ = false; baseReturnIsString_ = false;
         returnIsFloat_ = false; returnIsVoid_ = false;
@@ -9290,7 +9624,8 @@ class JavaStrategy : public BackendStrategy
         for (const auto& [v, t] : hoistVars_) {
             if (declared.count(v)) continue;
             std::string line;
-            if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
+            if      (boxedVars_.count(v))  line = "AcDynVal " + v + " = AcDynVal.ofInt(0);";
+            else if (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
             else if (t == IRType::STRING)   line = "String " + v + " = \"\";";
             else if (t == IRType::LIST)   { listVars.insert(v); line = "java.util.ArrayList<Long> " + v + " = new java.util.ArrayList<>();"; }
             else                            line = "long " + v + " = 0;";
@@ -9332,6 +9667,8 @@ class JavaStrategy : public BackendStrategy
         if (javaWidgetCtor(out, indent, res, func, args)) return;
         // Java: call through a functional interface — use applyAsLong / apply
         std::string call = func + ".applyAsLong(" + args + ")";
+        if (func.rfind("t_", 0) == 0 && !funcValueTable_.empty())   // a function VALUE out of a list: id dispatch
+            call = "ac_callfn" + std::to_string(callArgCount(args)) + "(" + func + (args.empty() ? "" : ", " + args) + ")";
         if (res.empty())
             emit(out, indent, call + ";");
         else
@@ -9388,6 +9725,23 @@ class JavaStrategy : public BackendStrategy
         // #7 (Java): DECLARE on first sight; parse at the string↔number boundary.
         bool isNew = declared.insert(var).second;
         bool srcIsStr = (!src.empty() && src.front() == '"') || isStringVar(src);
+        // Casting a BOXED source (`to_string(x)` where x is tagged): read the value out of the tag.
+        if (boxedVars_.count(src)) {
+            std::string conv = (t == IRType::STRING) ? src + ".toString()" : (t == IRType::FLOAT) ? src + ".asD()" : src + ".asL()";
+            if (boxedVars_.count(var)) {
+                std::string wrap = (t == IRType::STRING) ? "AcDynVal.ofString(" + conv + ")"
+                                 : (t == IRType::FLOAT)  ? "AcDynVal.ofFloat(" + conv + ")" : "AcDynVal.ofInt(" + conv + ")";
+                emit(out, indent, (isNew ? "AcDynVal " : "") + var + " = " + wrap + ";");
+            } else if (t == IRType::STRING) {
+                emit(out, indent, (isNew ? "String " : "") + var + " = " + conv + ";");
+            } else if (t == IRType::FLOAT) {
+                floatVars.insert(var);
+                emit(out, indent, (isNew ? "double " : "") + var + " = " + conv + ";");
+            } else {
+                emit(out, indent, (isNew ? "long " : "") + var + " = " + conv + ";");
+            }
+            return;
+        }
         // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point.
         if (boxedVars_.count(var)) {
             std::string rhs = (t == IRType::STRING) ? (srcIsStr ? "AcDynVal.ofString(" + src + ")" : "AcDynVal.ofString(String.valueOf(" + src + "))")
@@ -9459,6 +9813,9 @@ class JavaStrategy : public BackendStrategy
 
 class RustStrategy : public BackendStrategy
 {
+    bool curFuncReturnsDyn_ = false;   // current function returns a boxed AcDynVal
+    bool supportsBoxedReturn() const override { return true; }
+    bool usesFuncIds() const override { return true; }
     std::set<std::string> declared;
     std::set<std::string> floatVars;
     std::set<std::string> listVars;
@@ -9660,19 +10017,19 @@ class RustStrategy : public BackendStrategy
         // C/Java/Go ports' explicit-call style. A Display impl means `{}`/println! formats it
         // correctly with no special-casing at the print site.
         emitRaw(out, "#[derive(Clone)]");
-        emitRaw(out, "enum AcDynVal { AcInt(i64), AcFloat(f64), AcStr(String), AcBool(bool) }");
+        emitRaw(out, "enum AcDynVal { AcInt(i64), AcFloat(f64, bool), AcStr(String), AcBool(bool) }   // AcFloat(.., true): from smart `/`");
         emitRaw(out, "impl AcDynVal {");
         emitRaw(out, "    fn of_i(v: i64) -> AcDynVal { AcDynVal::AcInt(v) }");
-        emitRaw(out, "    fn of_f(v: f64) -> AcDynVal { AcDynVal::AcFloat(v) }");
+        emitRaw(out, "    fn of_f(v: f64) -> AcDynVal { AcDynVal::AcFloat(v, false) }\n    fn sm_ok(&self) -> bool { !matches!(self, AcDynVal::AcFloat(_, false)) }\n    fn fr(v: f64, a: &AcDynVal, b: &AcDynVal) -> AcDynVal { AcDynVal::AcFloat(v, a.sm_ok() && b.sm_ok()) }");
         emitRaw(out, "    fn of_s(v: String) -> AcDynVal { AcDynVal::AcStr(v) }");
         emitRaw(out, "    fn of_b(v: bool) -> AcDynVal { AcDynVal::AcBool(v) }");
-        emitRaw(out, "    fn as_d(&self) -> f64 { match self { AcDynVal::AcFloat(d)=>*d, AcDynVal::AcInt(i)=>*i as f64, AcDynVal::AcBool(b)=>if *b {1.0} else {0.0}, _=>0.0 } }");
-        emitRaw(out, "    fn as_i(&self) -> i64 { match self { AcDynVal::AcInt(i)=>*i, AcDynVal::AcFloat(d)=>*d as i64, AcDynVal::AcBool(b)=>if *b {1} else {0}, _=>0 } }");
+        emitRaw(out, "    fn as_d(&self) -> f64 { match self { AcDynVal::AcFloat(d,_)=>*d, AcDynVal::AcInt(i)=>*i as f64, AcDynVal::AcBool(b)=>if *b {1.0} else {0.0}, _=>0.0 } }");
+        emitRaw(out, "    fn as_i(&self) -> i64 { match self { AcDynVal::AcInt(i)=>*i, AcDynVal::AcFloat(d,_)=>*d as i64, AcDynVal::AcBool(b)=>if *b {1} else {0}, _=>0 } }");
         emitRaw(out, "    fn is_str(&self) -> bool { matches!(self, AcDynVal::AcStr(_)) }");
-        emitRaw(out, "    fn ac_add(&self, o: &AcDynVal) -> AcDynVal { if self.is_str()||o.is_str() { AcDynVal::of_s(format!(\"{}{}\", self, o)) } else if matches!(self, AcDynVal::AcFloat(_))||matches!(o, AcDynVal::AcFloat(_)) { AcDynVal::of_f(self.as_d()+o.as_d()) } else { AcDynVal::of_i(self.as_i()+o.as_i()) } }");
-        emitRaw(out, "    fn ac_sub(&self, o: &AcDynVal) -> AcDynVal { if matches!(self, AcDynVal::AcFloat(_))||matches!(o, AcDynVal::AcFloat(_)) { AcDynVal::of_f(self.as_d()-o.as_d()) } else { AcDynVal::of_i(self.as_i()-o.as_i()) } }");
-        emitRaw(out, "    fn ac_mul(&self, o: &AcDynVal) -> AcDynVal { if matches!(self, AcDynVal::AcFloat(_))||matches!(o, AcDynVal::AcFloat(_)) { AcDynVal::of_f(self.as_d()*o.as_d()) } else { AcDynVal::of_i(self.as_i()*o.as_i()) } }");
-        emitRaw(out, "    fn ac_div(&self, o: &AcDynVal) -> AcDynVal { AcDynVal::of_f(self.as_d()/o.as_d()) }");
+        emitRaw(out, "    fn ac_add(&self, o: &AcDynVal) -> AcDynVal { if self.is_str()||o.is_str() { AcDynVal::of_s(format!(\"{}{}\", self, o)) } else if matches!(self, AcDynVal::AcFloat(..))||matches!(o, AcDynVal::AcFloat(..)) { AcDynVal::fr(self.as_d()+o.as_d(), self, o) } else { AcDynVal::of_i(self.as_i()+o.as_i()) } }");
+        emitRaw(out, "    fn ac_sub(&self, o: &AcDynVal) -> AcDynVal { if matches!(self, AcDynVal::AcFloat(..))||matches!(o, AcDynVal::AcFloat(..)) { AcDynVal::fr(self.as_d()-o.as_d(), self, o) } else { AcDynVal::of_i(self.as_i()-o.as_i()) } }");
+        emitRaw(out, "    fn ac_mul(&self, o: &AcDynVal) -> AcDynVal { if matches!(self, AcDynVal::AcFloat(..))||matches!(o, AcDynVal::AcFloat(..)) { AcDynVal::fr(self.as_d()*o.as_d(), self, o) } else { AcDynVal::of_i(self.as_i()*o.as_i()) } }");
+        emitRaw(out, "    fn ac_div(&self, o: &AcDynVal) -> AcDynVal { AcDynVal::AcFloat(self.as_d()/o.as_d(), true) }");
         emitRaw(out, "    fn ac_eq(&self, o: &AcDynVal) -> bool { if self.is_str()||o.is_str() { format!(\"{}\",self)==format!(\"{}\",o) } else { self.as_d()==o.as_d() } }");
         emitRaw(out, "    fn ac_lt(&self, o: &AcDynVal) -> bool { if self.is_str()||o.is_str() { format!(\"{}\",self)<format!(\"{}\",o) } else { self.as_d()<o.as_d() } }");
         emitRaw(out, "    fn ac_gt(&self, o: &AcDynVal) -> bool { if self.is_str()||o.is_str() { format!(\"{}\",self)>format!(\"{}\",o) } else { self.as_d()>o.as_d() } }");
@@ -9683,7 +10040,7 @@ class RustStrategy : public BackendStrategy
         emitRaw(out, "            AcDynVal::AcStr(s) => write!(f, \"{}\", s),");
         emitRaw(out, "            AcDynVal::AcBool(b) => write!(f, \"{}\", if *b {\"true\"} else {\"false\"}),");
         emitRaw(out, "            AcDynVal::AcInt(i) => write!(f, \"{}\", i),");
-        emitRaw(out, "            AcDynVal::AcFloat(d) => { let xi = *d as i64; if xi as f64 == *d { write!(f, \"{}\", xi) } else { write!(f, \"{}\", d) } }");
+        emitRaw(out, "            AcDynVal::AcFloat(d, sm) => { if *sm && *d > -9.2e18 && *d < 9.2e18 && *d == (*d as i64) as f64 { write!(f, \"{}\", *d as i64) } else { write!(f, \"{}\", ac_fmt_double(*d)) } }");
         emitRaw(out, "        }");
         emitRaw(out, "    }");
         emitRaw(out, "}");
@@ -9708,8 +10065,10 @@ class RustStrategy : public BackendStrategy
             emitRaw(out, "fn _ac_bind(key: &str, f: fn()) { _ac_events().lock().unwrap().insert(key.to_string(), f); }");
             emitRaw(out, "fn _ac_trigger(key: &str) { let f = _ac_events().lock().unwrap().get(key).copied(); if let Some(f) = f { f(); } }");
         }
-        for (const auto& v : promotedGlobals_)
-            emitRaw(out, "static mut " + promotedGlobalName(v) + ": i64 = 0;");
+        for (const auto& v : promotedGlobals_) {
+            if (listGlobals_.count(v)) emitRaw(out, "static mut " + promotedGlobalName(v) + ": Vec<i64> = Vec::new();");
+            else                       emitRaw(out, "static mut " + promotedGlobalName(v) + ": i64 = 0;");
+        }
         if (!promotedGlobals_.empty()) emitRaw(out, "");
         emitRaw(out, "fn ac_iota(n: i64) -> String { (0..n).map(|i| i.to_string()).collect() }");
         emitRaw(out, "fn ac_ipow(b: i64, e: i64) -> i64 { let mut r: i64 = 1; let mut k = e; while k > 0 { r *= b; k -= 1; } r }");
@@ -10207,6 +10566,18 @@ class RustStrategy : public BackendStrategy
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        const bool bitwiseOp = op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>";
+        if (bitwiseOp && (boxedVars_.count(lhs) || boxedVars_.count(rhs) || isFloatVal(lhs) || isFloatVal(rhs))) {
+            // integer operations: a boxed operand contributes its integer value, a float operand is
+            // truncated first; the result is an integer (boxed if an operand was)
+            bool anyB = boxedVars_.count(lhs) || boxedVars_.count(rhs);
+            auto asI = [&](const std::string &v) { return boxedVars_.count(v) ? v + ".as_i()" : "((" + v + ") as i64)"; };
+            std::string e = asI(lhs) + " " + op + " " + asI(rhs);
+            bool isNewB = declared.insert(res).second;
+            if (anyB) emit(out, indent, (isNewB ? "let mut " + res + ": AcDynVal = " : res + " = ") + "AcDynVal::of_i(" + e + ");");
+            else      emit(out, indent, (isNewB ? "let mut " + res + ": i64 = " : res + " = ") + e + ";");
+            return;
+        }
         // Boxed operand — see AcDynVal's comment in emitHeader; must run before the string-forcing
         // branch below (format! on an AcDynVal calls its Display impl and does the wrong thing —
         // string-formats it unconditionally instead of adding/concatenating by CURRENT tag).
@@ -10604,6 +10975,11 @@ class RustStrategy : public BackendStrategy
             }
         }
         std::string call = rfunc + "(" + actualArgs + ")";
+        // The callee itself returns a tagged value: the result is already an AcDynVal, no wrapping.
+        if (!res.empty() && boxedRetFuncs_.count(rfunc)) {
+            emit(out, indent, (declared.insert(res).second ? "let mut " + res + ": AcDynVal = " : res + " = ") + call + ";");
+            return;
+        }
         // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
         // see AcDynVal's comment in emitHeader.
         if (!res.empty() && boxedVars_.count(res)) {
@@ -10700,6 +11076,7 @@ class RustStrategy : public BackendStrategy
             // paths are strings), so a numeric-literal/int-typed branch needs the SAME
             // `.to_string()` treatment, not just an already-string literal (verified:
             // leap_year.ac's trailing `return 0` — "expected String, found integer").
+            if (curFuncReturnsDyn_) { emit(out, indent, "return " + boxWrap(val) + ";"); lastWasReturn = true; return; }
             bool needsStringify = curFuncReturnIsString_
                 && !isStringVar(val) && !stringVars_.count(val);
             std::string v = needsStringify ? "(" + val + ").to_string()" : val;
@@ -10990,6 +11367,12 @@ class RustStrategy : public BackendStrategy
                 declared.insert(var);
                 return;
             }
+            { std::string bare;
+              if (stripPromotedGlobalWrap(var, bare)) {   // a promoted list: fill the file-scope static, don't `let` a shadow
+                  emit(out, indent, "unsafe { " + bare + " = vec![" + content + "]; }");
+                  listVars.insert(var);
+                  return;
+              } }
             emit(out, indent, "let mut " + var + " = vec![" + content + "];");
             listVars.insert(var);
             declared.insert(var);
@@ -11022,6 +11405,11 @@ class RustStrategy : public BackendStrategy
             emit(out, indent, "let " + result + " = (" + arr + ".as_bytes()[(" + idx + ") as usize] as char).to_string();");
             return;
         }
+        { std::string bare;
+          if (stripPromotedGlobalWrap(arr, bare)) {   // element of a promoted list global
+              emit(out, indent, decl(result, "unsafe { " + bare + "[(" + idx + ") as usize] }"));
+              return;
+          } }
         emit(out, indent, decl(result, arr + "[(" + idx + ") as usize]"));
     }
     void emitStoreIndex(std::ostringstream &out, int &indent,
@@ -11032,7 +11420,45 @@ class RustStrategy : public BackendStrategy
             emit(out, indent, arr + ".insert((" + idx + ").to_string(), " + val + ");");
             return;
         }
-        emit(out, indent, arr + "[(" + idx + ") as usize] = " + val + ";");
+        auto fv = funcValueIds_.find(val);   // a user function stored as a value: keep its integer id
+        std::string sval = fv != funcValueIds_.end() ? std::to_string(fv->second) : val;
+        { std::string bare;
+          if (stripPromotedGlobalWrap(arr, bare)) { emit(out, indent, "unsafe { " + bare + "[(" + idx + ") as usize] = " + sval + "; }"); return; } }
+        emit(out, indent, arr + "[(" + idx + ") as usize] = " + sval + ";");
+    }
+    // Function values held in lists are integer ids; ac_callfn<N>(id, args) matches to the real function.
+    void emitFuncValueDispatch(std::ostringstream &out, int &indent) override
+    {
+        std::set<int> arities;
+        for (const auto &e : funcValueTable_) arities.insert(e.arity);
+        for (int n : arities) {
+            std::string sig = "id: i64";
+            for (int k = 0; k < n; k++) sig += ", a" + std::to_string(k) + ": i64";
+            emit(out, indent, "fn ac_callfn" + std::to_string(n) + "(" + sig + ") -> i64 {");
+            indent++;
+            emit(out, indent, "match id {");
+            for (size_t k = 0; k < funcValueTable_.size(); k++) {
+                if (funcValueTable_[k].arity != n) continue;
+                std::string a;
+                for (int q = 0; q < n; q++) a += (q ? ", a" : "a") + std::to_string(q);
+                emit(out, indent, std::to_string(k) + " => " + funcValueTable_[k].name + "(" + a + "),");
+            }
+            emit(out, indent, "_ => panic!(\"call through an invalid function value\"),");
+            emit(out, indent, "}");
+            indent--;
+            emit(out, indent, "}");
+        }
+        emitRaw(out, "");
+    }
+    void emitIndirectCall(std::ostringstream &out, int &indent,
+                          const std::string &res, const std::string &func,
+                          const std::string &args) override
+    {
+        std::string call = func + "(" + args + ")";
+        if (func.rfind("t_", 0) == 0 && !funcValueTable_.empty())   // a function VALUE out of a list: id dispatch
+            call = "ac_callfn" + std::to_string(callArgCount(args)) + "(" + func + (args.empty() ? "" : ", " + args) + ")";
+        if (res.empty()) emit(out, indent, call + ";");
+        else             emit(out, indent, decl(res, call));
     }
     void emitInput(std::ostringstream &out, int &indent,
                    const std::string &result, const std::string &prompt) override
@@ -11209,6 +11635,8 @@ class RustStrategy : public BackendStrategy
             auto classRetIt = classReturnFuncs_.find(name);
             if (classRetIt != classReturnFuncs_.end()) { curFuncReturnClass_ = classRetIt->second; retT = "-> " + classRetIt->second + " "; }
         }
+        curFuncReturnsDyn_ = !isNew && classOwner.empty() && boxedRetFuncs_.count(name) > 0;
+        if (curFuncReturnsDyn_) retT = "-> AcDynVal ";   // returns a var whose type cycles (see detectBoxedVars)
         returnIsList_ = false;
         returnIsFloat_ = false;
         baseReturnIsString_ = false;
@@ -11394,6 +11822,24 @@ class RustStrategy : public BackendStrategy
         // A string source parses at the boundary (`"42".parse()`), not `as` (which won't compile
         // from &str). Fixes `to_int n = $42$` on Rust.
         bool srcIsStr = (!src.empty() && src.front() == '"') || isStringVar(src);
+        // Casting a BOXED source (`to_string(x)` where x is tagged): read the value out of the tag.
+        if (boxedVars_.count(src)) {
+            std::string conv = (t == IRType::STRING) ? src + ".to_string()" : (t == IRType::FLOAT) ? src + ".as_d()" : src + ".as_i()";
+            if (boxedVars_.count(var)) {
+                std::string wrap = (t == IRType::STRING) ? "AcDynVal::of_s(" + conv + ")"
+                                 : (t == IRType::FLOAT)  ? "AcDynVal::of_f(" + conv + ")" : "AcDynVal::of_i(" + conv + ")";
+                emit(out, indent, (isNew ? "let mut " + var + ": AcDynVal = " : var + " = ") + wrap + ";");
+            } else if (t == IRType::STRING) {
+                stringVars_.insert(var);
+                emit(out, indent, (isNew ? "let mut " + var + ": String = " : var + " = ") + conv + ";");
+            } else if (t == IRType::FLOAT) {
+                floatVars.insert(var);
+                emit(out, indent, (isNew ? "let mut " + var + ": f64 = " : var + " = ") + conv + ";");
+            } else {
+                emit(out, indent, (isNew ? "let mut " + var + ": i64 = " : var + " = ") + conv + ";");
+            }
+            return;
+        }
         // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point.
         if (boxedVars_.count(var)) {
             std::string rhs = (t == IRType::STRING) ? "AcDynVal::of_s((" + src + ").to_string())"
@@ -11507,6 +11953,9 @@ class GoStrategy : public BackendStrategy
         }
     }
     bool curFuncRetString_ = false;
+    bool curFuncReturnsDyn_ = false;   // current function returns a boxed AcDynVal
+    bool supportsBoxedReturn() const override { return true; }
+    bool usesFuncIds() const override { return true; }
     std::set<std::string> userStringFuncs_;
 public:
     void setStringReturnFuncs(const std::set<std::string>& s) override { userStringFuncs_ = s; }
@@ -11806,7 +12255,9 @@ private:
         // overloading, so like the C/Java ports, every consumer calls these helpers explicitly.
         // A String() method (Stringer interface) means fmt.Println(x) formats it correctly with
         // no special-casing at the print site. strconv is already unconditionally imported.
-        emitRaw(out, "type AcDynVal struct { tag int; i int64; d float64; s string; b bool }");
+        emitRaw(out, "type AcDynVal struct { tag int; i int64; d float64; s string; b bool; sm bool }   // sm: float from smart `/`");
+        emitRaw(out, "func acSmOk(v AcDynVal) bool { return !(v.tag==1 && !v.sm) }");
+        emitRaw(out, "func acDynFr(d float64, a, b AcDynVal) AcDynVal { r := AcDynVal{tag:1, d:d}; r.sm = acSmOk(a) && acSmOk(b); return r }");
         emitRaw(out, "func acDynI(v int64) AcDynVal { return AcDynVal{tag:0, i:v} }");
         emitRaw(out, "func acDynF(v float64) AcDynVal { return AcDynVal{tag:1, d:v} }");
         emitRaw(out, "func acDynS(v string) AcDynVal { return AcDynVal{tag:2, s:v} }");
@@ -11819,19 +12270,18 @@ private:
         emitRaw(out, "    case 3: if v.b { return \"true\" }; return \"false\"");
         emitRaw(out, "    case 0: return strconv.FormatInt(v.i, 10)");
         emitRaw(out, "    default:");
-        emitRaw(out, "        xi := int64(v.d)");
-        emitRaw(out, "        if float64(xi) == v.d { return strconv.FormatInt(xi, 10) }");
-        emitRaw(out, "        return strconv.FormatFloat(v.d, 'g', -1, 64)");
+        emitRaw(out, "        if v.sm { return ac_smart_double(v.d) }");
+        emitRaw(out, "        return ac_fmt_double(v.d)");
         emitRaw(out, "    }");
         emitRaw(out, "}");
         emitRaw(out, "func acDynAdd(a, b AcDynVal) AcDynVal {");
         emitRaw(out, "    if a.tag==2 || b.tag==2 { return acDynS(a.String()+b.String()) }");
-        emitRaw(out, "    if a.tag==1 || b.tag==1 { return acDynF(a.acAsD()+b.acAsD()) }");
+        emitRaw(out, "    if a.tag==1 || b.tag==1 { return acDynFr(a.acAsD()+b.acAsD(), a, b) }");
         emitRaw(out, "    return acDynI(a.acAsI()+b.acAsI())");
         emitRaw(out, "}");
-        emitRaw(out, "func acDynSub(a, b AcDynVal) AcDynVal { if a.tag==1||b.tag==1 { return acDynF(a.acAsD()-b.acAsD()) }; return acDynI(a.acAsI()-b.acAsI()) }");
-        emitRaw(out, "func acDynMul(a, b AcDynVal) AcDynVal { if a.tag==1||b.tag==1 { return acDynF(a.acAsD()*b.acAsD()) }; return acDynI(a.acAsI()*b.acAsI()) }");
-        emitRaw(out, "func acDynDiv(a, b AcDynVal) AcDynVal { return acDynF(a.acAsD()/b.acAsD()) }");
+        emitRaw(out, "func acDynSub(a, b AcDynVal) AcDynVal { if a.tag==1||b.tag==1 { return acDynFr(a.acAsD()-b.acAsD(), a, b) }; return acDynI(a.acAsI()-b.acAsI()) }");
+        emitRaw(out, "func acDynMul(a, b AcDynVal) AcDynVal { if a.tag==1||b.tag==1 { return acDynFr(a.acAsD()*b.acAsD(), a, b) }; return acDynI(a.acAsI()*b.acAsI()) }");
+        emitRaw(out, "func acDynDiv(a, b AcDynVal) AcDynVal { r := acDynF(a.acAsD()/b.acAsD()); r.sm = true; return r }");
         emitRaw(out, "func acDynEq(a, b AcDynVal) bool { if a.tag==2||b.tag==2 { return a.String()==b.String() }; return a.acAsD()==b.acAsD() }");
         emitRaw(out, "func acDynLt(a, b AcDynVal) bool { if a.tag==2||b.tag==2 { return a.String()<b.String() }; return a.acAsD()<b.acAsD() }");
         emitRaw(out, "func acDynGt(a, b AcDynVal) bool { if a.tag==2||b.tag==2 { return a.String()>b.String() }; return a.acAsD()>b.acAsD() }\n");
@@ -12055,7 +12505,7 @@ private:
         // default (scalars/lists promoted this way have always been plain ints in practice).
         for (auto& v : promotedGlobals_) {
             auto it = widgetVarType_.find(v);
-            emitRaw(out, "var " + v + " " + (it != widgetVarType_.end() ? it->second : "int64"));
+            emitRaw(out, "var " + v + " " + (it != widgetVarType_.end() ? it->second : listGlobals_.count(v) ? "[]int64" : "int64"));
         }
         if (!promotedGlobals_.empty()) emitRaw(out, "");
     }
@@ -12301,6 +12751,18 @@ private:
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        const bool bitwiseOp = op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>";
+        if (bitwiseOp && (boxedVars_.count(lhs) || boxedVars_.count(rhs) || isFloatVal(lhs) || isFloatVal(rhs))) {
+            // integer operations: a boxed operand contributes its integer value, a float operand is
+            // truncated first; the result is an integer (boxed if an operand was)
+            bool anyB = boxedVars_.count(lhs) || boxedVars_.count(rhs);
+            auto asI = [&](const std::string &v) { return boxedVars_.count(v) ? v + ".acAsI()" : "int64(" + v + ")"; };
+            std::string e = asI(lhs) + " " + op + " " + asI(rhs);
+            bool isNewB = declared.insert(res).second;
+            if (anyB) emit(out, indent, (isNewB ? "var " + res + " AcDynVal = " : res + " = ") + "acDynI(" + e + ")");
+            else      emit(out, indent, (isNewB ? res + " := " : res + " = ") + e);
+            return;
+        }
         // Boxed operand — see AcDynVal's comment in emitHeader; must run before the string-forcing
         // branch below (fmt.Sprintf on an AcDynVal calls its String() and does the wrong thing —
         // string-formats it unconditionally instead of adding/concatenating by CURRENT tag).
@@ -12534,6 +12996,11 @@ private:
         // math_to_int takes float64 — cast integer args explicitly
         std::string actualArgs = (func == "math_to_int") ? "float64(" + args + ")" : args;
         std::string call = func + "(" + actualArgs + ")";
+        // The callee itself returns a tagged value: the result is already an AcDynVal, no wrapping.
+        if (!res.empty() && boxedRetFuncs_.count(func)) {
+            emit(out, indent, (declared.insert(res).second ? "var " + res + " AcDynVal = " : res + " = ") + call);
+            return;
+        }
         // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
         // see AcDynVal's comment in emitHeader.
         if (!res.empty() && boxedVars_.count(res)) {
@@ -12611,13 +13078,15 @@ private:
         // consulted here, for a REAL `return <value>` statement (verified: examples/
         // leap_year.ac's trailing `return 0` — "cannot use 0 (untyped int constant) as string
         // value in return statement").
+        if (curFuncReturnsDyn_) { emit(out, indent, "return " + boxWrap(val)); return; }
         bool needsStringify = curFuncRetString_ && !looksString(val) && !isStringVar(val);
         std::string v = needsStringify ? "fmt.Sprint(" + val + ")" : val;
         emit(out, indent, "return " + v);
     }
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
-        if (smartPrint_) emit(out, indent, "fmt.Println(ac_smart_double(float64(" + val + ")))");
+        if (boxedVars_.count(val)) emit(out, indent, "fmt.Println(" + val + ")");   // AcDynVal.String() prints its current tag
+        else if (smartPrint_) emit(out, indent, "fmt.Println(ac_smart_double(float64(" + val + ")))");
         else if (hardPrint_ || floatVars.count(val)) emit(out, indent, "_ac_dblprint(float64(" + val + "))");
         else emit(out, indent, "fmt.Println(" + val + ")");
     }
@@ -12883,6 +13352,11 @@ private:
                 declared.insert(var);
                 return;
             }
+            if (std::find(promotedGlobals_.begin(), promotedGlobals_.end(), var) != promotedGlobals_.end()) {   // a package-level list global: assign it, don't shadow it with `:=`
+                emit(out, indent, var + " = []int64{" + content + "}");
+                declared.insert(var);
+                return;
+            }
             emit(out, indent, var + " := []int64{" + content + "}");
             declared.insert(var);
         }
@@ -12920,7 +13394,42 @@ private:
                         const std::string &arr, const std::string &idx,
                         const std::string &val) override
     {
-        emit(out, indent, arr + "[" + idx + "] = " + val);
+        auto fv = funcValueIds_.find(val);   // a user function stored as a value: keep its integer id
+        emit(out, indent, arr + "[" + idx + "] = " + (fv != funcValueIds_.end() ? std::to_string(fv->second) : val));
+    }
+    // Function values held in lists are integer ids; ac_callfn<N>(id, args) switches to the real function.
+    void emitFuncValueDispatch(std::ostringstream &out, int &indent) override
+    {
+        std::set<int> arities;
+        for (const auto &e : funcValueTable_) arities.insert(e.arity);
+        for (int n : arities) {
+            std::string sig = "id int64";
+            for (int k = 0; k < n; k++) sig += ", a" + std::to_string(k) + " int64";
+            emit(out, indent, "func ac_callfn" + std::to_string(n) + "(" + sig + ") int64 {");
+            indent++;
+            emit(out, indent, "switch id {");
+            for (size_t k = 0; k < funcValueTable_.size(); k++) {
+                if (funcValueTable_[k].arity != n) continue;
+                std::string a;
+                for (int q = 0; q < n; q++) a += (q ? ", a" : "a") + std::to_string(q);
+                emit(out, indent, "case " + std::to_string(k) + ": return " + funcValueTable_[k].name + "(" + a + ")");
+            }
+            emit(out, indent, "}");
+            emit(out, indent, "panic(\"call through an invalid function value\")");
+            indent--;
+            emit(out, indent, "}");
+        }
+        emitRaw(out, "");
+    }
+    void emitIndirectCall(std::ostringstream &out, int &indent,
+                          const std::string &res, const std::string &func,
+                          const std::string &args) override
+    {
+        std::string call = func + "(" + args + ")";
+        if (func.rfind("t_", 0) == 0 && !funcValueTable_.empty())   // a function VALUE out of a list: id dispatch
+            call = "ac_callfn" + std::to_string(callArgCount(args)) + "(" + func + (args.empty() ? "" : ", " + args) + ")";
+        if (res.empty()) emit(out, indent, call);
+        else             emit(out, indent, decl(res, call));
     }
     void emitInput(std::ostringstream &out, int &indent,
                    const std::string &result, const std::string &prompt) override
@@ -13070,6 +13579,8 @@ private:
             if (classRetIt != classReturnFuncs_.end()) { curFuncReturnClass_ = classRetIt->second; retT = "*" + classRetIt->second; }
         }
         curFuncRetString_ = baseReturnIsString_;
+        curFuncReturnsDyn_ = !isNew && classOwner.empty() && boxedRetFuncs_.count(name) > 0;
+        if (curFuncReturnsDyn_) retT = "AcDynVal";   // returns a var whose type cycles (see detectBoxedVars)
         baseReturnIsString_ = false;
         returnIsList_ = false; returnIsFloat_ = false; returnIsVoid_ = false;
         if (isNew) {
@@ -13137,8 +13648,10 @@ private:
                             // `*ClassName` return type set in emitFunctionBegin; still has to
                             // typecheck even though unreachable after a real `return p`.
                             : !curFuncReturnClass_.empty() ? "return nil"
+                            : curFuncReturnsDyn_     ? "return AcDynVal{}"
                             : curFuncReturnIsList_   ? "return nil"
                             : curFuncRetString_      ? "return \"\"" : "return 0");
+        curFuncReturnsDyn_ = false;
         curFuncReturnIsList_ = false; curFuncRetString_ = false;
         curFuncIsConstructor_ = false; curFuncReturnIsVoid_ = false; curFuncReturnClass_ = "";
         indent--;
@@ -13218,6 +13731,20 @@ private:
         bool srcIsStr = looksString(src) || stringVars.count(src) || isStringVar(src);
         std::string intSrc = srcIsStr ? "ac_atoi(" + src + ")" : "int64(" + src + ")";
         std::string fltSrc = srcIsStr ? "ac_atof(" + src + ")" : "float64(" + src + ")";
+        // Casting a BOXED source (`to_string(x)` where x is tagged): read the value out of the tag.
+        if (boxedVars_.count(src)) {
+            std::string conv = (t == IRType::STRING) ? src + ".String()" : (t == IRType::FLOAT) ? src + ".acAsD()" : src + ".acAsI()";
+            bool isNewC = declared.insert(var).second;
+            if (boxedVars_.count(var)) {
+                std::string wrap = (t == IRType::STRING) ? "acDynS(" + conv + ")" : (t == IRType::FLOAT) ? "acDynF(" + conv + ")" : "acDynI(" + conv + ")";
+                emit(out, indent, (isNewC ? "var " + var + " AcDynVal = " : var + " = ") + wrap);
+            } else {
+                if (t == IRType::STRING) stringVars.insert(var);
+                else if (t == IRType::FLOAT) floatVars.insert(var);
+                emit(out, indent, (isNewC ? var + " := " : var + " = ") + conv);
+            }
+            return;
+        }
         // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point.
         if (boxedVars_.count(var)) {
             std::string rhs = (t == IRType::STRING) ? (srcIsStr ? "acDynS(" + src + ")" : "acDynS(fmt.Sprintf(\"%v\", " + src + "))")
@@ -13311,6 +13838,9 @@ private:
 
 class VStrategy : public BackendStrategy
 {
+    bool curFuncReturnsDyn_ = false;   // current function returns a boxed AcDynVal
+    bool supportsBoxedReturn() const override { return true; }
+    bool usesFuncIds() const override { return true; }
     std::set<std::string> classInstanceVars_;   // vars holding a bundle instance (V-transformed names)
     std::map<std::string,std::string> classInstanceVarNames_;  // var -> class name (both V-transformed)
     std::map<std::string,std::string> classReturnFuncs_;   // fn.name -> class name (see setClassReturnFuncs)
@@ -13595,7 +14125,7 @@ class VStrategy : public BackendStrategy
         // keeps the int64-equivalent `i64` default other backends use for a promoted scalar.
         for (auto& v : promotedGlobals_) {
             auto it = widgetVarType_.find(v);
-            emitRaw(out, "__global ( " + v + " " + (it != widgetVarType_.end() ? it->second : "i64") + " )");
+            emitRaw(out, "__global ( " + v + " " + (it != widgetVarType_.end() ? it->second : listGlobals_.count(v) ? "[]i64" : "i64") + " )");
         }
         for (auto& body : ffiBodies) {
             out << "\n" << body;
@@ -13619,7 +14149,9 @@ class VStrategy : public BackendStrategy
         // own scope — one fixed V declared type per var name can't do that. Like the C/Java/Go
         // ports, every consumer calls these helpers explicitly. `.str()` is V's own convention
         // for a type's string form — string interpolation and println use it automatically.
-        emitRaw(out, "struct AcDynVal { tag int i i64 d f64 s string b bool }");
+        emitRaw(out, "struct AcDynVal { tag int i i64 d f64 s string b bool sm bool }   // sm: float from smart `/`");
+        emitRaw(out, "fn ac_dyn_smok(v AcDynVal) bool { return !(v.tag == 1 && !v.sm) }");
+        emitRaw(out, "fn ac_dyn_fr(d f64, a AcDynVal, b AcDynVal) AcDynVal { return AcDynVal{tag: 1, d: d, sm: ac_dyn_smok(a) && ac_dyn_smok(b)} }");
         emitRaw(out, "fn ac_dyn_i(v i64) AcDynVal { return AcDynVal{tag: 0, i: v} }");
         emitRaw(out, "fn ac_dyn_f(v f64) AcDynVal { return AcDynVal{tag: 1, d: v} }");
         emitRaw(out, "fn ac_dyn_s(v string) AcDynVal { return AcDynVal{tag: 2, s: v} }");
@@ -13630,18 +14162,17 @@ class VStrategy : public BackendStrategy
         emitRaw(out, "    if v.tag == 2 { return v.s }");
         emitRaw(out, "    if v.tag == 3 { return if v.b { 'true' } else { 'false' } }");
         emitRaw(out, "    if v.tag == 0 { return v.i.str() }");
-        emitRaw(out, "    xi := i64(v.d)");
-        emitRaw(out, "    if f64(xi) == v.d { return xi.str() }");
-        emitRaw(out, "    return v.d.str()");
+        emitRaw(out, "    if v.sm { return ac_smart_double(v.d) }");
+        emitRaw(out, "    return ac_fmtg(v.d)");
         emitRaw(out, "}");
         emitRaw(out, "fn ac_dyn_add(a AcDynVal, b AcDynVal) AcDynVal {");
         emitRaw(out, "    if a.tag == 2 || b.tag == 2 { return ac_dyn_s(a.str() + b.str()) }");
-        emitRaw(out, "    if a.tag == 1 || b.tag == 1 { return ac_dyn_f(a.as_d() + b.as_d()) }");
+        emitRaw(out, "    if a.tag == 1 || b.tag == 1 { return ac_dyn_fr(a.as_d() + b.as_d(), a, b) }");
         emitRaw(out, "    return ac_dyn_i(a.as_i() + b.as_i())");
         emitRaw(out, "}");
-        emitRaw(out, "fn ac_dyn_sub(a AcDynVal, b AcDynVal) AcDynVal { if a.tag == 1 || b.tag == 1 { return ac_dyn_f(a.as_d() - b.as_d()) }; return ac_dyn_i(a.as_i() - b.as_i()) }");
-        emitRaw(out, "fn ac_dyn_mul(a AcDynVal, b AcDynVal) AcDynVal { if a.tag == 1 || b.tag == 1 { return ac_dyn_f(a.as_d() * b.as_d()) }; return ac_dyn_i(a.as_i() * b.as_i()) }");
-        emitRaw(out, "fn ac_dyn_div(a AcDynVal, b AcDynVal) AcDynVal { return ac_dyn_f(a.as_d() / b.as_d()) }");
+        emitRaw(out, "fn ac_dyn_sub(a AcDynVal, b AcDynVal) AcDynVal { if a.tag == 1 || b.tag == 1 { return ac_dyn_fr(a.as_d() - b.as_d(), a, b) }; return ac_dyn_i(a.as_i() - b.as_i()) }");
+        emitRaw(out, "fn ac_dyn_mul(a AcDynVal, b AcDynVal) AcDynVal { if a.tag == 1 || b.tag == 1 { return ac_dyn_fr(a.as_d() * b.as_d(), a, b) }; return ac_dyn_i(a.as_i() * b.as_i()) }");
+        emitRaw(out, "fn ac_dyn_div(a AcDynVal, b AcDynVal) AcDynVal { return AcDynVal{tag: 1, d: a.as_d() / b.as_d(), sm: true} }");
         emitRaw(out, "fn ac_dyn_eq(a AcDynVal, b AcDynVal) bool { if a.tag == 2 || b.tag == 2 { return a.str() == b.str() }; return a.as_d() == b.as_d() }");
         emitRaw(out, "fn ac_dyn_lt(a AcDynVal, b AcDynVal) bool { if a.tag == 2 || b.tag == 2 { return a.str() < b.str() }; return a.as_d() < b.as_d() }");
         emitRaw(out, "fn ac_dyn_gt(a AcDynVal, b AcDynVal) bool { if a.tag == 2 || b.tag == 2 { return a.str() > b.str() }; return a.as_d() > b.as_d() }");
@@ -13989,6 +14520,18 @@ class VStrategy : public BackendStrategy
     void emitBinaryOp(std::ostringstream &out, int &indent, const std::string &res,
                       const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
+        const bool bitwiseOp = op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>";
+        if (bitwiseOp && (boxedVars_.count(lhs) || boxedVars_.count(rhs) || floatVars.count(lhs) || floatVars.count(rhs))) {
+            // integer operations: a boxed operand contributes its integer value, a float operand is
+            // truncated first; the result is an integer (boxed if an operand was)
+            bool anyB = boxedVars_.count(lhs) || boxedVars_.count(rhs);
+            auto asI = [&](const std::string &v) { return boxedVars_.count(v) ? v + ".as_i()" : "i64(" + v + ")"; };
+            std::string e = asI(lhs) + " " + op + " " + asI(rhs);
+            bool isNewB = declared.insert(res).second;
+            if (anyB) emit(out, indent, (isNewB ? "mut " + res + " := " : res + " = ") + "ac_dyn_i(" + e + ")");
+            else      emit(out, indent, (isNewB ? "mut " + res + " := " : res + " = ") + e);
+            return;
+        }
         // Boxed operand — see AcDynVal's comment in emitHeader; must run before the string-forcing
         // branch below (V's native `+` doesn't accept an AcDynVal struct operand).
         if (boxedVars_.count(lhs) || boxedVars_.count(rhs)) {
@@ -14096,6 +14639,13 @@ class VStrategy : public BackendStrategy
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                   const std::string &func, const std::string &args) override
     {
+        // `math.mod` is type-preserving (int args -> int result, like PY): route int args to the int variant so
+        // the result is usable as an array index / bitwise operand / i64 parameter.
+        if ((func == "math.mod" || func == "math_mod") && !res.empty()
+            && callArgsAllInt(args, [&](const std::string &t) { return looksFloat(t) || floatVars.count(t) > 0; })) {
+            emitCall(out, indent, res, func == "math.mod" ? "math.mod_int" : "math_mod_int", args);
+            return;
+        }
         // Widget ctor (`root = Screen(...)`, `tb = textbox(root, c, f, lazy)`) — V's own
         // `:=` type inference means no explicit type annotation is needed here (unlike Go),
         // so this only needs to: (1) lowercase "Screen" specifically (the ONLY capitalized
@@ -14178,6 +14728,11 @@ class VStrategy : public BackendStrategy
             }
         }
         std::string call = func + "(" + args + ")";
+        // The callee itself returns a tagged value: the result is already an AcDynVal, no wrapping.
+        if (!res.empty() && boxedRetFuncs_.count(func)) {
+            emit(out, indent, (declared.insert(res).second ? "mut " + res + " := " : res + " = ") + call);
+            return;
+        }
         // Boxed var: a CALL result flowing directly into a var that ALSO gets retyped later —
         // see AcDynVal's comment in emitHeader.
         if (!res.empty() && boxedVars_.count(res)) {
@@ -14264,6 +14819,7 @@ class VStrategy : public BackendStrategy
             // A float-returning fn must return f64. Wrap unless the value is already an f64
             // expression (avoids i64/f64 mismatch when the body returns an int local/literal).
             std::string rv = val;
+            if (curFuncReturnsDyn_) { emit(out, indent, "return " + boxWrap(val)); lastWasReturn = true; return; }
             if (curFuncReturnIsFloat_ && !floatVars.count(val) && val.rfind("f64(", 0) != 0)
                 rv = "f64(" + val + ")";
             // AC functions can genuinely mix return types across branches (dynamic typing —
@@ -14281,7 +14837,8 @@ class VStrategy : public BackendStrategy
     void emitPrint(std::ostringstream &out, int &indent, const std::string &val) override
     {
         lastWasReturn = false;
-        if (smartPrint_) emit(out, indent, "println(ac_smart_double(f64(" + val + ")))");
+        if (boxedVars_.count(val)) emit(out, indent, "println(" + val + ".str())");   // AcDynVal: prints its current tag
+        else if (smartPrint_) emit(out, indent, "println(ac_smart_double(f64(" + val + ")))");
         else if (floatVars.count(val)) emit(out, indent, "println(ac_fmtg(" + val + "))");
         else emit(out, indent, "println(" + val + ")");
     }
@@ -14462,6 +15019,17 @@ class VStrategy : public BackendStrategy
             declared.insert(iterVar);
             return;
         }
+        // The loop variable is ALREADY a declared local (an earlier loop left it behind): V rejects
+        // redefining it as the iteration variable — iterate with a fresh name and assign the existing one.
+        if (declared.count(iterVar) && !isStringVar(collection)) {
+            std::string tmp = iterVar + "_it";
+            if (rangeOf_.count(collection))      emit(out, indent, "for " + tmp + " in 0.." + rangeOf_[collection] + " {");
+            else if (seqOf_.count(collection))   emit(out, indent, "for " + tmp + " in " + seqOf_[collection].first + ".." + seqOf_[collection].second + " {");
+            else                                 emit(out, indent, "for " + tmp + " in " + collection + " {");
+            indent++;
+            emit(out, indent, iterVar + " = i64(" + tmp + ")");
+            return;
+        }
         if (rangeOf_.count(collection)) {
             emit(out, indent, "for " + iterVar + " in 0.." + rangeOf_[collection] + " {");
             indent++;
@@ -14557,15 +15125,16 @@ class VStrategy : public BackendStrategy
                 size_t a2 = c.find_first_not_of(" \t");
                 c = (a2 == std::string::npos) ? "" : c.substr(a2, c.find_last_not_of(" \t") - a2 + 1);
             }
+            const bool promotedList = promotedGlobals_.count(var) > 0;   // file-scope __global: assign, don't shadow
             if (c.empty()) {
-                emit(out, indent, "mut " + var + " := []i64{}");
+                emit(out, indent, (promotedList ? var + " = " : "mut " + var + " := ") + "[]i64{}");
                 declared.insert(var);
             } else {
                 size_t comma = c.find(',');
                 std::string vContent = comma != std::string::npos
                                            ? "i64(" + c.substr(0, comma) + ")" + c.substr(comma)
                                            : "i64(" + c + ")";
-                emit(out, indent, "mut " + var + " := [" + vContent + "]");
+                emit(out, indent, (promotedList ? var + " = " : "mut " + var + " := ") + "[" + vContent + "]");
                 declared.insert(var);
             }
         }
@@ -14602,7 +15171,45 @@ class VStrategy : public BackendStrategy
                         const std::string &arr, const std::string &idx,
                         const std::string &val) override
     {
-        emit(out, indent, arr + "[" + idx + "] = " + val);
+        auto fv = funcValueIds_.find(val);   // a user function stored as a value: keep its integer id
+        emit(out, indent, arr + "[" + idx + "] = " + (fv != funcValueIds_.end() ? "i64(" + std::to_string(fv->second) + ")" : val));
+    }
+    // Function values held in lists are integer ids; ac_callfn<N>(id, args) matches to the real function.
+    void emitFuncValueDispatch(std::ostringstream &out, int &indent) override
+    {
+        std::set<int> arities;
+        for (const auto &e : funcValueTable_) arities.insert(e.arity);
+        for (int n : arities) {
+            std::string sig = "id i64";
+            for (int k = 0; k < n; k++) sig += ", a" + std::to_string(k) + " i64";
+            emit(out, indent, "fn ac_callfn" + std::to_string(n) + "(" + sig + ") i64 {");
+            indent++;
+            emit(out, indent, "match id {");
+            indent++;
+            for (size_t k = 0; k < funcValueTable_.size(); k++) {
+                if (funcValueTable_[k].arity != n) continue;
+                std::string a;
+                for (int q = 0; q < n; q++) a += (q ? ", a" : "a") + std::to_string(q);
+                emit(out, indent, std::to_string(k) + " { return " + vName(funcValueTable_[k].name) + "(" + a + ") }");
+            }
+            emit(out, indent, "else { panic('call through an invalid function value') }");
+            indent--;
+            emit(out, indent, "}");
+            emit(out, indent, "return 0");
+            indent--;
+            emit(out, indent, "}");
+        }
+        emitRaw(out, "");
+    }
+    void emitIndirectCall(std::ostringstream &out, int &indent,
+                          const std::string &res, const std::string &func,
+                          const std::string &args) override
+    {
+        std::string call = func + "(" + args + ")";
+        if (func.rfind("t_", 0) == 0 && !funcValueTable_.empty())   // callee is a temp = a function VALUE out of a list: id dispatch
+            call = "ac_callfn" + std::to_string(callArgCount(args)) + "(" + func + (args.empty() ? "" : ", " + args) + ")";
+        if (res.empty()) emit(out, indent, call);
+        else             emit(out, indent, decl(res, call));
     }
     void emitInput(std::ostringstream &out, int &indent,
                    const std::string &result, const std::string &prompt) override
@@ -14756,6 +15363,8 @@ class VStrategy : public BackendStrategy
         std::string vret = curFuncReturnIsVoid_ ? ""
                          : baseReturnIsString_ ? "string"
                          : baseReturnIsList_ ? "[]i64" : returnIsFloat_ ? "f64" : "i64";
+        curFuncReturnsDyn_ = !isNew && classOwner.empty() && boxedRetFuncs_.count(name) > 0;
+        if (curFuncReturnsDyn_) vret = "AcDynVal";   // returns a var whose type cycles (see detectBoxedVars)
         // A free function whose every `return` traces to one directly-constructed bundle
         // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that struct
         // directly, by value — overrides every inference above. Not applicable to the
@@ -14926,6 +15535,20 @@ class VStrategy : public BackendStrategy
         // A string source parses at the boundary (`'42'.i64()`), not a numeric conversion (which V
         // rejects from a string). Fixes `to_int n = $42$` / `to_dec` on V.
         bool srcIsStr = (!src.empty() && (src.front() == '\'' || src.front() == '"')) || isStringVar(src);
+        // Casting a BOXED source (`to_string(x)` where x is tagged): read the value out of the tag.
+        if (boxedVars_.count(src)) {
+            std::string conv = (t == IRType::STRING) ? src + ".str()" : (t == IRType::FLOAT) ? src + ".as_d()" : src + ".as_i()";
+            bool isNewC = declared.insert(var).second;
+            if (boxedVars_.count(var)) {
+                std::string wrap = (t == IRType::STRING) ? "ac_dyn_s(" + conv + ")" : (t == IRType::FLOAT) ? "ac_dyn_f(" + conv + ")" : "ac_dyn_i(" + conv + ")";
+                emit(out, indent, (isNewC ? "mut " + var + " := " : var + " = ") + wrap);
+            } else {
+                if (t == IRType::STRING) stringVars_.insert(var);
+                else if (t == IRType::FLOAT) floatVars.insert(var);
+                emit(out, indent, (isNewC ? "mut " + var + " := " : var + " = ") + conv);
+            }
+            return;
+        }
         // Boxed var (see AcDynVal in emitHeader): this IS the actual retype point.
         if (boxedVars_.count(var)) {
             std::string rhs = (t == IRType::STRING) ? "ac_dyn_s(" + src + ".str())"
@@ -14995,6 +15618,9 @@ class VStrategy : public BackendStrategy
 
 class AsmStrategy : public BackendStrategy
 {
+    // Function values held in lists: shares the driver's table (it validates int->int and names the functions), but the
+    // list slot holds the function's ADDRESS (`lea`), not an id — an indirect `call r10` needs no dispatcher.
+    bool usesFuncIds() const override { return true; }
     std::vector<std::string> dataSec; // accumulates .data entries
     std::map<std::string, int> slot;  // var/temp → rbp offset
     int nextSlot = 0;
@@ -16569,6 +17195,26 @@ class AsmStrategy : public BackendStrategy
             storeXMM0(out, res);
             return;
         }
+        if (op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>")
+        {
+            // Bitwise ops and the literal shifts (ptm/ptd) are integer operations: a float operand (a math
+            // result, a folded constant) is truncated to an integer first. `<<`/`>>` had NO case at all — they
+            // fell through and stored the untouched left operand (`x ptd 2` silently returned x).
+            auto loadInt = [&](const std::string &v) {
+                if (isFloatVal(v)) { loadDouble(out, v, "xmm0"); out << "    cvttsd2si rax, xmm0\n"; }
+                else               loadRAX(out, v);
+            };
+            loadInt(rhs);
+            out << "    mov rcx, rax\n";
+            loadInt(lhs);
+            if      (op == "&")  out << "    and rax, rcx\n";
+            else if (op == "|")  out << "    or rax, rcx\n";
+            else if (op == "^")  out << "    xor rax, rcx\n";
+            else if (op == "<<") out << "    shl rax, cl\n";
+            else                 out << "    sar rax, cl\n";
+            storeRAX(out, res);
+            return;
+        }
         loadRAX(out, lhs);
         if (op == "+")
         {
@@ -16956,8 +17602,27 @@ class AsmStrategy : public BackendStrategy
         out << "    mov rbx, rax\n";
         loadRAX(out, idx);
         out << "    mov rcx, rax\n";
-        loadRAX(out, val);
+        if (funcValueIds_.count(val)) out << "    lea rax, [rel " << val << "]\n";   // a user function stored as a value
+        else                          loadRAX(out, val);
         out << "    mov qword [rbx + 8 + rcx*8], rax\n";
+    }
+    // Call through a function VALUE loaded out of a list (`funcs[k](x)`): the callee temp holds a code address.
+    void emitIndirectCall(std::ostringstream &out, int &indent, const std::string &res,
+                          const std::string &func, const std::string &args) override
+    {
+        if (func.rfind("t_", 0) != 0 || funcValueTable_.empty()) { emitCall(out, indent, res, func, args); return; }
+        static const char *argRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        std::vector<std::string> parsed = splitCallArgs(args);
+        for (size_t i = 0; i < parsed.size() && i < 6; i++) {
+            std::string a = parsed[i];
+            size_t s0 = a.find_first_not_of(' '), e0 = a.find_last_not_of(' ');
+            if (s0 == std::string::npos) continue;
+            loadRAX(out, a.substr(s0, e0 - s0 + 1));
+            out << "    mov " << argRegs[i] << ", rax\n";
+        }
+        loadRAX(out, func);
+        out << "    mov r10, rax\n    call r10\n";
+        if (!res.empty()) storeRAX(out, res);
     }
     void emitCall(std::ostringstream &out, int & /*indent*/, const std::string &res,
                   const std::string &func_in, const std::string &args) override
@@ -17120,6 +17785,18 @@ class AsmStrategy : public BackendStrategy
             // actual exported alias names (see ml.cpp), not ml_get_grad/ml_sgd_step directly.
             {"ml_grad", {"i", 'i'}}, {"ml_optimize", {"di", 'i'}},
         };
+        // `math.mod` is type-preserving (int args -> int result, like PY): the real ac_mod takes/returns doubles,
+        // so route whole-number args to the integer variant (result usable as index/bitwise operand/int).
+        if (func == "ac_mod") {
+            bool allInt = true;
+            for (auto &pa : parsed) {
+                size_t s0 = pa.find_first_not_of(' '), e0 = pa.find_last_not_of(' ');
+                if (s0 == std::string::npos) continue;
+                std::string aa = pa.substr(s0, e0 - s0 + 1);
+                if (looksFloat(aa) || floatVars_.count(aa)) { allInt = false; break; }
+            }
+            if (allInt) func = "ac_mod_int";
+        }
         auto sigIt = floatSig.find(func);
         if (sigIt != floatSig.end()) {
             const std::string &argTypes = sigIt->second.first;
@@ -17586,6 +18263,12 @@ class AsmStrategy : public BackendStrategy
                            const std::string &name, const std::string &params,
                            const std::string &classOwner = "") override
     {
+        // String/float-ness is inferred per NAME as code is emitted and was never reset, so a local `x` that one
+        // function used as a string (or float) made every later function's unrelated `x` a string (or float) too —
+        // `x + i` compiled as strlen/malloc/strcat (crash). Keep only the promoted (file-scope) globals, whose
+        // type really is shared across functions.
+        for (auto it = strVars_.begin(); it != strVars_.end();)   it = isPromoted(*it) ? std::next(it) : strVars_.erase(it);
+        for (auto it = floatVars_.begin(); it != floatVars_.end();) it = isPromoted(*it) ? std::next(it) : floatVars_.erase(it);
         // Bundle-method generators are an explicit scope cut, same as every other backend —
         // `self` has nowhere to come from without a real incoming `call`.
         curFuncIsGenerator_ = isGenerator_ && classOwner.empty();
@@ -18169,6 +18852,55 @@ static std::set<std::string> detectNumericRetype(const std::vector<AC_IR::IRInst
     return numeric;
 }
 
+// A user function whose ENTIRE body is one `<Foreign>` block that itself defines a C/C++ function of the
+// same name (`Make seg2 func(n)` followed by `<Foreign> int seg2(int n) {...} <Foreign>`): the block IS the
+// function's definition, so it is emitted at file scope in place of the AC wrapper (wrapped, it became a
+// GNU nested function inside an empty `void seg2`, and every caller saw a void function). `sig` is the
+// declaration (no body) for a prototype; retKind: 0 int, 1 float, 3 string, 4 void.
+struct ForeignFuncDef { std::string text, sig; int retKind = 0; };
+static bool foreignFunctionDef(const AC_IR::IRFunction& fn, ForeignFuncDef& out) {
+    using namespace AC_IR;
+    const IRInstruction* fi = nullptr;
+    for (const auto& ins : fn.instructions) {
+        if (ins.opcode == IROpcode::FUNC_BEGIN || ins.opcode == IROpcode::FUNC_END || ins.opcode == IROpcode::NOP) continue;
+        if (ins.opcode == IROpcode::RETURN && ins.typedOperands.empty()) continue;
+        if (ins.opcode == IROpcode::LIB_CALL && !fi && ins.typedOperands.size() > 1
+            && ins.typedOperands[0].kind == IRRef::Kind::CONST && ins.typedOperands[0].value.type == IRType::STRING
+            && std::get<std::string>(ins.typedOperands[0].value.data) == "foreign") { fi = &ins; continue; }
+        return false;
+    }
+    if (!fi) return false;
+    const auto& fop = fi->typedOperands[1];
+    if (fop.kind != IRRef::Kind::CONST || fop.value.type != IRType::STRING) return false;
+    const std::string text = std::get<std::string>(fop.value.data);
+    auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+    int depth = 0;
+    for (size_t k = 0; k < text.size(); k++) {
+        if (text[k] == '{') depth++;
+        else if (text[k] == '}') depth--;
+        if (depth != 0 || text.compare(k, fn.name.size(), fn.name) != 0) continue;
+        if (k > 0 && idc(text[k - 1])) continue;
+        size_t e = k + fn.name.size();
+        if (e < text.size() && idc(text[e])) continue;
+        while (e < text.size() && text[e] == ' ') e++;
+        if (e >= text.size() || text[e] != '(') continue;
+        size_t close = text.find(')', e);
+        if (close == std::string::npos) continue;
+        size_t b = close + 1;
+        while (b < text.size() && std::isspace((unsigned char)text[b])) b++;
+        if (b >= text.size() || text[b] != '{') continue;           // a call or a prototype, not a definition
+        size_t ls = text.rfind('\n', k); ls = (ls == std::string::npos) ? 0 : ls + 1;
+        std::string ret = text.substr(ls, k - ls);
+        out.sig = text.substr(ls, close + 1 - ls);
+        out.text = text;
+        out.retKind = ret.find("void") != std::string::npos ? 4
+                    : (ret.find("double") != std::string::npos || ret.find("float") != std::string::npos) ? 1
+                    : (ret.find("char") != std::string::npos && ret.find('*') != std::string::npos) ? 3 : 0;
+        return true;
+    }
+    return false;
+}
+
 // Which vars need a genuine boxed/tagged runtime value rather than one fixed declared type
 // (see the setBoxedVars comment on BackendStrategy for the full spec). detectNumericRetype
 // (above) implements the EXISTING "last assignment wins" heuristic that decides a var's single
@@ -18188,7 +18920,9 @@ static std::set<std::string> detectNumericRetype(const std::vector<AC_IR::IRInst
 static std::set<std::string> detectBoxedVars(const std::vector<AC_IR::IRInstruction>& insns,
                                               const AC_IR::SymbolTable& symbols,
                                               const std::set<std::string>& stringVars,
-                                              const std::set<std::string>& stringReturningFuncs) {
+                                              const std::set<std::string>& stringReturningFuncs,
+                                              const std::set<std::string>& boxedReturningFuncs = {},
+                                              std::set<std::string>* cyclingOut = nullptr) {
     using namespace AC_IR;
     auto& S = const_cast<SymbolTable&>(symbols);
     auto nm2 = [&](const IRRef& r) -> std::string {
@@ -18212,6 +18946,74 @@ static std::set<std::string> detectBoxedVars(const std::vector<AC_IR::IRInstruct
         if (stringReturningFuncs.count(callee)) continue;
         std::string v = S.getName(ins.result.id);
         if (!v.empty() && stringVars.count(v)) boxed.insert(v);
+    }
+    // Seed 2: the result of a call to a function that itself returns a boxed value.
+    for (const auto& ins : insns) {
+        if (ins.opcode != IROpcode::CALL || ins.typedOperands.empty()) continue;
+        if (ins.typedOperands[0].kind != IRRef::Kind::VAR || ins.typedOperands[0].id < 0) continue;
+        if (!boxedReturningFuncs.count(S.getName(ins.typedOperands[0].id))) continue;
+        std::string dst = nm2(ins.result);
+        if (!dst.empty()) boxed.insert(dst);
+    }
+    // Seed 3 — a var whose TYPE CYCLES inside a loop: within one loop nest it is assigned both a string
+    // and a non-string value (`x=to_string(x)+..` next to `x+=i`). Which type it holds at a use then
+    // depends on the iteration, so no single declared type (nor a one-way retype) can be right; only a
+    // tagged runtime value is. A var whose string assignment is outside the loop (retype AFTER the loop)
+    // is NOT caught here — that stays the static flow-sensitive retype.
+    {
+        int depth = 0, topLoop = 0, nextLoop = 0;
+        std::map<std::string, std::map<int, int>> classesInLoop;   // var -> loop id -> bit0 string, bit1 other
+        // Low-level backends (BNY/ASM/ARM) get loops already flattened to `label Lk ... jmp Lk`: a backward jump
+        // to an earlier label marks a loop. flatLoop[i] = id of the outermost such loop covering instruction i.
+        std::vector<int> flatLoop(insns.size(), 0);
+        {
+            std::map<int, size_t> labelAt;
+            std::vector<std::pair<size_t, size_t>> spans;
+            for (size_t k = 0; k < insns.size(); k++) {
+                const auto& in = insns[k];
+                if (in.opcode == IROpcode::LABEL && !in.typedOperands.empty() && in.typedOperands[0].kind == IRRef::Kind::LABEL)
+                    labelAt[in.typedOperands[0].id] = k;
+                else if (in.opcode == IROpcode::JUMP && !in.typedOperands.empty() && in.typedOperands[0].kind == IRRef::Kind::LABEL) {
+                    auto it = labelAt.find(in.typedOperands[0].id);
+                    if (it != labelAt.end() && it->second < k) spans.push_back({it->second, k});
+                }
+            }
+            std::sort(spans.begin(), spans.end(), [](const std::pair<size_t,size_t>& a, const std::pair<size_t,size_t>& b) {
+                return a.first != b.first ? a.first < b.first : a.second > b.second; });
+            int id = 0; size_t curEnd = 0; bool open = false;
+            for (const auto& sp : spans) {
+                if (!open || sp.first > curEnd) { id++; open = true; curEnd = sp.second; }   // a new outermost loop
+                else if (sp.second > curEnd) curEnd = sp.second;
+                for (size_t k = sp.first; k <= sp.second; k++) flatLoop[k] = id;
+            }
+        }
+        size_t insIdx = (size_t)-1;
+        for (const auto& ins : insns) {
+            insIdx++;
+            if (ins.opcode == IROpcode::FOR_BEGIN || ins.opcode == IROpcode::WHILE_BEGIN) {
+                if (depth++ == 0) topLoop = ++nextLoop;
+                continue;
+            }
+            if (ins.opcode == IROpcode::FOR_END || ins.opcode == IROpcode::WHILE_END) { if (depth > 0) depth--; continue; }
+            if (depth == 0 && flatLoop[insIdx] == 0) continue;
+            IRRef tgt, val; bool have = false;
+            if (ins.opcode == IROpcode::STORE_VAR && ins.typedOperands.size() >= 2) {
+                tgt = ins.typedOperands[0]; val = ins.typedOperands[1]; have = true;
+            } else if (ins.opcode == IROpcode::STORE_VAR && ins.result.isValid() && !ins.typedOperands.empty()) {
+                tgt = ins.result; val = ins.typedOperands[0]; have = true;
+            }
+            if (!have || tgt.kind != IRRef::Kind::VAR || tgt.id < 0) continue;
+            std::string v = S.getName(tgt.id);
+            if (v.empty()) continue;   // NOT gated on stringVars.count(v): a var whose LAST assignment is numeric was
+                                       // already erased from that set by the numeric-retype pass
+            bool valStr = ins.resultType == IRType::STRING
+                        || (val.kind == IRRef::Kind::CONST && val.value.type == IRType::STRING)
+                        || ((val.kind == IRRef::Kind::VAR || val.kind == IRRef::Kind::TEMP) && stringVars.count(nm2(val)));
+            classesInLoop[v][depth > 0 ? topLoop : 100000 + flatLoop[insIdx]] |= valStr ? 1 : 2;
+        }
+        for (auto& [v, byLoop] : classesInLoop)
+            for (auto& [lp, bits] : byLoop)
+                if (bits == 3) { boxed.insert(v); if (cyclingOut) cyclingOut->insert(v); break; }
     }
     if (boxed.empty()) return boxed;
     // Propagate: any instruction whose result depends on an already-boxed operand is boxed too.
@@ -18406,6 +19208,8 @@ class UnifiedIRCodeGen
     // `p.field` formats as a real struct access instead of a flattened `p_field` name).
     std::map<std::string, std::map<int, std::string>> classParamTypes_;
     std::set<std::string> protoFloatFuncs_, protoListFuncs_, protoStringFuncs_; // fwd-decl return types
+    std::map<std::string, ForeignFuncDef> foreignDefs_;   // funcs whose body IS a foreign definition (C/C++)
+    std::set<std::string> boxedRetFuncsDrv_;   // user fns returning a boxed (tagged) value — see setBoxedRetFuncs
     std::set<std::string> voidUserFuncs_;   // user functions with no `return <value>;` anywhere
     std::set<std::string> generatorFuncNamesIco_;   // fn.name for every fn.isGenerator (family B/C
                                                      // need this at CALL sites, not just genFunction)
@@ -18927,6 +19731,12 @@ class UnifiedIRCodeGen
                     args += ilibCall ? strategy->libArgRef(a, isStr)
                                      : strategy->valueArgRef(a, ir.symbols.getType(aop.id));
                 }
+                else if (aop.kind == IRRef::Kind::TEMP && rawName.find('.') != std::string::npos) {
+                    // a string TEMP (`stringm.b(to_string(n))`'s inner result) into a namespaced ilib
+                    // call needs the same const char* treatment a named string var gets above
+                    std::string a = ref(aop);
+                    args += strategy->libArgRef(a, strategy->isStringVar(a));
+                }
                 else
                     args += ref(aop);
             }
@@ -19265,7 +20075,7 @@ class UnifiedIRCodeGen
                     if (j > 1)
                         args += ", ";
                     std::string a = ref(i.typedOperands[j]);
-                    bool isStr = i.typedOperands[j].kind == IRRef::Kind::VAR
+                    bool isStr = (i.typedOperands[j].kind == IRRef::Kind::VAR || i.typedOperands[j].kind == IRRef::Kind::TEMP)
                                  && strategy->isStringVar(a);
                     args += strategy->libArgRef(a, isStr);
                 }
@@ -19396,6 +20206,15 @@ class UnifiedIRCodeGen
 
     void genFunction(const IRFunction &func)
     {
+        {   // the whole body is a foreign definition of this very function: emit it verbatim, at file scope
+            auto fdIt = foreignDefs_.find(func.name);
+            if (fdIt != foreignDefs_.end() && func.classOwner.empty()) {
+                int ind = 0;
+                strategy->emitForeign(out, ind, fdIt->second.text);
+                out << "\n";
+                return;
+            }
+        }
         std::string params;
         std::set<std::string> paramSet(func.parameters.begin(), func.parameters.end());
         for (size_t i = 0; i < func.parameters.size(); i++)
@@ -19470,7 +20289,7 @@ class UnifiedIRCodeGen
         for (const auto& nv : detectNumericRetype(func.instructions, ir.symbols, fnStringVars))
             fnStringVars.erase(nv);   // #retype: last-assign numeric → NOT string-unified
         strategy->setStringVars(fnStringVars);
-        strategy->setBoxedVars(detectBoxedVars(func.instructions, ir.symbols, fnStringVars, protoStringFuncs_));
+        strategy->setBoxedVars(detectBoxedVars(func.instructions, ir.symbols, fnStringVars, protoStringFuncs_, boxedRetFuncsDrv_));
 
         // Pre-scan: detect function return type (float or list)
         // Note: list literals use mkTemp() → Kind::TEMP; named vars use Kind::VAR. Check both.
@@ -19735,7 +20554,7 @@ public:
                             if (aclContent.empty()) {
 #ifndef _WIN32
                                 char exeBuf[4096] = {};
-                                ssize_t len = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf)-1);
+                                ssize_t len = acSelfExe(exeBuf, sizeof(exeBuf)-1);
                                 if (len > 0) {
                                     std::string bd(exeBuf, len);
                                     auto sl = bd.rfind('/');
@@ -20120,6 +20939,24 @@ public:
                 strategy->setPromotedGlobalSymIds(globalVarSymIds_);
             }
             promotedGlobalsList_ = promoted; // reused for C/compiled file-scope global emission
+            // Which promoted globals hold LISTS (an `ALLOC "list"` targets them): Rust/Go/V declare a typed
+            // file-scope global for those instead of the scalar default, and index/append through it.
+            if (ir.backend == "RS" || ir.backend == "GO" || ir.backend == "V") {
+                std::set<std::string> lg;
+                auto scanLg = [&](const std::vector<IRInstruction> &code) {
+                    for (const auto &ins : code)
+                        if (ins.opcode == IROpcode::ALLOC && ins.result.kind == IRRef::Kind::VAR && ins.result.id >= 0
+                            && !ins.typedOperands.empty() && ins.typedOperands[0].kind == IRRef::Kind::CONST
+                            && ins.typedOperands[0].value.type == IRType::STRING
+                            && std::get<std::string>(ins.typedOperands[0].value.data) == "list") {
+                            std::string vn = ir.symbols.getName(ins.result.id);
+                            if (std::find(promoted.begin(), promoted.end(), vn) != promoted.end()) lg.insert(vn);
+                        }
+                };
+                scanLg(ir.globalInit);
+                for (const auto &fn : ir.functions) scanLg(fn.instructions);
+                strategy->setListGlobals(lg);
+            }
 
             // Which of these promoted vars are STRUCT-typed (ilib widget constructor calls,
             // e.g. `name_inp = call ask, root, 45` in mainloop) rather than scalar/list — needed
@@ -20393,11 +21230,18 @@ public:
         // introduced this session). voidUserFuncs_ lets the CALL case below null out `res` for
         // exactly these callees, so every backend's existing `res.empty()` bare-statement path
         // (already there for indirect/void-result calls) handles it correctly.
+        foreignDefs_.clear();
+        if (ir.backend == "C" || ir.backend == "CPP")
+            for (const auto& fn : ir.functions) {
+                ForeignFuncDef fd;
+                if (fn.classOwner.empty() && foreignFunctionDef(fn, fd)) foreignDefs_[fn.name] = fd;
+            }
         for (const auto& fn : ir.functions) {
             // A generator's `return`s are always bare (all real value production goes
             // through `yield`, not `return <value>`) but calling it always produces a
             // genuine generator/channel object to capture — never treat it as void here.
             if (fn.isGenerator) continue;
+            if (foreignDefs_.count(fn.name) && foreignDefs_[fn.name].retKind != 4) continue;   // its C signature returns a value
             bool hasValueReturn = false;
             for (const auto& ins : fn.instructions)
                 if (ins.opcode == IROpcode::RETURN && !ins.typedOperands.empty()) { hasValueReturn = true; break; }
@@ -20491,6 +21335,10 @@ public:
             protoFloatFuncs_ = floatFuncs;
             protoListFuncs_  = listFuncs;
             protoStringFuncs_ = stringFuncs;
+            for (const auto& [fname, fd] : foreignDefs_) {   // return type comes from the foreign C signature
+                if (fd.retKind == 1) protoFloatFuncs_.insert(fname);
+                else if (fd.retKind == 3) protoStringFuncs_.insert(fname);
+            }
         }
 
         strategy->setNeedsInput(hasInput);
@@ -20693,6 +21541,60 @@ public:
             }
         }
 
+        // Function values kept in lists (`funcs=[f1,f2]`): for backends that dispatch through integer ids,
+        // collect every user function stored into a list slot (STORE_INDEX whose value is a function name).
+        if (strategy->usesFuncIds()) {
+            std::map<std::string, int> arityOf;
+            for (const auto &fn : ir.functions) if (fn.classOwner.empty()) arityOf[fn.name] = (int)fn.parameters.size();
+            std::set<std::string> seenFv;
+            std::vector<BackendStrategy::FuncValueEntry> fvTable;
+            auto scanFv = [&](const std::vector<IRInstruction> &code) {
+                for (const auto &ins : code) {
+                    if (ins.opcode != IROpcode::STORE_INDEX || ins.typedOperands.size() < 3) continue;
+                    const auto &v = ins.typedOperands[2];
+                    if (v.kind != IRRef::Kind::VAR || v.id < 0) continue;
+                    std::string vn = ir.symbols.getName(v.id);
+                    if (!arityOf.count(vn) || !seenFv.insert(vn).second) continue;
+                    if (protoFloatFuncs_.count(vn) || protoListFuncs_.count(vn) || protoStringFuncs_.count(vn) || voidUserFuncs_.count(vn))
+                        throw ACError::backend("function '" + vn + "' can't be stored in a list: function values held in a list "
+                                               "must take and return integers");
+                    fvTable.push_back({vn, arityOf[vn]});
+                }
+            };
+            scanFv(ir.globalInit);
+            for (const auto &fn : ir.functions) scanFv(fn.instructions);
+            std::sort(fvTable.begin(), fvTable.end(), [](const BackendStrategy::FuncValueEntry &a, const BackendStrategy::FuncValueEntry &b) { return a.name < b.name; });
+            strategy->setFuncValueTable(fvTable);
+        }
+
+        // Functions whose RETURNED value is a boxed (tagged) var — a var whose type cycles inside a
+        // loop, e.g. `x` in `x+=i / x=to_string(x)+.. / x=length(..)+i`. Such a function returns the
+        // AcDynVal itself and its callers hold the result boxed. A fixpoint, since a function returning
+        // another boxed function's result is boxed too. Only computed for backends that implement it.
+        boxedRetFuncsDrv_.clear();
+        if (strategy->supportsBoxedReturn()) {
+            bool grew = true;
+            while (grew) {
+                grew = false;
+                for (const auto &func : ir.functions) {
+                    if (!func.classOwner.empty() || func.isGenerator || boxedRetFuncsDrv_.count(func.name)) continue;
+                    std::set<std::string> sp = detectStringParams(func, ir.symbols);
+                    std::set<std::string> sv = detectStringVars(func.instructions, ir.symbols, sp, protoStringFuncs_);
+                    for (const auto& nv : detectNumericRetype(func.instructions, ir.symbols, sv)) sv.erase(nv);
+                    std::set<std::string> bx = detectBoxedVars(func.instructions, ir.symbols, sv, protoStringFuncs_, boxedRetFuncsDrv_);
+                    if (bx.empty()) continue;
+                    for (const auto &ins : func.instructions) {
+                        if (ins.opcode != IROpcode::RETURN || ins.typedOperands.empty()) continue;
+                        const auto &op = ins.typedOperands[0];
+                        std::string rn = op.kind == IRRef::Kind::TEMP ? "t_" + std::to_string(op.id)
+                                       : (op.kind == IRRef::Kind::VAR && op.id >= 0) ? ir.symbols.getName(op.id) : "";
+                        if (!rn.empty() && bx.count(rn)) { boxedRetFuncsDrv_.insert(func.name); grew = true; break; }
+                    }
+                }
+            }
+        }
+        strategy->setBoxedRetFuncs(boxedRetFuncsDrv_);
+
         // Forward declarations first (C++ requires them for mutual recursion —
         // is_even calling is_odd defined later otherwise fails to compile).
         {
@@ -20710,6 +21612,10 @@ public:
                 // generator called before its own definition is not supported by this fiber
                 // design for now.
                 if (func.isGenerator) continue;
+                {   // foreign-defined: the prototype is the foreign signature itself
+                    auto fdIt = foreignDefs_.find(func.name);
+                    if (fdIt != foreignDefs_.end()) { out << fdIt->second.sig << ";\n"; continue; }
+                }
                 std::string params;
                 for (size_t pi = 0; pi < func.parameters.size(); pi++) {
                     if (pi) params += ", ";
@@ -20775,6 +21681,8 @@ public:
         // Emit free (non-method) functions
         for (const auto &func : ir.functions)
             if (func.classOwner.empty()) genFunction(func);
+        if (strategy->usesFuncIds() && !strategy->funcValueTable_.empty())
+            strategy->emitFuncValueDispatch(out, indentLevel);
 
         // Second pass: emit main body (skip class blocks).
         // #6: the mainloop (globalInit) needs its own string inference — it's not a function, so
@@ -20784,7 +21692,7 @@ public:
             std::set<std::string> mlStr = detectStringVars(ir.globalInit, ir.symbols, {}, protoStringFuncs_);
             for (const auto& nv : detectNumericRetype(ir.globalInit, ir.symbols, mlStr)) mlStr.erase(nv);
             strategy->setStringVars(mlStr);   // #retype
-            strategy->setBoxedVars(detectBoxedVars(ir.globalInit, ir.symbols, mlStr, protoStringFuncs_));
+            strategy->setBoxedVars(detectBoxedVars(ir.globalInit, ir.symbols, mlStr, protoStringFuncs_, boxedRetFuncsDrv_));
         }
         // Mainloop cross-block hoist (block-scoped backends: JS/C/C++/V/Java/Rust) — the mainloop
         // is not a function, so the per-function hoist pass above never covered it (#41 in main).
@@ -20862,6 +21770,31 @@ public:
 };
 
 // ─── public API ──────────────────────────────────────────────────────────────
+
+// Backends with no tagged runtime value (BNY, ASM, ARM) cannot represent a variable whose type changes between
+// int/float/string inside a loop (`x+=i` next to `x=to_string(x)+..`): they would run it as raw bits and crash or
+// print garbage. Refuse at compile time instead.
+void rejectTypeCyclingVars(const IRProgram &ir, const std::string &backend)
+{
+    auto check = [&](const std::vector<IRInstruction> &code, const std::vector<std::string> &params, const std::string &where) {
+        std::set<std::string> ps(params.begin(), params.end());
+        IRFunction tmp("");
+        tmp.parameters = params;
+        tmp.instructions = code;
+        std::set<std::string> sp = detectStringParams(tmp, ir.symbols);
+        std::set<std::string> sv = detectStringVars(code, ir.symbols, sp, {});
+        for (const auto &nv : detectNumericRetype(code, ir.symbols, sv)) sv.erase(nv);
+        std::set<std::string> cyc;
+        detectBoxedVars(code, ir.symbols, sv, {}, {}, &cyc);
+        if (!cyc.empty())
+            throw ACError::backend("variable '" + *cyc.begin() + "' in " + where + " changes type between int/float/string "
+                                   "inside a loop, which the " + backend + " backend cannot represent (it has no tagged "
+                                   "values yet) — use another backend");
+    };
+    check(ir.globalInit, {}, "the mainloop");
+    for (const auto &fn : ir.functions)
+        if (!fn.isGenerator) check(fn.instructions, fn.parameters, "function '" + fn.name + "'");
+}
 
 std::string generateFromIR(const IRProgram &ir, const std::string &stem,
                            const std::string &outputBase)
