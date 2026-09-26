@@ -31,5 +31,5 @@ use ilib math
 
     Term.display $--- Pythagorean: sqrt(3^2 + 4^2) = 5 ---$
     Term.display math.hypot(3.0, 4.0)
-    /kill
+    Term.display $Expected: 5.0$
 <mainloop>

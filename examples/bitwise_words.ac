@@ -8,4 +8,5 @@ AC->BNY
     Term.display 12 bxor 10
     Term.display bnot 0
     Term.display ~ 5
+    Term.display $Expected: -6$
 <mainloop>

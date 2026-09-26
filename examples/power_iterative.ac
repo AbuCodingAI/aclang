@@ -13,4 +13,5 @@ Make ipow func(base, exp)
 <mainloop>
     Term.display ipow(2, 10)
     Term.display 2 ^ 10
+    Term.display $Expected: 1024$
 <mainloop>

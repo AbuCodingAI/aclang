@@ -9,4 +9,5 @@ AC->BNY
     Term.display length squares
     FOR s in squares
         Term.display s
+    Term.display $Expected: 25$
 <mainloop>

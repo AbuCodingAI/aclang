@@ -12,4 +12,5 @@ Make gcd func(a, b)
 <mainloop>
     Term.display gcd(48, 18)
     Term.display gcd(1071, 462)
+    Term.display $Expected: 21$
 <mainloop>

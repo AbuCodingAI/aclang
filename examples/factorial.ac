@@ -10,4 +10,5 @@ Make fact func(n)
 <mainloop>
     Term.display fact(5)
     Term.display fact(10)
+    Term.display $Expected: 3628800$
 <mainloop>

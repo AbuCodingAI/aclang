@@ -13,4 +13,5 @@ Make is_pal func(s)
 <mainloop>
     Term.display is_pal($racecar$)
     Term.display is_pal($hello$)
+    Term.display $Expected: 0$
 <mainloop>

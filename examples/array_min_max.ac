@@ -15,4 +15,5 @@ Make minmax_diff func(arr)
 <mainloop>
     Term.display minmax_diff([7, 2, 9, 4])
     Term.display minmax_diff([5, 5, 5])
+    Term.display $Expected: 0$
 <mainloop>

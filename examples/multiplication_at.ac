@@ -8,4 +8,5 @@ AC->BNY
     x = 5
     x @= 3
     Term.display x
+    Term.display $Expected: 15$
 <mainloop>

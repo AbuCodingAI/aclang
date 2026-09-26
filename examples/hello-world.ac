@@ -2,5 +2,5 @@ AC->BNY
 
 <mainloop>
     Term.display $Hello, World!$
-    /kill
+    Term.display $Expected: Hello, World!$
 <mainloop>

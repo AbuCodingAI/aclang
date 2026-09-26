@@ -9,4 +9,5 @@ Make c_to_f func(c)
     Term.display c_to_f(0)
     Term.display c_to_f(100)
     Term.display c_to_f(37)
+    Term.display $Expected: 98.59999999999999$
 <mainloop>

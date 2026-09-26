@@ -9,4 +9,5 @@ AC->BNY
     Term.display length nums
     nums[2] = 99
     Term.display nums[2]
+    Term.display $Expected: 99$
 <mainloop>

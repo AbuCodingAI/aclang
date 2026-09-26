@@ -8,4 +8,5 @@ Make tri func(n)
 <mainloop>
     FOR n in sequence(1, 8)
         Term.display tri(n)
+    Term.display $Expected: 28$
 <mainloop>

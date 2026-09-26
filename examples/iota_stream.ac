@@ -11,4 +11,5 @@ AC->PY
     FOR v in stream(2, 9, 3)
         free total += v
         Term.display v
+    Term.display $Expected: 8$
 <mainloop>

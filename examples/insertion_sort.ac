@@ -19,4 +19,5 @@ Make isort func(arr)
     s = isort([31, 41, 59, 26, 53])
     FOR v in s
         Term.display v
+    Term.display $Expected: 59$
 <mainloop>

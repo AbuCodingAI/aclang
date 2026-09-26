@@ -16,4 +16,5 @@ Make fib func(n)
 <mainloop>
     Term.display fib(10)
     Term.display fib(30)
+    Term.display $Expected: 832040$
 <mainloop>

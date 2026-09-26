@@ -8,4 +8,5 @@ AC->PY
         line += $ab$
     Term.display line
     Term.display length line
+    Term.display $Expected: 10$
 <mainloop>

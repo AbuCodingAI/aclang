@@ -10,4 +10,5 @@ Make powdemo func(b, e)
     Term.display 3 ^ 4
     Term.display powdemo(5, 3)
     Term.display 2 ^ 0
+    Term.display $Expected: 1$
 <mainloop>

@@ -12,4 +12,5 @@ Make vowels func(s)
 <mainloop>
     Term.display vowels($programming language$)
     Term.display vowels($xyz$)
+    Term.display $Expected: 0$
 <mainloop>

@@ -111,4 +111,5 @@ Make statsStress func(rounds)
     checksum = fib + fact + pow + sum + arith + branch + stats
 
     Term.display checksum
+    Term.display $Expected: 3.344024546978682e+17$
 <mainloop>

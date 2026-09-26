@@ -8,4 +8,5 @@ AC->BNY
     Term.display $---$
     FOR n in sequence(0, 20, 5)
         Term.display n
+    Term.display $Expected: 15$
 <mainloop>

@@ -41,5 +41,5 @@ Make testNotLt func(a, b)
     Term.display ng
     nl = testNotLt(5, 3)
     Term.display nl
-    /kill
+    Term.display $Expected: 1$
 <mainloop>

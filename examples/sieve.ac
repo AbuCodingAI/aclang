@@ -31,4 +31,5 @@ Make sieve func(n)
     limit = 50
     primes = sieve(limit)
     Term.display primes
+    Term.display $Expected: [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]$
 <mainloop>

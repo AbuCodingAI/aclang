@@ -10,4 +10,5 @@ AC->BNY
     b = t
     Term.display a
     Term.display b
+    Term.display $Expected: 1$
 <mainloop>

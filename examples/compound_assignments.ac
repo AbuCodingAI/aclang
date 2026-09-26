@@ -12,4 +12,5 @@ AC->BNY
     Term.display x
     x /= 4
     Term.display x
+    Term.display $Expected: 6$
 <mainloop>

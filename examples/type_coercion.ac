@@ -9,4 +9,5 @@ AC->PY
     Term.display label + $!$
     to_dec d = 7
     Term.display d / 2
+    Term.display $Expected: 3.5$
 <mainloop>

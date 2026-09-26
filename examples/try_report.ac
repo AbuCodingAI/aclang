@@ -11,4 +11,5 @@ Make risky func(d)
     catch
         report err
         Term.display err
+    Term.display $Expected: division by zero$
 <mainloop>

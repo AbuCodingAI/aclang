@@ -6,4 +6,5 @@ AC->PY
     word = $hello$
     FOR c in word
         Term.display c
+    Term.display $Expected: o$
 <mainloop>

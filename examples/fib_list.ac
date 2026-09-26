@@ -18,4 +18,5 @@ Make fibs func(n)
 <mainloop>
     FOR v in fibs(10)
         Term.display v
+    Term.display $Expected: 34$
 <mainloop>

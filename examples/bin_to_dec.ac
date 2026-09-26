@@ -13,4 +13,5 @@ Make from_bin func(s)
 <mainloop>
     Term.display from_bin($1010$)
     Term.display from_bin($11111111$)
+    Term.display $Expected: 255$
 <mainloop>

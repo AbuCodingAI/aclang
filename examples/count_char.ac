@@ -12,4 +12,5 @@ Make count_l func(s)
 <mainloop>
     Term.display count_l($hello well$)
     Term.display count_l($abc$)
+    Term.display $Expected: 0$
 <mainloop>

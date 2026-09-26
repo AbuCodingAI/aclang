@@ -13,4 +13,5 @@ Make clamp func(v, lo, hi)
     Term.display clamp(5, 0, 10)
     Term.display clamp(-3, 0, 10)
     Term.display clamp(99, 0, 10)
+    Term.display $Expected: 10$
 <mainloop>

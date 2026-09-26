@@ -9,4 +9,5 @@ AC->BNY
         IF v > best
             free best = v
         Term.display best
+    Term.display $Expected: 9$
 <mainloop>

@@ -8,4 +8,5 @@ AC->BNY
         Term.display n
         n -= 1
     Term.display $liftoff$
+    Term.display $Expected: liftoff$
 <mainloop>

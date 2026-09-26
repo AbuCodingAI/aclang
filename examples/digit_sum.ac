@@ -14,4 +14,5 @@ Make digit_sum func(n)
 <mainloop>
     Term.display digit_sum(1234)
     Term.display digit_sum(99999)
+    Term.display $Expected: 45$
 <mainloop>

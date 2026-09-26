@@ -13,4 +13,5 @@ Make sum_evens func(n)
 <mainloop>
     Term.display sum_evens(10)
     Term.display sum_evens(100)
+    Term.display $Expected: 2550$
 <mainloop>

@@ -12,4 +12,5 @@ Make ack func(m, n)
 <mainloop>
     Term.display ack(2, 3)
     Term.display ack(3, 3)
+    Term.display $Expected: 61$
 <mainloop>

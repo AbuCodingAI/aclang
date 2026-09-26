@@ -20,4 +20,5 @@ Make sort func(arr)
     s = sort([5, 2, 9, 1, 7])
     FOR v in s
         Term.display v
+    Term.display $Expected: 9$
 <mainloop>

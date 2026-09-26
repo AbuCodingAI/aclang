@@ -13,4 +13,5 @@ Make find func(arr, target)
 <mainloop>
     Term.display find([4, 8, 15, 16, 23, 42], 15)
     Term.display find([4, 8, 15], 99)
+    Term.display $Expected: 0$
 <mainloop>

@@ -14,4 +14,5 @@ AC->BNY
         Term.display x
     FOR x in stream(1, 100, 4)
         Term.display x
+    Term.display $Expected: 97$
 <mainloop>

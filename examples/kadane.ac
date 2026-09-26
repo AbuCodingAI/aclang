@@ -20,4 +20,5 @@ Make max_subarray func(arr)
 <mainloop>
     Term.display max_subarray([-2, 1, -3, 4, -1, 2, 1, -5, 4])
     Term.display max_subarray([-3, -1, -2])
+    Term.display $Expected: -1$
 <mainloop>

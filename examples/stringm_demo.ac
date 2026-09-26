@@ -9,4 +9,5 @@ use ilib string-cheese
     Term.display stringm.lower($WHISPER$)
     Term.display stringm.strip($  padded  $)
     Term.display stringm.replace($x.y.z$, $.$, $_$)
+    Term.display $Expected: x_y_z$
 <mainloop>

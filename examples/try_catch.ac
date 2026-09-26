@@ -13,4 +13,5 @@ Make risky func(d)
         Term.display $caught a runtime error$
     after
         Term.display $always runs$
+    Term.display $Expected: always runs$
 <mainloop>

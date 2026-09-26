@@ -8,4 +8,5 @@ AC->BNY
     Term.display 5 ptm 3
     Term.display 40 ptd 2
     Term.display 7 ptd 1
+    Term.display $Expected: 3$
 <mainloop>

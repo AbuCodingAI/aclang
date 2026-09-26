@@ -10,4 +10,5 @@ use ilib math
     Term.display math.floor(3.9)
     Term.display math.ceil(3.1)
     Term.display math.sqrt(144.0)
+    Term.display $Expected: 12.0$
 <mainloop>

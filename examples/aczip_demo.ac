@@ -40,4 +40,5 @@ use ilib aczip
     os.rmdir($aczip_demo_out$)
     os.rmfile($aczip_demo.aczip$)
     Term.display $removed all demo files and directories$
+    Term.display $Expected: removed all demo files and directories$
 <mainloop>

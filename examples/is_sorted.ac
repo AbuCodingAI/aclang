@@ -13,4 +13,5 @@ Make sorted_check func(arr)
 <mainloop>
     Term.display sorted_check([1, 2, 3, 4])
     Term.display sorted_check([1, 3, 2])
+    Term.display $Expected: 0$
 <mainloop>

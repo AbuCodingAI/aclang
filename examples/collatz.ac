@@ -17,4 +17,5 @@ Make collatz func(n)
 <mainloop>
     Term.display collatz(27)
     Term.display collatz(6)
+    Term.display $Expected: 8$
 <mainloop>

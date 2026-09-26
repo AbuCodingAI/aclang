@@ -10,4 +10,5 @@ use ilib os
     Term.display os.exists($/tmp/ac_os_demo.txt$)
     os.rmfile($/tmp/ac_os_demo.txt$)
     Term.display os.exists($/tmp/ac_os_demo.txt$)
+    Term.display $Expected: False$
 <mainloop>

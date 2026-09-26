@@ -25,4 +25,5 @@ Make is_prime func(n)
         free n += 1
     FOR p in found
         Term.display p
+    Term.display $Expected: 29$
 <mainloop>

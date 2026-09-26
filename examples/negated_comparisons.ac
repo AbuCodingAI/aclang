@@ -8,4 +8,5 @@ AC->BNY
     Term.display 5 #< 3
     Term.display 4 #= 4
     Term.display 4 #= 9
+    Term.display $Expected: 1$
 <mainloop>

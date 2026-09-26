@@ -24,4 +24,5 @@ Make is_happy func(n)
 <mainloop>
     Term.display is_happy(19)
     Term.display is_happy(4)
+    Term.display $Expected: 0$
 <mainloop>

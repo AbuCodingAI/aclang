@@ -19,4 +19,5 @@ Make is_prime func(n)
     Term.display is_prime(91)
     Term.display is_prime(2)
     Term.display is_prime(1)
+    Term.display $Expected: 0$
 <mainloop>

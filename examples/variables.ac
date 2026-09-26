@@ -11,4 +11,5 @@ AC->BNY
     Term.display diff
     x = x + 100
     Term.display x
+    Term.display $Expected: 110$
 <mainloop>

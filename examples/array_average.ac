@@ -11,4 +11,5 @@ Make mean func(arr)
 <mainloop>
     Term.display mean([2, 4, 6, 8])
     Term.display mean([1, 2, 4])
+    Term.display $Expected: 2.333333333333333$
 <mainloop>

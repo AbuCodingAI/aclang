@@ -17,4 +17,5 @@ Make grade func(score)
             free passed += 1
     Term.display s / length scores
     Term.display passed
+    Term.display $Expected: 3$
 <mainloop>

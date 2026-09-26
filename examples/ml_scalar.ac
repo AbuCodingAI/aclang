@@ -13,4 +13,5 @@ use ilib ml
     updated = ml.take(w)
     Term.display before
     Term.display updated
+    Term.display $Expected: 1.6400000000000001$
 <mainloop>

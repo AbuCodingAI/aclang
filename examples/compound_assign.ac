@@ -7,5 +7,5 @@ AC->BNY
     y = 1
     y = y bxor 1
     Term.display y
-    /kill
+    Term.display $Expected: 0$
 <mainloop>

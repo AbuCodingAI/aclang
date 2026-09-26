@@ -14,4 +14,5 @@ Make formula func(n)
 <mainloop>
     Term.display loop_sum(10)
     Term.display formula(10)
+    Term.display $Expected: 385$
 <mainloop>

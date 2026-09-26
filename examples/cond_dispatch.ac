@@ -15,4 +15,5 @@ Make day_type func(d)
     Term.display day_type(1)
     Term.display day_type(3)
     Term.display day_type(7)
+    Term.display $Expected: 100$
 <mainloop>

@@ -19,4 +19,5 @@ Make is_perfect func(n)
     Term.display is_perfect(6)
     Term.display is_perfect(28)
     Term.display is_perfect(12)
+    Term.display $Expected: 0$
 <mainloop>

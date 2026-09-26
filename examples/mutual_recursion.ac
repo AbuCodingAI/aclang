@@ -16,4 +16,5 @@ Make is_odd func(n)
     Term.display is_even(10)
     Term.display is_even(7)
     Term.display is_odd(7)
+    Term.display $Expected: 1$
 <mainloop>

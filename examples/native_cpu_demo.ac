@@ -43,4 +43,5 @@ use ilib native-cpu
     ncpu.broadcast($shutdown_request$)
     got_after = ncpu.recieve($shutdown_request$)
     Term.display $recieve() after the matching broadcast = $ + to_string(got_after)
+    Term.display $Expected: recieve() after the matching broadcast = 1$
 <mainloop>

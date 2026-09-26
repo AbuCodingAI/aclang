@@ -6,4 +6,5 @@ AC->BNY
     total = 0
     FOR i in range 10
         Term.display i
+    Term.display $Expected: 9$
 <mainloop>

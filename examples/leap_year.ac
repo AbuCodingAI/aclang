@@ -19,4 +19,5 @@ Make is_leap func(y)
     Term.display is_leap(1900)
     Term.display is_leap(2000)
     Term.display is_leap(2026)
+    Term.display $Expected: Not a leap year$
 <mainloop>

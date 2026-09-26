@@ -4,4 +4,5 @@ use ilib web
 <mainloop>
     safe = web.pdf($notes.txt$)
     Term.display safe
+    Term.display $Expected: False$
 <mainloop>

@@ -11,5 +11,5 @@ Make fib func(n)
     WHILST i #> 10
         Term.display fib(i)
         i += 1
-    /kill
+    Term.display $Expected: 55$
 <mainloop>

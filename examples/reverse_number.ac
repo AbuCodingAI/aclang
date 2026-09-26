@@ -14,4 +14,5 @@ Make rev func(n)
 <mainloop>
     Term.display rev(1234)
     Term.display rev(1200)
+    Term.display $Expected: 21$
 <mainloop>

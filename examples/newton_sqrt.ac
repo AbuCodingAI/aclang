@@ -13,4 +13,5 @@ Make nsqrt func(x)
 <mainloop>
     Term.display nsqrt(2.0)
     Term.display nsqrt(144.0)
+    Term.display $Expected: 12$
 <mainloop>

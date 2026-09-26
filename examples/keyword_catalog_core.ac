@@ -13,6 +13,8 @@ Make crunch func(id)
         bound total += (i @ id) band 3
     return total
 
+fn twice(n)=n*2
+
 bundle Critter
     public name = $unnamed$
     public hp = 10
@@ -113,7 +115,7 @@ bundle Critter
     /* --- functions --- */
     Term.display risky(2)
     quickthread crunch(1)
-    fn Term.display $chained-one$ & Term.display $chained-two$
+    Term.display twice(21)
 
     /* --- data / sequences --- */
     Term.display length $hello$

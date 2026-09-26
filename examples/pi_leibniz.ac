@@ -11,4 +11,5 @@ use ilib math
         free pi4 += sign / (2.0 @ k + 1.0)
         free sign = 0.0 - sign
     Term.display pi4 @ 4.0
+    Term.display $Expected: 3.141492653590034$
 <mainloop>

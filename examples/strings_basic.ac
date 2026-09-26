@@ -8,4 +8,5 @@ AC->PY
     message = greeting + $, $ + name + $!$
     Term.display message
     Term.display length message
+    Term.display $Expected: 10$
 <mainloop>

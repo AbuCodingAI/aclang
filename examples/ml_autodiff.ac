@@ -14,4 +14,5 @@ use ilib ml
     Term.display ml.take(w)
     ml.weights(0.01, w)
     Term.display ml.take(w)
+    Term.display $Expected: 1.6400000000000001$
 <mainloop>

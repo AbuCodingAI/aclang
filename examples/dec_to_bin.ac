@@ -18,4 +18,5 @@ Make to_bin func(n)
     Term.display to_bin(10)
     Term.display to_bin(255)
     Term.display to_bin(0)
+    Term.display $Expected: 0$
 <mainloop>

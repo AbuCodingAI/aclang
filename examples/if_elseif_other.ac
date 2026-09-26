@@ -14,4 +14,5 @@ Make classify func(n)
     Term.display classify(5)
     Term.display classify(50)
     Term.display classify(500)
+    Term.display $Expected: 3$
 <mainloop>

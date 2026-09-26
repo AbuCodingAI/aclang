@@ -8,4 +8,5 @@ AC->BNY
         Term.display v
     Term.display nums[1]
     Term.display nums[4]
+    Term.display $Expected: 40$
 <mainloop>

@@ -19,4 +19,5 @@ Make is_armstrong func(n)
     Term.display is_armstrong(153)
     Term.display is_armstrong(370)
     Term.display is_armstrong(100)
+    Term.display $Expected: 0$
 <mainloop>

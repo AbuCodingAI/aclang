@@ -20,4 +20,5 @@ Make bin_search func(arr, target)
     Term.display bin_search(sorted, 23)
     Term.display bin_search(sorted, 2)
     Term.display bin_search(sorted, 99)
+    Term.display $Expected: 0$
 <mainloop>

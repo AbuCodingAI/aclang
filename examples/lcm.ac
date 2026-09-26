@@ -17,4 +17,5 @@ Make lcm func(a, b)
 <mainloop>
     Term.display lcm(4, 6)
     Term.display lcm(21, 6)
+    Term.display $Expected: 42$
 <mainloop>

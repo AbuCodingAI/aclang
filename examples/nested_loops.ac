@@ -7,4 +7,5 @@ AC->BNY
         FOR j in sequence(1, 4)
             Term.display i @ j
         Term.display $---$
+    Term.display $Expected: ---$
 <mainloop>

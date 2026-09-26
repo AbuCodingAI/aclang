@@ -10,4 +10,5 @@ Make hanoi func(n)
 <mainloop>
     Term.display hanoi(3)
     Term.display hanoi(10)
+    Term.display $Expected: 1023$
 <mainloop>

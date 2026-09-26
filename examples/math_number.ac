@@ -40,5 +40,5 @@ Make collatz func(n)
     Term.display $--- Collatz Steps ---$
     Term.display collatz(6)
     Term.display collatz(27)
-    /kill
+    Term.display $Expected: 111$
 <mainloop>

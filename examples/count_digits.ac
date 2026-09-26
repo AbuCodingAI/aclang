@@ -15,4 +15,5 @@ Make ndigits func(n)
     Term.display ndigits(0)
     Term.display ndigits(7)
     Term.display ndigits(123456)
+    Term.display $Expected: 6$
 <mainloop>

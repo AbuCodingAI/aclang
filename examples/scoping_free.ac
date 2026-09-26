@@ -8,4 +8,5 @@ AC->PY
     FOR i in range 5
         free total += i
     Term.display total
+    Term.display $Expected: 10$
 <mainloop>

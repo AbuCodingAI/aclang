@@ -7,4 +7,5 @@ AC->BNY
     Term.display 7 // 2
     Term.display 1.5 + 2.25
     Term.display 10.0 / 4.0
+    Term.display $Expected: 2.5$
 <mainloop>

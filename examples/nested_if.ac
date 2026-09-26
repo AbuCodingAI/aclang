@@ -12,4 +12,5 @@ AC->BNY
             Term.display $a is small but bigger than b$
     OTHER
         Term.display $b wins$
+    Term.display $Expected: a is big and bigger than b$
 <mainloop>
