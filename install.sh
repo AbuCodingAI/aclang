@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
-# AC installer — pulls the packages the AC compiler needs, builds it from source, and installs
-# it globally (`ac` on your PATH). Linux only (AC's native backends emit ELF binaries); on
-# Windows use WSL, or the prebuilt ac-compiler/ac.exe for the text-emitting backends.
+# AC installer — installs the AC compiler globally (`ac` on your PATH; `ac.exe` on Windows).
+#   Linux    builds the compiler from source (or uses a prebuilt one), pulls the packages it needs, and
+#            builds the ilib shared libraries.
+#   macOS    builds from source with the system compiler (Xcode Command Line Tools), or uses the prebuilt
+#            universal binary. Installed as `ac`.
+#   Windows  run from Git Bash / MSYS2 / Cygwin: installs the prebuilt `ac.exe` (no build step).
+# A universal binary (ac-compiler/ac.com, Cosmopolitan: one file for Linux/macOS/Windows on x86-64 and
+# ARM64) is preferred when it ships in the repo; otherwise the per-platform binary is used:
+# ac-compiler/ac (Linux x86-64), ac.arm (Linux AArch64), ac.exe (Windows).
 #
-#   ./install.sh                  build + install to /usr/local, pull the default dependencies
+#   ./install.sh                  build + install to /usr/local (Windows: ~/AC), pull the default dependencies
 #   ./install.sh --user           install to ~/.local (no root needed for the install itself)
 #   ./install.sh --prefix DIR     install somewhere else
 #   ./install.sh --minimal        only what is needed to build the compiler
 #   ./install.sh --all            also the toolchains for every backend + optional ilib deps
 #   ./install.sh --dev            also the cross toolchains used to rebuild ac.exe / ac.arm
 #   ./install.sh --no-deps        do not touch system packages at all
-#   ./install.sh --prebuilt       use the shipped ac-compiler/ac instead of compiling (x86-64)
+#   ./install.sh --prebuilt       use the shipped binary instead of compiling
 #   ./install.sh --dry-run        print what would happen, change nothing
 #   ./install.sh --uninstall      remove a previous install
 set -euo pipefail
 
-PREFIX="/usr/local"
+PREFIX=""
 DEPS="default"          # minimal | default | all
 DEV=0
 INSTALL_DEPS=1
@@ -31,7 +37,18 @@ info() { printf '%s==>%s %s\n' "$B$G" "$Z" "$*"; }
 warn() { printf '%swarning:%s %s\n' "$B$Y" "$Z" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$B$R" "$Z" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n 2,23p "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+# ── which OS / CPU / executable name ──────────────────────────────────────────────────────────
+case "$(uname -s)" in
+  Linux)                OS="linux"   ;;
+  Darwin)               OS="macos"   ;;
+  MINGW*|MSYS*|CYGWIN*) OS="windows" ;;
+  *) die "unsupported OS: $(uname -s) (Linux, macOS, or Windows via Git Bash / MSYS2 / Cygwin)" ;;
+esac
+ARCH="$(uname -m)"
+[ "$ARCH" = "arm64" ] && ARCH="aarch64"
+if [ "$OS" = "windows" ]; then EXE_NAME="ac.exe"; else EXE_NAME="ac"; fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,11 +69,24 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-[ "$(uname -s)" = "Linux" ] || die "AC's installer supports Linux only (detected $(uname -s)). On Windows use WSL."
+if [ -z "$PREFIX" ]; then
+  if [ "$OS" = "windows" ]; then PREFIX="$HOME/AC"; else PREFIX="/usr/local"; fi
+fi
 
-LIBDIR="$PREFIX/lib/ac"
+# Layout. `ac` finds its library as <dir of the real binary>/../library:
+#   Linux/macOS: $PREFIX/lib/ac/{ac-compiler/ac, library/}  + a symlink $PREFIX/bin/ac
+#   Windows:     $PREFIX/bin/ac.exe + $PREFIX/library/       (no symlinks — Git Bash's are unreliable)
+if [ "$OS" = "windows" ]; then
+  LIBDIR="$PREFIX"
+  BINDEST="$PREFIX/bin/$EXE_NAME"
+  LIBRARYDEST="$PREFIX/library"
+else
+  LIBDIR="$PREFIX/lib/ac"
+  BINDEST="$LIBDIR/ac-compiler/$EXE_NAME"
+  LIBRARYDEST="$LIBDIR/library"
+fi
 SHAREDIR="$PREFIX/share/ac"
-BINLINK="$PREFIX/bin/ac"
+BINLINK="$PREFIX/bin/$EXE_NAME"
 
 run() {   # echo, and execute unless --dry-run
   if [ "$DRY_RUN" = 1 ]; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi
@@ -86,21 +116,48 @@ prefix_run() {  # run a command that writes under $PREFIX, escalating only if ne
 # ── uninstall ──────────────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = "uninstall" ]; then
   info "Removing AC from $PREFIX"
-  prefix_run rm -rf "$LIBDIR" "$SHAREDIR"
-  prefix_run rm -f "$BINLINK"
+  if [ "$OS" = "windows" ]; then
+    prefix_run rm -rf "$LIBRARYDEST" "$SHAREDIR"
+    prefix_run rm -f "$BINDEST"
+  else
+    prefix_run rm -rf "$LIBDIR" "$SHAREDIR"
+    prefix_run rm -f "$BINLINK"
+  fi
   info "Done. (System packages installed for AC's toolchains were left in place.)"
   exit 0
 fi
 
+# ── the shipped binary for this machine (empty if there is none) ─────────────────────────────────
+pick_prebuilt() {
+  local d="$HERE/ac-compiler"
+  if [ -f "$d/ac.com" ]; then echo "$d/ac.com"; return 0; fi   # universal Cosmopolitan binary: every OS, x86-64 + ARM64
+  case "$OS/$ARCH" in
+    windows/*)               [ -f "$d/ac.exe" ] && echo "$d/ac.exe" ;;
+    linux/x86_64)            [ -f "$d/ac" ]     && echo "$d/ac" ;;
+    linux/aarch64|linux/arm) [ -f "$d/ac.arm" ] && echo "$d/ac.arm" ;;
+  esac
+  return 0
+}
+
+# Windows has no build step here — it always uses a shipped binary.
+[ "$OS" = "windows" ] && PREBUILT=1
+
 # ── package manager + package names ──────────────────────────────────────────────────────────
 PM=""
-for c in pacman apt-get dnf zypper; do command -v "$c" >/dev/null 2>&1 && { PM="$c"; break; }; done
+if [ "$OS" = "macos" ]; then
+  command -v brew >/dev/null 2>&1 && PM="brew"
+elif [ "$OS" = "linux" ]; then
+  for c in pacman apt-get dnf zypper; do command -v "$c" >/dev/null 2>&1 && { PM="$c"; break; }; done
+fi
 
 PKGS=()
 add() { PKGS+=("$@"); }
 
 pick_packages() {
   case "$PM" in
+    brew)
+      [ "$DEPS" != minimal ] && add python node
+      [ "$DEPS" = all ]      && add openjdk rust go pkgconf ;;
     pacman)
       add base-devel pkgconf
       [ "$DEPS" != minimal ] && add python nodejs nasm zlib gtk3
@@ -127,11 +184,17 @@ pick_packages() {
 
 install_deps() {
   [ "$INSTALL_DEPS" = 1 ] || { info "Skipping system packages (--no-deps)"; return; }
-  [ -n "$PM" ] || { warn "no supported package manager found (pacman, apt-get, dnf, zypper) — install a C++17 compiler and make yourself"; return; }
+  if [ "$OS" = "windows" ]; then info "Windows: no system packages are installed (the compiler is a prebuilt exe)"; return; fi
+  if [ "$OS" = "macos" ]; then
+    xcode-select -p >/dev/null 2>&1 || warn "Xcode Command Line Tools are missing — run: xcode-select --install"
+  fi
+  [ -n "$PM" ] || { warn "no supported package manager found — install a C++17 compiler and make yourself$([ "$OS" = macos ] && echo " (macOS: Homebrew, https://brew.sh)")"; return; }
   pick_packages
+  [ ${#PKGS[@]} -gt 0 ] || { info "No extra packages needed"; return; }
   info "Installing packages with $PM: ${PKGS[*]}"
   local yes_flag=()
   case "$PM" in
+    brew)    run brew install "${PKGS[@]}" ;;   # Homebrew refuses to run as root — never sudo it
     pacman)  [ "$ASSUME_YES" = 1 ] && yes_flag=(--noconfirm); root_run pacman -S --needed ${yes_flag[@]+"${yes_flag[@]}"} "${PKGS[@]}" ;;
     apt-get) root_run apt-get update
              [ "$ASSUME_YES" = 1 ] && yes_flag=(-y); root_run apt-get install ${yes_flag[@]+"${yes_flag[@]}"} "${PKGS[@]}" ;;
@@ -143,21 +206,26 @@ install_deps() {
   fi
 }
 
-# ── build ──────────────────────────────────────────────────────────────────────────────────────
+# ── build / pick the binary ────────────────────────────────────────────────────────────────────
+SRC_BIN=""     # the binary that gets installed
 build_compiler() {
-  local jobs; jobs="$(nproc 2>/dev/null || echo 2)"
+  local jobs; jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
   if [ "$PREBUILT" = 1 ]; then
-    [ "$(uname -m)" = "x86_64" ] || die "--prebuilt ships an x86-64 binary; this machine is $(uname -m) — build from source instead"
-    [ -x "$HERE/ac-compiler/ac" ] || die "ac-compiler/ac not found or not executable"
-    info "Using the shipped ac-compiler/ac"
+    SRC_BIN="$(pick_prebuilt)"
+    [ -n "$SRC_BIN" ] || die "no prebuilt binary ships for $OS/$ARCH (looked for ac-compiler/ac.com, ac, ac.arm, ac.exe) — build from source instead"
+    info "Using the shipped $(basename "$SRC_BIN")"
     return
   fi
-  command -v g++ >/dev/null 2>&1 || [ "$DRY_RUN" = 1 ] || die "g++ not found (C++17 required) — re-run without --no-deps, or install a C++ toolchain"
+  command -v g++ >/dev/null 2>&1 || command -v c++ >/dev/null 2>&1 || [ "$DRY_RUN" = 1 ] \
+    || die "no C++ compiler found (C++17 required) — re-run without --no-deps, or install one"
   info "Building the compiler (make -j$jobs)"
   run make -C "$HERE/ac-compiler" -j"$jobs"
+  SRC_BIN="$HERE/ac-compiler/ac"
 }
 
 build_ilibs() {
+  # The ilib shared libraries are Linux builds; elsewhere the compiler still works for every text backend.
+  if [ "$OS" != "linux" ]; then info "Skipping the ilib shared libraries (Linux only for now)"; return; fi
   # Best effort: an ilib whose system dependency is missing (e.g. GTK for widgets) is skipped, not fatal.
   info "Building the ilib shared libraries"
   local d name
@@ -171,29 +239,55 @@ build_ilibs() {
 }
 
 # ── install ────────────────────────────────────────────────────────────────────────────────────
-# `ac` finds its library as <dir of the real binary>/../library, so the binary and library/
-# live side by side under $PREFIX/lib/ac and only a symlink goes on the PATH.
 install_files() {
   info "Installing to $PREFIX"
-  prefix_run mkdir -p "$LIBDIR/ac-compiler" "$SHAREDIR" "$PREFIX/bin"
-  prefix_run install -m 0755 "$HERE/ac-compiler/ac" "$LIBDIR/ac-compiler/ac"
-  prefix_run rm -rf "$LIBDIR/library"
-  prefix_run cp -a "$HERE/library" "$LIBDIR/library"
+  if [ "$OS" = "windows" ]; then
+    prefix_run mkdir -p "$PREFIX/bin" "$SHAREDIR"
+  else
+    prefix_run mkdir -p "$LIBDIR/ac-compiler" "$SHAREDIR" "$PREFIX/bin"
+  fi
+  prefix_run install -m 0755 "$SRC_BIN" "$BINDEST"       # installed under the platform's name: `ac`, or `ac.exe` on Windows
+  prefix_run rm -rf "$LIBRARYDEST"
+  prefix_run cp -a "$HERE/library" "$LIBRARYDEST"
   prefix_run rm -rf "$SHAREDIR/examples"
   prefix_run cp -a "$HERE/examples" "$SHAREDIR/examples"
-  prefix_run ln -sf "$LIBDIR/ac-compiler/ac" "$BINLINK"
+  [ "$OS" = "windows" ] || prefix_run ln -sf "$BINDEST" "$BINLINK"
+  # A file that came through a browser/zip carries macOS's quarantine flag and would be blocked on first run.
+  if [ "$OS" = "macos" ] && [ "$DRY_RUN" != 1 ]; then
+    xattr -d com.apple.quarantine "$BINDEST" 2>/dev/null || true
+  fi
 }
 
 smoke_test() {
   [ "$DRY_RUN" = 1 ] && return
   info "Smoke test"
+  local bin="$BINLINK"
+  if ! "$bin" --version >/dev/null 2>&1; then
+    warn "$bin did not start — run: $bin --version"
+    return
+  fi
+  printf '  ac %s\n' "$("$bin" --version 2>&1 | head -1)"
   local t; t="$(mktemp -d)"
-  printf 'AC->BNY\n\n<mainloop>\n    Term.display $AC works$\n<mainloop>\n' > "$t/hello.ac"
-  if ( cd "$t" && "$BINLINK" hello.ac --no-cache 2>&1 | grep -q "AC works" ); then
-    printf '  ac %s\n' "$("$BINLINK" --version 2>&1 | head -1)"
-    printf '  hello world: ok (native BNY backend)\n'
+  if [ "$OS" = "linux" ] && [ "$ARCH" = "x86_64" ]; then
+    # native BNY backend: hand-written x86-64 ELF, no external toolchain
+    printf 'AC->BNY\n\n<mainloop>\n    Term.display $AC works$\n<mainloop>\n' > "$t/hello.ac"
+    if ( cd "$t" && "$bin" hello.ac --no-cache 2>&1 | grep -q "AC works" ); then
+      printf '  hello world: ok (native BNY backend)\n'
+    else
+      warn "the smoke test did not print the expected output — run: $bin --version"
+    fi
   else
-    warn "the smoke test did not print the expected output — run: $BINLINK --version"
+    local py=""; command -v python3 >/dev/null 2>&1 && py=python3
+    if [ -n "$py" ]; then
+      printf 'AC->PY\n\n<mainloop>\n    Term.display $AC works$\n<mainloop>\n' > "$t/hello.ac"
+      if ( cd "$t" && "$bin" hello.ac --no-cache 2>&1 | grep -q "AC works" ); then
+        printf '  hello world: ok (PY backend)\n'
+      else
+        warn "the smoke test did not print the expected output — run: $bin --version"
+      fi
+    else
+      printf '  (no python3 found — skipped the hello-world run)\n'
+    fi
   fi
   rm -rf "$t"
 }
@@ -206,6 +300,11 @@ smoke_test
 
 case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
-  *) warn "$PREFIX/bin is not on your PATH — add:  export PATH=\"$PREFIX/bin:\$PATH\"" ;;
+  *) if [ "$OS" = "windows" ]; then
+       wp="$PREFIX/bin"; command -v cygpath >/dev/null 2>&1 && wp="$(cygpath -w "$PREFIX/bin")"
+       warn "$wp is not on your PATH — add it in Windows' Environment Variables (or, in Git Bash: export PATH=\"$PREFIX/bin:\$PATH\")"
+     else
+       warn "$PREFIX/bin is not on your PATH — add:  export PATH=\"$PREFIX/bin:\$PATH\""
+     fi ;;
 esac
-info "AC is installed. Try:  ac $SHAREDIR/examples/hello_all_targets.ac"
+info "AC is installed. Try:  $EXE_NAME $SHAREDIR/examples/hello_all_targets.ac"

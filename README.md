@@ -8,8 +8,10 @@ Current version: **AC 1** — see `ac --version`. Licensed under the [GNU GPL v3
 
 ## Install
 
-AC targets Linux (its native backends emit ELF binaries). On Windows use WSL, or the prebuilt
-`ac-compiler/ac.exe` for the text-emitting backends.
+The compiler runs on Linux, macOS and Windows. Its native backends (BNY, ASM, ARM) emit Linux ELF binaries,
+so those run on Linux only; every text backend (PY, JS, C, C++, Java, Rust, Go, V) works everywhere its
+toolchain is installed. The installer puts `ac` on your `PATH` on Linux and macOS, and `ac.exe` on Windows
+(run it from Git Bash, MSYS2 or Cygwin).
 
 ```bash
 git clone https://github.com/AbuCodingAI/aclang.git
@@ -17,9 +19,10 @@ cd aclang
 ./install.sh
 ```
 
-`install.sh` installs the packages the compiler needs (via `pacman`, `apt`, `dnf` or `zypper`),
-builds `ac` from source, builds the ilib shared libraries, and installs everything under
-`/usr/local` with `ac` on your `PATH`. It only uses `sudo` where the destination needs it.
+`install.sh` installs the packages the compiler needs (via `pacman`, `apt`, `dnf`, `zypper`, or Homebrew on
+macOS), builds `ac` from source, builds the ilib shared libraries (Linux only for now), and installs
+everything under `/usr/local` with `ac` on your `PATH`. On Windows it installs the prebuilt `ac.exe` under
+`~/AC` (add `~/AC/bin` to your Windows `PATH`). It only uses `sudo` where the destination needs it.
 
 | Option | Effect |
 |--------|--------|
@@ -29,7 +32,7 @@ builds `ac` from source, builds the ilib shared libraries, and installs everythi
 | `--all` | Also the toolchains for every backend (JDK, Rust, Go) and the optional ilib dependencies |
 | `--dev` | Also the cross toolchains used to rebuild `ac.exe` and `ac.arm` |
 | `--no-deps` | Do not touch system packages |
-| `--prebuilt` | Use the shipped `ac-compiler/ac` instead of compiling (x86-64 only) |
+| `--prebuilt` | Use the shipped binary instead of compiling: the universal `ac-compiler/ac.com` if present, else `ac` (Linux x86-64), `ac.arm` (Linux AArch64) or `ac.exe` (Windows). Always on for Windows |
 | `--dry-run` | Print what would happen, change nothing |
 | `--uninstall` | Remove a previous install |
 
@@ -169,7 +172,7 @@ OTHER
 |------|---------|
 | `$text$` | Standard string. Supports `\n`, `\t`, `\r`, `\\`, `\$` |
 | `r$text$` | Raw string. No escape processing |
-| `"text"` | Double-quoted. Valid inside `fn` expressions only; a syntax error elsewhere |
+| `"text"` | Not an AC string — a syntax error. Write `$text$` |
 | `\ws` | Whitespace sentinel literal → compiles to `" \t\n\r"` |
 
 ### Numbers
@@ -875,13 +878,21 @@ obj.config width=10 - height=20
 
 Attribute separator in `config` calls is ` - ` (space-dash-space).
 
-### `fn` Lines and Method Chains
+### `fn` — single-line functions
 
 ```ac
-fn Term.display $Hello$ & Term.display $World$
+fn square(n)=n^2
+fn add(a, b)=a + b
+fn origin()=0, 0            /* returns a tuple, like `return 0, 0` */
+
+<mainloop>
+    Term.display square(5)      /* 25 */
+    Term.display add(2, 3)      /* 5  */
 ```
 
-`&` chains calls with separate arguments. `&&` chains calls reusing the previous argument.
+`fn name(args)=expr` is exactly `Make name func(args)` whose whole body is `return expr` — same scoping,
+same backends, and the function can be passed as a value (`apply(square, 6)`). Use `Make` when the body
+needs more than one statement. (`fn` used to prefix "multiply / method-chain" lines; that form is gone.)
 
 ---
 
@@ -1160,7 +1171,7 @@ Use `--force` or `--no-cache` when working on compiler internals.
 
 **Exceptions:** `try`, `catch`, `report`, `after`, `raise`, `ERR`
 
-**Functions:** `Make` / `make`, `func`, `eval`, `lazy_eval`, `yield`, `quickthread`
+**Functions:** `Make` / `make`, `func`, `fn`, `eval`, `lazy_eval`, `yield`, `quickthread`
 
 **Imports:** `use`, `using`, `from`, `as`, `ilib`, `elib`, `clib`, `flib`, `datac`, `header`
 
