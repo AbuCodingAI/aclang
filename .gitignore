@@ -24,6 +24,12 @@
 # wasm/ is source for the embedded blobs (wasm_blobs.hpp); its npm deps are not
 /ac-compiler/wasm/node_modules/
 
+# relics/: the old per-backend codegen files (codegen_py.cpp, codegen_c.cpp, etc.) from
+# before everything merged into ir_codegen.cpp. Kept on disk as a local reference, never
+# tracked — already covered by the /ac-compiler/* deny above, named here so it doesn't
+# get mistaken for untracked clutter and cleaned up by accident.
+/ac-compiler/relics/
+
 # ── Build / run byproducts, anywhere in the tree ──────────────────────────────────────────
 *.o
 *.d
