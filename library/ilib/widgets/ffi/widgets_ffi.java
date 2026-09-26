@@ -51,6 +51,7 @@ final class AcWidgets {
     private static final MethodHandle _screenUpdate    = _mh("ac_widgets_screen_update",   FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _screenDestroy   = _mh("ac_widgets_screen_destroy",  FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _screenDimensions = _mh("ac_widgets_screen_dimensions", FunctionDescriptor.ofVoid(W,I,I));
+    private static final MethodHandle _screenFps        = _mh("ac_widgets_screen_fps",        FunctionDescriptor.ofVoid(W,I,A,A));
     private static final MethodHandle _displayNew      = _mh("ac_widgets_display_new",     FunctionDescriptor.of(W,W,A));
     private static final MethodHandle _displayPack     = _mh("ac_widgets_display_pack",    FunctionDescriptor.ofVoid(W));
     private static final MethodHandle _displaySet      = _mh("ac_widgets_display_set",     FunctionDescriptor.ofVoid(W,A));
@@ -118,44 +119,46 @@ final class AcWidgets {
 
     public static void setLazy(long h) { _v(_setLazy, h); }
 
-    private static String _str(MemorySegment p) { return p == null || p.equals(MemorySegment.NULL) ? "" : p.reinterpret(Long.MAX_VALUE).getUtf8String(0); }
+    private static String _str(MemorySegment p) { return p == null || p.equals(MemorySegment.NULL) ? "" : p.reinterpret(Long.MAX_VALUE).getString(0); }
 
     // title is mandatory — no geometry positional arg. Use screenDimensions(h, w, h) instead.
     public static long   screenNew(String title) {
-        try (Arena a=Arena.ofConfined()){return _l(_screenNew,a.allocateUtf8String(title));}
+        try (Arena a=Arena.ofConfined()){return _l(_screenNew,a.allocateFrom(title));}
     }
     public static void   screenMainloop(long h) { _v(_screenMainloop, h); }
     public static void   screenUpdate(long h)   { _v(_screenUpdate, h); }
     public static void   screenDimensions(long h, int w, int hh) { _v(_screenDimensions, h, w, hh); }
     public static void   screenDestroy(long h)  { _v(_screenDestroy, h); }
 
-    public static long   displayNew(long m, String text)  { try(Arena a=Arena.ofConfined()){return _l(_displayNew,m,a.allocateUtf8String(text));} }
+    public static long   displayNew(long m, String text)  { try(Arena a=Arena.ofConfined()){return _l(_displayNew,m,a.allocateFrom(text));} }
     public static void   displayPack(long h)              { _v(_displayPack, h); }
-    public static void   displaySet(long h, String t)     { try(Arena a=Arena.ofConfined()){_v(_displaySet,h,a.allocateUtf8String(t));} }
+    public static void   displaySet(long h, String t)     { try(Arena a=Arena.ofConfined()){_v(_displaySet,h,a.allocateFrom(t));} }
     public static String displayGet(long h)               { return _str(_a(_displayGet, h)); }
 
     public static long   askNew(long m, int width)        { return _l(_askNew, m, width); }
     public static void   askPack(long h)                  { _v(_askPack, h); }
     public static String askGet(long h)                   { return _str(_a(_askGet, h)); }
-    public static void   askSet(long h, String t)         { try(Arena a=Arena.ofConfined()){_v(_askSet,h,a.allocateUtf8String(t));} }
+    public static void   askSet(long h, String t)         { try(Arena a=Arena.ofConfined()){_v(_askSet,h,a.allocateFrom(t));} }
 
-    public static long   btnNew(long m, String text)      { try(Arena a=Arena.ofConfined()){return _l(_btnNew,m,a.allocateUtf8String(text));} }
+    public static long   btnNew(long m, String text)      { try(Arena a=Arena.ofConfined()){return _l(_btnNew,m,a.allocateFrom(text));} }
     public static void   btnPack(long h)                  { _v(_btnPack, h); }
     // `stub` is a native upcall trampoline for `void (*)(void*)` — see the AC-generated class's
     // own static block (per-callback bridge + MethodHandle + Linker.upcallStub) for how it's
     // built; userdata is unused (each stub is already bound to one specific AC function).
     public static void   btnOnClick(long h, MemorySegment stub) { _v(_btnOnClick, h, stub, MemorySegment.NULL); }
 
-    public static long   ckbtnNew(long m, String text)    { try(Arena a=Arena.ofConfined()){return _l(_ckbtnNew,m,a.allocateUtf8String(text));} }
+    public static void   screenFps(long h, int rate, MemorySegment stub) { _v(_screenFps, h, rate, stub, MemorySegment.NULL); }
+
+    public static long   ckbtnNew(long m, String text)    { try(Arena a=Arena.ofConfined()){return _l(_ckbtnNew,m,a.allocateFrom(text));} }
     public static void   ckbtnPack(long h)                { _v(_ckbtnPack, h); }
     public static boolean ckbtnGet(long h)                { return _i(_ckbtnGet, h) != 0; }
     public static void   ckbtnSet(long h, boolean v)      { _v(_ckbtnSet, h, v ? 1 : 0); }
 
     public static long   dropdownNew(long m)              { return _l(_dropNew, m); }
     public static void   dropdownPack(long h)             { _v(_dropPack, h); }
-    public static void   dropdownAdd(long h, String item) { try(Arena a=Arena.ofConfined()){_v(_dropAdd,h,a.allocateUtf8String(item));} }
+    public static void   dropdownAdd(long h, String item) { try(Arena a=Arena.ofConfined()){_v(_dropAdd,h,a.allocateFrom(item));} }
     public static String dropdownGet(long h)              { return _str(_a(_dropGet, h)); }
-    public static void   dropdownSet(long h, String item) { try(Arena a=Arena.ofConfined()){_v(_dropSet,h,a.allocateUtf8String(item));} }
+    public static void   dropdownSet(long h, String item) { try(Arena a=Arena.ofConfined()){_v(_dropSet,h,a.allocateFrom(item));} }
 
     public static long   advanceNew(long m, int length)   { return _l(_advNew, m, length); }
     public static void   advancePack(long h)              { _v(_advPack, h); }
@@ -163,31 +166,31 @@ final class AcWidgets {
     public static double advanceGet(long h)               { return _d(_advGet, h); }
 
     public static long   sliderNew(long m, double from_val, double to_val, String orient) {
-        try(Arena a=Arena.ofConfined()){return _l(_sliderNew,m,from_val,to_val,a.allocateUtf8String(orient));}
+        try(Arena a=Arena.ofConfined()){return _l(_sliderNew,m,from_val,to_val,a.allocateFrom(orient));}
     }
     public static void   sliderPack(long h)               { _v(_sliderPack, h); }
     public static double sliderGet(long h)                { return _d(_sliderGet, h); }
     public static void   sliderSet(long h, double v)      { _v(_sliderSet, h, v); }
 
-    public static long   groupNew(long m, String text)    { try(Arena a=Arena.ofConfined()){return _l(_groupNew,m,a.allocateUtf8String(text));} }
+    public static long   groupNew(long m, String text)    { try(Arena a=Arena.ofConfined()){return _l(_groupNew,m,a.allocateFrom(text));} }
     public static void   groupPack(long h)                { _v(_groupPack, h); }
 
     public static long   tabsNew(long m)                  { return _l(_tabsNew, m); }
     public static void   tabsPack(long h)                 { _v(_tabsPack, h); }
-    public static long   tabsAddTab(long h, String name)  { try(Arena a=Arena.ofConfined()){return _l(_tabsAddTab,h,a.allocateUtf8String(name));} }
+    public static long   tabsAddTab(long h, String name)  { try(Arena a=Arena.ofConfined()){return _l(_tabsAddTab,h,a.allocateFrom(name));} }
 
-    public static long   scrollerNew(long m, String orient) { try(Arena a=Arena.ofConfined()){return _l(_scrollNew,m,a.allocateUtf8String(orient));} }
+    public static long   scrollerNew(long m, String orient) { try(Arena a=Arena.ofConfined()){return _l(_scrollNew,m,a.allocateFrom(orient));} }
     public static void   scrollerPack(long h)                { _v(_scrollPack, h); }
 
     public static long   tableNew(long m, String columnsCsv, int height) {
-        try(Arena a=Arena.ofConfined()){return _l(_tblNew,m,a.allocateUtf8String(columnsCsv),height);}
+        try(Arena a=Arena.ofConfined()){return _l(_tblNew,m,a.allocateFrom(columnsCsv),height);}
     }
     public static void   tablePack(long h)                { _v(_tblPack, h); }
-    public static void   tableAdd(long h, String valuesCsv){ try(Arena a=Arena.ofConfined()){_v(_tblAdd,h,a.allocateUtf8String(valuesCsv));} }
+    public static void   tableAdd(long h, String valuesCsv){ try(Arena a=Arena.ofConfined()){_v(_tblAdd,h,a.allocateFrom(valuesCsv));} }
 
     public static long   listboxNew(long m, int w, int ht){ return _l(_lbNew, m, w, ht); }
     public static void   listboxPack(long h)              { _v(_lbPack, h); }
-    public static void   listboxAdd(long h, String item)  { try(Arena a=Arena.ofConfined()){_v(_lbAdd,h,a.allocateUtf8String(item));} }
+    public static void   listboxAdd(long h, String item)  { try(Arena a=Arena.ofConfined()){_v(_lbAdd,h,a.allocateFrom(item));} }
     public static String listboxItem(long h, int idx)     { return _str(_a(_lbItem, h, idx)); }
     public static int    listboxCount(long h)             { return _i(_lbCount, h); }
 
@@ -198,19 +201,19 @@ final class AcWidgets {
     public static void   sketchRect(long h, double x1, double y1, double x2, double y2, byte r, byte g, byte b) { _v(_skRect,h,x1,y1,x2,y2,r,g,b); }
     public static void   sketchCircle(long h, double cx, double cy, double rad, byte r, byte g, byte b)         { _v(_skCircle,h,cx,cy,rad,r,g,b); }
     public static void   sketchText(long h, double x, double y, String t, byte r, byte g, byte b) {
-        try(Arena a=Arena.ofConfined()){_v(_skText,h,x,y,a.allocateUtf8String(t),r,g,b);}
+        try(Arena a=Arena.ofConfined()){_v(_skText,h,x,y,a.allocateFrom(t),r,g,b);}
     }
 
     public static long   textboxNew(long m, String color, String font) {
-        try (Arena a=Arena.ofConfined()){return _l(_tbNew,m,a.allocateUtf8String(color),a.allocateUtf8String(font));}
+        try (Arena a=Arena.ofConfined()){return _l(_tbNew,m,a.allocateFrom(color),a.allocateFrom(font));}
     }
     public static void   textboxPack(long h)  { _v(_tbPack, h); }
-    public static void   textboxWrite(long h, String s) { try(Arena a=Arena.ofConfined()){_v(_tbWrite,h,a.allocateUtf8String(s));} }
+    public static void   textboxWrite(long h, String s) { try(Arena a=Arena.ofConfined()){_v(_tbWrite,h,a.allocateFrom(s));} }
     public static String textboxGet(long h)   { return _str(_a(_tbGet, h)); }
     public static String textboxFind(long h, String needle) {
-        try(Arena a=Arena.ofConfined()){return _str(_a(_tbFind,h,a.allocateUtf8String(needle)));}
+        try(Arena a=Arena.ofConfined()){return _str(_a(_tbFind,h,a.allocateFrom(needle)));}
     }
-    public static void   textboxFix(long h, String s) { try(Arena a=Arena.ofConfined()){_v(_tbFix,h,a.allocateUtf8String(s));} }
+    public static void   textboxFix(long h, String s) { try(Arena a=Arena.ofConfined()){_v(_tbFix,h,a.allocateFrom(s));} }
 }
 
 // ── Wrapper classes — AC-generated Java uses Screen(title=...), display(master=...) etc. ──
@@ -223,6 +226,7 @@ class Screen {
     void update()   { AcWidgets.screenUpdate(this._h); }
     void dimensions(int w, int h) { AcWidgets.screenDimensions(this._h, w, h); }
     void destroy()  { AcWidgets.screenDestroy(this._h); }
+    void fps(int rate, java.lang.foreign.MemorySegment stub) { AcWidgets.screenFps(this._h, rate, stub); }
 }
 class AcDisplay {
     long _h;

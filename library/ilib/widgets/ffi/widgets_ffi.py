@@ -30,6 +30,7 @@ if _lib:
     _lib.ac_widgets_screen_update.restype   = None; _lib.ac_widgets_screen_update.argtypes   = [_W]
     _lib.ac_widgets_screen_destroy.restype  = None; _lib.ac_widgets_screen_destroy.argtypes  = [_W]
     _lib.ac_widgets_screen_dimensions.restype = None; _lib.ac_widgets_screen_dimensions.argtypes = [_W, _ct.c_int, _ct.c_int]
+    _lib.ac_widgets_screen_fps.restype        = None; _lib.ac_widgets_screen_fps.argtypes        = [_W, _I, _CB, _ct.c_void_p]
 
     _lib.ac_widgets_display_new.restype     = _W;   _lib.ac_widgets_display_new.argtypes     = [_W, _CS]
     _lib.ac_widgets_display_pack.restype    = None; _lib.ac_widgets_display_pack.argtypes    = [_W]
@@ -111,6 +112,7 @@ if _lib:
 
     # ── Python wrapper classes ────────────────────────────────────────────────
     class Screen:
+        _cbs = []  # keep CFUNCTYPE wrappers alive — ctypes doesn't, same reason as btn._cbs
         # title is mandatory — no geometry positional/default arg. Use .dimensions(w, h).
         def __init__(self, title, **_):
             self._h = _lib.ac_widgets_screen_new(_b(title))
@@ -118,6 +120,10 @@ if _lib:
         def update(self):   _lib.ac_widgets_screen_update(self._h)
         def dimensions(self, w, h): _lib.ac_widgets_screen_dimensions(self._h, int(w), int(h))
         def destroy(self):  _lib.ac_widgets_screen_destroy(self._h)
+        def fps(self, rate, cb):
+            wrapped = _CB(lambda _: cb())
+            Screen._cbs.append(wrapped)
+            _lib.ac_widgets_screen_fps(self._h, int(rate), wrapped, None)
 
     class display:
         def __init__(self, master, text='', _lz=None):
@@ -270,6 +276,7 @@ else:
         def mainloop(self): pass
         def update(self): pass
         def destroy(self): pass
+        def fps(self, rate, cb): pass
     class display:
         def __init__(self, master, text='', **_): pass
         def pack(self, **_): pass

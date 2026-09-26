@@ -1224,6 +1224,19 @@ private:
             em.call("ac_widgets_screen_dimensions");
             return true;
         }
+        // root.fps(rate, Tick) — same _ac_widget_call0/1 adapter trick as btn's on_click
+        // (bnyWidgetCtor above), just with ac_widgets_screen_fps's extra `rate` arg ahead of
+        // the callback pair.
+        if (method == "fps" && kind == "Screen" && args.size() >= 2) {
+            std::string cbName = funcName(args[1]);
+            std::string adapter = userFuncArity(cbName) > 0 ? "_ac_widget_call1" : "_ac_widget_call0";
+            loadNamedVar(recv, R::RDI);
+            load(args[0], R::RSI);
+            em.lea_r_label(R::RDX, adapter);
+            em.lea_r_label(R::RCX, cbName);
+            em.call("ac_widgets_screen_fps");
+            return true;
+        }
         if (method == "add") {
             std::string fn = (kind == "dropdown" ? "ac_widgets_dropdown_add" :
                               kind == "listbox"  ? "ac_widgets_listbox_add"  :
@@ -7406,6 +7419,7 @@ class BinaryCompiler {
             else if (meth == "update" && kind == "Screen") addSym("ac_widgets_screen_update");
             else if (meth == "destroy" && kind == "Screen") addSym("ac_widgets_screen_destroy");
             else if (meth == "dimensions" && kind == "Screen") addSym("ac_widgets_screen_dimensions");
+            else if (meth == "fps" && kind == "Screen") addSym("ac_widgets_screen_fps");
             else if (meth == "add")
                 addSym(kind == "dropdown" ? "ac_widgets_dropdown_add" :
                        kind == "listbox"  ? "ac_widgets_listbox_add"  :

@@ -14,6 +14,7 @@ fn C.ac_widgets_screen_mainloop(h isize)
 fn C.ac_widgets_screen_update(h isize)
 fn C.ac_widgets_screen_destroy(h isize)
 fn C.ac_widgets_screen_dimensions(h isize, width int, height int)
+fn C.ac_widgets_screen_fps(h isize, fps int, cb fn (voidptr), userdata voidptr)
 
 fn C.ac_widgets_display_new(master isize, text &char) isize
 fn C.ac_widgets_display_pack(h isize)
@@ -108,6 +109,12 @@ fn (s AcScreen) mainloop()  { C.ac_widgets_screen_mainloop(s.h) }
 fn (s AcScreen) update()    { C.ac_widgets_screen_update(s.h) }
 fn (s AcScreen) dimensions(w int, h int) { C.ac_widgets_screen_dimensions(s.h, w, h) }
 fn (s AcScreen) destroy()   { C.ac_widgets_screen_destroy(s.h) }
+// Same ac_widget_callbacks/ac_widget_cb_trampoline registry as on_click above.
+fn (s AcScreen) fps(rate int, cb fn ()) {
+	id := ac_widget_callbacks.len
+	ac_widget_callbacks << cb
+	C.ac_widgets_screen_fps(s.h, rate, ac_widget_cb_trampoline, voidptr(usize(id)))
+}
 
 struct AcDisplay { h isize }
 fn display(master AcScreen, text string) AcDisplay {

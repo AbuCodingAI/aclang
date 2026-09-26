@@ -12,6 +12,7 @@ const _m=_ffi.Library(_lib,{
     'ac_widgets_init':            [_V,[]],'ac_widgets_screen_new':      [_W,[_S]],
     'ac_widgets_screen_mainloop': [_V,[_W]],'ac_widgets_screen_update':  [_V,[_W]],
     'ac_widgets_screen_destroy':  [_V,[_W]],'ac_widgets_screen_dimensions':[_V,[_W,_I,_I]],
+    'ac_widgets_screen_fps':      [_V,[_W,_I,'pointer','pointer']],
     'ac_widgets_display_new':     [_W,[_W,_S]],'ac_widgets_display_pack': [_V,[_W]],
     'ac_widgets_display_set':     [_V,[_W,_S]],'ac_widgets_display_get':  [_S,[_W]],
     'ac_widgets_ask_new':         [_W,[_W,_I]],'ac_widgets_ask_pack':     [_V,[_W]],
@@ -71,6 +72,11 @@ function Screen(title) {
     o.update=()=>_m.ac_widgets_screen_update(o._h);
     o.dimensions=(w,h)=>_m.ac_widgets_screen_dimensions(o._h,w|0,h|0);
     o.destroy=()=>_m.ac_widgets_screen_destroy(o._h);
+    o.fps=(rate,cb)=>{
+        const wrapped=_ffi.Callback(_V,['pointer'],()=>cb());
+        _cbs.push(wrapped);
+        _m.ac_widgets_screen_fps(o._h,rate|0,wrapped,null);
+    };
     return o;
 }
 function display(master,text='',lz=null) {

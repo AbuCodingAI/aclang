@@ -18,6 +18,9 @@ extern void _ac_go_cb_trampoline(void*);
 static void _ac_register_btn_click(ac_widget_t h, void* userdata) {
     ac_widgets_btn_on_click(h, _ac_go_cb_trampoline, userdata);
 }
+static void _ac_register_screen_fps(ac_widget_t h, int rate, void* userdata) {
+    ac_widgets_screen_fps(h, rate, _ac_go_cb_trampoline, userdata);
+}
 */
 import "C"
 import "unsafe"
@@ -45,6 +48,14 @@ func widgets_btn_on_click(h C.ac_widget_t, cb func()) {
 	id := len(_acCallbacks)
 	_acCallbacks = append(_acCallbacks, cb)
 	C._ac_register_btn_click(h, unsafe.Pointer(uintptr(id)))
+}
+
+// ac_widgets_screen_fps blocks (same as mainloop) until the window closes — reuses the
+// same trampoline/registry as on_click, just registered against the fps C entrypoint.
+func widgets_screen_fps(h C.ac_widget_t, rate int, cb func()) {
+	id := len(_acCallbacks)
+	_acCallbacks = append(_acCallbacks, cb)
+	C._ac_register_screen_fps(h, C.int(rate), unsafe.Pointer(uintptr(id)))
 }
 
 // title is mandatory — no geometry positional arg. Use Dimensions(w, h) instead.
@@ -165,6 +176,7 @@ func (s *AcScreen) mainloop()        { widgets_screen_mainloop(s._h) }
 func (s *AcScreen) update()          { widgets_screen_update(s._h) }
 func (s *AcScreen) dimensions(w, h int) { widgets_screen_dimensions(s._h, w, h) }
 func (s *AcScreen) destroy()         { widgets_screen_destroy(s._h) }
+func (s *AcScreen) fps(rate int, cb func()) { widgets_screen_fps(s._h, rate, cb) }
 
 type AcDisplay struct{ _h C.ac_widget_t }
 func display(m *AcScreen, text string) *AcDisplay { return &AcDisplay{_h: widgets_display_new(m._h, text)} }

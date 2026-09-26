@@ -19,6 +19,8 @@ extern ac_widgets_screen_new
 extern ac_widgets_screen_mainloop
 extern ac_widgets_screen_update
 extern ac_widgets_screen_destroy
+extern ac_widgets_screen_dimensions
+extern ac_widgets_screen_fps
 
 extern ac_widgets_display_new
 extern ac_widgets_display_pack

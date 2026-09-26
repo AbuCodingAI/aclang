@@ -42,6 +42,17 @@ struct Screen : _AcMasterHandle {
     void update()   { ac_widgets_screen_update(_h); }
     void destroy()  { ac_widgets_screen_destroy(_h); }
     void dimensions(int w, int h) { ac_widgets_screen_dimensions(_h, w, h); }
+    // Same AC-callback-shape handling as btn::on_click — see its comment.
+    template<typename F>
+    void fps(int rate, F cb) {
+        std::function<void()> wrapped;
+        if constexpr (std::is_invocable_v<F>) wrapped = [cb]() { cb(); };
+        else                                  wrapped = [cb]() { cb(0); };
+        auto* heapCb = new std::function<void()>(std::move(wrapped));
+        ac_widgets_screen_fps(_h, rate,
+            [](void* d){ (*static_cast<std::function<void()>*>(d))(); },
+            heapCb);
+    }
 };
 
 struct display {

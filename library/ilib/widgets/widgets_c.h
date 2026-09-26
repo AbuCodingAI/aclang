@@ -22,6 +22,10 @@ void        ac_widgets_screen_mainloop(ac_widget_t screen);
 void        ac_widgets_screen_update(ac_widget_t screen);
 void        ac_widgets_screen_destroy(ac_widget_t screen);
 void        ac_widgets_screen_dimensions(ac_widget_t screen, int width, int height);
+/* Alternative to mainloop(): instead of blocking in GTK's own event loop until the
+   window closes, runs its own loop at ~fps ticks/sec, pumping pending GTK events and
+   calling cb once per tick, until the window is closed. */
+void        ac_widgets_screen_fps(ac_widget_t screen, int fps, void (*cb)(void*), void* userdata);
 
 /* ── display (label) ─────────────────────────────────────────────────────── */
 ac_widget_t ac_widgets_display_new(ac_widget_t master, const char* text);

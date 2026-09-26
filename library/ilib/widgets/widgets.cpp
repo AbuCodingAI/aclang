@@ -43,6 +43,9 @@ struct AcWidget {
     int columnCount = 0;               // TABLE
     std::vector<std::string> rows;     // TABLE — each row stored CSV-joined, for .row()/.count()
     GtkTextBuffer* textBuffer = nullptr; // TEXTBOX
+    bool closed = false;                // SCREEN — set true by the destroy signal; fps()'s
+                                         // own loop has no gtk_main() to unblock via gtk_main_quit,
+                                         // so it polls this instead.
 };
 
 static AcWidget* U(ac_widget_t h) { return reinterpret_cast<AcWidget*>(h); }
@@ -91,6 +94,11 @@ void ac_widgets_init(void) {
 }
 
 // ── Screen ────────────────────────────────────────────────────────────────────
+static void ac_widgets_screen_destroy_cb(GtkWidget*, gpointer data) {
+    AcWidget* w = static_cast<AcWidget*>(data);
+    if (w) w->closed = true;
+    gtk_main_quit();  // no-op if fps()'s own loop is running instead of gtk_main()
+}
 // title is mandatory (enforced at the AC-language level — see ir.cpp's Screen ctor
 // handling); there is no geometry positional arg anymore — use .dimensions(w, h).
 ac_widget_t ac_widgets_screen_new(const char* title) {
@@ -98,7 +106,7 @@ ac_widget_t ac_widgets_screen_new(const char* title) {
     w->widget = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(w->widget), title ? title : "AC App");
     gtk_window_set_default_size(GTK_WINDOW(w->widget), 800, 600);
-    g_signal_connect(w->widget, "destroy", G_CALLBACK(gtk_main_quit), nullptr);
+    g_signal_connect(w->widget, "destroy", G_CALLBACK(ac_widgets_screen_destroy_cb), w);
     gtk_container_set_border_width(GTK_CONTAINER(w->widget), 8);
     w->container = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_container_add(GTK_CONTAINER(w->widget), w->container);
@@ -119,6 +127,22 @@ void ac_widgets_screen_destroy(ac_widget_t h) {
 // "WxH" geometry string for callers who'd rather not build/parse that string themselves.
 void ac_widgets_screen_dimensions(ac_widget_t h, int w, int hh) {
     gtk_window_set_default_size(GTK_WINDOW(U(h)->widget), w > 0 ? w : 800, hh > 0 ? hh : 600);
+}
+// Alternative to mainloop(): that blocks in gtk_main() until gtk_main_quit() fires on
+// window close. Here there's no gtk_main() running at all — this is its own plain loop,
+// so it polls AcWidget::closed (set by the destroy signal) instead. g_usleep (not
+// usleep/Sleep) since it's already part of the GLib dependency this whole file has,
+// and stays correct if widgets ever gets a Windows GTK build.
+void ac_widgets_screen_fps(ac_widget_t h, int fps, void (*cb)(void*), void* userdata) {
+    AcWidget* w = U(h);
+    gtk_widget_show_all(w->widget);
+    guint64 frame_us = 1000000ULL / (guint64)(fps > 0 ? fps : 30);
+    while (!w->closed) {
+        while (gtk_events_pending()) gtk_main_iteration();
+        if (w->closed) break;
+        if (cb) cb(userdata);
+        g_usleep(frame_us);
+    }
 }
 
 // ── display ───────────────────────────────────────────────────────────────────

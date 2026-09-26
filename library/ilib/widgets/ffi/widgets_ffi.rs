@@ -20,6 +20,7 @@ extern "C" {
     fn ac_widgets_screen_update(h: AcW);
     fn ac_widgets_screen_destroy(h: AcW);
     fn ac_widgets_screen_dimensions(h: AcW, width: c_int, height: c_int);
+    fn ac_widgets_screen_fps(h: AcW, fps: c_int, cb: extern "C" fn(*mut std::ffi::c_void), userdata: *mut std::ffi::c_void);
 
     fn ac_widgets_display_new(master: AcW, text: *const c_char) -> AcW;
     fn ac_widgets_display_set(h: AcW, text: *const c_char);
@@ -85,6 +86,12 @@ pub trait AcWidgetExt {
     fn update(self);
     fn dimensions(self, w: i64, h: i64);
     fn destroy(self);
+    // Generic (not the fixed `fn(i64) -> i64` shape btn's on_click uses) because, unlike a
+    // button handler, AC's own fps examples use zero-arg callbacks (`Make Tick func()`),
+    // which is a genuinely different Rust fn-pointer TYPE (`fn() -> ()`, no implicit coercion
+    // to `fn(i64) -> i64` the way btn's callback needs). `F: Fn() + 'static` accepts either
+    // shape's zero-arg AC-compiled function directly, no call-site wrapping needed.
+    fn fps<F: Fn() + 'static>(self, rate: i64, cb: F);
     fn add(self, item: &str);
     fn set(self, v: i64);
     fn set_str(self, v: &str);
@@ -109,6 +116,11 @@ impl AcWidgetExt for i64 {
     fn update(self)             { unsafe { ac_widgets_screen_update(self as AcW) } }
     fn dimensions(self, w: i64, h: i64) { unsafe { ac_widgets_screen_dimensions(self as AcW, w as c_int, h as c_int) } }
     fn destroy(self)            { unsafe { ac_widgets_screen_destroy(self as AcW) } }
+    fn fps<F: Fn() + 'static>(self, rate: i64, cb: F) {
+        let boxed: Box<dyn Fn()> = Box::new(cb);
+        let cb_ptr = Box::leak(Box::new(boxed)) as *mut Box<dyn Fn()>;
+        unsafe { ac_widgets_screen_fps(self as AcW, rate as c_int, _ac_fps_cb, cb_ptr as *mut std::ffi::c_void) }
+    }
     fn add(self, item: &str)    { let c = _cs(item); unsafe { ac_widgets_add(self as AcW, c.as_ptr()) } }
     fn set(self, v: i64)        { unsafe { ac_widgets_set_d(self as AcW, v as c_double) } }
     fn set_str(self, v: &str)   { let c = _cs(v); unsafe { ac_widgets_set(self as AcW, c.as_ptr()) } }
@@ -153,6 +165,13 @@ extern "C" fn _ac_btn_cb(userdata: *mut std::ffi::c_void) {
     if userdata.is_null() { return; }
     let cb = unsafe { &*(userdata as *const fn(i64) -> i64) };
     cb(0);
+}
+// fps's callback is a boxed trait object (Box<dyn Fn()>), not a bare fn pointer — see
+// AcWidgetExt::fps's own comment for why it can't share _ac_btn_cb's fixed shape.
+extern "C" fn _ac_fps_cb(userdata: *mut std::ffi::c_void) {
+    if userdata.is_null() { return; }
+    let cb = unsafe { &*(userdata as *const Box<dyn Fn()>) };
+    cb();
 }
 
 // ── Free constructor functions (matching AC codegen output) ───────────────────

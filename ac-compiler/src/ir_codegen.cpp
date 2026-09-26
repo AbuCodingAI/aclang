@@ -8737,6 +8737,21 @@ class JavaStrategy : public BackendStrategy
                     emit(out, indent, func + "(" + joined + ");");
                     return;
                 }
+                // root.fps(rate, Tick) — same callback-arg handling as javaWidgetCtor's btn
+                // on_click (2nd arg is an AC function reference, needs its own upcall stub, not
+                // a direct Java method reference — Panama has no way to call a plain Java method
+                // as a native `void(*)(void*)`), plus the same `long`->`int` narrowing fixup
+                // dimensions() needed for its rate argument.
+                if (wit != widgetVarClass_.end() && wit->second == "Screen" && method == "fps") {
+                    std::vector<std::string> a = splitTopArgs(args);
+                    if (a.size() == 2) {
+                        auto cc = a[1].rfind("::");
+                        std::string cbName = (cc != std::string::npos) ? a[1].substr(cc + 2) : a[1];
+                        widgetCallbacks_.insert(cbName);
+                        emit(out, indent, func + "((int)(" + a[0] + "), _ac_cb_" + cbName + "_stub);");
+                        return;
+                    }
+                }
             }
         }
         // `x = recv.get()` where recv is a widget var — the generic dot-call fallback below
@@ -12519,6 +12534,24 @@ private:
 
     std::string decl(const std::string &var, const std::string &val)
     {
+        // Widget ctor result (`root = Screen(...)`) — the ONLY path a fresh local widget-typed
+        // assignment actually goes through for Go (not emitTypedStoreVar/emitCall's own
+        // widget-ctor branch, despite those functions' comments claiming otherwise). Without
+        // this, `root` fell through every branch below to the generic `int64` default, and
+        // every later `root.method(...)` call was a hard Go compile error ("type int64 has no
+        // method dimensions"). Detected from `val`'s own text (`CtorName(...)`) since the
+        // callee name isn't passed in separately here.
+        {
+            size_t paren = val.find('(');
+            if (paren != std::string::npos) {
+                std::string ty = widgetGoType(val.substr(0, paren));
+                if (!ty.empty()) {
+                    widgetVarType_[var] = ty;
+                    if (declared.insert(var).second) return "var " + var + " " + ty + " = " + val;
+                    return var + " = " + val;
+                }
+            }
+        }
         // Bundle field write (self.field = ...): Go structs already use plain `self.field` for
         // both reads and writes (Go auto-derefs a pointer receiver for `.` access, same as
         // Rust) — `self` isn't a reserved word in Go either (unlike Rust), so the constructor
@@ -14256,6 +14289,22 @@ class VStrategy : public BackendStrategy
 
     std::string decl(const std::string &var, const std::string &val)
     {
+        // Widget ctor result (`root = Screen(...)`) reaching a plain assignment — same bug
+        // class as Go's decl() (see its comment): this is the actual path a fresh local
+        // widget-typed assignment goes through, not emitCall's own widget-ctor branch, so
+        // without this `root` fell through to the generic `i64(...)` wrap below and every
+        // later `root.method(...)` was a hard V compile error ("unknown method or field").
+        {
+            size_t paren = val.find('(');
+            if (paren != std::string::npos) {
+                std::string ty = widgetVType(val.substr(0, paren));
+                if (!ty.empty()) {
+                    widgetVarType_[var] = ty;
+                    if (declared.insert(var).second) return "mut " + var + " := " + val;
+                    return var + " = " + val;
+                }
+            }
+        }
         // A generator-call result (a `chan i64`) — no other check here knows about channels,
         // so it fell to the `i64(...)` wrap and V rejected it outright ("cannot use `chan i64`
         // as `i64`"). No wrapper needed either way — V's `:=` infers the channel type directly.
@@ -15797,6 +15846,24 @@ class AsmStrategy : public BackendStrategy
         if (method == "destroy" && kind == "Screen")  { asmCallSimple(out, "ac_widgets_screen_destroy", {recv}, ""); return true; }
         if (method == "dimensions" && kind == "Screen" && a.size() >= 2) {
             asmCallSimple(out, "ac_widgets_screen_dimensions", {recv, a[0], a[1]}, "");
+            return true;
+        }
+        // root.fps(rate, Tick) — same _ac_widget_call0/1 adapter + "userdata is really the
+        // target function's own address" trick as btn's on_click above (asmWidgetCtor), just
+        // with ac_widgets_screen_fps's extra `rate` arg (esi) ahead of the callback pair.
+        if (method == "fps" && kind == "Screen" && a.size() >= 2) {
+            std::string cb = a[1];
+            auto ar = userFuncArity_.find(cb);
+            std::string adapter = (ar != userFuncArity_.end() && ar->second > 0)
+                                  ? "_ac_widget_call1" : "_ac_widget_call0";
+            loadRAX(out, recv);
+            out << "    mov rdi, rax\n";
+            loadRAX(out, a[0]);
+            out << "    mov rsi, rax\n";
+            out << "    lea rdx, [rel " << adapter << "]\n";
+            out << "    lea rcx, [rel " << cb << "]\n";
+            calledFuncs_.insert("ac_widgets_screen_fps");
+            out << "    call ac_widgets_screen_fps\n";
             return true;
         }
         if (method == "add") {
@@ -18499,6 +18566,13 @@ class AsmStrategy : public BackendStrategy
             out << "    lea rdi, [_ac_atomic_lock]\n    xor esi, esi\n    call pthread_mutex_init\n";
             calledFuncs_.insert("pthread_mutex_init");
         }
+        // `use ilib widgets` needs a one-time ac_widgets_init() (== gtk_init()) before ANY
+        // widget constructor — same bug CStrategy's emitMainBegin already documents and fixes
+        // (see its comment): nothing ever called this on ASM either, so the first real GTK call
+        // segfaulted (GTK-CRITICAL assertions, no display connection — looks like "no display",
+        // actually means "GTK was never initialized").
+        for (auto& [lt, ln] : pendingImports_)
+            if (lt == "ilib" && ln == "widgets") { out << "    call ac_widgets_init\n"; calledFuncs_.insert("ac_widgets_init"); break; }
     }
     void emitMainEnd(std::ostringstream &out, int &indent) override
     {
