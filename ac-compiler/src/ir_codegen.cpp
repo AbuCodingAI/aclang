@@ -18621,6 +18621,21 @@ static std::set<std::string> detectStringParams(const AC_IR::IRFunction& fn,
     return out;
 }
 
+// Ilib functions whose non-callee args are ALL strings (os_c.h: every ac_os_* function except
+// bash/sbash/wait/pid takes only `const char*` — bash/sbash's cmd arg IS a string too, only
+// wait(pid)/pid(status) take a plain int). Dotted or underscore form, matching isAcStrFunc's
+// own convention. stringm.* matches the SAME (already-accepted) "every arg is a string"
+// approximation the LIB_CALL case below already uses for it — imprecise for the rare int-arg
+// tail like split_nth's count, but this whole detector is a heuristic everywhere else too.
+static bool takesStringArgs(const std::string& f) {
+    bool isOs = f.rfind("os.", 0) == 0 || f.rfind("os_", 0) == 0;
+    if (isOs) {
+        std::string tail = f.substr(f.find_first_of("._") + 1);
+        return tail != "wait" && tail != "pid";
+    }
+    return f.find("stringm") != std::string::npos;
+}
+
 // Infer which locals/params are STRINGS from usage (fixpoint). Signals: assigned a string literal
 // or a string-returning call; produced by string concat; compared to a string literal; passed to a
 // stringm.* ilib; copied from a known string var. Lets block backends declare std::string/String,
@@ -18818,8 +18833,18 @@ static std::set<std::string> detectStringVars(const std::vector<AC_IR::IRInstruc
                     // silently defaulted to `i64`, empty-string init literal(`""`)and all).
                     if ((ins.result.kind == IRRef::Kind::VAR || ins.result.kind == IRRef::Kind::TEMP)
                         && ins.typedOperands.size() >= 2)
-                        if (known(ins.typedOperands[0]) || known(ins.typedOperands[1]) || ins.resultType == IRType::STRING)
+                        if (known(ins.typedOperands[0]) || known(ins.typedOperands[1]) || ins.resultType == IRType::STRING) {
                             add(nm2(ins.result));
+                            // AC's `+` never silently coerces a non-string into a concat (unlike
+                            // some languages) — a confirmed string concat means BOTH operands were
+                            // real strings, even the one with no OTHER evidence of its own (e.g.
+                            // `bc + $ $ + operand`: `operand`'s only proof anywhere is standing
+                            // next to two already-known strings in this exact expression).
+                            if (ins.resultType == IRType::STRING) {
+                                add(nm2(ins.typedOperands[0]));
+                                add(nm2(ins.typedOperands[1]));
+                            }
+                        }
                     break;
                 case IROpcode::EQ: case IROpcode::NEQ:
                     if (ins.typedOperands.size() >= 2 && (known(ins.typedOperands[0]) || known(ins.typedOperands[1]))) {
@@ -18845,17 +18870,23 @@ static std::set<std::string> detectStringVars(const std::vector<AC_IR::IRInstruc
                         add(nm2(ins.result));
                     break;
                 case IROpcode::CALL:
-                    if ((ins.result.kind == IRRef::Kind::VAR || ins.result.kind == IRRef::Kind::TEMP)
-                        && !ins.typedOperands.empty()) {
+                    if (!ins.typedOperands.empty()) {
                         std::string cf = constFuncName(ins.typedOperands[0]);
-                        if (BackendStrategy::isAcStrFunc(cf) || strFuncs.count(cf))
+                        if ((ins.result.kind == IRRef::Kind::VAR || ins.result.kind == IRRef::Kind::TEMP)
+                            && (BackendStrategy::isAcStrFunc(cf) || strFuncs.count(cf)))
                             add(nm2(ins.result));
+                        // os.read/write_to/append_to/mkfile/... all take string args (only
+                        // os.wait/os.pid take an int) — a result-capturing use of one of these
+                        // (`text = os.read(bcpath)`) lowers to CALL, not LIB_CALL, so it never
+                        // hit the stringm-only LIB_CALL rule below at all.
+                        if (takesStringArgs(cf))
+                            for (size_t k = 1; k < ins.typedOperands.size(); k++) add(nm(ins.typedOperands[k]));
                     }
                     break;
                 case IROpcode::LIB_CALL: {
                     if (ins.typedOperands.empty()) break;
                     std::string f = constFuncName(ins.typedOperands[0]);
-                    if (f.find("stringm") != std::string::npos)   // stringm.* args are strings
+                    if (takesStringArgs(f))
                         for (size_t k = 1; k < ins.typedOperands.size(); k++) add(nm(ins.typedOperands[k]));
                     // Same VAR-only gap the CALL case above already had fixed (see its comment) —
                     // this one's result lands in a TEMP just as often (e.g. `low = speech.lower()`
@@ -19284,6 +19315,17 @@ class UnifiedIRCodeGen
     std::set<std::string> protoFloatFuncs_, protoListFuncs_, protoStringFuncs_; // fwd-decl return types
     std::map<std::string, ForeignFuncDef> foreignDefs_;   // funcs whose body IS a foreign definition (C/C++)
     std::set<std::string> boxedRetFuncsDrv_;   // user fns returning a boxed (tagged) value — see setBoxedRetFuncs
+    // Whole-program string-var sets, one per function — see the fixpoint that fills this in at
+    // the top of generate(). detectStringVars alone only looks at ONE function's own body: a
+    // param/local whose only "evidence" of being a string is getting passed into ANOTHER
+    // user function whose OWN param is independently known-string (e.g. `ch` in `tokenize`,
+    // whose only direct evidence is `is_digit_char(ch)`/`token_for(ch)` — both real functions
+    // whose OWN bodies compare their param to string literals) was invisible to the old
+    // per-function-only call, and every typed backend defaulted it to a plain int, then
+    // rejected the call site outright ("passing argument 1 ... makes pointer from integer
+    // without a cast") once the callee's OWN (correctly-inferred) string parameter met the
+    // caller's wrongly-int argument.
+    std::map<std::string, std::set<std::string>> crossFnStringVars_;
     std::set<std::string> voidUserFuncs_;   // user functions with no `return <value>;` anywhere
     std::set<std::string> generatorFuncNamesIco_;   // fn.name for every fn.isGenerator (family B/C
                                                      // need this at CALL sites, not just genFunction)
@@ -20357,11 +20399,17 @@ class UnifiedIRCodeGen
 
         std::set<std::string> fnStringParams = detectStringParams(func, ir.symbols);
         strategy->setStringParams(fnStringParams);
-        // #6: infer string-typed locals/params (seeded with string params) so backends declare and
-        // iterate them as strings.
-        std::set<std::string> fnStringVars = detectStringVars(func.instructions, ir.symbols, fnStringParams, protoStringFuncs_);
-        for (const auto& nv : detectNumericRetype(func.instructions, ir.symbols, fnStringVars))
-            fnStringVars.erase(nv);   // #retype: last-assign numeric → NOT string-unified
+        // #6/cross-function propagation: use the whole-program fixpoint (crossFnStringVars_,
+        // computed once at the top of generate()) instead of a fresh per-function-only
+        // detectStringVars call — the local-only version can't see a param/local whose only
+        // evidence of being a string is a pass-through into ANOTHER function's own
+        // independently-string-inferred parameter (see crossFnStringVars_'s comment).
+        auto gsvIt = crossFnStringVars_.find(func.name);
+        std::set<std::string> fnStringVars = gsvIt != crossFnStringVars_.end() ? gsvIt->second
+            : detectStringVars(func.instructions, ir.symbols, fnStringParams, protoStringFuncs_);
+        if (gsvIt == crossFnStringVars_.end())
+            for (const auto& nv : detectNumericRetype(func.instructions, ir.symbols, fnStringVars))
+                fnStringVars.erase(nv);   // #retype: last-assign numeric → NOT string-unified
         strategy->setStringVars(fnStringVars);
         strategy->setBoxedVars(detectBoxedVars(func.instructions, ir.symbols, fnStringVars, protoStringFuncs_, boxedRetFuncsDrv_));
 
@@ -20570,6 +20618,81 @@ public:
 
     std::string generate()
     {
+        // Whole-program string-parameter propagation — see crossFnStringVars_'s own comment.
+        // Seed each function from its own body, then repeatedly walk every CALL/LIB_CALL site:
+        // if the callee's Nth parameter is (by now) known-string, mark the CALLER's Nth
+        // argument (if a plain var/temp) string too, in the CALLER's own set. Repeat until
+        // nothing changes — a chain of plain pass-throughs (A calls B calls C, only C's body
+        // has real evidence) needs more than one round to fully propagate back to A.
+        {
+            crossFnStringVars_.clear();
+            std::map<std::string, const IRFunction*> byName;
+            for (auto& func : ir.functions) byName[func.name] = &func;
+            for (auto& func : ir.functions) {
+                std::set<std::string> sp = detectStringParams(func, ir.symbols);
+                auto& sv = crossFnStringVars_[func.name];
+                sv = detectStringVars(func.instructions, ir.symbols, sp, protoStringFuncs_);
+                // Numeric-retype cleanup belongs HERE, on the seed (this function's own body
+                // evidence) only — NOT after the cross-function fixpoint below. That fixpoint can
+                // mark a var string purely from EXTERNAL evidence (passed into another function's
+                // known-string param) with no direct assignment evidence of its own at all (e.g.
+                // `tok = tokens[x]`, an array-index load with no local proof either way, later
+                // passed to `bytecode_for(tok)`) — detectNumericRetype only understands the LOCAL
+                // assignment shape, so running it again after the fixpoint saw exactly that "no
+                // proof" and silently erased the fixpoint's own correct answer.
+                for (auto& nv : detectNumericRetype(func.instructions, ir.symbols, sv)) sv.erase(nv);
+            }
+            bool changed = true;
+            int guard = 0;
+            while (changed && guard++ < 50) {
+                changed = false;
+                // Step 1: cross-function call-argument evidence — collect into a side table
+                // rather than mutating crossFnStringVars_ mid-scan (a function calling itself,
+                // directly or mutually, would otherwise see a half-updated set this same round).
+                std::map<std::string, std::set<std::string>> extra;
+                for (auto& func : ir.functions) {
+                    for (auto& ins : func.instructions) {
+                        if (ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL) continue;
+                        if (ins.typedOperands.empty()) continue;
+                        const auto& f0 = ins.typedOperands[0];
+                        std::string callee;
+                        if (f0.kind == IRRef::Kind::VAR && f0.id >= 0) callee = ir.symbols.getName(f0.id);
+                        else if (f0.kind == IRRef::Kind::CONST && f0.value.type == IRType::STRING)
+                            callee = std::get<std::string>(f0.value.data);
+                        auto cit = byName.find(callee);
+                        if (cit == byName.end()) continue;
+                        const IRFunction* cf = cit->second;
+                        auto sit = crossFnStringVars_.find(cf->name);
+                        if (sit == crossFnStringVars_.end()) continue;
+                        const auto& calleeStrs = sit->second;
+                        for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
+                            size_t pidx = ai - 1;
+                            if (pidx >= cf->parameters.size()) continue;
+                            if (!calleeStrs.count(cf->parameters[pidx])) continue;
+                            const auto& arg = ins.typedOperands[ai];
+                            std::string argName;
+                            if (arg.kind == IRRef::Kind::VAR && arg.id >= 0) argName = ir.symbols.getName(arg.id);
+                            else if (arg.kind == IRRef::Kind::TEMP) argName = "t_" + std::to_string(arg.id);
+                            if (!argName.empty()) extra[func.name].insert(argName);
+                        }
+                    }
+                }
+                // Step 2: re-run detectStringVars per function, seeded with its OWN current set
+                // PLUS this round's fresh cross-function evidence — a full re-run (not a bare
+                // insert) so detectStringVars' OWN internal rules (FOR-loop iteration partner,
+                // concat operands, etc.) get a chance to cascade from the new evidence too, e.g.
+                // `ch` only becoming known-string via this round's `is_digit_char(ch)` call still
+                // needs to separately propagate to `source` via `FOR ch in source` — a rule that
+                // only fires inside detectStringVars' own pass, never in step 1 above.
+                for (auto& func : ir.functions) {
+                    std::set<std::string> seed = crossFnStringVars_[func.name];
+                    for (auto& s : extra[func.name]) seed.insert(s);
+                    std::set<std::string> full = detectStringVars(func.instructions, ir.symbols, seed, protoStringFuncs_);
+                    if (full.size() != crossFnStringVars_[func.name].size()) changed = true;
+                    crossFnStringVars_[func.name] = std::move(full);
+                }
+            }
+        }
         // Pre-scan: collect global var names, check for INPUT / EVENT_BIND / LIB_CALL imports
         bool hasInput  = false;
         bool hasEvents = false;
@@ -21322,12 +21445,24 @@ public:
             if (!hasValueReturn) voidUserFuncs_.insert(fn.name);
         }
 
-        // Build set of user-defined functions that return float (contain a DIV instruction)
+        // Build set of user-defined functions that return float (contain a DIV instruction).
+        // Fixpoint (not a single pass): a function whose return value comes only from CALLING
+        // another user function (`run_vm`'s `x = apply_line(...); return x`) needs that OTHER
+        // function's float-ness known FIRST — a single top-to-bottom pass over ir.functions
+        // only sees that if the callee happens to be processed earlier in the list. Re-running
+        // with the so-far-accumulated floatFuncs fed back in (detectFloatVars's own `floatFuncs`
+        // param already supports exactly this — it just always got an empty `{}` here before)
+        // converges regardless of function order, same fix shape as crossFnStringVars_ above.
         {
             std::set<std::string> floatFuncs;
             std::set<std::string> listFuncs;
             std::set<std::string> stringFuncs;
             std::map<std::string, std::set<int>> userFloatParamIdx;
+            bool fpChanged = true;
+            int fpGuard = 0;
+            while (fpChanged && fpGuard++ < 50) {
+            fpChanged = false;
+            size_t fpBefore = floatFuncs.size() + listFuncs.size() + stringFuncs.size();
             for (const auto& fn : ir.functions) {
                 // Same exemption as voidUserFuncs_ just above: a generator's `return` (if it has
                 // one at all — bare, by construction) tells this scan NOTHING about the function's
@@ -21343,7 +21478,7 @@ public:
                 if (fn.isGenerator) continue;
                 std::set<std::string> fnSV; bool fnSVdone = false;
                 auto fnStringVars = [&]() -> const std::set<std::string>& {
-                    if (!fnSVdone) { fnSV = detectStringVars(fn.instructions, ir.symbols, detectStringParams(fn, ir.symbols)); fnSVdone = true; }
+                    if (!fnSVdone) { fnSV = detectStringVars(fn.instructions, ir.symbols, detectStringParams(fn, ir.symbols), stringFuncs); fnSVdone = true; }
                     return fnSV;
                 };
                 // #floatret (caller-facing half — see the identical fix + comment at the
@@ -21356,7 +21491,7 @@ public:
                 // mismatch once the callee's OWN signature was correctly fixed to `-> i64`).
                 std::set<std::string> fnFV; bool fnFVdone = false;
                 auto fnFloatVars = [&]() -> const std::set<std::string>& {
-                    if (!fnFVdone) { fnFV = detectFloatVars(fn.instructions, ir.symbols, {}, detectFloatParams(fn, ir.symbols)); fnFVdone = true; }
+                    if (!fnFVdone) { fnFV = detectFloatVars(fn.instructions, ir.symbols, floatFuncs, detectFloatParams(fn, ir.symbols)); fnFVdone = true; }
                     return fnFV;
                 };
                 // #floatparam (call-site half): a param this function's OWN body treats as float
@@ -21402,6 +21537,9 @@ public:
                     }
                 }
             }
+            size_t fpAfter = floatFuncs.size() + listFuncs.size() + stringFuncs.size();
+            if (fpAfter != fpBefore) fpChanged = true;
+            }  // while (fpChanged)
             if (!userFloatParamIdx.empty()) strategy->setUserFloatParams(userFloatParamIdx);
             if (!floatFuncs.empty()) strategy->setFloatReturnFuncs(floatFuncs);
             if (!listFuncs.empty()) strategy->setListReturnFuncs(listFuncs);
