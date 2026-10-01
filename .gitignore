@@ -1,12 +1,15 @@
 # AC repository layout — everything at the top level is ignored unless allow-listed here.
 # The repo ships: compiler source + includes + prebuilt binaries, examples/, library/,
-# README, LICENSE, install.sh. Anything else (IDE, LSP, website, scratch, benchmarks,
-# session notes) lives outside the repo.
+# README, LICENSE, install.sh, plus the npm package.json/bin/ wrapper (ac --version prints
+# just "AC 1" — the npm semver only ever appears in package.json itself, for publishing).
+# Anything else (IDE, LSP, website, scratch, benchmarks, session notes) lives outside the repo.
 /*
 !/.gitignore
 !/README.md
 !/LICENSE
 !/install.sh
+!/package.json
+!/bin/
 !/ac-compiler/
 !/examples/
 !/library/

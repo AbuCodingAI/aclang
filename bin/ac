@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+// npm entry point: picks the prebuilt AC compiler binary for the current
+// platform/arch and execs it, forwarding argv/stdio/exit code untouched.
+const { spawnSync } = require('child_process');
+const path = require('path');
+
+let binName;
+if (process.platform === 'win32') {
+    binName = 'ac.exe';
+} else if (process.platform === 'linux' && process.arch === 'arm64') {
+    binName = 'ac.arm';
+} else if (process.platform === 'linux' && process.arch === 'x64') {
+    binName = 'ac';
+} else {
+    console.error(
+        `aclang: no prebuilt compiler for ${process.platform}/${process.arch}.\n` +
+        'Build from source instead: see install.sh at https://github.com/AbuCodingAI/aclang'
+    );
+    process.exit(1);
+}
+
+const binPath = path.join(__dirname, '..', 'ac-compiler', binName);
+const result = spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
+if (result.error) {
+    console.error(`aclang: failed to run ${binPath}: ${result.error.message}`);
+    process.exit(1);
+}
+process.exit(result.status === null ? 1 : result.status);

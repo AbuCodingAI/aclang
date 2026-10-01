@@ -760,10 +760,11 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--version" || arg == "-v") {
-            // Java-style product versioning: the compiler is "AC 1". The npm artifact rides a
-            // compliant semver underneath (aclang 1.0.1 — 1.0.0 is a burned prototype release),
-            // exactly like "Java 8" shipping as 1.8.0_xxx.
-            std::cout << "AC 1 (aclang 1.0.1)\n";
+            // Java-style product versioning: the compiler always identifies itself as "AC 1" —
+            // no semver number here, ever (that's npm's own concern, in package.json, visible
+            // only to the publishing step and package managers — exactly like "Java 8" shows
+            // just "8" at runtime while the underlying JDK build number lives elsewhere).
+            std::cout << "AC 1\n";
             return 0;
         }
         if (arg == "--help" || arg == "-h") {
