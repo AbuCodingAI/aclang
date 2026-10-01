@@ -183,6 +183,11 @@ class StringCheese {
         }
         return true;
     }
+    // AC's own dotted call is the all-lowercase `stringm.ischar(...)` (matches every other
+    // backend's ffi naming) — this class's own method was camelCase and never matched, "cannot
+    // find symbol: method ischar(String); location: class stringm" on any AC program that
+    // actually calls it (verified: abu_speaks_ac's lexer, `stringm.ischar(ch)`).
+    public static boolean ischar(String s) { return isChar(s); }
 
     /**
      * stringm_isws - Check if all whitespace
@@ -246,6 +251,7 @@ class stringm {
     public static boolean startswith(String s, String p)   { return StringCheese.startsWith(s, p); }
     public static boolean endswith(String s, String p)     { return StringCheese.endsWith(s, p); }
     public static long   count(String s, String sub)       { return StringCheese.count(s, sub); }
+    public static boolean ischar(String s)                 { return StringCheese.ischar(s); }
     public static String format(String t)                  { return StringCheese.format(t); }
     public static String getline()                         { return StringCheese.getline(); }
     public static boolean scan(String needle)               { return StringCheese.scan(needle); }
