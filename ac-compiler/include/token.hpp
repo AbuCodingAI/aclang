@@ -6,6 +6,8 @@ enum class TokenType {
     // Literals
     STRING,         // $...$
     DQUOTE_STRING,  // "..." — lexed only so the parser can reject it with a clear error (AC strings are $...$)
+    FSTRING,        // f$...$ / t$...$ — text with {expr} parts; the parser builds the concatenation
+    BSTRING,        // b$...$ — the bytes of the text as a list of numbers
     NUMBER,
     IDENTIFIER,
 
@@ -105,6 +107,7 @@ enum class TokenType {
     KW_XRANGE,      // xrange N → [1..N], 1-indexed range (desugars to sequence(1, N+1))
     KW_XIOTA,       // xiota N  → lazy 1..N, 1-indexed iota (desugars to stream(1, N+1))
     KW_IS,          // is  → equality comparison
+    KW_HAS,         // has — dict key membership: dict has key -> bool
     KW_PASS,        // pass → no-op placeholder
     KW_SKIP,        // skip → stop rest of if/elseif/other chain
     KW_CONTINUE,    // continue → next loop iteration

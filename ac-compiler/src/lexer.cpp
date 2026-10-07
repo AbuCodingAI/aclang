@@ -69,6 +69,7 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"xrange",   TokenType::KW_XRANGE},
     {"xiota",    TokenType::KW_XIOTA},
     {"is",       TokenType::KW_IS},
+    {"has",      TokenType::KW_HAS},
     {"xsub",     TokenType::KW_XSUB},
     {"pass",     TokenType::KW_PASS},
     {"skip",     TokenType::KW_SKIP},
@@ -212,6 +213,15 @@ public:
                 if (rawStr) tokens.pop_back(); // consume the 'r' prefix token
 
                 int sc = col; pos++; col++;
+                // A one-letter prefix right before the $ (f$, t$, b$) changes what the string is.
+                // Only when the letter touches the $, so an identifier `f` followed by a space stays one.
+                char prefix = 0;
+                if (!rawStr && !tokens.empty() && tokens.back().type == TokenType::IDENTIFIER
+                    && tokens.back().line == line && tokens.back().col + 1 == sc
+                    && (tokens.back().value == "f" || tokens.back().value == "t" || tokens.back().value == "b")) {
+                    prefix = tokens.back().value[0];
+                    tokens.pop_back();
+                }
                 std::string s;
                 if (rawStr) {
                     // Raw string: copy bytes until closing $, no escape processing
@@ -248,7 +258,9 @@ public:
                     }
                 }
                 if (pos < src.size()) { pos++; col++; } // skip closing $
-                tokens.emplace_back(TokenType::STRING, std::move(s), line, sc);
+                TokenType stype = prefix == 'b' ? TokenType::BSTRING
+                                : (prefix == 'f' || prefix == 't') ? TokenType::FSTRING : TokenType::STRING;
+                tokens.emplace_back(stype, std::move(s), line, sc);
                 continue;
             }
 

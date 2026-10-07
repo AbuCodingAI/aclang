@@ -160,8 +160,12 @@ enum class IROpcode {
                     // result = opaque generator handle
     GEN_NEXT,       // operand[0] = handle; result = the value produced by the next
                     // resume (undefined if the generator is already done)
-    GEN_DONE        // operand[0] = handle; result = bool — was the most recent
+    GEN_DONE,       // operand[0] = handle; result = bool — was the most recent
                     // GEN_NEXT the terminal no-value resume?
+    WILDCARD_MATCH, // operand[0] = subject string, operand[1] = pattern string; result = bool.
+                    // `%` in a pattern matches any run of characters (including none); the whole
+                    // subject must match. `p%` starts-with, `%p` ends-with, `%p%` contains.
+    DICT_HAS        // operand[0] = dict, operand[1] = key; result = bool (the key is present).
 };
 
 enum class IRType {

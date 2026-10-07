@@ -19,6 +19,16 @@
 #include <climits>
 #include <sys/stat.h>
 
+// First `ch` outside a $...$ string span: a string value in a dict literal may hold ",", ":".
+static size_t dictSplitPos(const std::string& s, char ch) {
+    bool inSpan = false;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '$') inSpan = !inSpan;
+        else if (!inSpan && s[i] == ch) return i;
+    }
+    return std::string::npos;
+}
+
 #ifdef _WIN32
 #  define TARGET_WINDOWS 1
 #elif __linux__
@@ -795,6 +805,8 @@ static bool returnsCString(const std::string& irName) {
         "dns.resolve", "dns.list",
         "server.req_body", "server.req_header",
         "maudio.listen",
+        "ptr_deref",   // native-cpu: returns the stored bytes as text (see native-cpu_c.h)
+        "os.tmpdir", "os.tmpfile", "os.mktmpdir", "os.join", "os.basename", "os.dirname", "os.homedir",
     };
     return cstr.count(irName) > 0;
 }
@@ -860,12 +872,22 @@ static std::string bnyWidgetNewFn(const std::string& func) {
 // FuncCompiler<NasmEmitter> emits the same logic as NASM text. Duck-typed on `Em`:
 // the body only ever calls em.<instruction>() — never touches byte-buffer machinery
 // (pos/code/fixups/PLT live on X64Emitter and are used only by the ELF driver).
+// What the program's GLOBAL names hold (dictionary, list, string list). The global init is compiled after
+// the functions that read those globals, so these kinds are learned from it up front, and each function
+// compiler reads them (read-only) for any name that is not one of its own locals.
+struct GlobalKinds {
+    std::set<std::string> dict, arr, strList, dictAllStr;
+    std::map<std::string, std::set<std::string>> dictStrKeys;   // global dict -> keys holding a string
+};
+
 template<class Em>
 class FuncCompiler {
 public:
     std::set<std::string>*  floatFuncs_ = nullptr; // set by BinaryCompiler; shared across funcs
     std::set<std::string>*  stringFuncs_ = nullptr; // user fns returning char* (shared)
     std::set<std::string>*  arrayFuncs_ = nullptr;  // user fns returning list blocks (shared)
+    std::set<std::string>*  strListFuncs_ = nullptr; // user fns returning a list of strings (shared)
+    const GlobalKinds*      globalKinds_ = nullptr;  // kinds of the program's global names (read-only)
     std::set<std::string>   forcedStringParams_;
     std::set<std::string>   forcedFloatParams_;   // params a caller passes a float to (→ load as double)
     // NA→free: free-var names that live in shared global slots, and the name→slot map (shared).
@@ -1029,6 +1051,8 @@ private:
     std::map<std::string,int> localVarIds_;
     void buildLocalVarIds(const std::vector<AC_IR::IRInstruction>& instrs) {
         localVarIds_.clear();
+        boolTempIds_.clear();   // temp ids restart per block
+        strListTempIds_.clear();
         auto add = [&](const AC_IR::IRRef& r) {
             if (r.kind == AC_IR::IRRef::Kind::VAR && r.id >= 0) {
                 std::string n = prog.symbols.getName(r.id);
@@ -1057,6 +1081,25 @@ private:
     std::set<std::string>   floatVarNames_;  // var names assigned from float-returning calls
     std::set<std::string>   stringVarNames_; // var names holding string pointers (LongInt big values)
     std::set<int>           stringTempIds_;  // temp IDs holding char* (ilib string returns)
+    // stringm.split results: a list block whose elements are char* (see emitStringListCall).
+    std::set<int>           strListTempIds_;
+    std::set<std::string>   strListVarNames_;
+    std::set<std::string>   dictAllStrVars_;   // dicts whose every value is a string (any read is a string)
+    int                     strListSeq_ = 0;  // unique label suffix per call site
+    bool isStrListRef(const AC_IR::IRRef& r) const {
+        if (r.kind == AC_IR::IRRef::Kind::TEMP) return strListTempIds_.count(r.id) > 0;
+        if (r.kind == AC_IR::IRRef::Kind::VAR)
+            return strListVarNames_.count(varName(r)) > 0 || isGlobalNamed(r, &GlobalKinds::strList);
+        return false;
+    }
+    std::string libMethodName(const AC_IR::IRInstruction& ins) {
+        if (ins.typedOperands.empty()) return "";
+        const auto& m = ins.typedOperands[0];
+        if (m.kind == AC_IR::IRRef::Kind::CONST && m.value.type == AC_IR::IRType::STRING)
+            return std::get<std::string>(m.value.data);
+        return funcName(m);
+    }
+    std::set<int>           boolTempIds_;    // temp IDs holding a real bool (reset with localVarIds_, per block)
     std::set<std::string>   arrayVarNames_;  // var names holding list blocks ([len][e0]…)
     std::set<int>           arrayTempIds_;   // temp IDs holding list blocks
     std::set<std::string>   dictVarNames_;   // var names holding dict blocks ([n][k0][v0]…)
@@ -1078,6 +1121,10 @@ private:
         } else if (r.kind == AC_IR::IRRef::Kind::VAR) {
             auto it = dictStrKeysByVar_.find(varName(r));
             if (it != dictStrKeysByVar_.end()) return it->second;
+            if (globalKinds_) {                       // a global dictionary read from inside a function
+                auto g = globalKinds_->dictStrKeys.find(varName(r));
+                if (g != globalKinds_->dictStrKeys.end()) return g->second;
+            }
         }
         return {};
     }
@@ -1422,15 +1469,25 @@ private:
         if (r.kind == AC_IR::IRRef::Kind::VAR && stringVarNames_.count(varName(r))) return true;
         return false;
     }
+    // A VAR named by the global init may be read here as that global (localVarIds_ lists every name a
+    // function touches, globals included, so it cannot tell the two apart).
+    bool isGlobalNamed(const AC_IR::IRRef& r, const std::set<std::string> GlobalKinds::*which) const {
+        if (r.kind != AC_IR::IRRef::Kind::VAR || !globalKinds_) return false;
+        return (globalKinds_->*which).count(varName(r)) > 0;
+    }
+    bool dictAllStrRef(const AC_IR::IRRef& r) const {
+        if (r.kind != AC_IR::IRRef::Kind::VAR) return false;
+        return dictAllStrVars_.count(varName(r)) > 0 || isGlobalNamed(r, &GlobalKinds::dictAllStr);
+    }
     bool isArrRef(const AC_IR::IRRef& r) const {
         if (r.kind == AC_IR::IRRef::Kind::TEMP && arrayTempIds_.count(r.id)) return true;
         if (r.kind == AC_IR::IRRef::Kind::VAR && arrayVarNames_.count(varName(r))) return true;
-        return false;
+        return isGlobalNamed(r, &GlobalKinds::arr);
     }
     bool isDictRef(const AC_IR::IRRef& r) const {
         if (r.kind == AC_IR::IRRef::Kind::TEMP && dictTempIds_.count(r.id)) return true;
         if (r.kind == AC_IR::IRRef::Kind::VAR && dictVarNames_.count(varName(r))) return true;
-        return false;
+        return isGlobalNamed(r, &GlobalKinds::dict);
     }
     void markDstDict(const AC_IR::IRRef& r) {
         if (r.kind == AC_IR::IRRef::Kind::TEMP) dictTempIds_.insert(r.id);
@@ -1655,6 +1712,68 @@ private:
         else                    em.call(name);
     }
 
+    // stringm.split(s, sep) -> a list of strings. The ilib returns char** and writes the piece count
+    // through its third argument. BNY copies the pointers into a fresh list block with the layout
+    // ALLOC "list" uses: [cap][len][e0][e1]... (each piece is a NUL-terminated pointer, one slot).
+    // The callee-saved registers are pushed and restored, because the register allocator owns them.
+    void emitStringListCall(const AC_IR::IRInstruction& ins) {
+        using namespace AC_IR;
+        const int k = strListSeq_++;
+        const std::string capL  = "__sl_cap_"  + std::to_string(k);
+        const std::string loopL = "__sl_loop_" + std::to_string(k);
+        const std::string doneL = "__sl_done_" + std::to_string(k);
+        em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14);
+        em.mov_ri32(R::RDI, 8);
+        em.call("__ac_alloc__");
+        em.mov_rr(R::RBX, R::RAX);                        // rbx = piece-count cell (the ilib's out_count)
+        load(ins.typedOperands[1], R::RDI);               // s
+        const IRRef& sep = ins.typedOperands[2];
+        if (sep.kind == IRRef::Kind::CONST && sep.value.type == IRType::STRING
+                && std::get<std::string>(sep.value.data) == "__WS__")
+            em.mov_ri64_str(R::RSI, sp.add(" \t\n\r"));   // the whitespace sentinel
+        else
+            load(sep, R::RSI);
+        em.mov_rr(R::RDX, R::RBX);
+        emitExtCall("stringm.split");
+        em.mov_rr(R::R12, R::RAX);                        // r12 = char** pieces
+        em.mov_r_ptr(R::R13, R::RBX);                     // r13 = n
+        em.mov_rr(R::R14, R::R13);                        // r14 = cap = max(n, 8)
+        em.mov_ri32(R::RCX, 8);
+        em.cmp_rr(R::R14, R::RCX);
+        em.jge(capL);
+        em.mov_rr(R::R14, R::RCX);
+        em.label(capL);
+        em.mov_rr(R::RDI, R::R14);                        // block = cap*8 + 16 (cap word + len word)
+        em.mov_ri32(R::RCX, 8);
+        em.imul_rr(R::RDI, R::RCX);
+        em.add_ri32(R::RDI, 16);
+        em.call("__ac_alloc__");                          // rax = block
+        em.mov_ptr_r(R::RAX, R::R14);                     // [block] = cap
+        em.add_ri32(R::RAX, 8);                           // rax = list ptr
+        em.mov_ptr_r(R::RAX, R::R13);                     // [ptr] = len
+        em.mov_rr(R::R14, R::RAX);                        // r14 = list ptr
+        em.mov_ri32(R::RCX, 0);                           // i = 0
+        em.label(loopL);
+        em.cmp_rr(R::RCX, R::R13);
+        em.jge(doneL);
+        em.mov_rr(R::RDX, R::RCX);                        // rdx = 8*i
+        em.mov_ri32(R::RSI, 8);
+        em.imul_rr(R::RDX, R::RSI);
+        em.mov_rr(R::RSI, R::R12);                        // rsi = &pieces[i]
+        em.add_rr(R::RSI, R::RDX);
+        em.mov_r_ptr(R::R8, R::RSI);                      // r8 = pieces[i]
+        em.mov_rr(R::R9, R::R14);                         // r9 = &block[1+i] = ptr + 8 + 8*i (block[0] is len)
+        em.add_rr(R::R9, R::RDX);
+        em.add_ri32(R::R9, 8);
+        em.mov_ptr_r(R::R9, R::R8);
+        em.add_ri32(R::RCX, 1);
+        em.jmp(loopL);
+        em.label(doneL);
+        em.mov_rr(R::RAX, R::R14);
+        em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+        store(ins.result, R::RAX);
+    }
+
     void emitLibCall(const AC_IR::IRInstruction& ins) {
         if (ins.typedOperands.empty()) return;
         using namespace AC_IR;
@@ -1791,6 +1910,12 @@ private:
             return;
         }
 
+        // stringm.split(s, sep): the list-returning form (see emitStringListCall).
+        if (method == "stringm.split" && ins.typedOperands.size() == 3) {
+            emitStringListCall(ins);
+            return;
+        }
+
         // Namespaced ilib calls — ml.tensor(2), os.mkfile(p), regex.match(s,p),
         // stringm.upper(s), web.open(u), ncpu.dha(n) — all route through their .so PLT stubs.
         if (method.rfind("ml.", 0) == 0 || method.rfind("os.", 0) == 0 || method.rfind("dns.", 0) == 0 ||
@@ -1860,6 +1985,10 @@ private:
                     if (!vn.empty()) stringVarNames_.insert(vn);
                 }
             }
+            if (returnsCString(method)) {                 // copy: see __ac_strdup__
+                em.mov_rr(R::RDI, R::RAX);
+                em.call("__ac_strdup__");
+            }
             if (ins.result.isValid()) store(ins.result, R::RAX);
             return;
         }
@@ -1889,6 +2018,8 @@ private:
     }
 
     void compileInstr(const AC_IR::IRInstruction& ins) {
+        if (ins.result.kind == AC_IR::IRRef::Kind::TEMP && ins.resultType == AC_IR::IRType::BOOL)
+            boolTempIds_.insert(ins.result.id);
         using namespace AC_IR;
         auto& ops = ins.typedOperands;
 
@@ -2261,6 +2392,31 @@ private:
             break;
         }
 
+        case IROpcode::WILDCARD_MATCH: {
+            // `subject % pattern`: a bool from the always-emitted __ac_wildcard_match__ routine.
+            auto loadS = [&](const AC_IR::IRRef& r, R dst) {
+                if (r.kind == IRRef::Kind::CONST && r.value.type == AC_IR::IRType::STRING) {
+                    int sid = sp.add(std::get<std::string>(r.value.data));
+                    em.mov_ri64_str(dst, sid);
+                } else load(r, dst);
+            };
+            loadS(op0(), R::RDI);
+            loadS(op1(), R::RSI);
+            em.call("__ac_wildcard_match__");
+            store(ins.result, R::RAX);
+            break;
+        }
+        case IROpcode::DICT_HAS: {
+            // `dict has key`: __ac_dict_has__ scans the pairs with __ac_streq__; rax = 1/0.
+            load(op0(), R::RDI);
+            if (op1().kind == AC_IR::IRRef::Kind::CONST && op1().value.type == AC_IR::IRType::STRING) {
+                int sid = sp.add(std::get<std::string>(op1().value.data));
+                em.mov_ri64_str(R::RSI, sid);
+            } else load(op1(), R::RSI);
+            em.call("__ac_dict_has__");
+            store(ins.result, R::RAX);
+            break;
+        }
         case IROpcode::EQ:  case IROpcode::NEQ:
         case IROpcode::LT:  case IROpcode::GT:
         case IROpcode::LTE: case IROpcode::GTE: {
@@ -2454,6 +2610,11 @@ private:
                 break;
             }
             std::string rawFn = funcName(ops[0]);
+            // stringm.split(s, sep): the list-returning form (see emitStringListCall).
+            if (rawFn == "stringm.split" && ops.size() == 3) {
+                emitStringListCall(ins);
+                break;
+            }
             // math.mod(a,b) with two non-float operands is ALWAYS exact — PY's own math_mod
             // wrapper ("int-exact when operands and result are whole") always returns a real int
             // in this case, since integer modulo can never be fractional. The real ac_mod (the
@@ -2635,6 +2796,10 @@ private:
                     if (!vn.empty()) stringVarNames_.insert(vn);
                 }
             }
+            if (returnsCString(fn)) {                     // copy: see __ac_strdup__
+                em.mov_rr(R::RDI, R::RAX);
+                em.call("__ac_strdup__");
+            }
             if (ins.result.isValid()) {
                 store(ins.result, R::RAX);
                 // `q = f()` where f always constructs+returns one bundle class
@@ -2761,6 +2926,17 @@ private:
                     // chained-call lowering specifically.
                     if (s.size() >= 2 && s.front() == '$' && s.back() == '$')
                         s = s.substr(1, s.size() - 2);
+                    // Keyword literals print as PY does: null -> None, nil -> set().
+                    if (s == "null") s = "None";
+                    else if (s == "nil") s = "set()";
+                    int sid = sp.add(s);
+                    em.mov_ri64_str(abi.argRegs[0], sid);
+                    em.mov_ri32(abi.argRegs[1], (int32_t)s.size());
+                    em.call("__ac_print_str__");
+                    if (usesSave_) { em.mov_ri64_str(R::RDI, sid); em.call("__ac_save_append_cstr__"); }
+                } else if (v.kind == IRRef::Kind::CONST && v.value.type == AC_IR::IRType::BOOL) {
+                    // True/False print as words (PY), not as the 1/0 the bool holds.
+                    std::string s = std::get<bool>(v.value.data) ? "True" : "False";
                     int sid = sp.add(s);
                     em.mov_ri64_str(abi.argRegs[0], sid);
                     em.mov_ri32(abi.argRegs[1], (int32_t)s.size());
@@ -2780,6 +2956,24 @@ private:
                     // Array capture isn't wired up (same narrow, documented scope boundary every
                     // other backend's emitCapture currently has — Term.display of a plain
                     // scalar/string is the demonstrated, verified case).
+                } else if ((v.kind == AC_IR::IRRef::Kind::TEMP && boolTempIds_.count(v.id))
+                           || (v.kind == AC_IR::IRRef::Kind::VAR && v.id >= 0
+                               && prog.symbols.getType(v.id) == AC_IR::IRType::BOOL)) {
+                    // A bool prints as True/False (PY); the operand is 0 or 1 at run time.
+                    load(v, R::RAX);
+                    em.test_rr(R::RAX, R::RAX);
+                    std::string falseL = uniq("__ac_pbool_f_" + std::to_string(catchCounter_++) + "__");
+                    std::string doneL  = uniq("__ac_pbool_d_" + std::to_string(catchCounter_++) + "__");
+                    em.je(falseL);
+                    em.mov_ri64_str(abi.argRegs[0], sp.add("True"));
+                    em.mov_ri32(abi.argRegs[1], 4);
+                    em.call("__ac_print_str__");
+                    em.jmp(doneL);
+                    em.label(falseL);
+                    em.mov_ri64_str(abi.argRegs[0], sp.add("False"));
+                    em.mov_ri32(abi.argRegs[1], 5);
+                    em.call("__ac_print_str__");
+                    em.label(doneL);
                 } else if (isFloatRef(v)) {
                     load(v, R::RDI);
                     em.movq_xmm0_from_gpr(R::RDI);
@@ -3022,10 +3216,10 @@ private:
                                       ? std::get<std::string>(ops[1].value.data) : "";
                 std::string rest = content;
                 while (!rest.empty()) {
-                    auto comma = rest.find(',');
+                    auto comma = dictSplitPos(rest, ',');
                     std::string pair = comma == std::string::npos ? rest : rest.substr(0, comma);
                     rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
-                    auto colon = pair.find(':');
+                    auto colon = dictSplitPos(pair, ':');
                     if (colon == std::string::npos) continue;
                     std::string k = pair.substr(0, colon), v = pair.substr(colon + 1);
                     auto trim = [](std::string& x){ size_t a=x.find_first_not_of(' '), b=x.find_last_not_of(' ');
@@ -3255,6 +3449,7 @@ private:
                           && std::get<std::string>(ops[1].value.data) == "__len__";
                 // dict[key] → __ac_dict_get__ (string keys; content compare inside)
                 if (!isLen && ops.size() >= 2 && isDictRef(ops[0])) {
+                    if (dictAllStrRef(ops[0])) markDstString(ins.result);   // every value is a string
                     load(ops[0], R::RDI);
                     if (ops[1].kind == AC_IR::IRRef::Kind::CONST
                         && ops[1].value.type == AC_IR::IRType::STRING) {
@@ -3265,6 +3460,8 @@ private:
                     store(ins.result, R::RAX);
                     break;
                 }
+                // An element of a string list is a char*: mark it so PRINT/compare treat it as text.
+                if (!isLen && ops.size() >= 2 && isStrListRef(ops[0])) markDstString(ins.result);
                 // s[i] on a STRING → 1-char heap string (AC semantics).
                 // NOTE: do NOT use RBX/R12 inline — the register allocator owns callee-saved
                 // regs for loop vars; clobbering them corrupted FOR counters. Stack-save instead.
@@ -3376,6 +3573,9 @@ private:
             break;
 
         case IROpcode::NOP:
+            break;
+        case IROpcode::EVAL:
+            throw ACError::backend("eval() is not implemented in the BNY backend");
         default:
             break;
         }
@@ -3566,6 +3766,25 @@ public:
                            && !ins.typedOperands.empty() && isArrRef(ins.typedOperands[0])) {
                     markA(ins.result);
                 }
+                // stringm.split(...) returns a list of strings: a list block whose elements are char*.
+                if ((ins.opcode == OP::LIB_CALL || ins.opcode == OP::CALL) && ins.result.isValid()
+                    && (libMethodName(ins) == "stringm.split"
+                        || (strListFuncs_ && ins.opcode == OP::CALL && strListFuncs_->count(libMethodName(ins))))) {
+                    markA(ins.result);
+                    if (ins.result.kind == AC_IR::IRRef::Kind::TEMP) strListTempIds_.insert(ins.result.id);
+                    else if (ins.result.kind == AC_IR::IRRef::Kind::VAR && !varName(ins.result).empty())
+                        strListVarNames_.insert(varName(ins.result));
+                }
+                if (ins.opcode == OP::STORE_VAR && ins.result.isValid() && !ins.typedOperands.empty()
+                    && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::TEMP
+                    && strListTempIds_.count(ins.typedOperands[0].id) && !varName(ins.result).empty())
+                    strListVarNames_.insert(varName(ins.result));
+                // a copy of a string list (FOR's iterator is LOAD_VAR of the collection) is a string list too
+                if (ins.opcode == OP::LOAD_VAR && ins.result.isValid() && !ins.typedOperands.empty()
+                    && isStrListRef(ins.typedOperands[0])) {
+                    if (ins.result.kind == AC_IR::IRRef::Kind::TEMP) strListTempIds_.insert(ins.result.id);
+                    else if (!varName(ins.result).empty()) strListVarNames_.insert(varName(ins.result));
+                }
                 // dict propagation: ALLOC "dict" result + copies keep dict-ness
                 if (ins.opcode == OP::ALLOC && ins.result.isValid() && !ins.typedOperands.empty()
                     && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::CONST
@@ -3580,20 +3799,24 @@ public:
                         && ins.typedOperands[1].value.type == AC_IR::IRType::STRING
                         ? std::get<std::string>(ins.typedOperands[1].value.data) : "";
                     std::set<std::string> strKeys; std::string rest = content;
+                    size_t pairCount = 0;
                     while (!rest.empty()) {
-                        auto comma = rest.find(',');
+                        auto comma = dictSplitPos(rest, ',');
                         std::string pair = comma == std::string::npos ? rest : rest.substr(0, comma);
                         rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
-                        auto colon = pair.find(':');
+                        auto colon = dictSplitPos(pair, ':');
                         if (colon == std::string::npos) continue;
                         std::string k = pair.substr(0, colon), v2 = pair.substr(colon + 1);
                         auto trim = [](std::string& x){ size_t a=x.find_first_not_of(' '), b=x.find_last_not_of(' ');
                             x = (a==std::string::npos) ? "" : x.substr(a, b-a+1); };
                         trim(k); trim(v2);
                         if (k.size() >= 2 && k.front()=='$' && k.back()=='$') k = k.substr(1, k.size()-2);
+                        ++pairCount;
                         if (v2.size() >= 2 && v2.front()=='$' && v2.back()=='$') strKeys.insert(k);
                     }
                     if (mergeDictStrKeysChanged(ins.result, strKeys)) changed = true;
+                    if (pairCount > 0 && strKeys.size() == pairCount && ins.result.kind == AC_IR::IRRef::Kind::VAR)
+                        dictAllStrVars_.insert(varName(ins.result));
                 } else if ((ins.opcode == OP::STORE_VAR || ins.opcode == OP::LOAD_VAR)
                            && ins.result.isValid() && !ins.typedOperands.empty()
                            && isDictRef(ins.typedOperands[0])) {
@@ -3666,6 +3889,14 @@ public:
     }
 
     // Record functions whose RETURN value is a list block (so `Term.display f(x)` list-prints).
+    // Record functions whose RETURN value is a list of strings (so call sites mark the result as one).
+    void recordStrListReturn(const std::vector<AC_IR::IRInstruction>& instrs, const std::string& fname) {
+        if (!strListFuncs_) return;
+        for (const auto& ins : instrs)
+            if (ins.opcode == AC_IR::IROpcode::RETURN && !ins.typedOperands.empty()
+                && isStrListRef(ins.typedOperands[0])) { strListFuncs_->insert(fname); return; }
+    }
+
     void recordArrayReturn(const std::vector<AC_IR::IRInstruction>& instrs, const std::string& fname) {
         if (!arrayFuncs_) return;
         for (const auto& ins : instrs)
@@ -3678,6 +3909,12 @@ public:
         // `init`), a collision risk between classes AND a naming mismatch with what any call
         // site actually needs (`Critter_greet`) — see the field-order pre-scan's comment.
         std::string label = fn.classOwner.empty() ? fn.name : fn.classOwner + "_" + fn.name;
+        // Parameters travel in registers only (SysV: 6 integer args). A seventh used to be dropped
+        // silently (f(1..7) summed to 21 instead of 28) — refuse instead until stack args exist.
+        if (fn.parameters.size() > abi.argRegs.size())
+            throw ACError::backend("BNY backend: '" + label + "' takes " + std::to_string(fn.parameters.size())
+                                   + " parameters; only " + std::to_string(abi.argRegs.size())
+                                   + " fit in registers (stack arguments are not implemented)");
         currentClass_ = fn.classOwner;
         labelPrefix_ = "__fn_" + label + "_";
         buildLocalVarIds(fn.instructions);
@@ -3714,6 +3951,7 @@ public:
         recordFloatReturn(fn.instructions, fn.name);
         recordStringReturn(fn.instructions, fn.name);
         recordArrayReturn(fn.instructions, fn.name);
+        recordStrListReturn(fn.instructions, fn.name);
         // Pass 1: register allocation (must know N callee-saves before frame layout)
         regAlloc.run(fn.instructions);
         calleeSaves.clear();
@@ -3820,13 +4058,19 @@ public:
         curFnIsGenerator_ = true;
         labelPrefix_ = "__fn_" + label + "_";
         buildLocalVarIds(fn.instructions);
-        preScanFloats(fn.instructions);
+        // Forced param types must be in place BEFORE the float pre-scan: `a + b` with a float
+        // parameter `a` is only float-marked if `a` already is when preScanFloats runs.
         for (const auto& p : forcedStringParams_) stringVarNames_.insert(p);
         for (const auto& p : forcedFloatParams_)  floatVarNames_.insert(p);
+        preScanFloats(fn.instructions);
+        // Re-check after preScanFloats: the return temp is only float-marked there, so the check
+        // above (which runs first) missed a float-returning function and callers printed its bits.
+        recordFloatReturn(fn.instructions, fn.name);
         preScanStrings(fn.instructions);
         recordFloatReturn(fn.instructions, fn.name);
         recordStringReturn(fn.instructions, fn.name);
         recordArrayReturn(fn.instructions, fn.name);
+        recordStrListReturn(fn.instructions, fn.name);
 
         regAlloc.run(fn.instructions);
         calleeSaves.clear();
@@ -4236,6 +4480,90 @@ static void emitStrEqLinux(X64Emitter& em) {
     em.ret();
 }
 
+// __ac_strdup__(rdi = C string or NULL) -> rax = fresh heap copy (or NULL). Library string results point
+// into the library's own shared buffers (os.join, os.mktmpdir, ...), so each one is copied on the way in:
+// a second call would otherwise overwrite the first result, or the variable holding it.
+static void emitStrDupLinux(X64Emitter& em) {
+    em.label("__ac_strdup__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13);
+    em.mov_rr(R::RBX, R::RDI);                       // source
+    em.test_rr(R::RBX, R::RBX);
+    em.je("__ac_sd_null__");
+    em.call("__ac_strlen__");                        // rax = length (rdi = source)
+    em.mov_rr(R::R12, R::RAX);
+    em.mov_rr(R::RDI, R::R12); em.inc_r(R::RDI);     // + NUL
+    em.call("__ac_alloc__");
+    em.mov_rr(R::R13, R::RAX);                       // destination
+    em.mov_rr(R::RSI, R::RBX);                       // source cursor
+    em.mov_rr(R::RDI, R::R13);                       // destination cursor
+    em.label("__ac_sd_loop__");
+    em.movzx_r64_ptr8(R::RAX, R::RSI);
+    em.mov_ptr_r8(R::RDI, R::RAX);
+    em.test_rr(R::RAX, R::RAX);
+    em.je("__ac_sd_done__");
+    em.inc_r(R::RSI); em.inc_r(R::RDI);
+    em.jmp("__ac_sd_loop__");
+    em.label("__ac_sd_done__");
+    em.mov_rr(R::RAX, R::R13);
+    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+    em.label("__ac_sd_null__");
+    em.mov_ri32(R::RAX, 0);
+    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+}
+
+// __ac_wildcard_match__(rdi = subject, rsi = pattern) -> rax = 1 if the whole subject matches.
+// `%` = any run of characters. Classic linear glob: on a mismatch, retry from just after the most
+// recent `%`, letting it absorb one more character. Pointer-walking only (no index register):
+// r8 = pattern position of the last `%` (0 = none yet), r9 = subject position it started at.
+static void emitWildcardLinux(X64Emitter& em) {
+    em.label("__ac_wildcard_match__");
+    em.mov_ri32(R::R8, 0);
+    em.label("__ac_wm_loop__");
+    em.movzx_r64_ptr8(R::RAX, R::RDI);
+    em.test_rr(R::RAX, R::RAX);
+    em.je("__ac_wm_tail__");                 // subject used up
+    em.movzx_r64_ptr8(R::RCX, R::RSI);
+    em.cmp_r_i32(R::RCX, '%');
+    em.jne("__ac_wm_lit__");
+    em.mov_rr(R::R8, R::RSI);                // remember this %
+    em.inc_r(R::RSI);
+    em.mov_rr(R::R9, R::RDI);
+    em.jmp("__ac_wm_loop__");
+    em.label("__ac_wm_lit__");
+    em.test_rr(R::RCX, R::RCX);
+    em.je("__ac_wm_backtrack__");            // pattern ended but subject has more
+    em.cmp_rr(R::RAX, R::RCX);
+    em.jne("__ac_wm_backtrack__");
+    em.inc_r(R::RSI);
+    em.inc_r(R::RDI);
+    em.jmp("__ac_wm_loop__");
+    em.label("__ac_wm_backtrack__");
+    em.test_rr(R::R8, R::R8);
+    em.je("__ac_wm_fail__");                 // no % to widen
+    em.mov_rr(R::RSI, R::R8);
+    em.inc_r(R::RSI);                        // pattern resumes just after the %
+    em.inc_r(R::R9);
+    em.mov_rr(R::RDI, R::R9);                // the % absorbs one more character
+    em.jmp("__ac_wm_loop__");
+    em.label("__ac_wm_tail__");
+    em.movzx_r64_ptr8(R::RCX, R::RSI);
+    em.cmp_r_i32(R::RCX, '%');
+    em.jne("__ac_wm_end__");
+    em.inc_r(R::RSI);
+    em.jmp("__ac_wm_tail__");
+    em.label("__ac_wm_end__");
+    em.test_rr(R::RCX, R::RCX);
+    em.jne("__ac_wm_fail__");
+    em.mov_ri32(R::RAX, 1);
+    em.ret();
+    em.label("__ac_wm_fail__");
+    em.mov_ri32(R::RAX, 0);
+    em.ret();
+}
+
 // Event-listener bind/trigger table — same fixed 64-slot parallel-array design
 // AsmStrategy/CStrategy already use (see their emitEventBind/emitEventTrigger +
 // _ac_bind/_ac_trigger comments); ported here because BNY's opcode switch never had a case
@@ -4396,6 +4724,39 @@ static void emitDictLinux(X64Emitter& em, StringPool& sp) {
         em.call("__ac_sys_write__");
         em.mov_ri32(R::RDI, 1); em.call("__ac_sys_exit__");
     }
+}
+
+// __ac_dict_has__(rdi = block [n][k0][v0]..., rsi = key) -> rax = 1 if the key is present, else 0.
+// The same scan as __ac_dict_get__, but a miss is an answer, not a KeyError.
+static void emitDictHasLinux(X64Emitter& em) {
+    em.label("__ac_dict_has__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13);
+    em.mov_rr(R::RBX, R::RDI);                  // block
+    em.mov_rr(R::R12, R::RSI);                  // key
+    em.mov_ri32(R::R13, 0);                     // i
+    em.label("__ac_dh_loop__");
+    em.mov_r_ptr(R::RAX, R::RBX);               // n
+    em.cmp_rr(R::R13, R::RAX);
+    em.jge("__ac_dh_miss__");
+    em.mov_rr(R::RCX, R::R13);
+    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
+    em.mov_r_ptr(R::RDI, R::RDI);               // key_i
+    em.mov_rr(R::RSI, R::R12);
+    em.call("__ac_streq__");
+    em.test_rr(R::RAX, R::RAX);
+    em.jne("__ac_dh_hit__");
+    em.inc_r(R::R13);
+    em.jmp("__ac_dh_loop__");
+    em.label("__ac_dh_hit__");
+    em.mov_ri32(R::RAX, 1);
+    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+    em.label("__ac_dh_miss__");
+    em.mov_ri32(R::RAX, 0);
+    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
 }
 
 // __ac_dict_set__(rdi = ptr, rsi = key, rdx = val) -> rax = ptr (same pointer whenever
@@ -6281,7 +6642,7 @@ struct ExtSym {
 static bool isNativeCpuPtrSym(const std::string& name) {
     static const std::set<std::string> bareCarriedOver = {
         "ptr_new", "ptr_deref", "ptr_null", "ptr_is_null",
-        "ptr_eq", "ptr_copy", "ptr_update"
+        "ptr_eq", "ptr_copy", "ptr_update", "ptr_free"
     };
     return bareCarriedOver.count(name) > 0;
 }
@@ -6342,6 +6703,8 @@ static std::string normalizeExtSym(const std::string& irName) {
         {"aczip.compress",          "ac_zip_compress_to_file"},
         {"aczip.decompress",        "ac_zip_decompress_from_file"},
         {"aczip.get_ratio",         "ac_get_compression_ratio"},
+        {"aczip.iso",               "ac_zip_iso"},
+        {"aczip.pack",              "ac_zip_package"},
         // ── Web library ──────────────────────────────────────────────────────
         {"web.open",                "ac_web_open"},
         {"web.file_open",           "ac_web_file_open"},
@@ -6907,7 +7270,8 @@ class BinaryCompiler {
             for (auto& fn : prog.functions) if (hasStrCmp(fn.instructions)) { usesStrEq_ = true; break; }
         auto hasDict = [&](const std::vector<IRInstruction>& code) {
             for (auto& ins : code)
-                if (ins.opcode == IROpcode::ALLOC && !ins.typedOperands.empty()
+                if (ins.opcode == IROpcode::DICT_HAS) return true;
+                else if (ins.opcode == IROpcode::ALLOC && !ins.typedOperands.empty()
                     && ins.typedOperands[0].kind == IRRef::Kind::CONST
                     && ins.typedOperands[0].value.type == AC_IR::IRType::STRING
                     && std::get<std::string>(ins.typedOperands[0].value.data) == "dict")
@@ -7714,9 +8078,11 @@ public:
         // call at codegen → undefined label. Both helpers are tiny; unconditional = always-consistent.
         emitConcatLinux(em);
         emitStrEqLinux(em);
+        emitStrDupLinux(em);
+        emitWildcardLinux(em);   // always: ~110 bytes; backs `subject % pattern`
         emitItoaLinux(em);
         emitWidgetTrampolinesLinux(em);
-        if (usesDict_) { emitDictLinux(em, sp); emitDictSetLinux(em); }
+        if (usesDict_) { emitDictLinux(em, sp); emitDictSetLinux(em); emitDictHasLinux(em); }
         if (usesAtoi_) emitAtoiLinux(em);
         if (usesRand_) emitRandLinux(em);
 
@@ -7731,7 +8097,69 @@ public:
         std::set<std::string> floatFuncs;
         std::set<std::string> stringFuncs;   // user fns returning strings (#6)
         std::set<std::string> arrayFuncs;    // user fns returning list blocks
+        std::set<std::string> strListFuncs;  // user fns returning lists of strings
 
+        // Global names' kinds, from the global init, before any function is compiled.
+        GlobalKinds globalKinds;
+        {
+            std::set<int> dictT, arrT, strT;
+            auto nameOf = [&](const AC_IR::IRRef& r) -> std::string {
+                if (r.kind == AC_IR::IRRef::Kind::VAR) return prog.symbols.getName(r.id);
+                if (r.kind == AC_IR::IRRef::Kind::CONST && r.value.type == AC_IR::IRType::STRING)
+                    return std::get<std::string>(r.value.data);
+                return "";
+            };
+            for (const auto& ins : prog.globalInit) {
+                if (ins.opcode == AC_IR::IROpcode::ALLOC && !ins.typedOperands.empty()) {
+                    std::string ty = nameOf(ins.typedOperands[0]);
+                    if (ins.result.kind == AC_IR::IRRef::Kind::VAR) {        // x = alloc "dict", ...
+                        if (ty == "dict") {
+                            globalKinds.dict.insert(nameOf(ins.result));
+                            // keys whose value is a $...$ string (the dict's content is "k:v,k:v", padded)
+                            std::string content = ins.typedOperands.size() >= 2 ? nameOf(ins.typedOperands[1]) : "";
+                            std::string rest = content;
+                            size_t pairCount = 0, strCount = 0;
+                            while (!rest.empty()) {
+                                auto comma = dictSplitPos(rest, ',');
+                                std::string pair = comma == std::string::npos ? rest : rest.substr(0, comma);
+                                rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
+                                auto colon = dictSplitPos(pair, ':');
+                                if (colon == std::string::npos) continue;
+                                auto trim = [](std::string x) {
+                                    size_t a = x.find_first_not_of(' '), b = x.find_last_not_of(' ');
+                                    return a == std::string::npos ? std::string() : x.substr(a, b - a + 1);
+                                };
+                                std::string k = trim(pair.substr(0, colon)), v = trim(pair.substr(colon + 1));
+                                if (k.size() >= 2 && k.front() == '$' && k.back() == '$') k = k.substr(1, k.size() - 2);
+                                ++pairCount;
+                                if (v.size() >= 2 && v.front() == '$' && v.back() == '$') {
+                                    globalKinds.dictStrKeys[nameOf(ins.result)].insert(k);
+                                    ++strCount;
+                                }
+                            }
+                            if (pairCount > 0 && strCount == pairCount) globalKinds.dictAllStr.insert(nameOf(ins.result));
+                        }
+                        else if (ty == "list") globalKinds.arr.insert(nameOf(ins.result));
+                    } else if (ins.result.kind == AC_IR::IRRef::Kind::TEMP) {
+                        if (ty == "dict") dictT.insert(ins.result.id);
+                        else if (ty == "list") arrT.insert(ins.result.id);
+                    }
+                }
+                bool splitCall = (ins.opcode == AC_IR::IROpcode::LIB_CALL || ins.opcode == AC_IR::IROpcode::CALL)
+                              && !ins.typedOperands.empty() && nameOf(ins.typedOperands[0]) == "stringm.split";
+                if (splitCall && ins.result.kind == AC_IR::IRRef::Kind::TEMP) {
+                    arrT.insert(ins.result.id); strT.insert(ins.result.id);
+                }
+                if (ins.opcode == AC_IR::IROpcode::STORE_VAR && ins.result.kind == AC_IR::IRRef::Kind::VAR
+                    && !ins.typedOperands.empty() && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::TEMP) {
+                    std::string vn = nameOf(ins.result);
+                    int t = ins.typedOperands[0].id;
+                    if (dictT.count(t)) globalKinds.dict.insert(vn);
+                    if (arrT.count(t))  globalKinds.arr.insert(vn);
+                    if (strT.count(t))  globalKinds.strList.insert(vn);
+                }
+            }
+        }
         // Emit user-defined functions; record start/end offsets for DWARF
         std::vector<FuncBounds> funcBounds;
         for (auto& fn : prog.functions) {
@@ -7740,6 +8168,8 @@ public:
             fc.floatFuncs_ = &floatFuncs;
             fc.stringFuncs_ = &stringFuncs;
             fc.arrayFuncs_ = &arrayFuncs;
+            fc.strListFuncs_ = &strListFuncs;
+            fc.globalKinds_ = &globalKinds;
             fc.forcedStringParams_ = stringParamHints_[fn.name];
             fc.forcedFloatParams_ = floatParamHints_[fn.name];
             fc.promotedGlobals_ = &promotedGlobals_;
@@ -7764,6 +8194,8 @@ public:
             gc.floatFuncs_ = &floatFuncs;
             gc.stringFuncs_ = &stringFuncs;
             gc.arrayFuncs_ = &arrayFuncs;
+            gc.strListFuncs_ = &strListFuncs;
+            gc.globalKinds_ = &globalKinds;
             gc.promotedGlobals_ = &promotedGlobals_;
             gc.gvarSlots_ = &gvarSlots_;
             gc.usesSave_ = usesSave_;

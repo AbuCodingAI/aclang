@@ -9,6 +9,7 @@
 //   Children are written recursively (depth-first).
 
 #include "../include/ast.hpp"
+#include "../include/selfpath.hpp"
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
@@ -16,7 +17,7 @@
 #include <stdexcept>
 
 static const char ACC_MAGIC[4] = {'A','C','C','1'};
-static const uint8_t ACC_VERSION = 9; // bumped: bound + quickthread keywords
+static const uint8_t ACC_VERSION = 10; // bumped: bound + quickthread keywords
 
 // ── Timestamp check ──────────────────────────────────────────────────────────
 
@@ -26,19 +27,20 @@ inline time_t fileModTime(const std::string& path) {
     return st.st_mtime;
 }
 
-inline bool cacheIsValid(const std::string& acFile, const std::string& accFile) {
-    time_t acMod  = fileModTime(acFile);
-    time_t accMod = fileModTime(accFile);
-    if (accMod <= 0 || accMod < acMod) return false;
+// Nanosecond modification time: whole-second stamps let a source edited in the same second as its
+// cached parse look up to date (a stale AST was reused — the bug this comparison fixes).
+inline bool fileNewerThan(const std::string& a, const std::string& b) {
+    struct stat sa, sb;
+    if (stat(a.c_str(), &sa) != 0 || stat(b.c_str(), &sb) != 0) return false;
+    if (sa.st_mtim.tv_sec != sb.st_mtim.tv_sec) return sa.st_mtim.tv_sec > sb.st_mtim.tv_sec;
+    return sa.st_mtim.tv_nsec > sb.st_mtim.tv_nsec;
+}
 
-    std::ifstream f(accFile, std::ios::binary);
-    if (!f) return false;
-    char magic[4];
-    f.read(magic, 4);
-    if (!f || std::string(magic, 4) != std::string(ACC_MAGIC, 4)) return false;
-    uint8_t ver = 0;
-    f.read((char*)&ver, 1);
-    return f && ver == ACC_VERSION;
+// FNV-1a 64-bit digest: a cache key is only reused for exactly the same text.
+inline uint64_t accDigest(const std::string& data) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (unsigned char c : data) { h ^= c; h *= 0x00000100000001B3ULL; }
+    return h;
 }
 
 // ── Write helpers ─────────────────────────────────────────────────────────────
@@ -63,11 +65,12 @@ static void serializeNode(std::ofstream& f, const ASTNode& node) {
     for (auto& c : node.children) if (c) serializeNode(f, *c);
 }
 
-inline void saveCache(const std::string& accFile, const ASTNode& root) {
+inline void saveCache(const std::string& accFile, uint64_t key, const ASTNode& root) {
     std::ofstream f(accFile, std::ios::binary);
     if (!f) return; // silently skip if can't write
     f.write(ACC_MAGIC, 4);
     writeU8(f, ACC_VERSION);
+    f.write((const char*)&key, 8);   // the program's digest: a different program must not reuse this parse
     serializeNode(f, root);
 }
 
@@ -96,7 +99,7 @@ static NodePtr deserializeNode(std::ifstream& f) {
 }
 
 // Returns nullptr if cache is invalid or corrupt
-inline NodePtr loadCache(const std::string& accFile) {
+inline NodePtr loadCache(const std::string& accFile, uint64_t key) {
     std::ifstream f(accFile, std::ios::binary);
     if (!f) return nullptr;
     char magic[4];
@@ -104,6 +107,9 @@ inline NodePtr loadCache(const std::string& accFile) {
     if (std::string(magic, 4) != std::string(ACC_MAGIC, 4)) return nullptr;
     uint8_t ver = readU8(f);
     if (ver != ACC_VERSION) return nullptr;
+    uint64_t stored = 0;
+    f.read((char*)&stored, 8);
+    if (!f || stored != key) return nullptr;
     try {
         return deserializeNode(f);
     } catch (...) {

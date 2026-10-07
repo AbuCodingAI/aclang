@@ -4,6 +4,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+std::vector<Token> lex(const std::string& source);   // lexer.cpp
+
 class Parser {
 public:
     struct ParseError {
@@ -162,12 +164,15 @@ private:
 
             // Precedence 7: Comparisons (#> = ≤, #< = ≥) and overlap/is infix
             case TokenType::KW_IS:
+            case TokenType::KW_HAS:      // dict has key
+            case TokenType::KW_IN:       // key in dict (sugar for dict has key)
             case TokenType::NOT_EQUAL:
             case TokenType::LT:
             case TokenType::GT:
             case TokenType::HASH_GT:
             case TokenType::HASH_LT:
             case TokenType::KW_OVERLAP:
+            case TokenType::PERCENT:     // wildcard match: subject % pattern -> bool
                 return 7;
 
             // Precedence 8: Addition/Subtraction/xsub
@@ -330,6 +335,15 @@ private:
             return node;
         }
         
+        // f$...$ / t$...$ (interpolated) and b$...$ (bytes)
+        if (at(TokenType::FSTRING)) {
+            auto tok = advance();
+            return fstringNode(tok.value, tok.line, tok.col);
+        }
+        if (at(TokenType::BSTRING)) {
+            return bstringNode(advance().value);
+        }
+
         // String literal
         if (at(TokenType::STRING)) {
             auto tok = advance();
@@ -384,21 +398,6 @@ private:
             at(TokenType::KW_PROGRAM_LOOP) || at(TokenType::KW_AFTER)) {
             auto tok = advance();
 
-            // Trailing wildcard: `p%` (starts-with pattern — `_wmatch` in the gl ilib's C++/JS/
-            // Python runtimes already implements this exact match rule against the live GL
-            // object-name registry, just never reachable from AC source before now: the lexer
-            // emitted a PERCENT token but nothing consumed it, so any `%` was a hard parse
-            // error — "Expected ')' after expression [got '%']", blocking examples/pong.ac's
-            // `ball.hitbox.coords overlap p%.hitbox.coords`). Fold the `%` into the identifier
-            // text itself so the REST of this function (dot-chain building, MethodCall/variable
-            // construction) treats "p%" exactly like any other bare receiver name — no new AST
-            // shape needed; ir.cpp's `overlap` lowering (see its own matching comment) is what
-            // actually turns a `%`-suffixed name into the real wildcard-overlap call.
-            if (at(TokenType::PERCENT)) {
-                tok.value += "%";
-                advance();
-            }
-
             // Method call in expression: obj.method or obj.ns.method(args) etc.
             if (at(TokenType::DOT)) {
                 advance(); // consume "."
@@ -411,6 +410,17 @@ private:
                         methodName += "." + advance().value;
                 }
                 std::string fullName = tok.value + "." + methodName;
+                // Indexed field: obj.field[index] — the same IndexExpr the plain-name path builds
+                // (without this the `[` was taken as a method argument: `self.toks[i]` became a call).
+                if (at(TokenType::LBRACKET)) {
+                    advance();
+                    auto idxExpr = parseExpression(0);
+                    expect(TokenType::RBRACKET, "Expected ']' after array index");
+                    auto idxNode = std::make_unique<ASTNode>(NodeType::IndexExpr, fullName);
+                    idxNode->children.push_back(std::make_unique<ASTNode>(NodeType::Identifier, fullName));
+                    idxNode->children.push_back(std::move(idxExpr));
+                    return idxNode;
+                }
                 auto node = std::make_unique<ASTNode>(NodeType::MethodCall, fullName);
                 if (at(TokenType::LPAREN)) {
                     advance();
@@ -613,6 +623,7 @@ private:
     NodePtr parseInfix(NodePtr left, TokenType op) {
         int prec = getPrecedence(op);
         std::string opStr;
+        bool swapOperands = false;   // `key in dict` builds the same node as `dict has key`
 
         // Get operator string
         if (op == TokenType::IDENTIFIER) {
@@ -663,6 +674,16 @@ private:
             advance();
         } else if (op == TokenType::CARET) {
             opStr = "^";
+            advance();
+        } else if (op == TokenType::PERCENT) {
+            opStr = "%";
+            advance();
+        } else if (op == TokenType::KW_HAS) {
+            opStr = "has";
+            advance();
+        } else if (op == TokenType::KW_IN) {
+            opStr = "has";
+            swapOperands = true;
             advance();
         } else if (op == TokenType::KW_OVERLAP) {
             // "a.hitbox.coords overlap b.hitbox.coords" → hitbox overlap check
@@ -716,12 +737,67 @@ private:
 
         // Create binary expression node
         auto node = std::make_unique<ASTNode>(NodeType::BinaryExpr, opStr);
-        node->children.push_back(std::move(left));
-        node->children.push_back(std::move(right));
+        if (swapOperands) {
+            node->children.push_back(std::move(right));
+            node->children.push_back(std::move(left));
+        } else {
+            node->children.push_back(std::move(left));
+            node->children.push_back(std::move(right));
+        }
         return node;
     }
     
     // Main Pratt parser entry point
+    // f$...$ and t$...$: literal text with {expr} parts. Desugars to
+    //   "text" + to_string(expr) + "more text"   (TO_STRING is the parser's to_string node)
+    // so every backend sees ordinary string concatenation. {{ and }} write a literal brace.
+    NodePtr fstringNode(const std::string& text, int line, int col) {
+        std::vector<NodePtr> parts;
+        std::string lit;
+        auto flush = [&]() {
+            if (lit.empty() && !parts.empty()) return;
+            auto n = std::make_unique<ASTNode>(NodeType::LiteralExpr, lit);
+            n->attrs.push_back("STRING");
+            parts.push_back(std::move(n));
+            lit.clear();
+        };
+        for (size_t i = 0; i < text.size(); i++) {
+            char c = text[i];
+            if ((c == '{' || c == '}') && i + 1 < text.size() && text[i + 1] == c) { lit += c; i++; continue; }
+            if (c == '}') throw SYNTAX_ERROR("f-string: '}' without a matching '{' (write '}}' for a literal brace)", line, col);
+            if (c != '{') { lit += c; continue; }
+            size_t close = text.find('}', i + 1);
+            if (close == std::string::npos) throw SYNTAX_ERROR("f-string: '{' without a closing '}'", line, col);
+            std::string inner = text.substr(i + 1, close - i - 1);
+            if (inner.find_first_not_of(" \t") == std::string::npos) throw SYNTAX_ERROR("f-string: empty {} part", line, col);
+            flush();
+            Parser sub(lex(inner), lenient);
+            auto conv = std::make_unique<ASTNode>(NodeType::UnaryExpr, "TO_STRING");   // same node as to_string(x)
+            conv->children.push_back(sub.parseExpression(0));
+            parts.push_back(std::move(conv));
+            i = close;
+        }
+        flush();
+        NodePtr acc = std::move(parts[0]);
+        for (size_t k = 1; k < parts.size(); k++) {
+            auto plus = std::make_unique<ASTNode>(NodeType::BinaryExpr, "+");
+            plus->children.push_back(std::move(acc));
+            plus->children.push_back(std::move(parts[k]));
+            acc = std::move(plus);
+        }
+        return acc;
+    }
+
+    // b$...$: the bytes of the text as a list of numbers, e.g. b$AB$ is [65,66].
+    NodePtr bstringNode(const std::string& text) {
+        std::string contents;
+        for (size_t i = 0; i < text.size(); i++) {
+            if (i) contents += ",";
+            contents += std::to_string((int)(unsigned char)text[i]);
+        }
+        return std::make_unique<ASTNode>(NodeType::ListLiteral, contents);
+    }
+
     NodePtr parseExpression(int precedence = 0) {
         // Parse prefix
         auto left = parsePrefix();
@@ -2457,6 +2533,111 @@ private:
         }
 
         // Obj.Name
+        // Index statement on a target: `target[expr] = value`, or a bare `target[expr]` read. The target is
+        // the plain name, or "obj.field" for a field (called from the dotted-name branch above).
+        auto indexStmt = [&](const std::string& target) -> NodePtr {
+            advance();
+            const size_t idxStart = pos;
+            std::string indexExpr;
+            while (!at(TokenType::RBRACKET) && !at(TokenType::END_OF_FILE)) {
+                if (at(TokenType::STRING)) indexExpr += "$" + advance().value + "$";
+                else indexExpr += advance().value;
+            }
+            if (at(TokenType::RBRACKET)) advance();
+
+            // Compound assignment to an element: arr[i] += v is arr[i] = arr[i] + v. The read side is built
+            // as a structured IndexExpr (same shape as an expression read) so the IR sees a real element load.
+            const bool compound = at(TokenType::PLUS_EQUAL) || at(TokenType::MINUS_EQUAL)
+                               || at(TokenType::MULTIPLY_EQUAL) || at(TokenType::DIVIDE_EQUAL)
+                               || at(TokenType::AT_EQUAL);
+            if (compound) {
+                std::string op;
+                switch (advance().type) {
+                    case TokenType::PLUS_EQUAL:     op = "+"; break;
+                    case TokenType::MINUS_EQUAL:    op = "-"; break;
+                    case TokenType::MULTIPLY_EQUAL: op = "*"; break;
+                    case TokenType::DIVIDE_EQUAL:   op = "/"; break;
+                    default:                        op = "@"; break;
+                }
+                const size_t afterIndex = pos;
+                pos = idxStart;
+                auto readIndex = parseExpression(0);
+                expect(TokenType::RBRACKET, "Expected ']' after array index");
+                pos = afterIndex;
+                auto readNode = std::make_unique<ASTNode>(NodeType::IndexExpr, target);
+                readNode->children.push_back(std::make_unique<ASTNode>(NodeType::Identifier, target));
+                readNode->children.push_back(std::move(readIndex));
+                auto rhs = parseExpression(0);
+                if (!rhs) throw SYNTAX_ERROR("Expected expression after compound assignment operator", peek().line, peek().col);
+                auto binary = std::make_unique<ASTNode>(NodeType::BinaryExpr, op);
+                binary->children.push_back(std::move(readNode));
+                binary->children.push_back(std::move(rhs));
+                auto store = std::make_unique<ASTNode>(NodeType::IndexExpr, target);
+                store->attrs.push_back(indexExpr);
+                store->attrs.push_back("");
+                store->children.push_back(std::move(binary));
+                return store;
+            }
+
+            // List/index access as expression
+            if (at(TokenType::ASSIGN)) {
+                advance();
+                std::string val;
+                std::unique_ptr<ASTNode> rhsNode;
+                if (at(TokenType::STRING)) { val = "$" + advance().value + "$"; }
+                else if (at(TokenType::KW_TRUE) || at(TokenType::KW_FALSE)) {
+                    // AC lists are i64 — store bool flags as 1/0 so `prime[i] = False` fits
+                    // []i64 (a bool literal here is a hard type error on V/C/Rust).
+                    bool isTrue = at(TokenType::KW_TRUE);
+                    advance();
+                    val = isTrue ? "1" : "0";
+                } else {
+                    // Parse the RHS as a real expression first: the token-glued string below has no
+                    // spaces, so a word operator (`arr[i] = arr[i] bxor 17` -> "arr[i]bxor17") could
+                    // never be split back apart and reached the backend as raw text. The glued
+                    // string is kept as the fallback for anything the expression parser rejects.
+                    size_t rhsStart = pos;
+                    try {
+                        rhsNode = parseExpression(0);
+                        if (!(at(TokenType::NEWLINE) || at(TokenType::END_OF_FILE))) rhsNode.reset();
+                    } catch (...) { rhsNode.reset(); }
+                    if (!rhsNode) {
+                        pos = rhsStart;
+                        while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
+                            if (at(TokenType::STRING)) val += "$" + advance().value + "$";
+                            else val += advance().value;
+                        }
+                    }
+                }
+                auto node = std::make_unique<ASTNode>(NodeType::IndexExpr, target);
+                node->attrs.push_back(indexExpr);
+                node->attrs.push_back(val);
+                if (rhsNode) node->children.push_back(std::move(rhsNode));   // structured RHS wins in the IR
+                return node;
+            } else if (at(TokenType::LPAREN)) {
+                // Indexed CALL as a statement: funcs[i](args). Build the same indirect-call
+                // CallExpr(value="") the expression path uses (its structured index child was
+                // dropped before — the (args) went unparsed).
+                advance();
+                std::string idxStr = indexExpr;
+                auto idxNode = std::make_unique<ASTNode>(NodeType::IndexExpr, target);
+                idxNode->children.push_back(std::make_unique<ASTNode>(NodeType::Identifier, target));
+                idxNode->children.push_back(std::make_unique<ASTNode>(NodeType::Identifier, idxStr));
+                auto call = std::make_unique<ASTNode>(NodeType::CallExpr, "");
+                call->children.push_back(std::move(idxNode));
+                while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
+                    call->children.push_back(parseExpression(0));
+                    if (at(TokenType::COMMA)) advance();
+                }
+                expect(TokenType::RPAREN, "Expected ')' after indexed-call args");
+                return call;
+            } else {
+                auto node = std::make_unique<ASTNode>(NodeType::IndexExpr, target);
+                node->attrs.push_back(indexExpr);
+                return node;
+            }
+        };
+
         if (at(TokenType::DOT)) {
             advance();
             std::string prop = advance().value; // property or method name
@@ -2466,6 +2647,8 @@ private:
                 advance();
                 prop += "." + advance().value;
             }
+
+            if (at(TokenType::LBRACKET)) return indexStmt(name + "." + prop);
 
             // Obj.Name or obj.Name as object declaration
             if (name == "Obj" || name == "obj") {
@@ -2488,6 +2671,24 @@ private:
             // method call: Name.method(args)
             if (at(TokenType::LPAREN)) {
                 advance();
+                // Each argument is also parsed as an expression (children), so it is lowered like an
+                // expression-form argument: `st.push(to_int(x))` must not stay raw text. The parse is
+                // rewound afterwards, because the text form below is still built from the same tokens.
+                std::vector<NodePtr> structuredArgs;
+                bool structuredOk = prop != "curveshape";
+                size_t argStart = pos;
+                if (structuredOk) {
+                    try {
+                        while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
+                            auto e = parseExpression(0);
+                            if (!e) { structuredOk = false; break; }
+                            structuredArgs.push_back(std::move(e));
+                            if (at(TokenType::COMMA)) advance(); else break;
+                        }
+                        if (!at(TokenType::RPAREN)) structuredOk = false;
+                    } catch (...) { structuredOk = false; }
+                    pos = argStart;
+                }
                 // Split at top-level commas so each arg becomes a separate attr
                 std::vector<std::string> argList;
                 std::string cur;
@@ -2511,6 +2712,8 @@ private:
                         else node->attrs.push_back(val);
                     }
                 }
+                if (structuredOk && structuredArgs.size() == node->attrs.size())
+                    for (auto& e : structuredArgs) node->children.push_back(std::move(e));
                 return node;
             }
 
@@ -2663,74 +2866,7 @@ private:
             return node;
         }
 
-        // Indexing / assignment: name[expr] = value or pure index expression
-        if (at(TokenType::LBRACKET)) {
-            advance();
-            std::string indexExpr;
-            while (!at(TokenType::RBRACKET) && !at(TokenType::END_OF_FILE)) {
-                if (at(TokenType::STRING)) indexExpr += "$" + advance().value + "$";
-                else indexExpr += advance().value;
-            }
-            if (at(TokenType::RBRACKET)) advance();
-
-            // List/index access as expression
-            if (at(TokenType::ASSIGN)) {
-                advance();
-                std::string val;
-                std::unique_ptr<ASTNode> rhsNode;
-                if (at(TokenType::STRING)) { val = "$" + advance().value + "$"; }
-                else if (at(TokenType::KW_TRUE) || at(TokenType::KW_FALSE)) {
-                    // AC lists are i64 — store bool flags as 1/0 so `prime[i] = False` fits
-                    // []i64 (a bool literal here is a hard type error on V/C/Rust).
-                    bool isTrue = at(TokenType::KW_TRUE);
-                    advance();
-                    val = isTrue ? "1" : "0";
-                } else {
-                    // Parse the RHS as a real expression first: the token-glued string below has no
-                    // spaces, so a word operator (`arr[i] = arr[i] bxor 17` -> "arr[i]bxor17") could
-                    // never be split back apart and reached the backend as raw text. The glued
-                    // string is kept as the fallback for anything the expression parser rejects.
-                    size_t rhsStart = pos;
-                    try {
-                        rhsNode = parseExpression(0);
-                        if (!(at(TokenType::NEWLINE) || at(TokenType::END_OF_FILE))) rhsNode.reset();
-                    } catch (...) { rhsNode.reset(); }
-                    if (!rhsNode) {
-                        pos = rhsStart;
-                        while (!at(TokenType::NEWLINE) && !at(TokenType::END_OF_FILE)) {
-                            if (at(TokenType::STRING)) val += "$" + advance().value + "$";
-                            else val += advance().value;
-                        }
-                    }
-                }
-                auto node = std::make_unique<ASTNode>(NodeType::IndexExpr, name);
-                node->attrs.push_back(indexExpr);
-                node->attrs.push_back(val);
-                if (rhsNode) node->children.push_back(std::move(rhsNode));   // structured RHS wins in the IR
-                return node;
-            } else if (at(TokenType::LPAREN)) {
-                // Indexed CALL as a statement: funcs[i](args). Build the same indirect-call
-                // CallExpr(value="") the expression path uses (its structured index child was
-                // dropped before — the (args) went unparsed).
-                advance();
-                std::string idxStr = indexExpr;
-                auto idxNode = std::make_unique<ASTNode>(NodeType::IndexExpr, name);
-                idxNode->children.push_back(std::make_unique<ASTNode>(NodeType::Identifier, name));
-                idxNode->children.push_back(std::make_unique<ASTNode>(NodeType::Identifier, idxStr));
-                auto call = std::make_unique<ASTNode>(NodeType::CallExpr, "");
-                call->children.push_back(std::move(idxNode));
-                while (!at(TokenType::RPAREN) && !at(TokenType::END_OF_FILE)) {
-                    call->children.push_back(parseExpression(0));
-                    if (at(TokenType::COMMA)) advance();
-                }
-                expect(TokenType::RPAREN, "Expected ')' after indexed-call args");
-                return call;
-            } else {
-                auto node = std::make_unique<ASTNode>(NodeType::IndexExpr, name);
-                node->attrs.push_back(indexExpr);
-                return node;
-            }
-        }
+        if (at(TokenType::LBRACKET)) return indexStmt(name);
 
         // Compound assignment: name += value, etc.
         if (at(TokenType::PLUS_EQUAL) || at(TokenType::MINUS_EQUAL) || at(TokenType::MULTIPLY_EQUAL) || at(TokenType::DIVIDE_EQUAL) || at(TokenType::AT_EQUAL)) {

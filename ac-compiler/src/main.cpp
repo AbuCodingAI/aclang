@@ -1,4 +1,5 @@
 #include "../include/selfpath.hpp"
+#include "../include/ilib_path.hpp"
 #include "../include/ac.hpp"
 #include "acc_cache.hpp"
 #include "ir_cache.hpp"
@@ -18,6 +19,16 @@
 #include <mutex>
 #include <atomic>
 #include <sys/stat.h>
+
+// qemu-aarch64 needs the AArch64 sysroot to find the dynamic loader for ilib-linked
+// binaries (PT_INTERP /lib/ld-linux-aarch64.so.1). Static binaries ignore -L.
+static std::vector<std::string> qemuArmArgv(const std::string& exe) {
+    struct stat st;
+    const char* sysroot = "/usr/aarch64-linux-gnu";
+    if (stat(sysroot, &st) == 0 && S_ISDIR(st.st_mode))
+        return {"qemu-aarch64", "-L", sysroot, exe};
+    return {"qemu-aarch64", exe};
+}
 #ifndef _WIN32
   #include <unistd.h>
   #include <cstring>
@@ -60,6 +71,7 @@ static bool hostIsActuallyWindows() {
 
 #include <utility>
 #include <map>
+#include <functional>
 
 // ── Shell-free process execution ────────────────────────────────────────────
 // Run a program via an argv array — NO shell — so a path/flag containing
@@ -115,6 +127,29 @@ std::vector<Token> lex(const std::string& source);
 static std::string acLibRoot();
 NodePtr parse(const std::vector<Token>& tokens, bool lenient = false);
 
+// eval(text) needs the arithmetic evaluator (include/eval_prelude.hpp) in the program. It is added to the
+// AST only when the program calls eval on a string, and only once per program (--all reuses the AST).
+#include "../include/eval_prelude.hpp"
+static bool astHasEvalExpr(const ASTNode& n) {
+    if (n.type == NodeType::EvalExpr) return true;
+    for (const auto& c : n.children) if (c && astHasEvalExpr(*c)) return true;
+    return false;
+}
+static bool astDefinesFunc(const ASTNode& prog, const std::string& name) {
+    for (const auto& c : prog.children)
+        if (c && c->type == NodeType::FuncDef && c->value == name) return true;
+    return false;
+}
+static void injectEvalPrelude(ASTNode& prog) {
+    if (!astHasEvalExpr(prog) || astDefinesFunc(prog, "ac_eval_str")) return;
+    NodePtr pre = parse(lex(kEvalPrelude), false);
+    if (!pre) return;
+    NodeList defs;
+    for (auto& c : pre->children) if (c) defs.push_back(std::move(c));
+    prog.children.insert(prog.children.begin(), std::make_move_iterator(defs.begin()),
+                         std::make_move_iterator(defs.end()));
+}
+
 // Build a string of FFI file mtimes for any "use ilib X" imports in source.
 // This makes the IR cache invalidate when a library's FFI file changes.
 static std::string ffiMtimesSuffix(const std::string& source, const std::string& backend) {
@@ -141,13 +176,13 @@ static std::string ffiMtimesSuffix(const std::string& source, const std::string&
         // Get mtime of the FFI file for this backend
         std::string ext = backend;
         for (char& c : ext) c = (char)std::tolower((unsigned char)c);
-        std::string ffiPath = acLibRoot() + "/ilib/" + libName + "/ffi/" + libName + "_ffi." + ext;
+        std::string ffiPath = acLibRoot() + "/ilib/" + ilibSubdir(libName) + "/ffi/" + libName + "_ffi." + ext;
         struct stat st{};
         if (stat(ffiPath.c_str(), &st) == 0) {
             result += ffiPath + ":" + std::to_string((long long)st.st_mtime) + ";";
         }
         // Also check the .acl file
-        std::string aclPath = acLibRoot() + "/ilib/" + libName + "/" + libName + ".acl";
+        std::string aclPath = acLibRoot() + "/ilib/" + ilibSubdir(libName) + "/" + libName + ".acl";
         if (stat(aclPath.c_str(), &st) == 0) {
             result += aclPath + ":" + std::to_string((long long)st.st_mtime) + ";";
         }
@@ -174,6 +209,22 @@ std::string generateFromIR(const AC_IR::IRProgram& ir, const std::string& stem =
 
 // Rejects (hard error) a variable whose type cycles inside a loop on a backend with no tagged values (ir_codegen.cpp).
 void rejectTypeCyclingVars(const AC_IR::IRProgram& ir, const std::string& backend);
+// `%` (WILDCARD_MATCH) is in the IR but not lowered on any backend yet. Each backend gets its
+// lowering on its own; until then a program that uses it stops here with a clear error, never
+// compiles to output that silently ignores the match.
+static void rejectUnloweredWildcard(const AC_IR::IRProgram& ir, const std::string& backend) {
+    static const std::set<std::string> lowered = {"C", "PY", "CPP", "C++", "LIB", "RS", "Java", "GO", "V", "JS", "HTML", "ASM", "BNY", "ARM", "RISC"};
+    if (lowered.count(backend)) return;
+    auto usesWildcard = [](const std::vector<AC_IR::IRInstruction>& instrs) {
+        for (const auto& ins : instrs)
+            if (ins.opcode == AC_IR::IROpcode::WILDCARD_MATCH) return true;
+        return false;
+    };
+    bool used = usesWildcard(ir.globalInit);
+    for (const auto& fn : ir.functions) used = used || usesWildcard(fn.instructions);
+    if (used)
+        throw ACError::backend("the '%' wildcard operator is not lowered for backend " + backend + " yet");
+}
 
 // Gating flag for <Foreign> raw-passthrough blocks.
 bool g_allow_foreign = false;
@@ -450,8 +501,15 @@ static std::string acLibRoot() {
 // tree is still caught), not just "have I imported this exact file with `resolve()` earlier"—the
 // visited set holds resolve()'d absolute paths precisely so the SAME file reached via two
 // different relative spellings is recognized as the same entry.
+// Text of every file the program pulled in (flib, elib, clib, datac), keyed by path. It is part of
+// the program, so the IR cache key covers it: editing an imported file must invalidate the cache.
+static std::map<std::string, std::string> g_injectedSources;
+// Flib files whose imports are being injected right now (the chain from the program down to here).
+static std::set<std::string> g_importStack;
+
 static void injectFlibModules(ASTNode& root, const std::string& srcDir, std::set<std::string>& visited) {
     NodeList toAppend;
+    NodeList toVars;   // top-level variables exported by a LIB file (see below)
     for (auto& child : root.children) {
         if (!child || child->type != NodeType::UseLibStmt) continue;
         // elib packages (installed by atar into library/elib/<name>/lib.ac) are AC-source
@@ -530,8 +588,11 @@ static void injectFlibModules(ASTNode& root, const std::string& srcDir, std::set
             // as a broken raw `import <name>` statement referencing a module that was never
             // written to disk. The file's symbols are already being inlined via whichever
             // earlier point in the chain first imported it.
-            std::cerr << "Preposterous: FlibError: cyclic flib import detected, skipping re-import of: "
-                      << canonicalPath << "\n";
+            // Only a file that is still on the import chain is a cycle. A file imported again from a sibling
+            // was already injected, and is simply not injected twice.
+            if (g_importStack.count(canonicalPath))
+                std::cerr << "Preposterous: FlibError: cyclic flib import detected, skipping re-import of: "
+                          << canonicalPath << "\n";
             child->value = "flib:__inlined__:" + libpath;
             continue;
         }
@@ -544,6 +605,7 @@ static void injectFlibModules(ASTNode& root, const std::string& srcDir, std::set
         }
         std::ostringstream buf;
         buf << ff.rdbuf();
+        g_injectedSources[canonicalPath] = buf.str();
 
         auto flibTokens = lex(buf.str());
         auto flibAst    = parse(flibTokens);
@@ -554,9 +616,6 @@ static void injectFlibModules(ASTNode& root, const std::string& srcDir, std::set
         std::string flibDir = fullPath;
         auto slash = flibDir.find_last_of("/\\");
         flibDir = (slash == std::string::npos) ? "." : flibDir.substr(0, slash);
-
-        // Recursively inject any flib imports inside the flib file
-        injectFlibModules(*flibAst, flibDir, visited);
 
         // Collect FuncDef, BundleDef, and resolved UseLibStmt nodes.
         // If the file uses `export`, only exported items are visible to importers
@@ -575,18 +634,77 @@ static void injectFlibModules(ASTNode& root, const std::string& srcDir, std::set
                 exportedNames.insert(node->value);
             }
         }
+        // Recursively inject any flib imports inside the flib file. This runs AFTER the export scan
+        // below: an imported file's `export` must not make THIS file look like it has exports, or its
+        // own non-exported functions get dropped.
+        g_importStack.insert(canonicalPath);
+        injectFlibModules(*flibAst, flibDir, visited);
+        g_importStack.erase(canonicalPath);
+
+        // `AC LIB` / `AC->LIB` files export everything they define: functions, bundles and top-level
+        // variables, with no `export` needed. Other flib files export functions and bundles only.
+        bool libFile = false;
+        for (auto& node : flibAst->children)
+            if (node && node->type == NodeType::BackendDecl && node->value == "LIB") libFile = true;
+        // An exported function may call this file's private helpers: those are part of the export too,
+        // followed transitively through every definition that gets pulled in.
+        std::set<std::string> needed = exportedNames;
+        {
+            std::map<std::string, const ASTNode*> defByName;
+            for (auto& node : flibAst->children)
+                if (node && (node->type == NodeType::FuncDef || node->type == NodeType::BundleDef))
+                    defByName[node->value] = node.get();
+            std::vector<std::string> work(needed.begin(), needed.end());
+            auto mention = [&](const std::string& name) {
+                if (defByName.count(name) && needed.insert(name).second) work.push_back(name);
+            };
+            std::function<void(const ASTNode&)> refs = [&](const ASTNode& n) {
+                mention(n.value);
+                // Some calls keep their arguments as text (`result.append(Token(...))`): scan those too.
+                for (const auto& a : n.attrs) {
+                    std::string word;
+                    for (size_t i = 0; i <= a.size(); i++) {
+                        char c = i < a.size() ? a[i] : ' ';
+                        if (std::isalnum((unsigned char)c) || c == '_') { word += c; continue; }
+                        if (!word.empty()) mention(word);
+                        word.clear();
+                    }
+                }
+                for (auto& c : n.children) if (c) refs(*c);
+            };
+            while (!work.empty()) {
+                std::string name = work.back();
+                work.pop_back();
+                auto it = defByName.find(name);
+                if (it != defByName.end()) refs(*it->second);
+            }
+        }
         for (auto& node : flibAst->children) {
             if (!node) continue;
             bool isDef = node->type == NodeType::FuncDef || node->type == NodeType::BundleDef;
             if (node->type == NodeType::UseLibStmt ||
-                (isDef && (!hasExports || exportedNames.count(node->value))))
+                (isDef && (libFile || !hasExports || needed.count(node->value))))
                 toAppend.push_back(std::move(node));
+            else if (node->type == NodeType::AssignStmt && (libFile || node->exported)) {
+                // a LIB variable keeps its exported flag, so a file that imports the LIB passes it on
+                node->exported = true;
+                toVars.push_back(std::move(node));
+            }
         }
 
         child->value = "flib:__inlined__:" + libpath;
     }
     for (auto& e : toAppend)
         root.children.push_back(std::move(e));
+    // A LIB file's variables must be set before the importing program's own statements run, so they go
+    // after the importing file's header lines (backend, use) and before everything else.
+    size_t at = 0;
+    while (at < root.children.size() && root.children[at] &&
+           (root.children[at]->type == NodeType::BackendDecl || root.children[at]->type == NodeType::UseStmt ||
+            root.children[at]->type == NodeType::UseLibStmt))
+        at++;
+    root.children.insert(root.children.begin() + (long)at,
+                         std::make_move_iterator(toVars.begin()), std::make_move_iterator(toVars.end()));
 }
 
 // ── .datac file parser ──────────────────────────────────────────────────────
@@ -712,6 +830,7 @@ static void injectDatacImports(ASTNode& root, const std::string& srcDir) {
         }
         std::ostringstream buf;
         buf << ff.rdbuf();
+        g_injectedSources[fullPath] = buf.str();
 
         auto rows = parseDatacRows(buf.str());
 
@@ -972,8 +1091,11 @@ int main(int argc, char* argv[]) {
 
         NodePtr ast;
 
-        if (!noCache && !accFile.empty() && !forceCompile && cacheIsValid(inputFile, accFile)) {
-            ast = loadCache(accFile);
+        // The AST cache key is the program's exact text plus this compiler build: an entry is reused only
+        // for the same program, never because a timestamp looks fresh.
+        uint64_t accKey = accDigest(source + '\0' + std::to_string((long long)acCompilerMtime()));
+        if (!noCache && !accFile.empty() && !forceCompile) {
+            ast = loadCache(accFile, accKey);
         }
 
         if (!ast) {
@@ -1038,8 +1160,11 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            if (!noCache && !accFile.empty() && g_parseErrors.empty()) saveCache(accFile, *ast);
+            if (!noCache && !accFile.empty() && g_parseErrors.empty()) saveCache(accFile, accKey, *ast);
         }
+        // Added after the AST cache is written (so the cache keeps the user's own program) and on every
+        // path, parsed or loaded from the cache.
+        if (ast) injectEvalPrelude(*ast);
 
         // Inject .ac/.ai flib modules into the AST before IR generation
         {
@@ -1048,6 +1173,10 @@ int main(int argc, char* argv[]) {
         }
         // Bake .datac files into the AST as list-of-dict variable assignments
         injectDatacImports(*ast, srcDir);
+        // Digest of the whole program: the main source plus every imported file's text.
+        std::string depsText;
+        for (const auto& [path, text] : g_injectedSources) depsText += path + '\0' + text + '\0';
+        const std::string depsKey = std::to_string(accDigest(depsText));
 
         // ── helper: compile AST to one backend ─────────────────────────────
         // Ensure a compiled binary path can be invoked (needs ./ on Linux for relative paths)
@@ -1074,7 +1203,7 @@ int main(int argc, char* argv[]) {
             // LD_LIBRARY_PATH value = the given ilib dirs + any inherited value (for the child env).
             auto ldLibPath = [&](std::initializer_list<const char*> dirs) -> std::string {
                 std::string lr = acLibRoot(), p;
-                for (const char* d : dirs) { if (!p.empty()) p += ":"; p += lr + "/ilib/" + d; }
+                for (const char* d : dirs) { if (!p.empty()) p += ":"; p += lr + "/ilib/" + ilibSubdir(d); }
                 const char* e = getenv("LD_LIBRARY_PATH");
                 if (e && *e) p += std::string(":") + e;
                 return p;
@@ -1097,8 +1226,12 @@ int main(int argc, char* argv[]) {
             AC_IR::IRProgram irProg;
             bool irFromCache = false;
             if (!noCache && !forceCompile && !ircFile.empty()) {
+                // The compiler build is part of the key: IR lowering changes with every rebuild, so an
+                // entry written by an older compiler must never be reused (it gave stale C++ output).
                 std::string irHashSource = source + ffiMtimesSuffix(source, tgt)
-                                         + "\nruntime=" + (runtimeMode ? "1" : "0");
+                                         + "\nruntime=" + (runtimeMode ? "1" : "0")
+                                         + "\ndeps=" + depsKey
+                                         + "\nbuild=" + std::to_string((long long)acCompilerMtime());
                 uint64_t h = hashForCache(irHashSource, tgt);
                 // Per-backend IRC file
                 std::string tgtIrc = cacheDir + "/" + baseName + "_" + tgt + ".irc";
@@ -1124,10 +1257,11 @@ int main(int argc, char* argv[]) {
                     std::string libRoot = acLibRoot();
                     const char* acls[] = {"math","camera","machine-audio","widgets","regex",
                                           "os","string-cheese","native-cpu","web","web-server","ml"};
-                    for (const char* a : acls) lw.load(libRoot + "/ilib/" + a + "/" + a + ".acl");
+                    for (const char* a : acls) lw.load(libRoot + "/ilib/" + ilibSubdir(a) + "/" + a + ".acl");
                     return lw;
                 }();
                 lowering.apply(irProg);
+                rejectUnloweredWildcard(irProg, tgt);
             }
 
             // Save human-readable LIR — only for low-level backends (BNY/ASM) where it aids debugging
@@ -1181,12 +1315,14 @@ int main(int argc, char* argv[]) {
 #ifndef _WIN32
                 if (!getenv("AC_ARM_ILIB_PATH")) {
                     std::string lr = acLibRoot();
+                    // Each ilib's AArch64 build lives in <ilib>/arm64/ (library/ilib/build-arm64.sh).
+                    // libacserver.so is built alongside web's, so "web" covers web-server too.
                     const char* dirs[] = {"math","camera","os","regex","string-cheese","web",
-                                          "web-server","machine-audio","native-cpu","ml","widgets","aczip"};
+                                          "machine-audio","native-cpu","ml","widgets","aczip"};
                     std::string armRunpath;
                     for (const char* d : dirs) {
                         if (!armRunpath.empty()) armRunpath += ":";
-                        armRunpath += lr + "/ilib/" + d;
+                        armRunpath += lr + "/ilib/" + ilibSubdir(d) + "/arm64";
                     }
                     setenv("AC_ARM_ILIB_PATH", armRunpath.c_str(), 0);
                 }
@@ -1213,11 +1349,14 @@ int main(int argc, char* argv[]) {
 #endif
                     // Cross-running on a non-ARM host: qemu-aarch64 user-mode emulation.
                     if (hostIsArm) timedRunArgv({outFile});
-                    else timedRunArgv({"qemu-aarch64", outFile});
+                    else timedRunArgv(qemuArmArgv(outFile));
                 }
                 printTiming();
                 return true;
             };
+            // RISC: the assembly listing is the output. Running it uses the same codegen's binary
+            // (identical instructions and layout), so programs that call ilibs resolve through the
+            // ARM dynamic-link path rather than a hand-linked stub.
             auto runArmAsm = [&](const std::string& outFile) -> bool {
                 if (!generateArmAsmFromIR(irProg, outFile)) {
                     std::cerr << "Preposterous: BackendError: ASM generation failed for RISC\n";
@@ -1225,24 +1364,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "Generated: " << outFile << " [exp_arm_asm]\n";
                 if (runAfterCompile && !compileAll) {
-                    std::string objFile = base + "_arm.o";
-                    std::string binFile = base + "_arm_bin";
-                    int rc = run_argv({"aarch64-linux-gnu-as", outFile, "-o", objFile});
-                    if (rc != 0) {
-                        std::cerr << "Preposterous: BackendError: aarch64-linux-gnu-as failed for RISC\n";
-                        return false;
-                    }
-                    rc = run_argv({"aarch64-linux-gnu-ld", objFile, "-o", binFile});
-                    if (rc != 0) {
-                        std::cerr << "Preposterous: BackendError: aarch64-linux-gnu-ld failed for RISC\n";
-                        return false;
-                    }
-                    bool hostIsArm = false;
-#if defined(__aarch64__) || defined(_M_ARM64)
-                    hostIsArm = true;
-#endif
-                    if (hostIsArm) timedRunArgv({binFile});
-                    else timedRunArgv({"qemu-aarch64", binFile});
+                    return runArmBinary(base + "_risc_bin");
                 }
                 printTiming();
                 return true;
@@ -1259,7 +1381,7 @@ int main(int argc, char* argv[]) {
                                           "aczip"};
                     for (const char* d : dirs) {
                         if (!bnyRunpath.empty()) bnyRunpath += ":";
-                        bnyRunpath += lr + "/ilib/" + d;
+                        bnyRunpath += lr + "/ilib/" + ilibSubdir(d);
                     }
                 }
                 if (!generateBinaryFromIR(irProg, outFile, debugInfo, inputFile, bnyRunpath,
@@ -1333,7 +1455,7 @@ int main(int argc, char* argv[]) {
                             std::string libRoot = acLibRoot();
                             const char* acls[] = {"math","camera","machine-audio","widgets","regex",
                                                   "os","string-cheese","native-cpu","web","web-server","ml"};
-                            for (const char* a : acls) lw.load(libRoot + "/ilib/" + a + "/" + a + ".acl");
+                            for (const char* a : acls) lw.load(libRoot + "/ilib/" + ilibSubdir(a) + "/" + a + ".acl");
                             return lw;
                         }();
                         lowering.apply(cIr);
@@ -1429,8 +1551,16 @@ int main(int argc, char* argv[]) {
             // Non-ARM AC->ASM falls through to generateFromIR below → AsmStrategy emits x86-64 NASM
             // (assemble with `nasm -f elf64`).
 
+            // A PY program is run as a script from its own folder, so a file named like a Python stdlib
+            // module (math.ac -> math.py) makes the script import itself. Such names get an _ac suffix.
+            static const std::set<std::string> pyStdlibNames = {
+                "math","random","string","time","os","sys","json","re","io","array","cmath","copy",
+                "decimal","fractions","statistics","collections","itertools","functools","operator",
+                "types","typing","enum","struct","socket","select","signal","threading","queue"};
+            std::string pyBase = base;
+            if (tgt == "PY" && pyStdlibNames.count(baseName)) pyBase = base + "_ac";
             std::string outFile = (!outputOverride.empty() && !compileAll)
-                                  ? outputOverride : base + info.extension;
+                                  ? outputOverride : pyBase + info.extension;
             // --all runs backends in PARALLEL; C++/CPP aliases and LIB all emit ".cpp" and would
             // trample each other's file mid-compile. Give the aliases distinct names in that mode.
             if (compileAll && tgt == "C++") outFile = base + "_cxx.cpp";
@@ -1850,8 +1980,8 @@ int main(int argc, char* argv[]) {
                 };
                 for (auto& [dir, lname] : otherIlibs) {
                     if (content.find("#[link(name = \"" + lname + "\")]") != std::string::npos)
-                        libFlags += " -L \"" + libRoot + "/ilib/" + dir + "\" -l " + lname
-                                  + " -C link-arg=-Wl,-rpath,\"" + libRoot + "/ilib/" + dir + "\"";
+                        libFlags += " -L \"" + libRoot + "/ilib/" + ilibSubdir(dir) + "\" -l " + lname
+                                  + " -C link-arg=-Wl,-rpath,\"" + libRoot + "/ilib/" + ilibSubdir(dir) + "\"";
                 }
                 // Parse FLIB_SO_LINK for user-provided .so files
                 {
@@ -1868,7 +1998,13 @@ int main(int argc, char* argv[]) {
                             std::string bn = (sl == std::string::npos) ? soPath : soPath.substr(sl + 1);
                             std::string lname = bn.substr(0, bn.rfind('.'));
                             if (lname.rfind("lib", 0) == 0) lname = lname.substr(3);
-                            libFlags += " -L \"" + ld + "\" -l " + lname;
+                            // rpath, not just -L: without it the compiled binary can only find
+                            // this .so again if LD_LIBRARY_PATH happens to be set at run time —
+                            // every hardcoded ilib case just above already embeds one, an
+                            // elib-sourced one (see RustStrategy's own FLIB_SO_LINK comment)
+                            // needs the exact same treatment since it's never in those tables.
+                            libFlags += " -L \"" + ld + "\" -l " + lname
+                                      + " -C link-arg=-Wl,-rpath,\"" + ld + "\"";
                         }
                     }
                 }
@@ -1913,7 +2049,9 @@ int main(int argc, char* argv[]) {
                 // feature needed preview mode back then has since stabilized, so the flag is
                 // just dropped rather than chasing the "match release to installed javac" tail
                 // forever.
-                int rc = run_argv({"javac","--release","21",outFile});
+                // --release 22: the ilib FFI files use the JDK 22+ Panama names (allocateFrom,
+                // getString) — release 21 has only the old allocateUtf8String/getUtf8String API.
+                int rc = run_argv({"javac","--release","22",outFile});
                 if (rc == 0) {
                     std::cout << "Compiled:  " << stem << ".class [javac]\n";
                     if (doRun) {
@@ -1926,7 +2064,7 @@ int main(int argc, char* argv[]) {
                         std::string lr = acLibRoot();
                         std::string projRoot = lr.size() > 8 && lr.compare(lr.size()-8, 8, "/library") == 0
                             ? lr.substr(0, lr.size()-8) : lr;
-                        timedRunArgv({"java","-cp",javaDir,stem}, {{"AC_PATH", projRoot}});
+                        timedRunArgv({"java","--enable-native-access=ALL-UNNAMED","-cp",javaDir,stem}, {{"AC_PATH", projRoot}});
                     }
                 } else {
                     std::cerr << Toxic::javacNotHavingIt(rc) << "\n";

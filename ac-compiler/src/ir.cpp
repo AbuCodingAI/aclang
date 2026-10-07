@@ -121,6 +121,8 @@ static std::string opcodeStr(IROpcode op) {
         case IROpcode::XOR:           return "xor";
         case IROpcode::XNOR:          return "xnor";
         case IROpcode::XSUB:          return "xsub";
+        case IROpcode::WILDCARD_MATCH: return "wildcard_match";
+        case IROpcode::DICT_HAS:      return "dict_has";
         case IROpcode::BAND:          return "band";
         case IROpcode::BOR:           return "bor";
         case IROpcode::BXOR:          return "bxor";
@@ -445,6 +447,60 @@ class IRGenerator {
     // convention exactly, so a lookup key built the same way at both prepass and real-lowering
     // time always agrees. Set/restored around FuncDef's own case.
     std::string currentFunc_;
+    // Dictionaries are not 1-based: `d[k]` never gets the array index shift. A name is a dictionary
+    // when it is assigned a dict literal (or the result of a dict-returning function), keyed
+    // "function::name" (see collectDictReturnFunctions).
+    std::set<std::string> dictReturnFuncs_;
+    // Dict content travels as a CONST string, and a CONST string that starts and ends with `$` is read
+    // as a $...$ literal and unwrapped. Padding keeps the content's own `$` markers intact.
+    static std::string dictAllocText(const std::string& content) { return " " + content + " "; }
+    // Top-level `name = $text$` constants (see collectGlobalStringConsts). A dictionary value that is a bare
+    // name (`auto: auto`) means that variable, so its constant text is spliced in as a $...$ string.
+    std::map<std::string, std::string> globalStrConsts_;
+    void collectGlobalStringConsts(const ASTNode& ast) {
+        globalStrConsts_.clear();
+        for (auto& top : ast.children) {
+            if (!top || top->type != NodeType::AssignStmt || top->children.empty() || !top->children[0]) continue;
+            const ASTNode& v = *top->children[0];
+            bool isStr = v.type == NodeType::StringLit ||
+                         (v.type == NodeType::LiteralExpr && !v.attrs.empty() && v.attrs[0] == "STRING");
+            if (isStr) globalStrConsts_[top->value] = v.value;
+            else globalStrConsts_.erase(top->value);        // reassigned to something else: no longer a constant
+        }
+    }
+    std::string resolveDictValues(const std::string& content) const {
+        auto splitAt = [](const std::string& t, char ch) {       // first `ch` outside a $...$ span
+            bool inSpan = false;
+            for (size_t i = 0; i < t.size(); i++) {
+                if (t[i] == '$') inSpan = !inSpan;
+                else if (!inSpan && t[i] == ch) return i;
+            }
+            return std::string::npos;
+        };
+        std::string out, rest = content;
+        bool first = true;
+        while (!rest.empty()) {
+            auto comma = splitAt(rest, ',');
+            std::string pair = comma == std::string::npos ? rest : rest.substr(0, comma);
+            rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
+            auto colon = splitAt(pair, ':');
+            if (colon == std::string::npos) { continue; }
+            std::string k = pair.substr(0, colon), v = pair.substr(colon + 1);
+            size_t a = v.find_first_not_of(' '), b = v.find_last_not_of(' ');
+            std::string vt = a == std::string::npos ? "" : v.substr(a, b - a + 1);
+            auto g = globalStrConsts_.find(vt);
+            if (g != globalStrConsts_.end()) v = "$" + g->second + "$";
+            if (!first) out += ",";
+            out += k + ":" + v;
+            first = false;
+        }
+        return out;
+    }
+    std::set<std::string> dictVarNames_;
+    // A name is a dictionary in this function, or as a global (top-level) dictionary.
+    bool isDictContainer(const std::string& name) const {
+        return dictVarNames_.count(currentFunc_ + "::" + name) > 0 || dictVarNames_.count("::" + name) > 0;
+    }
 
     static std::string sanitizeForVarName(const std::string& s) {
         std::string r = s;
@@ -1034,6 +1090,12 @@ class IRGenerator {
     }
 
     void emit(IRInstruction i) {
+        // `stringm.split(s)` with no separator splits on whitespace runs, as PY's str.split() does.
+        // Every backend reads the __WS__ sentinel as that separator, so the call gets it explicitly.
+        if ((i.opcode == IROpcode::CALL || i.opcode == IROpcode::LIB_CALL) && i.typedOperands.size() == 2 &&
+            i.typedOperands[0].kind == IRRef::Kind::VAR && i.typedOperands[0].id >= 0 &&
+            prog.symbols.getName(i.typedOperands[0].id) == "stringm.split")
+            i.typedOperands.push_back(mkConst("__WS__"));
         // Inside a <free> block: auto-emit FREE_DECL before the first assignment to each var
         if (inFreeScope && i.opcode == IROpcode::STORE_VAR
                         && i.result.kind == IRRef::Kind::VAR) {
@@ -1265,6 +1327,14 @@ class IRGenerator {
                         };
                         bool l = expr.children.size() >= 2 && isStrConst(expr.children[0].get());
                         bool r = expr.children.size() >= 2 && isStrConst(expr.children[1].get());
+                        // `%` is wildcard matching: both operands are strings (see IROpcode::WILDCARD_MATCH).
+                        if (op == "%") {
+                            auto isNumLit = [](const ASTNode* n) {
+                                return n && n->type == NodeType::LiteralExpr && !n->attrs.empty() && n->attrs[0] != "STRING";
+                            };
+                            if (expr.children.size() >= 2 && (isNumLit(expr.children[0].get()) || isNumLit(expr.children[1].get())))
+                                throw ACError::type("'%' is wildcard matching: its operands must be strings, not numbers");
+                        }
                         // These require numeric operands (ADD excluded — string concat).
                         if ((op == "-" || op == "*" || op == "/" || op == "//" || op == "///") && (l || r))
                             throw ACError::nonNumericArith(op);
@@ -1298,6 +1368,8 @@ class IRGenerator {
                     else if (op == "bor")               opcode = IROpcode::BOR;
 
                     else if (op == "xsub") opcode = IROpcode::XSUB;
+                    else if (op == "%")    opcode = IROpcode::WILDCARD_MATCH;
+                    else if (op == "has")  opcode = IROpcode::DICT_HAS;
 
                     if (op == "overlap") {
                         // Extract base object name (before first dot) from each operand
@@ -1582,6 +1654,8 @@ class IRGenerator {
                                            ? IRType::INT
                                            : ((lt == IRType::FLOAT || rt == IRType::FLOAT)
                                               ? IRType::FLOAT : (lt != IRType::VOID ? lt : rt));
+                        // `subject % pattern` is a bool, whatever its string operands are.
+                        if (opcode == IROpcode::WILDCARD_MATCH || opcode == IROpcode::DICT_HAS) resType = IRType::BOOL;
                         IRInstruction i(opcode, dst, {lRef, rRef});
                         i.resultType = resType;
                         setRefType(dst, resType);
@@ -1767,7 +1841,8 @@ class IRGenerator {
                     }
                     IRRef arr = lowerExprNode(*expr.children[0]);
                     IRRef rawIdx = lowerExprNode(*expr.children[1]);
-                    IRRef idx = adjustIndex(rawIdx);
+                    bool dictContainer = expr.children[0]->type == NodeType::Identifier && isDictContainer(expr.children[0]->value);
+                    IRRef idx = dictContainer ? rawIdx : adjustIndex(rawIdx);
                     IRRef dst = mkTemp();
                     IRInstruction i(IROpcode::LOAD_INDEX, dst, {arr, idx});
                     emit(std::move(i));
@@ -1945,6 +2020,18 @@ class IRGenerator {
                 IRRef arg = expr.children.empty()
                     ? mkConst("")
                     : lowerExprNode(*expr.children[0]);
+                // A string is code text: evaluate it with the arithmetic evaluator compiled into the program
+                // (include/eval_prelude.hpp, injected by main.cpp). The same on every backend.
+                // An argument of UNKNOWN type (VOID here, e.g. `line = Term.ask ...`) is routed the same
+                // way: user input is code text far more often than not, and an untyped value reaching
+                // the EVAL op would be dispatched per backend (V and the C builtin disagree).
+                IRType argTy = typeOfRef(arg);
+                if (argTy == IRType::STRING || argTy == IRType::VOID) {
+                    IRInstruction call(IROpcode::CALL, dst, {mkVar("ac_eval_str"), arg});
+                    call.resultType = IRType::FLOAT;
+                    emit(std::move(call));
+                    return dst;
+                }
                 IRInstruction i(IROpcode::EVAL, dst, {arg});
                 // The string branch always yields a FLOAT (the arithmetic evaluator); the
                 // expression branch yields whatever the expression's own known type is. Without
@@ -2055,6 +2142,12 @@ class IRGenerator {
                 return dst;
             }
 
+            case NodeType::DictLiteral: {
+                // `{k: v, ...}` used as a value (e.g. `return {...}`): allocate it, as the statement form does.
+                IRRef dst = mkTemp();
+                emit(IRInstruction(IROpcode::ALLOC, dst, {mkConst("dict"), mkConst(dictAllocText(resolveDictValues(expr.value)))}));
+                return dst;
+            }
             case NodeType::ListLiteral: {
                 IRRef dst = mkTemp();
                 if (!expr.children.empty()) {
@@ -2809,7 +2902,16 @@ class IRGenerator {
 
         // indexing: name[expr] → LOAD_INDEX (AC is 1-indexed; IR indices are 0-based)
         if (expr.back() == ']') {
-            auto lb = expr.find('[');
+            // The '[' that matches the FINAL ']' (scanning backwards). The first '[' would make
+            // "a[i] - b[j]" read as one index into "a" with a bogus subscript "i] - b[j".
+            size_t lb = std::string::npos;
+            {
+                int depth = 0;
+                for (size_t k = expr.size(); k-- > 0; ) {
+                    if (expr[k] == ']') depth++;
+                    else if (expr[k] == '[' && --depth == 0) { lb = k; break; }
+                }
+            }
             if (lb != std::string::npos && lb > 0) {
                 std::string recv = expr.substr(0, lb);
                 std::string inner = expr.substr(lb + 1, expr.size() - lb - 2);
@@ -2835,7 +2937,7 @@ class IRGenerator {
                         return lowerTupleIndex(tv->first, tv->second, idxRef);
                     }
                     IRRef idx = lowerExpr(inner);
-                    IRRef adj = adjustIndex(idx);   // string dict keys pass through; ints -1
+                    IRRef adj = isDictContainer(recv) ? idx : adjustIndex(idx);   // dicts: no shift; lists: -1
                     IRRef dst = mkTemp();
                     emit(IRInstruction(IROpcode::LOAD_INDEX, dst, {mkVar(recv), adj}));
                     return dst;
@@ -2952,8 +3054,9 @@ class IRGenerator {
         // scan right-to-left for +/- (lowest precedence)
         for (int i = (int)expr.size() - 1; i >= 0; --i) {
             char c = expr[i];
-            if (c == ')') depth++;
-            else if (c == '(') depth--;
+            // Square brackets nest like parens: the '+' in psi[j + 1] is not a top-level operator.
+            if (c == ')' || c == ']') depth++;
+            else if (c == '(' || c == '[') depth--;
             else if (depth == 0 && !inStrMask[i] && (c == '+' || c == '-') && i > 0) {
                 opPos = i;
                 opcode = (c == '+') ? IROpcode::ADD : IROpcode::SUB;
@@ -2965,8 +3068,8 @@ class IRGenerator {
             depth = 0;
             for (int i = (int)expr.size() - 1; i >= 0; --i) {
                 char c = expr[i];
-                if (c == ')') depth++;
-                else if (c == '(') depth--;
+                if (c == ')' || c == ']') depth++;
+                else if (c == '(' || c == '[') depth--;
                 else if (depth == 0 && !inStrMask[i] && (c == '*' || c == '/' || c == '@') && i > 0) {
                     opPos = i;
                     opcode = (c == '*') ? IROpcode::MUL : (c == '@') ? IROpcode::PMUL : IROpcode::DIV;
@@ -3447,6 +3550,7 @@ class IRGenerator {
             // Bundle field defaults should become instance fields (set in init), not class/static vars.
             currentClass_ = className;
             std::vector<std::pair<std::string, const ASTNode*>> fieldDefaults;
+            std::map<std::string, const ASTNode*> legacyDefaults;   // field -> string-form default (list/dict)
             bool hasUserInit = false;
             // Body is either: old style — one Block child; new style — BundleMember children.
             // Normalize to a flat list of (access, stmt*) pairs.
@@ -3478,6 +3582,7 @@ class IRGenerator {
                                 // Legacy string-based assignment: lowerExpr() later
                                 // Store nullptr to signal legacy; handled below.
                                 fieldDefaults.push_back({stmt.value, nullptr});
+                                legacyDefaults[stmt.value] = &stmt;
                             }
                         }
                     } else if (stmt.type == NodeType::FuncDef && stmt.value == "init") {
@@ -3506,9 +3611,13 @@ class IRGenerator {
                             IRInstruction i(IROpcode::STORE_VAR, dst, {src});
                             i.resultType = typeOfRef(src);
                             emit(std::move(i));
+                        } else if (legacyDefaults.count(field)) {
+                            // String-form default (a list or dict literal): lower it as an assignment to the
+                            // field, exactly as an assignment in init would be lowered.
+                            ASTNode renamed(NodeType::AssignStmt, "self." + field);
+                            renamed.attrs = legacyDefaults[field]->attrs;
+                            gen(renamed);
                         } else {
-                            // Legacy: value stored in attrs[0] on the AssignStmt. Re-lower from string.
-                            // (We don't have the original string here; default to 0.)
                             IRInstruction i(IROpcode::STORE_VAR, dst, {mkConstInt(0)});
                             i.resultType = IRType::INT;
                             emit(std::move(i));
@@ -3596,6 +3705,11 @@ class IRGenerator {
                 break;
             }
             IRRef dst = mkVar(n.value);
+            if (!n.attrs.empty() && n.attrs[0].rfind("__dict__", 0) == 0)
+                dictVarNames_.insert(currentFunc_ + "::" + n.value);
+            if (!n.children.empty() && n.children[0] && n.children[0]->type == NodeType::FunctionCall
+                    && dictReturnFuncs_.count(n.children[0]->value))
+                dictVarNames_.insert(currentFunc_ + "::" + n.value);
 
             // Check for special assignment types first (before checking children)
             if (!n.attrs.empty()) {
@@ -3671,7 +3785,7 @@ class IRGenerator {
                             } else if (lowerListLiteralArg(a, ops)) {
                                 // list literal argument — lowered to an ALLOC temp
                             } else {
-                                bool isIdent = true;
+                                bool isIdent = !a.empty() && !std::isdigit((unsigned char)a[0]);   // `0.5` is a number, not a name
                                 for (char c : a)
                                     if (!std::isalnum((unsigned char)c) && c != '_' && c != '.') { isIdent = false; break; }
                                 if (isIdent)
@@ -3690,7 +3804,7 @@ class IRGenerator {
                         // callee's own signature/codegen, so the plain CALL below already
                         // produces the right kind of value (a real Python/JS generator object,
                         // or a Go/Rust/V channel).
-                        static const std::set<std::string> genFamilyCA = {"Java", "C", "CPP", "C++", "LIB", "BNY", "ASM"};
+                        static const std::set<std::string> genFamilyCA = {"Java", "C", "CPP", "C++", "LIB", "BNY", "ASM", "ARM"};
                         if (generatorFuncNames_.count(fc.value) && genFamilyCA.count(prog.backend)) {
                             IRInstruction gc(IROpcode::GEN_CREATE, dst, ops);
                             emit(std::move(gc));
@@ -3957,7 +4071,7 @@ class IRGenerator {
                 IRInstruction i(IROpcode::ALLOC, dst, {mkConst("tuple"), mkConst(raw.substr(9))});
                 emit(std::move(i));
             } else if (raw.substr(0, 8) == "__dict__") {
-                IRInstruction i(IROpcode::ALLOC, dst, {mkConst("dict"), mkConst(raw.substr(8))});
+                IRInstruction i(IROpcode::ALLOC, dst, {mkConst("dict"), mkConst(dictAllocText(resolveDictValues(raw.substr(8))))});
                 emit(std::move(i));
                 datacDictVars_.insert(n.value);
             } else if (raw == "__range__") {
@@ -4283,6 +4397,14 @@ class IRGenerator {
             }
 
             std::vector<IRRef> ops = {mkVar(n.value)};
+            // Arguments the parser kept as expressions (the statement method-call branch in parser.cpp) are
+            // lowered as expressions, like expression-form arguments. Expression-form calls carry a
+            // "__called__" marker and keep the text form.
+            bool useChildren = !n.children.empty() && n.children.size() == n.attrs.size()
+                && std::find(n.attrs.begin(), n.attrs.end(), "__called__") == n.attrs.end();
+            if (useChildren) {
+                for (auto& c : n.children) ops.push_back(lowerExprNode(*c));
+            } else
             for (auto& a : mergeBracketAttrs(n.attrs)) {
                 // Trim whitespace
                 std::string trimmed = a;
@@ -4527,7 +4649,7 @@ class IRGenerator {
                 } else if (lowerListLiteralArg(a, ops)) {
                     // list literal argument — lowered to an ALLOC temp
                 } else {
-                    bool isIdent = true;
+                    bool isIdent = !a.empty() && !std::isdigit((unsigned char)a[0]);   // `0.5` is a number, not a name
                     for (char c : a)
                         if (!std::isalnum((unsigned char)c) && c != '_' && c != '.') { isIdent = false; break; }
                     if (isIdent)
@@ -5241,7 +5363,7 @@ class IRGenerator {
             // branch above, just expanded into the label/jump loop shape this function's own
             // low-level range/seq branch (just above, `isRangeLike`/`isSeqLike`) already
             // establishes for these backends, instead of WHILE_BEGIN/WHILE_END.
-            if (!prog.useHighLevelIR && (prog.backend == "BNY" || prog.backend == "ASM")) {
+            if (!prog.useHighLevelIR && (prog.backend == "BNY" || prog.backend == "ASM" || prog.backend == "ARM")) {
                 bool isGenCall = (collNode.type == NodeType::CallExpr || collNode.type == NodeType::FunctionCall);
                 std::string calleeName = isGenCall ? collNode.value : "";
                 bool isGenVar = (collNode.type == NodeType::Identifier)
@@ -5639,7 +5761,7 @@ class IRGenerator {
                 // store: arr[idx] = val  (AC 1-based → 0-based)
                 IRRef arr = mkVar(n.value);
                 IRRef rawIdx = lowerExpr(n.attrs[0]);
-                IRRef idx = adjustIndex(rawIdx);
+                IRRef idx = isDictContainer(n.value) ? rawIdx : adjustIndex(rawIdx);
                 IRRef val = (!n.children.empty() && n.children[0])
                                 ? lowerExprNode(*n.children[0])      // structured RHS from the parser
                                 : lowerExpr(n.attrs[1]);             // glued-token fallback
@@ -5650,7 +5772,7 @@ class IRGenerator {
                 // load: tmp = arr[idx]  (AC 1-based → 0-based)
                 IRRef arr = mkVar(n.value);
                 IRRef rawIdx = lowerExpr(n.attrs[0]);
-                IRRef idx = adjustIndex(rawIdx);
+                IRRef idx = isDictContainer(n.value) ? rawIdx : adjustIndex(rawIdx);
                 IRRef dst = mkTemp();
                 IRInstruction i(IROpcode::LOAD_INDEX, dst, {arr, idx});
                 emit(std::move(i));
@@ -5695,7 +5817,7 @@ class IRGenerator {
         }
         case NodeType::DictLiteral: {
             IRRef dst = mkTemp();
-            IRInstruction i(IROpcode::ALLOC, dst, {mkConst("dict"), mkConst(n.value)});
+            IRInstruction i(IROpcode::ALLOC, dst, {mkConst("dict"), mkConst(dictAllocText(resolveDictValues(n.value)))});
             emit(std::move(i));
             break;
         }
@@ -6068,6 +6190,28 @@ public:
     const std::map<std::string, std::vector<IRType>>& getTupleClassSlotTypes() const { return tupleClassSlotTypes_; }
     const std::set<std::string>& getTupleAnyClasses() const { return tupleAnyClasses_; }
 
+    // A function whose `return` is a dict literal (directly, or a local assigned one) returns a
+    // dictionary, so `t = f()` makes `t` a dictionary. Run before lowering, since flib functions are
+    // appended after the functions that call them.
+    void collectDictReturnFunctions(const ASTNode& ast) {
+        std::function<void(const ASTNode&, const std::string&, std::set<std::string>&)> walk;
+        walk = [&](const ASTNode& node, const std::string& fn, std::set<std::string>& dictLocals) {
+            if (node.type == NodeType::AssignStmt && !node.attrs.empty() && node.attrs[0].rfind("__dict__", 0) == 0)
+                dictLocals.insert(node.value);
+            if (node.type == NodeType::ReturnStmt && !fn.empty() && !node.children.empty() && node.children[0]) {
+                const ASTNode& r = *node.children[0];
+                if (r.type == NodeType::DictLiteral || (r.type == NodeType::Identifier && dictLocals.count(r.value)))
+                    dictReturnFuncs_.insert(fn);
+            }
+            for (auto& c : node.children) if (c) walk(*c, fn, dictLocals);
+        };
+        for (auto& top : ast.children) {
+            if (!top) continue;
+            std::set<std::string> locals;
+            walk(*top, top->type == NodeType::FuncDef ? top->value : std::string(), locals);
+        }
+    }
+
     IRProgram generate(const ASTNode& ast, const std::string& backend) {
         prog         = IRProgram();
         prog.backend = backend;
@@ -6086,6 +6230,9 @@ public:
         generatorFuncNames_.clear();
         generatorHandleVars_.clear();
         collectGeneratorFunctions(ast);
+        dictReturnFuncs_.clear(); dictVarNames_.clear();
+        collectDictReturnFunctions(ast);
+        collectGlobalStringConsts(ast);
         collectGeneratorHandleVars(ast);
         scalarizableTupleVars_.clear();
         tupleScalarShadowTypes_.clear();
@@ -7320,6 +7467,26 @@ static void runOptPasses(IRProgram& prog) {
             runDCE(prog.globalInit);
         }
     }
+    // A boolean appended to a list is stored as an integer (AC lists are i64, see the literal-arg
+    // path in the method-call lowering). Structured `x.append(True)` operands arrive as BOOL
+    // constants, which Rust/Go/V emit as true/false into an i64/bool-mismatched list.
+    for (auto* code : [&]{ std::vector<std::vector<IRInstruction>*> all; all.push_back(&prog.globalInit); all.push_back(&prog.mainSection);
+                           for (auto& fn : prog.functions) all.push_back(&fn.instructions); return all; }()) {
+        for (auto& ins : *code) {
+            if (ins.opcode != IROpcode::LIB_CALL || ins.typedOperands.size() < 2) continue;
+            const IRRef& f = ins.typedOperands[0];
+            std::string name;
+            if ((f.kind == IRRef::Kind::VAR || f.kind == IRRef::Kind::FUNCTION) && f.id >= 0) name = prog.symbols.getName(f.id);
+            else if (f.kind == IRRef::Kind::CONST && f.value.type == IRType::STRING) name = std::get<std::string>(f.value.data);
+            if (name.size() < 7 || name.compare(name.size() - 7, 7, ".append") != 0) continue;
+            for (size_t i = 1; i < ins.typedOperands.size(); i++) {
+                IRRef& op = ins.typedOperands[i];
+                if (op.kind == IRRef::Kind::CONST && op.value.type == IRType::BOOL)
+                    op = IRRef::constant(IRValue(int64_t(std::get<bool>(op.value.data) ? 1 : 0)));
+            }
+        }
+    }
+
     // Smart `/` MUST become a concrete DIV/FDIV before any backend sees it — a CORRECTNESS pass,
     // run once at every level including -O0. Likewise a final DCE keeps strict backends (Go rejects
     // unused vars) compiling even at -O0.

@@ -10,7 +10,9 @@
 #include <memory>
 
 static const char IRC_MAGIC[4] = {'A','C','I','R'};
-static const uint8_t IRC_VERSION = 18; // bumped: IRFunction::isGenerator serialized (`yield`)
+static const uint8_t IRC_VERSION = 19; // bumped: globalInit is stored as-is (passes change it after the sections are split)
+
+#include "../include/selfpath.hpp"
 
 // ── FNV-1a 64-bit hash ────────────────────────────────────────────────────────
 inline uint64_t fnv64(const std::string& data) {
@@ -23,7 +25,8 @@ inline uint64_t hashForCache(const std::string& source, const std::string& backe
     // IRC_VERSION bumped on any IR format change — invalidates caches without relying
     // on build timestamp (which would invalidate every cache on every recompile).
     static const char CACHE_VER[] = "ac-irc-v13-short-mini";
-    return fnv64(source + '\0' + backend + '\0' + CACHE_VER);
+    // the compiler's build time is part of the key: a rebuilt compiler lowers the same source differently
+    return fnv64(source + '\0' + backend + '\0' + CACHE_VER + '\0' + std::to_string((long long)acCompilerMtime()));
 }
 
 // ── Serialization primitives ──────────────────────────────────────────────────
@@ -171,6 +174,11 @@ inline void saveIRCache(const std::string& ircFile, uint64_t hash,
     wU32(f, (uint32_t)prog.mainSection.size());
     for (auto& ins : prog.mainSection) wInstr(f, ins);
 
+    // ── Section: globalInit (stored as-is: later passes edit it, so it is not always data + main) ──
+    wStr(f, "globalInit");
+    wU32(f, (uint32_t)prog.globalInit.size());
+    for (auto& ins : prog.globalInit) wInstr(f, ins);
+
     wI32(f, prog.globalTempCount);
     wI32(f, prog.globalLabelCount);
 }
@@ -208,7 +216,7 @@ inline std::unique_ptr<AC_IR::IRProgram> loadIRCache(const std::string& ircFile,
 
     // ── Sections ─────────────────────────────────────────────────────────────
     // Read three sections in order: defs, data, main
-    for (int sec = 0; sec < 3; sec++) {
+    for (int sec = 0; sec < 4; sec++) {
         std::string secName = rStr(f);
 
         if (secName == "defs") {
@@ -240,15 +248,16 @@ inline std::unique_ptr<AC_IR::IRProgram> loadIRCache(const std::string& ircFile,
             if (mc > 1000000) return nullptr;
             prog->mainSection.reserve(mc);
             for (uint32_t i = 0; i < mc; i++) prog->mainSection.push_back(rInstr(f));
+        } else if (secName == "globalInit") {
+            uint32_t gc = rU32(f);
+            if (gc > 1000000) return nullptr;
+            prog->globalInit.reserve(gc);
+            for (uint32_t i = 0; i < gc; i++) prog->globalInit.push_back(rInstr(f));
         } else {
             return nullptr; // unknown section — cache corrupt
         }
     }
 
-    // Reconstruct globalInit = data + main (codegen compatibility)
-    prog->globalInit.reserve(prog->dataSection.size() + prog->mainSection.size());
-    for (auto& ins : prog->dataSection) prog->globalInit.push_back(ins);
-    for (auto& ins : prog->mainSection) prog->globalInit.push_back(ins);
 
     prog->globalTempCount  = rI32(f);
     prog->globalLabelCount = rI32(f);

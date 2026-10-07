@@ -1,5 +1,6 @@
 #include "../include/backend_registry.hpp"
 #include "../include/ast.hpp"
+#include "../include/ilib_path.hpp"
 #include <string>
 #include <algorithm>
 
@@ -19,7 +20,7 @@ std::string resolveLibraryPath(const std::string& libName) {
     }
 
     // Default library paths
-    std::string path = "../library/ilib/" + libName + "/" + libName;
+    std::string path = "../library/ilib/" + ilibSubdir(libName) + "/" + libName;
     
     // Determine extension based on backend
     // For C/C++ backends: .hpp or .h

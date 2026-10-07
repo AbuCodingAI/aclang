@@ -58,13 +58,24 @@ bool needsCrossCompilation(bool targetNative) {
     return cpu == CPUArch::ARM64 || cpu == CPUArch::ARM32;
 }
 
+// Single-quote a path for /bin/sh: nothing inside '...' is expanded, and an embedded quote is closed,
+// escaped and reopened. Paths come from the user's source tree, so they must not be read as shell syntax.
+static std::string shellQuotePath(const std::string& s) {
+    std::string q = "'";
+    for (char c : s) {
+        if (c == '\'') q += "'\\''";
+        else q += c;
+    }
+    return q + "'";
+}
+
 bool compileWithGCC(const std::string& cFile, const std::string& outFile) {
     std::string compiler = "gcc";
 #ifdef __APPLE__
     compiler = "clang";
 #endif
 
-    std::string cmd = compiler + " -O2 -o \"" + outFile + "\" \"" + cFile + "\"";
+    std::string cmd = compiler + " -O2 -o " + shellQuotePath(outFile) + " " + shellQuotePath(cFile);
     std::cout << "[Cross-compile via C] " << cmd << std::endl;
     int result = std::system(cmd.c_str());
     if (result != 0) {

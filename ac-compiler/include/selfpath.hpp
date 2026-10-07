@@ -32,3 +32,16 @@ inline long acSelfExe(char* buf, size_t cap) {
     return -1;
 #endif
 }
+
+// Modification time of the running compiler binary (0 if unknown). A cache written by an older build
+// of the compiler is stale: the same source can lower or parse differently after a rebuild.
+#include <ctime>
+#include <sys/stat.h>
+inline time_t acCompilerMtime() {
+    char buf[4096] = {};
+    long n = acSelfExe(buf, sizeof(buf) - 1);
+    if (n <= 0) return 0;
+    struct stat st{};
+    if (stat(std::string(buf, (size_t)n).c_str(), &st) != 0) return 0;
+    return st.st_mtime;
+}

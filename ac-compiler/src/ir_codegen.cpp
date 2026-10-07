@@ -1,4 +1,5 @@
 #include "../include/selfpath.hpp"
+#include "../include/ilib_path.hpp"
 #include "../include/ac.hpp"
 #include "../include/wasm_blobs.hpp"
 #include <sstream>
@@ -42,28 +43,37 @@ static std::pair<std::string, std::string> splitSeqStep(const std::string& conte
 // Reads library/<libName>/ffi/<libName>_ffi.<ext>.
 // Tries cwd-relative first, then binary-relative so "ac examples/foo.ac" works.
 // Optional out-param foundLibDir: set to the absolute library/<libName> directory.
+// Tries library/ilib/<libName>/ first, then library/elib/<libName>/ — same reasoning
+// as resolveIlibDir's own comment (below): a default-shipped ilib lives under ilib/,
+// an atar-installed elib that bundles its own native code (one `use ilib <name>` plus
+// a co-located ffi/ it ships with the package) lives under elib/ instead, and this
+// reader needs to find either one by the same name without main.cpp knowing about it.
 static std::string readFFIFile(const std::string &libName, const std::string &ext,
                                std::string *foundLibDir = nullptr)
 {
     auto tryBase = [&](const std::string &base) -> std::string {
-        std::string path = base + "/library/ilib/" + libName + "/ffi/" + libName + "_ffi." + ext;
-        FILE *f = std::fopen(path.c_str(), "r");
-        if (!f) return "";
-        std::string content;
-        char buf[4096];
-        while (std::fgets(buf, sizeof(buf), f)) content += buf;
-        std::fclose(f);
-        if (foundLibDir) {
-            std::string rawDir = base + "/library/ilib/" + libName;
+        for (const char* kind : {"/library/ilib/", "/library/elib/"}) {
+            std::string sub = std::string(kind) == "/library/ilib/" ? ilibSubdir(libName) : libName;
+            std::string path = base + kind + sub + "/ffi/" + libName + "_ffi." + ext;
+            FILE *f = std::fopen(path.c_str(), "r");
+            if (!f) continue;
+            std::string content;
+            char buf[4096];
+            while (std::fgets(buf, sizeof(buf), f)) content += buf;
+            std::fclose(f);
+            if (foundLibDir) {
+                std::string rawDir = base + kind + libName;
 #ifndef _WIN32
-            char realBuf[4096] = {};
-            *foundLibDir = realpath(rawDir.c_str(), realBuf) ? std::string(realBuf) : rawDir;
+                char realBuf[4096] = {};
+                *foundLibDir = realpath(rawDir.c_str(), realBuf) ? std::string(realBuf) : rawDir;
 #else
-            char realBuf[4096] = {};
-            *foundLibDir = _fullpath(realBuf, rawDir.c_str(), sizeof(realBuf)) ? std::string(realBuf) : rawDir;
+                char realBuf[4096] = {};
+                *foundLibDir = _fullpath(realBuf, rawDir.c_str(), sizeof(realBuf)) ? std::string(realBuf) : rawDir;
 #endif
+            }
+            return content;
         }
-        return content;
+        return "";
     };
 
     // 1. cwd-relative (works when run from project root)
@@ -89,24 +99,35 @@ static std::string readFFIFile(const std::string &libName, const std::string &ex
 
 // Returns the absolute path of the ilib directory for a given library name.
 // Used to emit absolute -L and #include paths in C/C++ generated code.
+// A plain "ilib" is one of the small, fixed set shipped by default (hardcoded lists in
+// main.cpp). An "elib" (installed via atar into library/elib/<name>/) is never in those
+// lists — but one that genuinely needs native/compiled code (real sockets, GPU access,
+// etc, not expressible as pure AC source) bundles that code alongside its own lib.ac,
+// under the exact same <name>/ convention an ilib uses. `use ilib <name>` inside such an
+// elib's own lib.ac still names the native component directly; this resolver just also
+// checks library/elib/<name>/ as a fallback when library/ilib/<name>/ doesn't exist, so
+// that single keyword works for both without the elib ever touching main.cpp's lists.
 static std::string resolveIlibDir(const std::string& libName) {
     auto tryBase = [&](const std::string& base) -> std::string {
-        std::string raw = base + "/library/ilib/" + libName;
+        for (const char* kind : {"/library/ilib/", "/library/elib/"}) {
+            std::string raw = base + kind + ilibSubdir(libName);
 #ifndef _WIN32
-        struct stat st{};
-        if (::stat(raw.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return "";
-        char buf[4096] = {};
-        return realpath(raw.c_str(), buf) ? std::string(buf) : raw;
+            struct stat st{};
+            if (::stat(raw.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            char buf[4096] = {};
+            return realpath(raw.c_str(), buf) ? std::string(buf) : raw;
 #else
-        // Windows: resolve to a full path, and (like the POSIX branch) only accept a directory that EXISTS —
-        // this used to return the path unchecked, so the `.` (cwd) candidate always won and ac.exe emitted
-        // `#include "<cwd>\library\ilib\math/..."` for a library that lives next to the exe instead.
-        char buf[4096] = {};
-        std::string full = _fullpath(buf, raw.c_str(), sizeof(buf)) ? std::string(buf) : raw;
-        struct stat st{};
-        if (::stat(full.c_str(), &st) != 0 || !(st.st_mode & S_IFDIR)) return "";
-        return full;
+            // Windows: resolve to a full path, and (like the POSIX branch) only accept a directory that EXISTS —
+            // this used to return the path unchecked, so the `.` (cwd) candidate always won and ac.exe emitted
+            // `#include "<cwd>\library\ilib\math/..."` for a library that lives next to the exe instead.
+            char buf[4096] = {};
+            std::string full = _fullpath(buf, raw.c_str(), sizeof(buf)) ? std::string(buf) : raw;
+            struct stat st{};
+            if (::stat(full.c_str(), &st) != 0 || !(st.st_mode & S_IFDIR)) continue;
+            return full;
 #endif
+        }
+        return "";
     };
     if (const char* acp = getenv("AC_PATH")) {
         std::string r0 = tryBase(acp);
@@ -132,7 +153,7 @@ static std::string resolveIlibDir(const std::string& libName) {
         if (!r.empty()) return r;
     }
 #endif
-    return "./library/ilib/" + libName; // relative fallback
+    return "./library/ilib/" + ilibSubdir(libName); // relative fallback
 }
 
 // Read a raw top-level ilib file (library/ilib/<libName>/<fileName>) — distinct from
@@ -374,6 +395,9 @@ static bool isIntReturningMathFunc(const char* s) {
         || strcmp(name, "abs_int")  == 0
         || strcmp(name, "mod_int")  == 0
         || strcmp(name, "gcd")      == 0
+        || strcmp(name, "modpow")   == 0
+        || strcmp(name, "modinv")   == 0
+        || strcmp(name, "modmul")   == 0
         || strcmp(name, "lcm")      == 0
         || strcmp(name, "is_prime") == 0;
 }
@@ -643,6 +667,9 @@ public:
             // silently miscompared or, on typed backends, wrapped the real `const char*` in an
             // int-to-string coercion instead of using it directly (hard compile error).
             f == "maudio_listen" || f == "maudio.listen") return true;
+        // native-cpu's ptr_deref(p) returns the stored bytes as a string (C/C++/Rust/Go/Java/V
+        // all read it through ac_ncpu_ptr_deref_str), not the 3-argument byte-count form.
+        if (f == "ptr_deref" || f == "ncpu.ptr_deref" || f == "ncpu_ptr_deref" || f == "AcNcpu.ptrDeref") return true;
         // ilib string-returning functions (dotted and underscore forms)
         // `bash`/`sbash` do NOT belong here — both are documented `int ac_os_bash(const char*)`/
         // `ac_os_sbash(...)` in os_c.h and confirmed by every backend's own real implementation
@@ -655,7 +682,9 @@ public:
         // operator '<'" comparing a String against a long literal).
         static const std::set<std::string> tails = {
             "upper", "lower", "trim", "strip", "replace", "b", "format", "getline",
-            "cwd", "env", "read", "read_from", "search", "escape", "join",
+            "cwd", "env", "read", "read_from", "search", "escape", "join", "replace_all",
+            "strip_clause", "stripln", "split_nth", "f", "t",
+            "tmpdir", "tmpfile", "mktmpdir", "homedir", "basename", "dirname",
         };
         for (const char* ns : {"stringm", "os", "regex"}) {
             std::string d = std::string(ns) + ".", u = std::string(ns) + "_";
@@ -678,14 +707,25 @@ public:
         // string-tail tables above.
         if (f == "sidebar.ask" || f == "sidebar_ask" ||
             f == "sidebar.getinput" || f == "sidebar_getinput") return true;
+        // dns elib (library/elib/dns — a native component bundled WITH the elib, not a
+        // default-shipped ilib; see resolveIlibDir's comment): resolve/list return real
+        // text (a backend address / a formatted record listing), never a number.
+        if (f == "dns.resolve" || f == "dns_resolve" ||
+            f == "dns.list" || f == "dns_list") return true;
         return false;
     }
 
     // ilib functions that return a list of strings — typed backends need an explicit
     // []string / Vec<String>-style declaration instead of the plain int64/i64 default.
-    // Currently only stringm.split; extend the tails set if more are added.
+    // Add a name here when the ilib call returns a list of strings.
     static bool isAcStrListFunc(const std::string &f) {
-        return f == "stringm.split" || f == "stringm_split";
+        // stringm.split and regex's list-returning calls (split / find_all / groups) all
+        // return a list of strings.
+        return f == "stringm.split" || f == "stringm_split" ||
+               f == "regex.split" || f == "regex_split" ||
+               f == "regex.find_all" || f == "regex_find_all" ||
+               f == "regex.groups" || f == "regex_groups" ||
+               f == "os.listdir" || f == "os_listdir";
     }
 
     virtual void emit(std::ostringstream &out, int indent, const std::string &line) = 0;
@@ -761,6 +801,25 @@ public:
                               const std::string &lhs, const std::string &rhs, const std::string &op) = 0;
     virtual void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                                 const std::string &lhs, const std::string &rhs, const std::string &op) = 0;
+    // `subject % pattern` (IROpcode::WILDCARD_MATCH): a bool. Lowered per backend; until a backend
+    // overrides this, reaching it is a backend error (main.cpp also rejects unlowered programs up front).
+    virtual void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                                   const std::string &subject, const std::string &pattern)
+    {
+        (void)out; (void)indent; (void)res; (void)subject; (void)pattern;
+        throw ACError::backend("the '%' wildcard operator is not lowered for this backend yet");
+    }
+    // `dict has key` (IROpcode::DICT_HAS): a bool, true when the key is present. Lowered per backend;
+    // until a backend overrides this, reaching it is a backend error.
+    virtual void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                             const std::string &dict, const std::string &key)
+    {
+        (void)out; (void)indent; (void)res; (void)dict; (void)key;
+        throw ACError::backend("'has' (dict key check) is not lowered for this backend yet");
+    }
+    // A statement with no code of its own (`pass`). Most targets need no line; Python needs `pass`
+    // wherever a block would otherwise be empty.
+    virtual void emitNop(std::ostringstream &out, int &indent) { (void)out; (void)indent; }
     virtual void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                           const std::string &func, const std::string &args) = 0;
     virtual void emitReturn(std::ostringstream &out, int &indent, const std::string &val) = 0;
@@ -785,8 +844,15 @@ public:
     // IRRef, letting ASM intercept and print real text WITHOUT changing null/nil's value
     // representation anywhere else. Default: not handled, falls through to the normal ref+emitPrint
     // path (every other backend keeps working exactly as before).
-    virtual bool emitPrintNullText(std::ostringstream &out, int &indent, bool isNil) {
-        (void)out; (void)indent; (void)isNil; return false;
+    // A keyword literal printed as its PY text (`True`, `None`, `set()`). Every backend prints it as a
+    // plain string literal, so one path gives the same output everywhere.
+    virtual void emitPrintLiteral(std::ostringstream &out, int &indent, const std::string &text) {
+        emitPrint(out, indent, "\"" + text + "\"");
+    }
+    // A runtime bool (a wildcard match, to_bool, ...) prints as True/False. The default is the plain
+    // print; backends that can tell a bool at run time override it.
+    virtual void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) {
+        emitPrint(out, indent, val);
     }
     // style: "bold", "italic", "header", "link", "title" — default falls back to plain print
     virtual void emitStyledPrint(std::ostringstream &out, int &indent,
@@ -970,6 +1036,8 @@ public:
     // callback slot — see its emitCall's `btn` handling) override it. NOT the same thing as
     // setFuncTypedParams, which tracks a narrower case (a function PARAMETER used as a callee).
     virtual void setUserFuncArity(const std::map<std::string, int>&) {}
+    // Per user function, one flag per parameter position: true when that parameter is a list.
+    virtual void setUserFuncListArgs(const std::map<std::string, std::vector<bool>>&) {}
     // Whole-program map: user function name -> indices of its parameters that are float-typed
     // (see #floatparam). Lets a CALL SITE cast an int-literal/int-typed argument to f64 for a
     // callee param the callee's OWN body treats as float (e.g. `collatz(6)` calling a `n: f64`
@@ -984,6 +1052,9 @@ public:
     // typed backends must declare them as arrays, not integers.
     std::set<std::string> listParams_;
     virtual void setListParams(const std::set<std::string>& s) { listParams_ = s; }
+    // List params the body REBINDS (`psi = []`): PY rebinds only the local name, so these stay by value.
+    std::set<std::string> reboundParams_;
+    virtual void setReboundParams(const std::set<std::string>& s) { reboundParams_ = s; }
     // Params inferred float-typed from local usage (see detectFloatParams) — default no-op;
     // only backends whose param types must be explicit and correct up front (no implicit
     // numeric coercion at use sites) need to override this. Currently just RustStrategy.
@@ -1170,6 +1241,7 @@ public:
     // needsSave_ is false) just no-ops here, matching every print call site rather than
     // duplicating each backend's own type-detection logic (isFloatVal/isStr/etc.) a second time.
     virtual void setNeedsSave(bool) {}
+    virtual void setNeedsWildcard(bool) {}
     // Which of the misc runtime-helper builtins (ac_ipow/ac_div/ac_length/_ac_add/random) this
     // PROGRAM actually uses — a backend whose preamble injects one function per builtin
     // unconditionally (Python) should gate each on the matching flag here instead of emitting
@@ -1240,6 +1312,9 @@ public:
 
     virtual void setReturnIsFloat(bool) {}  // called before emitFunctionBegin
     virtual void setFloatReturnFuncs(const std::set<std::string>&) {}  // funcs that return float
+    // Per function: which parameter positions are floats. A backend that passes arguments in
+    // integer registers (ASM) converts an integer argument bound to a float parameter at the call.
+    virtual void setCalleeFloatParams(const std::map<std::string, std::vector<bool>>&) {}
     virtual void setReturnIsList(bool v) { baseReturnIsList_ = v; }
     bool baseReturnIsList_ = false;
     bool baseReturnIsString_ = false;
@@ -1312,16 +1387,29 @@ static std::vector<std::string> splitCommaTrimmed(const std::string& content) {
 
 // Convert "key1:val1,key2:val2" dict content to raw {key, value} pairs.
 // Dollar-sign strings like $Alice$ are stored as-is; bare identifiers too.
+// First `ch` that is not inside a $...$ string span (a string value may hold ',' or ':').
+static size_t findDictSep(const std::string& s, char ch) {
+    bool inSpan = false;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '$') inSpan = !inSpan;
+        else if (!inSpan && s[i] == ch) return i;
+    }
+    return std::string::npos;
+}
+static std::string trimDictText(const std::string& t) {
+    size_t a = t.find_first_not_of(' '), b = t.find_last_not_of(' ');
+    return a == std::string::npos ? "" : t.substr(a, b - a + 1);
+}
 static std::vector<std::pair<std::string,std::string>> parseDictPairs(const std::string& content) {
     std::vector<std::pair<std::string,std::string>> out;
     std::string s = content;
     while (!s.empty()) {
-        auto comma = s.find(',');
+        auto comma = findDictSep(s, ',');
         std::string pair = comma == std::string::npos ? s : s.substr(0, comma);
         s = comma == std::string::npos ? "" : s.substr(comma + 1);
-        auto colon = pair.find(':');
+        auto colon = findDictSep(pair, ':');
         if (colon != std::string::npos)
-            out.push_back({pair.substr(0, colon), pair.substr(colon + 1)});
+            out.push_back({trimDictText(pair.substr(0, colon)), trimDictText(pair.substr(colon + 1))});
     }
     return out;
 }
@@ -1378,6 +1466,16 @@ static std::string fmtDictValStr(const std::string& v) {
 
 // 1. PYTHON  (AC->PY)
 // ═══════════════════════════════════════════════════════════════════════════
+
+// A Python variable name that is a keyword gets `_ac` (see PythonStrategy::formatRef).
+static std::string pyVarName(const std::string& n) {
+    static const std::set<std::string> pyKeywords = {
+        "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+        "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+        "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+        "return", "try", "while", "with", "yield"};
+    return pyKeywords.count(n) ? n + "_ac" : n;
+}
 
 class PythonStrategy : public BackendStrategy
 {
@@ -1440,6 +1538,8 @@ class PythonStrategy : public BackendStrategy
         out << std::string(indent * 4, ' ') << line << "\n";
     }
     void emitRaw(std::ostringstream &out, const std::string &line) override { out << line << "\n"; }
+    // An empty block (a lone `pass`) is a syntax error in Python, so a no-op becomes `pass`.
+    void emitNop(std::ostringstream &out, int &indent) override { emit(out, indent, "pass"); }
 
     void setNeedsEvents(bool v) override { needsEvents_ = v; }
     void setPendingImports(const std::vector<std::pair<std::string,std::string>>& imp) override
@@ -1485,6 +1585,22 @@ class PythonStrategy : public BackendStrategy
         emitRaw(out, "    return str(d)");
         emitRaw(out, "def _ac_smartprint(d):");
         emitRaw(out, "    print(_ac_smartfmt(d))");
+        // `subject % pattern`: % matches any run of characters (none included); the whole subject
+        // must match. Backtracks to the last % (linear-space glob matcher, same as the C one).
+        emitRaw(out, "def _ac_wildcard_match(s, p):");
+        emitRaw(out, "    star = -1; mark = 0; i = 0; j = 0");
+        emitRaw(out, "    while i < len(s):");
+        emitRaw(out, "        if j < len(p) and p[j] == '%':");
+        emitRaw(out, "            star = j; mark = i; j += 1");
+        emitRaw(out, "        elif j < len(p) and p[j] == s[i]:");
+        emitRaw(out, "            i += 1; j += 1");
+        emitRaw(out, "        elif star >= 0:");
+        emitRaw(out, "            j = star + 1; mark += 1; i = mark");
+        emitRaw(out, "        else:");
+        emitRaw(out, "            return False");
+        emitRaw(out, "    while j < len(p) and p[j] == '%':");
+        emitRaw(out, "        j += 1");
+        emitRaw(out, "    return j == len(p)");
         if (needsSave_) emitRaw(out, "_ac_saved = []  # `save as`: accumulates everything printed so far");
         if (anyAtomicVars()) {
             emitRaw(out, "import threading");
@@ -1607,9 +1723,12 @@ class PythonStrategy : public BackendStrategy
 
     bool dotCallSyntax() const override { return true; }
 
+    // Python keywords can't be variable names. An AC variable called `while` (or `def`, `lambda`, ...)
+    // gets an `_ac` suffix in the output, as CStrategy's cEscape does for libc names.
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
-        return commonRef(r, sym, "True", "False", "None", "set()");
+        std::string s = commonRef(r, sym, "True", "False", "None", "set()");
+        return r.kind == IRRef::Kind::VAR ? pyVarName(s) : s;
     }
 
     void emitTypeCast(std::ostringstream &out, int &indent,
@@ -1686,6 +1805,18 @@ class PythonStrategy : public BackendStrategy
             emit(out, indent, res + " = " + lhs + " " + op + " " + rhs);
         }
     }
+    // `dict has key`: Python's own `in` on the dict.
+    void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        emit(out, indent, res + " = " + key + " in " + dict);
+    }
+    // `subject % pattern` -> a Python bool from the prelude matcher (prints True/False, like PY's own bools).
+    void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        emit(out, indent, res + " = _ac_wildcard_match(" + subject + ", " + pattern + ")");
+    }
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
@@ -1741,7 +1872,8 @@ class PythonStrategy : public BackendStrategy
     }
     void emitHalt(std::ostringstream &out, int &indent) override
     {
-        emit(out, indent, "sys.stdout.flush(); os.abort()");
+        // `os` is the program's own ilib name when one is imported: abort through a fresh import of the stdlib module.
+        emit(out, indent, "sys.stdout.flush(); import os as _ac_os; _ac_os.abort()");
     }
     void emitSoftHalt(std::ostringstream &out, int &indent) override
     {
@@ -1812,7 +1944,9 @@ class PythonStrategy : public BackendStrategy
             bool first = true;
             for (auto& [k, v] : parseDictPairs(content)) {
                 if (!first) d += ", ";
-                d += fmtDictKey(k) + ": " + fmtDictVal(v);
+                // a bare identifier value is a variable reference: same rename as its declaration
+                bool bareName = !v.empty() && (std::isalpha((unsigned char)v[0]) || v[0] == '_');
+                d += fmtDictKey(k) + ": " + (bareName ? pyVarName(v) : fmtDictVal(v));
                 first = false;
             }
             emit(out, indent, var + " = " + d + "}");
@@ -1895,7 +2029,7 @@ class PythonStrategy : public BackendStrategy
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
     {
         std::string m = msg.empty() ? "\"Fatality occurred\"" : msg;
-        emit(out, indent, "import sys as _sys; _sys.stderr.write(\"Preposterous: \" + str(" + m + ") + \"\\n\"); os.abort()");
+        emit(out, indent, "import sys as _sys; _sys.stderr.write(\"Preposterous: \" + str(" + m + ") + \"\\n\"); import os as _ac_os; _ac_os.abort()");
     }
     void emitRaiseClause(std::ostringstream &out, int &indent,
                           const std::string &clause, const std::string &msg) override
@@ -2022,6 +2156,9 @@ protected:
     // whole numbers) instead of the default `_acp` — a real value-vs-display bug, not cosmetic
     // (silently makes a float look like an int in the program's actual output).
     std::set<std::string> floatVars_;
+    // Names bound to a dict literal (ALLOC "dict"). A read of one goes through _acDictGet so a
+    // missing key raises KeyError like PY, instead of JS's silent `undefined`.
+    std::set<std::string> jsDictVars_;
 
     // Whole-program set of user-defined AC functions that return a float, pushed in via
     // setFloatReturnFuncs (see BackendStrategy's own comment — every static backend already
@@ -2160,6 +2297,22 @@ private:
         emitRaw(out, "'use strict';");
         emitWasmBootstrap(out);
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
+        // `subject % pattern`: linear glob, `%` = any run of characters; backtrack to the last `%`.
+        emitRaw(out, "function ac_wildcard_match(s, p) {");
+        emitRaw(out, "    let si = 0, pi = 0, starP = -1, starS = 0;");
+        emitRaw(out, "    while (si < s.length) {");
+        emitRaw(out, "        if (pi < p.length && p[pi] === '%') { starP = pi++; starS = si; }");
+        emitRaw(out, "        else if (pi < p.length && p[pi] === s[si]) { pi++; si++; }");
+        emitRaw(out, "        else if (starP >= 0) { pi = starP + 1; si = ++starS; }");
+        emitRaw(out, "        else return false;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    while (pi < p.length && p[pi] === '%') pi++;");
+        emitRaw(out, "    return pi === p.length;");
+        emitRaw(out, "}");
+        emitRaw(out, "function _acDictGet(d, k) {");
+        emitRaw(out, "    if (!Object.prototype.hasOwnProperty.call(d, k)) throw new Error('Preposterous: KeyError: ' + k);");
+        emitRaw(out, "    return d[k];");
+        emitRaw(out, "}");
         emitRaw(out, "function ac_iota(n) {");
         emitRaw(out, "    let r = '';");
         emitRaw(out, "    for (let i = 0; i < n; i++) r += i;");
@@ -2207,6 +2360,7 @@ private:
         // -> scientific) directly on top of toExponential(15), which gives exact digits with no
         // native-rounding surprises. Verified byte-for-byte against real `%.16g` output across a
         // spread including whole/negative/tiny/huge/scientific-boundary values.
+        emitRaw(out, "function ac_tostr(v) { if (Array.isArray(v)) return '[' + v.map(x => typeof x === 'string' ? \"'\" + x + \"'\" : ac_tostr(x)).join(', ') + ']'; return String(v); }");
         emitRaw(out, "function ac_fmtg(d) {");
         emitRaw(out, "    if (d === 0) return Object.is(d, -0) ? '-0' : '0';");
         emitRaw(out, "    const neg = d < 0, ad = Math.abs(d);");
@@ -2265,6 +2419,111 @@ private:
             if (lt == "ilib" && ln == "math") {
                 // JS math = native Math — the FFI needed the ffi-napi npm module; the browser
                 // (HTML backend inherits this) has no FFI at all. Math.* covers the surface.
+                emitRaw(out, "// ── formula evaluator and calculus (port of math.cpp and calculus.hpp) ──");
+                emitRaw(out, "const _calcLib = (() => {");
+                emitRaw(out, "  const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);");
+                emitRaw(out, "  const isAlpha = c => /[A-Za-z_]/.test(c);");
+                emitRaw(out, "  const isAlnum = c => /[A-Za-z_0-9]/.test(c);");
+                emitRaw(out, "  const isDigit = c => c >= '0' && c <= '9';");
+                emitRaw(out, "  const CONSTS = { pi: Math.PI, e: Math.E, tau: 2 * Math.PI, em: 0.5772156649015329, phi: 1.6180339887498949, inf: Infinity };");
+                emitRaw(out, "  const TWO = { pow: Math.pow, atan2: Math.atan2, log: (b, x) => Math.log(x) / Math.log(b), hypot: Math.hypot, mod: (a, b) => a % b, min: Math.min, max: Math.max };");
+                emitRaw(out, "  const ONE = {");
+                emitRaw(out, "    sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,");
+                emitRaw(out, "    sqrt: Math.sqrt, cbrt: Math.cbrt, abs: Math.abs, floor: Math.floor, ceil: Math.ceil,");
+                emitRaw(out, "    round: a => Math.sign(a) * Math.round(Math.abs(a)), ln: Math.log, log: Math.log, log2: Math.log2, log10: Math.log10,");
+                emitRaw(out, "    exp: Math.exp, deg2rad: d => d * Math.PI / 180, rad2deg: r => r * 180 / Math.PI,");
+                emitRaw(out, "  };");
+                emitRaw(out, "  // The formula with its variable x set to x. An unknown name or a bad number gives NaN.");
+                emitRaw(out, "  function evalAt(s, x) {");
+                emitRaw(out, "    let i = 0;");
+                emitRaw(out, "    const peek = () => (i < s.length ? s[i] : '');");
+                emitRaw(out, "    const skip = () => { while (i < s.length && (s[i] === ' ' || s[i] === '\\t')) i++; };");
+                emitRaw(out, "    function expr() {");
+                emitRaw(out, "      let v = term(); skip();");
+                emitRaw(out, "      while (peek() === '+' || peek() === '-') { const op = peek(); i++; const r = term(); v = op === '+' ? v + r : v - r; skip(); }");
+                emitRaw(out, "      return v;");
+                emitRaw(out, "    }");
+                emitRaw(out, "    function term() {");
+                emitRaw(out, "      let v = factor(); skip();");
+                emitRaw(out, "      while (peek() === '*' || peek() === '/' || peek() === '%') {");
+                emitRaw(out, "        const op = peek(); i++; const r = factor();");
+                emitRaw(out, "        v = op === '*' ? v * r : op === '/' ? v / r : v % r; skip();");
+                emitRaw(out, "      }");
+                emitRaw(out, "      return v;");
+                emitRaw(out, "    }");
+                emitRaw(out, "    function factor() {");
+                emitRaw(out, "      const b = base(); skip();");
+                emitRaw(out, "      if (peek() === '^') { i++; const e = factor(); return Math.pow(b, e); }");
+                emitRaw(out, "      return b;");
+                emitRaw(out, "    }");
+                emitRaw(out, "    function base() {");
+                emitRaw(out, "      skip();");
+                emitRaw(out, "      const c = peek();");
+                emitRaw(out, "      if (c === '(') { i++; const v = expr(); skip(); if (peek() === ')') i++; return v; }");
+                emitRaw(out, "      if (c === '-') { i++; return -factor(); }");
+                emitRaw(out, "      if (c === '+') { i++; return factor(); }");
+                emitRaw(out, "      if (c !== '' && isAlpha(c)) {");
+                emitRaw(out, "        const start = i;");
+                emitRaw(out, "        while (i < s.length && isAlnum(s[i])) i++;");
+                emitRaw(out, "        const name = s.slice(start, i);");
+                emitRaw(out, "        skip();");
+                emitRaw(out, "        if (name === 'x' && peek() !== '(') return x;");
+                emitRaw(out, "        if (own(CONSTS, name)) return CONSTS[name];");
+                emitRaw(out, "        if (peek() === '(') {");
+                emitRaw(out, "          i++;");
+                emitRaw(out, "          const a = expr(); skip();");
+                emitRaw(out, "          if (peek() === ',') {");
+                emitRaw(out, "            i++; const b2 = expr(); skip();");
+                emitRaw(out, "            if (peek() === ')') i++;");
+                emitRaw(out, "            return own(TWO, name) ? TWO[name](a, b2) : NaN;");
+                emitRaw(out, "          }");
+                emitRaw(out, "          if (peek() === ')') i++;");
+                emitRaw(out, "          return own(ONE, name) ? ONE[name](a) : NaN;");
+                emitRaw(out, "        }");
+                emitRaw(out, "        return NaN;");
+                emitRaw(out, "      }");
+                emitRaw(out, "      const m = /^[0-9]*\\.?[0-9]*(?:[eE][+-]?[0-9]+)?/.exec(s.slice(i));");
+                emitRaw(out, "      if (!m || m[0] === '' || m[0] === '.') return NaN;");
+                emitRaw(out, "      i += m[0].length;");
+                emitRaw(out, "      return parseFloat(m[0]);");
+                emitRaw(out, "    }");
+                emitRaw(out, "    return expr();");
+                emitRaw(out, "  }");
+                emitRaw(out, "  const evalF = (f, x) => evalAt(String(f), x);");
+                emitRaw(out, "  const simpson = (g, a, b) => { const c = (a + b) / 2; return (b - a) / 6 * (g(a) + 4 * g(c) + g(b)); };");
+                emitRaw(out, "  function adaptive(g, a, b, tol, whole, depth) {");
+                emitRaw(out, "    const c = (a + b) / 2;");
+                emitRaw(out, "    const l = simpson(g, a, c), r = simpson(g, c, b);");
+                emitRaw(out, "    if (depth <= 0 || Math.abs(l + r - whole) <= 15 * tol) return l + r + (l + r - whole) / 15;");
+                emitRaw(out, "    return adaptive(g, a, c, tol / 2, l, depth - 1) + adaptive(g, c, b, tol / 2, r, depth - 1);");
+                emitRaw(out, "  }");
+                emitRaw(out, "  function golden(g, a, b) {");
+                emitRaw(out, "    const phi = (Math.sqrt(5) - 1) / 2;");
+                emitRaw(out, "    let c = b - phi * (b - a), d = a + phi * (b - a);");
+                emitRaw(out, "    while (Math.abs(b - a) > 1e-9) {");
+                emitRaw(out, "      if (g(c) < g(d)) b = d; else a = c;");
+                emitRaw(out, "      c = b - phi * (b - a); d = a + phi * (b - a);");
+                emitRaw(out, "    }");
+                emitRaw(out, "    return (a + b) / 2;");
+                emitRaw(out, "  }");
+                emitRaw(out, "  return {");
+                emitRaw(out, "    eval: f => evalF(f, 0),");
+                emitRaw(out, "    integrate: (f, a, b) => { const g = x => evalF(f, x); return adaptive(g, a, b, 1e-9, simpson(g, a, b), 20); },");
+                emitRaw(out, "    derivative: (f, x) => { const h = 1e-7; return (evalF(f, x + h) - evalF(f, x - h)) / (2 * h); },");
+                emitRaw(out, "    limit: (f, x) => {");
+                emitRaw(out, "      let l = NaN, r = NaN;");
+                emitRaw(out, "      for (let h = 1e-3; h >= 1e-8 - 1e-20; h /= 10) {");
+                emitRaw(out, "        l = evalF(f, x - h); r = evalF(f, x + h);");
+                emitRaw(out, "        if (!Number.isFinite(l) || !Number.isFinite(r)) return NaN;");
+                emitRaw(out, "      }");
+                emitRaw(out, "      const scale = Math.max(1, Math.abs(l), Math.abs(r));");
+                emitRaw(out, "      if (Math.abs(l - r) > 1e-6 * scale) return NaN;");
+                emitRaw(out, "      return (l + r) / 2;");
+                emitRaw(out, "    },");
+                emitRaw(out, "    minima: (f, a, b) => golden(x => evalF(f, x), a, b),");
+                emitRaw(out, "    maxima: (f, a, b) => golden(x => -evalF(f, x), a, b),");
+                emitRaw(out, "  };");
+                emitRaw(out, "})();");
                 emitRaw(out, "const math = {");
                 emitRaw(out, "  pi: Math.PI, e: Math.E, tau: 2*Math.PI, phi: 1.6180339887498949, em: 0.5772156649015329,");
                 emitRaw(out, "  sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,");
@@ -2275,6 +2534,11 @@ private:
                 emitRaw(out, "  mod: (a, b) => { let r = a % b; if (r !== 0 && (r < 0) !== (b < 0)) r += b; return r; },");
                 emitRaw(out, "  mod_int: (a, b) => { let r = Math.trunc(a) % Math.trunc(b); if (r !== 0 && (r < 0) !== (b < 0)) r += Math.trunc(b); return r; },");
                 emitRaw(out, "  is_prime: (n) => { if (n < 2) return 0; for (let d = 2; d*d <= n; d++) if (n % d === 0) return 0; return 1; },");
+                emitRaw(out, "  modpow: (b, e, m) => { if (m <= 0 || e < 0) return -1; const M = BigInt(m); let r = 1n % M, x = ((BigInt(b) % M) + M) % M, k = BigInt(e); while (k > 0n) { if (k & 1n) r = r * x % M; x = x * x % M; k >>= 1n; } return Number(r); },");
+                emitRaw(out, "  modinv: (a, m) => { if (m <= 1) return -1; let r0 = ((a % m) + m) % m, r1 = m, s0 = 1, s1 = 0; while (r1 !== 0) { const q = Math.trunc(r0 / r1); [r0, r1] = [r1, r0 - q*r1]; [s0, s1] = [s1, s0 - q*s1]; } if (r0 !== 1) return -1; return ((s0 % m) + m) % m; },");
+                emitRaw(out, "  modmul: (a, b, m) => { if (m <= 0) return -1; const M = BigInt(m); return Number((((BigInt(a) % M) + M) % M) * (((BigInt(b) % M) + M) % M) % M); },");
+                emitRaw(out, "  eval: (f) => _calcLib.eval(f), integrate: (f, a, b) => _calcLib.integrate(f, a, b), derivative: (f, x) => _calcLib.derivative(f, x),");
+                emitRaw(out, "  limit: (f, x) => _calcLib.limit(f, x), minima: (f, a, b) => _calcLib.minima(f, a, b), maxima: (f, a, b) => _calcLib.maxima(f, a, b),");
                 emitRaw(out, "  to_int: Math.trunc, deg2rad: (x) => x*Math.PI/180, rad2deg: (x) => x*180/Math.PI,");
                 emitRaw(out, "};");
                 continue;
@@ -2388,6 +2652,27 @@ private:
     void emitIntDiv(std::ostringstream &out, int &indent,
                     const std::string &res, const std::string &lhs, const std::string &rhs) override
     { emit(out, indent, decl(res, "ac_idiv(" + lhs + ", " + rhs + ")")); } // throws on 0 so try/catch fires
+    // `dict has key`: an own-property check, so inherited names like "constructor" do not count.
+    void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        std::string expr = "Object.prototype.hasOwnProperty.call(" + dict + ", " + key + ")";
+        if (declared.insert(res).second) emit(out, indent, "let " + res + " = " + expr + ";");
+        else emit(out, indent, res + " = " + expr + ";");
+    }
+    // `subject % pattern` -> a JS boolean (matcher is in the prelude; HTML inherits this).
+    void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        std::string expr = "ac_wildcard_match(" + subject + ", " + pattern + ")";
+        if (declared.insert(res).second) emit(out, indent, "let " + res + " = " + expr + ";");
+        else emit(out, indent, res + " = " + expr + ";");
+    }
+    // A runtime bool prints as True/False: routed through emitPrint so HTML keeps its own sink.
+    void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emitPrint(out, indent, "(" + val + " ? 'True' : 'False')");
+    }
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
@@ -2459,7 +2744,11 @@ private:
     void emitEval(std::ostringstream &out, int &indent,
                   const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
-        if (argIsString) emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')()')()"));
+        if (argIsString) {
+            // Python's eval branch returns float(eval(...)), so the result displays as a float (5.0).
+            emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')')()"));
+            floatVars_.insert(res);
+        }
         else emitLazyEval(out, indent, res, expr);
     }
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
@@ -2581,6 +2870,7 @@ private:
                 d += fmtDictKey(k) + ": " + fmtDictVal(v);
                 first = false;
             }
+            jsDictVars_.insert(var);
             emit(out, indent, kw + var + " = " + d + "};");
         } else if (type == "tuple") {
             emit(out, indent, kw + var + " = [" + content + "];");
@@ -2599,6 +2889,10 @@ private:
                        const std::string &result, const std::string &arr,
                        const std::string &idx) override
     {
+        if (jsDictVars_.count(arr)) {
+            emit(out, indent, "let " + result + " = _acDictGet(" + arr + ", " + idx + ");");
+            return;
+        }
         emit(out, indent, "let " + result + " = " + arr + "[" + idx + "];");
     }
     void emitStoreIndex(std::ostringstream &out, int &indent,
@@ -2736,7 +3030,7 @@ private:
                                       expr = "Math.trunc(Number(" + src + "))";
         else if (t == IRType::STRING) expr = smartPrint_ ? "ac_smartfmt(" + src + ")"
                                              : hardPrint_ ? "ac_hardfmt(" + src + ")"
-                                             : "String(" + src + ")";
+                                             : "ac_tostr(" + src + ")";
         else if (t == IRType::BOOL)   expr = "Boolean(" + src + ") ? 1 : 0";
         else return;
         emit(out, indent, decl(var, expr));
@@ -2843,6 +3137,7 @@ class HTMLStrategy : public JavaScriptStrategy
         // Cross-backend float-display convention (see JavaScriptStrategy::emitHeader's matching
         // `ac_fmtg` for the full rationale/verification — same function, duplicated here since
         // HTMLStrategy has its own separate emitHeader/print path, not JS's `_acpf`).
+        emitRaw(out, "function ac_tostr(v) { if (Array.isArray(v)) return '[' + v.map(x => typeof x === 'string' ? \"'\" + x + \"'\" : ac_tostr(x)).join(', ') + ']'; return String(v); }");
         emitRaw(out, "function ac_fmtg(d) {");
         emitRaw(out, "    if (d === 0) return Object.is(d, -0) ? '-0' : '0';");
         emitRaw(out, "    const neg = d < 0, ad = Math.abs(d);");
@@ -2877,6 +3172,22 @@ class HTMLStrategy : public JavaScriptStrategy
         // containing <script>…</script> or `\"` used to inject markup/JS into the page (XSS).
         emitRaw(out, "function _esc(s){ return String(s).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c])); }");
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
+        // `subject % pattern`: linear glob, `%` = any run of characters; backtrack to the last `%`.
+        emitRaw(out, "function ac_wildcard_match(s, p) {");
+        emitRaw(out, "    let si = 0, pi = 0, starP = -1, starS = 0;");
+        emitRaw(out, "    while (si < s.length) {");
+        emitRaw(out, "        if (pi < p.length && p[pi] === '%') { starP = pi++; starS = si; }");
+        emitRaw(out, "        else if (pi < p.length && p[pi] === s[si]) { pi++; si++; }");
+        emitRaw(out, "        else if (starP >= 0) { pi = starP + 1; si = ++starS; }");
+        emitRaw(out, "        else return false;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    while (pi < p.length && p[pi] === '%') pi++;");
+        emitRaw(out, "    return pi === p.length;");
+        emitRaw(out, "}");
+        emitRaw(out, "function _acDictGet(d, k) {");
+        emitRaw(out, "    if (!Object.prototype.hasOwnProperty.call(d, k)) throw new Error('Preposterous: KeyError: ' + k);");
+        emitRaw(out, "    return d[k];");
+        emitRaw(out, "}");
         emitRaw(out, "function ac_iota(n) {");
         emitRaw(out, "    let r = '';");
         emitRaw(out, "    for (let i = 0; i < n; i++) r += i;");
@@ -2941,6 +3252,111 @@ class HTMLStrategy : public JavaScriptStrategy
         // what's inlined here — that's an inherent limitation of the library, not this loader).
         for (auto& [lt, ln] : pendingImports_) {
             if (lt == "ilib" && ln == "math") {
+                emitRaw(out, "// ── formula evaluator and calculus (port of math.cpp and calculus.hpp) ──");
+                emitRaw(out, "const _calcLib = (() => {");
+                emitRaw(out, "  const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);");
+                emitRaw(out, "  const isAlpha = c => /[A-Za-z_]/.test(c);");
+                emitRaw(out, "  const isAlnum = c => /[A-Za-z_0-9]/.test(c);");
+                emitRaw(out, "  const isDigit = c => c >= '0' && c <= '9';");
+                emitRaw(out, "  const CONSTS = { pi: Math.PI, e: Math.E, tau: 2 * Math.PI, em: 0.5772156649015329, phi: 1.6180339887498949, inf: Infinity };");
+                emitRaw(out, "  const TWO = { pow: Math.pow, atan2: Math.atan2, log: (b, x) => Math.log(x) / Math.log(b), hypot: Math.hypot, mod: (a, b) => a % b, min: Math.min, max: Math.max };");
+                emitRaw(out, "  const ONE = {");
+                emitRaw(out, "    sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,");
+                emitRaw(out, "    sqrt: Math.sqrt, cbrt: Math.cbrt, abs: Math.abs, floor: Math.floor, ceil: Math.ceil,");
+                emitRaw(out, "    round: a => Math.sign(a) * Math.round(Math.abs(a)), ln: Math.log, log: Math.log, log2: Math.log2, log10: Math.log10,");
+                emitRaw(out, "    exp: Math.exp, deg2rad: d => d * Math.PI / 180, rad2deg: r => r * 180 / Math.PI,");
+                emitRaw(out, "  };");
+                emitRaw(out, "  // The formula with its variable x set to x. An unknown name or a bad number gives NaN.");
+                emitRaw(out, "  function evalAt(s, x) {");
+                emitRaw(out, "    let i = 0;");
+                emitRaw(out, "    const peek = () => (i < s.length ? s[i] : '');");
+                emitRaw(out, "    const skip = () => { while (i < s.length && (s[i] === ' ' || s[i] === '\\t')) i++; };");
+                emitRaw(out, "    function expr() {");
+                emitRaw(out, "      let v = term(); skip();");
+                emitRaw(out, "      while (peek() === '+' || peek() === '-') { const op = peek(); i++; const r = term(); v = op === '+' ? v + r : v - r; skip(); }");
+                emitRaw(out, "      return v;");
+                emitRaw(out, "    }");
+                emitRaw(out, "    function term() {");
+                emitRaw(out, "      let v = factor(); skip();");
+                emitRaw(out, "      while (peek() === '*' || peek() === '/' || peek() === '%') {");
+                emitRaw(out, "        const op = peek(); i++; const r = factor();");
+                emitRaw(out, "        v = op === '*' ? v * r : op === '/' ? v / r : v % r; skip();");
+                emitRaw(out, "      }");
+                emitRaw(out, "      return v;");
+                emitRaw(out, "    }");
+                emitRaw(out, "    function factor() {");
+                emitRaw(out, "      const b = base(); skip();");
+                emitRaw(out, "      if (peek() === '^') { i++; const e = factor(); return Math.pow(b, e); }");
+                emitRaw(out, "      return b;");
+                emitRaw(out, "    }");
+                emitRaw(out, "    function base() {");
+                emitRaw(out, "      skip();");
+                emitRaw(out, "      const c = peek();");
+                emitRaw(out, "      if (c === '(') { i++; const v = expr(); skip(); if (peek() === ')') i++; return v; }");
+                emitRaw(out, "      if (c === '-') { i++; return -factor(); }");
+                emitRaw(out, "      if (c === '+') { i++; return factor(); }");
+                emitRaw(out, "      if (c !== '' && isAlpha(c)) {");
+                emitRaw(out, "        const start = i;");
+                emitRaw(out, "        while (i < s.length && isAlnum(s[i])) i++;");
+                emitRaw(out, "        const name = s.slice(start, i);");
+                emitRaw(out, "        skip();");
+                emitRaw(out, "        if (name === 'x' && peek() !== '(') return x;");
+                emitRaw(out, "        if (own(CONSTS, name)) return CONSTS[name];");
+                emitRaw(out, "        if (peek() === '(') {");
+                emitRaw(out, "          i++;");
+                emitRaw(out, "          const a = expr(); skip();");
+                emitRaw(out, "          if (peek() === ',') {");
+                emitRaw(out, "            i++; const b2 = expr(); skip();");
+                emitRaw(out, "            if (peek() === ')') i++;");
+                emitRaw(out, "            return own(TWO, name) ? TWO[name](a, b2) : NaN;");
+                emitRaw(out, "          }");
+                emitRaw(out, "          if (peek() === ')') i++;");
+                emitRaw(out, "          return own(ONE, name) ? ONE[name](a) : NaN;");
+                emitRaw(out, "        }");
+                emitRaw(out, "        return NaN;");
+                emitRaw(out, "      }");
+                emitRaw(out, "      const m = /^[0-9]*\\.?[0-9]*(?:[eE][+-]?[0-9]+)?/.exec(s.slice(i));");
+                emitRaw(out, "      if (!m || m[0] === '' || m[0] === '.') return NaN;");
+                emitRaw(out, "      i += m[0].length;");
+                emitRaw(out, "      return parseFloat(m[0]);");
+                emitRaw(out, "    }");
+                emitRaw(out, "    return expr();");
+                emitRaw(out, "  }");
+                emitRaw(out, "  const evalF = (f, x) => evalAt(String(f), x);");
+                emitRaw(out, "  const simpson = (g, a, b) => { const c = (a + b) / 2; return (b - a) / 6 * (g(a) + 4 * g(c) + g(b)); };");
+                emitRaw(out, "  function adaptive(g, a, b, tol, whole, depth) {");
+                emitRaw(out, "    const c = (a + b) / 2;");
+                emitRaw(out, "    const l = simpson(g, a, c), r = simpson(g, c, b);");
+                emitRaw(out, "    if (depth <= 0 || Math.abs(l + r - whole) <= 15 * tol) return l + r + (l + r - whole) / 15;");
+                emitRaw(out, "    return adaptive(g, a, c, tol / 2, l, depth - 1) + adaptive(g, c, b, tol / 2, r, depth - 1);");
+                emitRaw(out, "  }");
+                emitRaw(out, "  function golden(g, a, b) {");
+                emitRaw(out, "    const phi = (Math.sqrt(5) - 1) / 2;");
+                emitRaw(out, "    let c = b - phi * (b - a), d = a + phi * (b - a);");
+                emitRaw(out, "    while (Math.abs(b - a) > 1e-9) {");
+                emitRaw(out, "      if (g(c) < g(d)) b = d; else a = c;");
+                emitRaw(out, "      c = b - phi * (b - a); d = a + phi * (b - a);");
+                emitRaw(out, "    }");
+                emitRaw(out, "    return (a + b) / 2;");
+                emitRaw(out, "  }");
+                emitRaw(out, "  return {");
+                emitRaw(out, "    eval: f => evalF(f, 0),");
+                emitRaw(out, "    integrate: (f, a, b) => { const g = x => evalF(f, x); return adaptive(g, a, b, 1e-9, simpson(g, a, b), 20); },");
+                emitRaw(out, "    derivative: (f, x) => { const h = 1e-7; return (evalF(f, x + h) - evalF(f, x - h)) / (2 * h); },");
+                emitRaw(out, "    limit: (f, x) => {");
+                emitRaw(out, "      let l = NaN, r = NaN;");
+                emitRaw(out, "      for (let h = 1e-3; h >= 1e-8 - 1e-20; h /= 10) {");
+                emitRaw(out, "        l = evalF(f, x - h); r = evalF(f, x + h);");
+                emitRaw(out, "        if (!Number.isFinite(l) || !Number.isFinite(r)) return NaN;");
+                emitRaw(out, "      }");
+                emitRaw(out, "      const scale = Math.max(1, Math.abs(l), Math.abs(r));");
+                emitRaw(out, "      if (Math.abs(l - r) > 1e-6 * scale) return NaN;");
+                emitRaw(out, "      return (l + r) / 2;");
+                emitRaw(out, "    },");
+                emitRaw(out, "    minima: (f, a, b) => golden(x => evalF(f, x), a, b),");
+                emitRaw(out, "    maxima: (f, a, b) => golden(x => -evalF(f, x), a, b),");
+                emitRaw(out, "  };");
+                emitRaw(out, "})();");
                 emitRaw(out, "const math = {");
                 emitRaw(out, "  pi: Math.PI, e: Math.E, tau: 2*Math.PI, phi: 1.6180339887498949, em: 0.5772156649015329,");
                 emitRaw(out, "  sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,");
@@ -2951,6 +3367,11 @@ class HTMLStrategy : public JavaScriptStrategy
                 emitRaw(out, "  mod: (a, b) => { let r = a % b; if (r !== 0 && (r < 0) !== (b < 0)) r += b; return r; },");
                 emitRaw(out, "  mod_int: (a, b) => { let r = Math.trunc(a) % Math.trunc(b); if (r !== 0 && (r < 0) !== (b < 0)) r += Math.trunc(b); return r; },");
                 emitRaw(out, "  is_prime: (n) => { if (n < 2) return 0; for (let d = 2; d*d <= n; d++) if (n % d === 0) return 0; return 1; },");
+                emitRaw(out, "  modpow: (b, e, m) => { if (m <= 0 || e < 0) return -1; const M = BigInt(m); let r = 1n % M, x = ((BigInt(b) % M) + M) % M, k = BigInt(e); while (k > 0n) { if (k & 1n) r = r * x % M; x = x * x % M; k >>= 1n; } return Number(r); },");
+                emitRaw(out, "  modinv: (a, m) => { if (m <= 1) return -1; let r0 = ((a % m) + m) % m, r1 = m, s0 = 1, s1 = 0; while (r1 !== 0) { const q = Math.trunc(r0 / r1); [r0, r1] = [r1, r0 - q*r1]; [s0, s1] = [s1, s0 - q*s1]; } if (r0 !== 1) return -1; return ((s0 % m) + m) % m; },");
+                emitRaw(out, "  modmul: (a, b, m) => { if (m <= 0) return -1; const M = BigInt(m); return Number((((BigInt(a) % M) + M) % M) * (((BigInt(b) % M) + M) % M) % M); },");
+                emitRaw(out, "  eval: (f) => _calcLib.eval(f), integrate: (f, a, b) => _calcLib.integrate(f, a, b), derivative: (f, x) => _calcLib.derivative(f, x),");
+                emitRaw(out, "  limit: (f, x) => _calcLib.limit(f, x), minima: (f, a, b) => _calcLib.minima(f, a, b), maxima: (f, a, b) => _calcLib.maxima(f, a, b),");
                 emitRaw(out, "  to_int: Math.trunc, deg2rad: (x) => x*Math.PI/180, rad2deg: (x) => x*180/Math.PI,");
                 emitRaw(out, "};");
                 continue;
@@ -3151,7 +3572,11 @@ class HTMLStrategy : public JavaScriptStrategy
     void emitEval(std::ostringstream &out, int &indent,
                   const std::string &res, const std::string &expr, bool argIsString, IRType /*resultType*/) override
     {
-        if (argIsString) emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')()')()"));
+        if (argIsString) {
+            // Python's eval branch returns float(eval(...)), so the result displays as a float (5.0).
+            emit(out, indent, decl(res, "Function('return (' + " + expr + " + ')')()"));
+            floatVars_.insert(res);
+        }
         else emitLazyEval(out, indent, res, expr);
     }
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
@@ -3375,7 +3800,7 @@ class HTMLStrategy : public JavaScriptStrategy
                                       expr = "Math.trunc(Number(" + src + "))";
         else if (t == IRType::STRING) expr = smartPrint_ ? "ac_smartfmt(" + src + ")"
                                              : hardPrint_ ? "ac_hardfmt(" + src + ")"
-                                             : "String(" + src + ")";
+                                             : "ac_tostr(" + src + ")";
         else if (t == IRType::BOOL)   expr = "Boolean(" + src + ") ? 1 : 0";
         else return;
         emit(out, indent, decl(var, expr));
@@ -3402,8 +3827,52 @@ class HTMLStrategy : public JavaScriptStrategy
 // 4. C  (AC->C)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// A user-defined AC function (or an elib's own bundled native wrapper — see
+// library/elib/dns/lib.ac's `remove`) can be named after any libc symbol the C/C++
+// backends' unconditional includes (stdio.h/stdlib.h/string.h/unistd.h — always
+// emitted, see CStrategy/CppStrategy's own emitHeader) bring into scope. AC itself
+// never reserves these words; only the target language does. Without this, such a name
+// collided outright — "conflicting types for 'remove'" between AC's own
+// `ac_int remove(const char*)` and stdio.h's real `int remove(const char*)` (verified:
+// library/elib/dns's own public API chose `remove`, a perfectly reasonable name for
+// "remove a DNS record" that happens to also be a real libc function). Scoped to the
+// handful from headers ALWAYS present, not an exhaustive libc dump — a name from a
+// CONDITIONALLY-included header (pthread.h/setjmp.h/time.h, only pulled in when
+// atomics/try-catch/generators are actually used) only risks colliding in programs that
+// already use that feature, a narrower and much rarer case not covered here. Shared
+// between CStrategy and CppStrategy (and LibStrategy, which inherits the latter) rather
+// than duplicated, since both target languages pull in the exact same libc headers.
+static const std::set<std::string>& cReservedLibcNames() {
+    static const std::set<std::string> names = {
+        // stdio.h
+        "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf",
+        "scanf", "fscanf", "sscanf", "fopen", "fclose", "fread", "fwrite", "fseek",
+        "ftell", "fgets", "fputs", "fgetc", "fputc", "getchar", "putchar", "puts",
+        "remove", "rename", "perror", "feof", "ferror", "rewind", "tmpfile", "tmpnam",
+        "gets",
+        // stdlib.h
+        "malloc", "calloc", "realloc", "free", "exit", "abort", "atexit", "system",
+        "getenv", "setenv", "rand", "srand", "atoi", "atol", "atof", "strtol",
+        "strtod", "qsort", "bsearch", "abs", "labs", "div", "ldiv",
+        // string.h
+        "strlen", "strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp",
+        "strchr", "strrchr", "strstr", "strtok", "memcpy", "memmove", "memset",
+        "memcmp", "strdup", "strerror",
+        // unistd.h
+        "read", "write", "open", "close", "fork", "pipe", "dup", "dup2", "sleep",
+        "usleep", "getpid", "getppid", "chdir", "getcwd", "access", "unlink",
+        "rmdir", "link", "symlink", "exec", "execl", "execv", "execvp",
+    };
+    return names;
+}
+static std::string cEscape(const std::string& n) {
+    return cReservedLibcNames().count(n) ? n + "_ac" : n;
+}
+
 class CStrategy : public BackendStrategy
 {
+    std::set<std::string> floatParams_;   // parameters typed double in this function's signature
+    void setFloatParams(const std::set<std::string>& s) override { floatParams_ = s; }
     std::set<std::string> declared;
     std::set<std::string> floatVars;
     std::set<std::string> classInstanceVars_;   // vars holding a bundle instance (see emitConstructCall)
@@ -3453,7 +3922,7 @@ class CStrategy : public BackendStrategy
     void emitGenCreate(std::ostringstream &out, int &indent, const std::string &res,
                        const std::string &func, const std::string &args) override
     {
-        emit(out, indent, "AcGen_" + func + "* " + res + " = " + func + "(" + args + ");");
+        emit(out, indent, "AcGen_" + func + "* " + res + " = " + cEscape(func) + "(" + args + ");");
         declared.insert(res);
     }
     void emitGenNext(std::ostringstream &out, int &indent, const std::string &res,
@@ -3581,7 +4050,10 @@ private:
         return v == "math.pi" || v == "math.e" || v == "math.tau" || v == "math.em" || v == "math.phi" || v == "math.inf"
             || v.rfind("math.", 0) == 0
             || v.rfind("stat_", 0) == 0
-            || v.rfind("ac_",   0) == 0;
+            // ac_ names are library float functions, but the compiler's own temporaries also start
+            // with ac_ (ac_sc_N for short-circuit or/and, ac_cond_N, ac_rep_N): those are never floats.
+            || (v.rfind("ac_", 0) == 0 && v.rfind("ac_sc_", 0) != 0 && v.rfind("ac_cond_", 0) != 0
+                && v.rfind("ac_rep_", 0) != 0);
     }
     bool isFloatVal(const std::string &v) const {
         return looksFloat(v) || floatVars.count(v) || isKnownFloatName(v);
@@ -3784,6 +4256,15 @@ private:
         emitRaw(out, "    ((ac_int*)a)[-2] = len + 1;");
         emitRaw(out, "    return a;");
         emitRaw(out, "}");
+        // Takes ownership of an ilib char** list (regex.split, stringm.split, ...): the string
+        // pointers move into the AC array and the container is freed. The strings are kept
+        // for the life of the program, like any other AC string.
+        emitRaw(out, "static ac_str* ac_arr_take_raw_str(char** raw, ac_int n) {");
+        emitRaw(out, "    ac_str* a = ac_arr_new_str(n);");
+        emitRaw(out, "    for (ac_int i = 0; i < n; i++) a[i] = raw[i];");
+        emitRaw(out, "    free(raw);");
+        emitRaw(out, "    return a;");
+        emitRaw(out, "}");
         emitRaw(out, "static void ac_arr_print_str(const ac_str* a) {");
         emitRaw(out, "    printf(\"[\");");
         emitRaw(out, "    for (ac_int i = 0; i < ac_arr_len_str(a); i++)");
@@ -3814,6 +4295,31 @@ private:
             emitRaw(out, "    return a / b;");
             emitRaw(out, "}");
         }
+        // ilib string results live in a buffer the library reuses on its next call; copy each one
+        // into its own storage so an earlier result (dir = os.mktmpdir(); sub = os.join(dir, ...))
+        // is not overwritten by a later call.
+        emitRaw(out, "static const char* ac_str_dup(const char* s) {");
+        emitRaw(out, "    if (!s) s = \"\";");
+        emitRaw(out, "    size_t n = strlen(s);");
+        emitRaw(out, "    char* d = (char*)malloc(n + 1);");
+        emitRaw(out, "    if (d) memcpy(d, s, n + 1);");
+        emitRaw(out, "    return d ? d : \"\";");
+        emitRaw(out, "}");
+        // `subject % pattern`: '%' matches any run of characters (none included); the whole subject
+        // must match. Backtracks to the last '%', the classic linear-space glob matcher.
+        emitRaw(out, "static int ac_wildcard_match(const char* s, const char* p) __attribute__((unused));");
+        emitRaw(out, "static int ac_wildcard_match(const char* s, const char* p) {");
+        emitRaw(out, "    const char* star = NULL;");
+        emitRaw(out, "    const char* mark = s;");
+        emitRaw(out, "    while (*s) {");
+        emitRaw(out, "        if (*p == '%') { star = p++; mark = s; }");
+        emitRaw(out, "        else if (*p == *s) { p++; s++; }");
+        emitRaw(out, "        else if (star) { p = star + 1; s = ++mark; }");
+        emitRaw(out, "        else return 0;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    while (*p == '%') p++;");
+        emitRaw(out, "    return *p == '\\0';");
+        emitRaw(out, "}");
         emitRaw(out, "static const char* ac_concat(const char* a, const char* b) {");
         emitRaw(out, "    size_t la = strlen(a), lb = strlen(b);");
         emitRaw(out, "    char* r = (char*)malloc(la + lb + 1);");
@@ -3825,6 +4331,42 @@ private:
         emitRaw(out, "static const char* ac_to_str(ac_int n) {");
         emitRaw(out, "    char* r = (char*)malloc(24);");
         emitRaw(out, "    snprintf(r, 24, \"%lld\", (long long)n);");
+        emitRaw(out, "    return r;");
+        emitRaw(out, "}");
+        // to_string(someArray): Python-style "[1, 2, 3]" — `to_string` on a plain scalar
+        // (ac_to_str above) was the only cast-to-string path C had at all; passing it a raw
+        // ac_int* (an array) instead reinterpreted the POINTER as a single number, a real
+        // "makes integer from pointer without a cast" compile error (verified: examples/
+        // html_page.ac's `to_string(primes)`, every other backend already stringifies the
+        // whole list — see e.g. Python's own str(list), "[2, 3, 5, 7, ...]"). 24 bytes/element
+        // is a safe upper bound for "-9223372036854775808, " (the widest possible i64 plus
+        // separator); 2 extra for the brackets, 1 for the NUL.
+        emitRaw(out, "static const char* ac_arr_to_str(const ac_int* a) {");
+        emitRaw(out, "    ac_int n = ac_arr_len(a);");
+        emitRaw(out, "    char* r = (char*)malloc((size_t)n * 24 + 3);");
+        emitRaw(out, "    size_t pos = 0; r[pos++] = '[';");
+        emitRaw(out, "    for (ac_int i = 0; i < n; i++) {");
+        emitRaw(out, "        if (i) { r[pos++] = ','; r[pos++] = ' '; }");
+        emitRaw(out, "        pos += (size_t)snprintf(r + pos, 24, \"%lld\", (long long)a[i]);");
+        emitRaw(out, "    }");
+        emitRaw(out, "    r[pos++] = ']'; r[pos] = '\\0';");
+        emitRaw(out, "    return r;");
+        emitRaw(out, "}");
+        // Same idea for a string list — Python's repr() quotes each element: "['a', 'b']".
+        emitRaw(out, "static const char* ac_arr_to_str_str(const ac_str* a) {");
+        emitRaw(out, "    ac_int n = ac_arr_len_str(a);");
+        emitRaw(out, "    size_t cap = 3;");
+        emitRaw(out, "    for (ac_int i = 0; i < n; i++) cap += strlen(a[i] ? a[i] : \"\") + 4;");
+        emitRaw(out, "    char* r = (char*)malloc(cap);");
+        emitRaw(out, "    size_t pos = 0; r[pos++] = '[';");
+        emitRaw(out, "    for (ac_int i = 0; i < n; i++) {");
+        emitRaw(out, "        if (i) { r[pos++] = ','; r[pos++] = ' '; }");
+        emitRaw(out, "        const char* s = a[i] ? a[i] : \"\"; size_t sl = strlen(s);");
+        emitRaw(out, "        r[pos++] = '\\'';");
+        emitRaw(out, "        memcpy(r + pos, s, sl); pos += sl;");
+        emitRaw(out, "        r[pos++] = '\\'';");
+        emitRaw(out, "    }");
+        emitRaw(out, "    r[pos++] = ']'; r[pos] = '\\0';");
         emitRaw(out, "    return r;");
         emitRaw(out, "}");
         // to_string of a float (see BackendStrategy::smartPrint_): smart = a whole value is its
@@ -3911,6 +4453,11 @@ private:
         emitRaw(out, "    d->vs[d->n] = v;");
         emitRaw(out, "    d->n++;");
         emitRaw(out, "}");
+        emitRaw(out, "static int ac_dict_has(const ac_dict* d, const char* k) {");
+        emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
+        emitRaw(out, "        if (!strcmp(d->ks[i], k)) return 1;");
+        emitRaw(out, "    return 0;");
+        emitRaw(out, "}");
         emitRaw(out, "static ac_int ac_dict_get(const ac_dict* d, const char* k) {");
         emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
         emitRaw(out, "        if (!strcmp(d->ks[i], k)) return d->vs[i];");
@@ -3940,6 +4487,11 @@ private:
         emitRaw(out, "    d->ks[d->n] = k;");
         emitRaw(out, "    d->vs[d->n] = v;");
         emitRaw(out, "    d->n++;");
+        emitRaw(out, "}");
+        emitRaw(out, "static int ac_sdict_has(const ac_sdict* d, const char* k) {");
+        emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
+        emitRaw(out, "        if (!strcmp(d->ks[i], k)) return 1;");
+        emitRaw(out, "    return 0;");
         emitRaw(out, "}");
         emitRaw(out, "static const char* ac_sdict_get(const ac_sdict* d, const char* k) {");
         emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
@@ -4131,6 +4683,11 @@ private:
         // fell to the generic `ac_int` default below and punned a genuine `ac_int*` list
         // pointer through a scalar (verified: "initialization of 'ac_int' from 'ac_int *'
         // makes integer from pointer without a cast", then a garbage printed value).
+        if (stringListVars_.count(val)) {   // a list of strings stays an ac_str* array
+            listVars.insert(var); stringListVars_.insert(var);
+            if (declared.insert(var).second) return "ac_str* " + var + " = " + val + ";";
+            return var + " = " + val + ";";
+        }
         if (listVars.count(val) || listGlobals_.count(val)) {
             listVars.insert(var);
             if (declared.insert(var).second) return "ac_int* " + var + " = " + val + ";";
@@ -4193,6 +4750,8 @@ private:
     void emitTrueDivision(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &lhs, const std::string &rhs) override
     {
+        // Division by zero is a hard error (PY raises ZeroDivisionError); C's float `/` would yield inf/nan.
+        emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
         std::string expr = "(double)(" + lhs + ") / (double)(" + rhs + ")";
         bool isNew = declared.insert(res).second;
         if (isNew) { floatVars.insert(res); emit(out, indent, "double " + res + " = " + expr + ";"); }
@@ -4339,6 +4898,24 @@ private:
         if (isNew && isFloat)  { floatVars.insert(res); emit(out, indent, "double " + res + " = " + expr + ";"); }
         else if (isNew)        emit(out, indent, "ac_int " + res + " = " + expr + ";");
         else                   emit(out, indent, res + " = " + expr + ";");
+    }
+    // A runtime bool prints as True/False.
+    void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "printf(\"%s\\n\", (" + val + ") ? \"True\" : \"False\");");
+    }
+    // `dict has key` -> an int 1/0 from the matching linear-scan helper (string or int valued dict).
+    void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        std::string fn = dictStrVals_.count(dict) ? "ac_sdict_has" : "ac_dict_has";
+        emit(out, indent, decl(res, "(ac_int)" + fn + "(" + dict + ", " + key + ")"));
+    }
+    // `subject % pattern` -> ac_wildcard_match (native matcher emitted in the prelude).
+    void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        emit(out, indent, decl(res, "ac_wildcard_match(" + subject + ", " + pattern + ")"));
     }
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
@@ -4729,7 +5306,7 @@ private:
                 }
             }
         }
-        std::string call = func + "(" + args + ")";
+        std::string call = cEscape(func) + "(" + args + ")";
         // The callee itself returns a tagged value: the result is already an AcDynVal, no wrapping.
         if (!res.empty() && boxedRetFuncs_.count(func)) {
             emit(out, indent, (declared.insert(res).second ? "AcDynVal " : "") + res + " = " + call + ";");
@@ -4745,7 +5322,16 @@ private:
             emit(out, indent, call + ";");
         } else if (isAcStrFunc(func) && declared.insert(res).second) {
             strVars.insert(res);
-            emit(out, indent, "ac_str " + res + " = " + call + ";");
+            emit(out, indent, "ac_str " + res + " = ac_str_dup(" + call + ");");
+        } else if (isAcStrListFunc(func) && declared.insert(res).second) {
+            // ilib char** list result (regex.split, stringm.split, ...): take the count out
+            // parameter, then move the list into an AC string array.
+            listVars.insert(res); stringListVars_.insert(res);
+            // the C name of the call: ns.fn / ns_fn -> ac_ns_fn (ac_stringm_split, ac_regex_split, ac_os_listdir)
+            std::string rawFn = "ac_" + func.substr(0, func.find_first_of("._")) + "_" + func.substr(func.find_first_of("._") + 1);
+            emit(out, indent, "int " + res + "_n = 0;");  // the ilib API takes an int*
+            emit(out, indent, "char** " + res + "_raw = " + rawFn + "(" + args + (args.empty() ? "" : ", ") + "&" + res + "_n);");
+            emit(out, indent, "ac_str* " + res + " = ac_arr_take_raw_str(" + res + "_raw, " + res + "_n);");
         } else if (isListReturningFunc(func) && declared.insert(res).second) {
             listVars.insert(res);
             if (stringListReturnFuncs_.count(func)) {
@@ -4982,6 +5568,14 @@ private:
             // AC iterates a string as 1-char strings; C: walk chars, make a 2-byte buffer.
             emit(out, indent, "for (size_t _fi = 0, _fn = strlen(" + collection + "); _fi < _fn; _fi++) {");
             emit(out, indent + 1, "char " + iterVar + "[2] = { " + collection + "[_fi], 0 };");
+            strVars.insert(iterVar);
+            declared.insert(iterVar); forVarStack_.push_back(iterVar);
+            indent++;
+            return;
+        }
+        if (stringListVars_.count(collection)) {   // list of strings: ac_str elements
+            emit(out, indent, "for (ac_int _fi = 0; _fi < ac_arr_len_str(" + collection + "); _fi++) {");
+            emit(out, indent + 1, "ac_str " + iterVar + " = " + collection + "[_fi];");
             strVars.insert(iterVar);
             declared.insert(iterVar); forVarStack_.push_back(iterVar);
             indent++;
@@ -5242,6 +5836,8 @@ private:
                 } else if (listParams_.count(pname)) {
                     tparams += stringListVars_.count(pname) ? "ac_str* " + pname   // string-array parameter
                                                              : "ac_int* " + pname;   // array parameter
+                } else if (floatParams_.count(pname)) {
+                    tparams += "double " + pname;   // float parameter (its callers pass real doubles)
                 } else if (fit != funcTypedParams_.end()) {
                     // emit function pointer: ac_int (*f)(ac_int, ...)
                     std::string argList;
@@ -5267,7 +5863,7 @@ private:
         std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
                          : boxedRetFuncs_.count(name) ? "AcDynVal "
                          : retKind == 4 ? "void " : retKind == 5 ? "ac_str* " : retKind == 2 ? "ac_int* " : retKind == 3 ? "ac_str " : retKind == 1 ? "double " : "ac_int ";
-        emit(out, 0, ret + name + "(" + typedParamListC(params, name) + ");");
+        emit(out, 0, ret + cEscape(name) + "(" + typedParamListC(params, name) + ");");
     }
     // Per-param (name, C type) breakdown — same type inference as typedParamListC, just not
     // pre-joined into one string, needed to build a generator's per-field struct.
@@ -5292,7 +5888,10 @@ private:
     {
         declared.clear(); floatVars.clear();
         for (auto& v : promotedGlobals_) declared.insert(v); // free vars are file-scope globals
-        std::string cName = name;
+        // cEscape here only — a class method's cName is about to be unconditionally
+        // overwritten with a `ClassName_method` composite just below, which can never
+        // collide with a bare libc name anyway; only the free-function case keeps this.
+        std::string cName = cEscape(name);
         std::string cParams = params;
         if (!classOwner.empty()) {
             cName = (name == "init") ? classOwner + "_init" : classOwner + "_" + name;
@@ -5595,7 +6194,9 @@ private:
             // was actually a real bug (int-to-pointer). Every OTHER numeric-coercion branch in
             // this function already casts; this one just never did. Reuses the exact
             // "already-a-string?" heuristic decl()/emitTypedStoreVar use elsewhere in this class.
-            std::string rhs = srcIsStringLiteral ? src
+            bool srcIsList = listVars.count(src) || listParams_.count(src) || listGlobals_.count(src);
+            std::string rhs = srcIsList ? (stringListVars_.count(src) ? "ac_arr_to_str_str(" + src + ")" : "ac_arr_to_str(" + src + ")")
+                            : srcIsStringLiteral ? src
                             : smartPrint_ ? "ac_smart_to_str((double)(" + src + "))"
                             : hardPrint_  ? "ac_hard_to_str((double)(" + src + "))"
                             : "ac_to_str(" + src + ")";
@@ -5663,6 +6264,8 @@ private:
 class CppStrategy : public BackendStrategy
 {
 protected:
+    std::set<std::string> floatParams_;   // parameters typed double in this function's signature
+    void setFloatParams(const std::set<std::string>& s) override { floatParams_ = s; }
     std::set<std::string> declared;
     std::set<std::string> cppListVars_;
     std::set<std::string> classInstanceVars_;   // vars holding a bundle instance — see emitConstructCall
@@ -5921,6 +6524,19 @@ protected:
             emitRaw(out, "}");
         }
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
+        // `subject % pattern`: % matches any run of characters (none included); the whole subject
+        // must match. Backtracks to the last %, the same linear-space matcher as the C backend.
+        emitRaw(out, "[[maybe_unused]] static bool ac_wildcard_match(const std::string& s, const std::string& p) {");
+        emitRaw(out, "    size_t star = std::string::npos, mark = 0, i = 0, j = 0;");
+        emitRaw(out, "    while (i < s.size()) {");
+        emitRaw(out, "        if (j < p.size() && p[j] == '%') { star = j; mark = i; j++; }");
+        emitRaw(out, "        else if (j < p.size() && p[j] == s[i]) { i++; j++; }");
+        emitRaw(out, "        else if (star != std::string::npos) { j = star + 1; mark++; i = mark; }");
+        emitRaw(out, "        else return false;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    while (j < p.size() && p[j] == '%') j++;");
+        emitRaw(out, "    return j == p.size();");
+        emitRaw(out, "}");
         emitRaw(out, "static std::string ac_iota(long long n) {");
         emitRaw(out, "    std::string r;");
         emitRaw(out, "    for (long long i = 0; i < n; i++) r += std::to_string(i);");
@@ -5939,7 +6555,7 @@ protected:
         if (hasIdivOp_) {
             // `//` truncating integer division
             emitRaw(out, "static long long ac_idiv(long long a, long long b) {");
-            emitRaw(out, "    if (!b) throw std::runtime_error(\"3rd grade mathematics violated (ZeroDivisionError)\");");
+            emitRaw(out, "    if (!b) { std::cout.flush(); fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
             emitRaw(out, "    return a / b;");
             emitRaw(out, "}");
         }
@@ -6085,6 +6701,21 @@ protected:
         emitRaw(out, "static inline std::string ac_cat(const char* s) {");
         emitRaw(out, "    return s ? std::string(s) : std::string();");
         emitRaw(out, "}");
+        // to_string(someArray): Python-style "[1, 2, 3]" — the generic template below (for any
+        // T with no dedicated overload) falls through to std::to_string(v), which has no
+        // std::vector overload at all — a real "no matching function" compile error (verified:
+        // examples/html_page.ac's `to_string(primes)`, every other backend already stringifies
+        // the whole list). String-list elements get Python's repr()-style single quotes.
+        emitRaw(out, "static inline std::string ac_cat(const std::vector<long long>& v) {");
+        emitRaw(out, "    std::string r = \"[\";");
+        emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) { if (i) r += \", \"; r += std::to_string(v[i]); }");
+        emitRaw(out, "    r += \"]\"; return r;");
+        emitRaw(out, "}");
+        emitRaw(out, "static inline std::string ac_cat(const std::vector<std::string>& v) {");
+        emitRaw(out, "    std::string r = \"[\";");
+        emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) { if (i) r += \", \"; r += \"'\" + v[i] + \"'\"; }");
+        emitRaw(out, "    r += \"]\"; return r;");
+        emitRaw(out, "}");
         emitRaw(out, "template<class T> static inline std::string ac_cat(T v) {");
         emitRaw(out, "    if constexpr (std::is_floating_point<T>::value) return ac_fstr((double)v);");
         emitRaw(out, "    else return std::to_string(v);");
@@ -6102,15 +6733,20 @@ protected:
             if (lt == "ilib") {
                 if (ln == "camera") {
                     emitRaw(out, "#include \"" + resolveIlibDir("camera") + "/camera_wrapper.hpp\"");
-                    // -I/usr/include/opencv4 matters, not just the -l flags: without it,
+                    // -I<opencv headers> matters, not just the -l flags: without it,
                     // `#include <opencv2/opencv.hpp>`'s __has_include check silently fails on
-                    // any system where the headers live under an opencv4/ subdir (Debian/
-                    // Ubuntu's pkg-config opencv4 layout) rather than directly on the default
-                    // include path, so HAVE_OPENCV falls back to 0 — camera.hpp's stub Camera/
-                    // Screen classes then get compiled instead of the real OpenCV-backed ones,
-                    // with a narrower method surface, even though OpenCV is fully installed.
-                    // Harmless -I on a system where this exact subdir doesn't exist.
-                    emitRaw(out, "// Link: g++ ... -I/usr/include/opencv4 -lopencv_core -lopencv_videoio -lopencv_highgui -lopencv_imgproc -lopencv_imgcodecs");
+                    // any system where the headers live under a versioned opencvN/ subdir
+                    // (Debian/Ubuntu's pkg-config opencv4 layout; Arch's opencv5 one once
+                    // OpenCV 5 shipped) rather than directly on the default include path, so
+                    // HAVE_OPENCV falls back to 0 — camera.hpp's stub Camera/Screen classes
+                    // then get compiled instead of the real OpenCV-backed ones, with a
+                    // narrower method surface, even though OpenCV is fully installed (verified
+                    // real regression: this was hardcoded to ONLY opencv4 — the moment this dev
+                    // machine's OpenCV was upgraded to 5.x, every method silently went stub,
+                    // `camera.init()` returning 0 instead of a hard, obvious compile error).
+                    // Every -I here is harmless on a system where that exact subdir doesn't
+                    // exist — gcc silently ignores a nonexistent include path.
+                    emitRaw(out, "// Link: g++ ... -I/usr/include/opencv4 -I/usr/include/opencv5 -I/usr/include/opencv6 -I/usr/local/include/opencv4 -I/usr/local/include/opencv5 -lopencv_core -lopencv_videoio -lopencv_highgui -lopencv_imgproc -lopencv_imgcodecs");
                     // Define global instances (camera.cpp is compiled into this TU) —
                     // named to match AC source's receivers directly (camera.init(), etc).
                     emitRaw(out, "namespace AC {");
@@ -6272,6 +6908,7 @@ protected:
         // as an array) missed it and fell to a bare `std::cout << y`, which doesn't compile for
         // a vector ("no match for operator<<").
         if (cppListVars_.count(val)) cppListVars_.insert(var);
+        if (stringListVars_.count(val)) stringListVars_.insert(var);   // a copy of a list of strings
         if (declared.insert(var).second)
         {
             IRType ct = castDeclType(var, isStringVar(var) ? IRType::STRING : (floatVars.count(var) ? IRType::FLOAT : IRType::VOID));
@@ -6348,6 +6985,7 @@ protected:
     void emitTrueDivision(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &lhs, const std::string &rhs) override
     {
+        emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
         std::string expr = "(double)(" + lhs + ") / (double)(" + rhs + ")";
         bool isNew = declared.insert(res).second;
         if (isNew) { floatVars.insert(res); emit(out, indent, "double " + res + " = " + expr + ";"); }
@@ -6465,6 +7103,23 @@ protected:
         else if (isNew)        emit(out, indent, "auto " + res + " = " + expr + ";");
         else                   emit(out, indent, res + " = " + expr + ";");
     }
+    // `dict has key` -> a bool (std::map::count).
+    void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        emit(out, indent, decl(res, "(long long)(" + dict + ".count(" + key + ") > 0)"));
+    }
+    // `subject % pattern` -> ac_wildcard_match (the matcher is in the header prelude).
+    void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        emit(out, indent, decl(res, "(long long)ac_wildcard_match(" + subject + ", " + pattern + ")"));
+    }
+    // A runtime bool prints as True/False.
+    void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "std::cout << ((" + val + ") ? \"True\" : \"False\") << \"\\n\";");
+    }
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
@@ -6532,6 +7187,10 @@ protected:
             emit(out, indent, call + ";");
         } else if ((isAcStrFunc(func) || isStringReturningFunc(func)) && declared.insert(res).second) {
             emit(out, indent, "std::string " + res + " = " + call + ";");
+        } else if (isAcStrListFunc(func) && declared.insert(res).second) {
+            // ilib list-of-string call (regex.split, stringm.split): a std::vector<std::string>
+            cppListVars_.insert(res); stringListVars_.insert(res);
+            emit(out, indent, "std::vector<std::string> " + res + " = " + call + ";");
         } else if (isListReturningFunc(func) && declared.insert(res).second) {
             cppListVars_.insert(res);
             if (stringListReturnFuncs_.count(func)) {
@@ -6771,6 +7430,12 @@ protected:
             declared.insert(iterVar); forVarStack_.push_back(iterVar);
             return;
         }
+        if (stringListVars_.count(collection)) {   // list of strings: std::string elements
+            emit(out, indent, "for (std::string " + iterVar + " : " + collection + ") {");
+            declared.insert(iterVar); forVarStack_.push_back(iterVar);
+            indent++;
+            return;
+        }
         emit(out, indent, "for (long long " + iterVar + " : " + collection + ") {");
         indent++;
     }
@@ -6874,6 +7539,12 @@ protected:
         // terminate, matching the crash-on-missing semantics of the other backends.
         if (dictVars_.count(arr))
             emit(out, indent, decl(result, arr + ".at(" + idx + ")"));
+        else if (isStringVar(arr)) {
+            // Indexing a string yields a one-character STRING, not a char (AC has no char type).
+            std::string value = "std::string(1, " + arr + "[" + idx + "])";
+            if (declared.insert(result).second) { stringVars_.insert(result); emit(out, indent, "std::string " + result + " = " + value + ";"); }
+            else emit(out, indent, result + " = " + value + ";");
+        }
         else
             emit(out, indent, decl(result, arr + "[" + idx + "]"));
     }
@@ -6974,6 +7645,8 @@ protected:
                     std::string argList;
                     for (int k = 0; k < fit->second; ++k) { if (k) argList += ", "; argList += "long long"; }
                     tparams += "std::function<long long(" + argList + ")> " + pname;
+                } else if (floatParams_.count(pname)) {
+                    tparams += "double " + pname;   // float parameter (its callers pass real doubles)
                 } else {
                     tparams += "long long " + pname;
                 }
@@ -6995,7 +7668,7 @@ protected:
                         : retKind == 3 ? "std::string "
                         : retKind == 1 ? "double " : "long long ";
         int ind = 0;
-        emit(out, ind, ret + name + "(" + typedParamList(params, name) + ");");
+        emit(out, ind, ret + cEscape(name) + "(" + typedParamList(params, name) + ");");
     }
     // Per-param (name, C++ type) breakdown — same type inference as typedParamList, just not
     // pre-joined, needed to build a generator's per-field struct. Uses VALUE semantics
@@ -7030,7 +7703,7 @@ protected:
     void emitGenCreate(std::ostringstream &out, int &indent, const std::string &res,
                        const std::string &func, const std::string &args) override
     {
-        emit(out, indent, "AcGen_" + func + "* " + res + " = " + func + "(" + args + ");");
+        emit(out, indent, "AcGen_" + func + "* " + res + " = " + cEscape(func) + "(" + args + ");");
         declared.insert(res);
         cppGenVars_.insert(res);
     }
@@ -7055,7 +7728,12 @@ protected:
         declared.clear(); floatVars.clear();
         for (auto& v : promotedGlobals_) declared.insert(v); // free vars are file-scope globals
         std::string cppParams = params;
-        std::string cppName   = name;
+        // cEscape only matters for the free-function case — a class method is scoped
+        // within its class in real C++ (ClassName::remove never collides with the
+        // global ::remove the way C's flat-namespace ClassName_remove workaround would
+        // need to worry about), and the classOwner branch just below unconditionally
+        // overwrites cppName for that case anyway.
+        std::string cppName   = cEscape(name);
         curFuncIsConstructor_ = false;
         if (!classOwner.empty()) {
             if (cppParams.rfind("self, ", 0) == 0) cppParams = cppParams.substr(6);
@@ -7486,7 +8164,7 @@ public:
         // Gated on hasIdivOp_ — see PythonStrategy::setUsedBuiltinOps' comment.
         if (hasIdivOp_) {
             emitRaw(out, "static long long ac_idiv(long long a, long long b) {");
-            emitRaw(out, "    if (!b) throw std::runtime_error(\"3rd grade mathematics violated (ZeroDivisionError)\");");
+            emitRaw(out, "    if (!b) { std::cout.flush(); fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
             emitRaw(out, "    return a / b;");
             emitRaw(out, "}");
         }
@@ -7553,6 +8231,21 @@ public:
         emitRaw(out, "static inline std::string ac_cat(const char* s) {");
         emitRaw(out, "    return s ? std::string(s) : std::string();");
         emitRaw(out, "}");
+        // to_string(someArray): Python-style "[1, 2, 3]" — the generic template below (for any
+        // T with no dedicated overload) falls through to std::to_string(v), which has no
+        // std::vector overload at all — a real "no matching function" compile error (verified:
+        // examples/html_page.ac's `to_string(primes)`, every other backend already stringifies
+        // the whole list). String-list elements get Python's repr()-style single quotes.
+        emitRaw(out, "static inline std::string ac_cat(const std::vector<long long>& v) {");
+        emitRaw(out, "    std::string r = \"[\";");
+        emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) { if (i) r += \", \"; r += std::to_string(v[i]); }");
+        emitRaw(out, "    r += \"]\"; return r;");
+        emitRaw(out, "}");
+        emitRaw(out, "static inline std::string ac_cat(const std::vector<std::string>& v) {");
+        emitRaw(out, "    std::string r = \"[\";");
+        emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) { if (i) r += \", \"; r += \"'\" + v[i] + \"'\"; }");
+        emitRaw(out, "    r += \"]\"; return r;");
+        emitRaw(out, "}");
         emitRaw(out, "template<class T> static inline std::string ac_cat(T v) {");
         emitRaw(out, "    if constexpr (std::is_floating_point<T>::value) return ac_fstr((double)v);");
         emitRaw(out, "    else return std::to_string(v);");
@@ -7581,6 +8274,19 @@ public:
             emitRaw(out, "}");
         }
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
+        // `subject % pattern`: % matches any run of characters (none included); the whole subject
+        // must match. Backtracks to the last %, the same linear-space matcher as the C backend.
+        emitRaw(out, "[[maybe_unused]] static bool ac_wildcard_match(const std::string& s, const std::string& p) {");
+        emitRaw(out, "    size_t star = std::string::npos, mark = 0, i = 0, j = 0;");
+        emitRaw(out, "    while (i < s.size()) {");
+        emitRaw(out, "        if (j < p.size() && p[j] == '%') { star = j; mark = i; j++; }");
+        emitRaw(out, "        else if (j < p.size() && p[j] == s[i]) { i++; j++; }");
+        emitRaw(out, "        else if (star != std::string::npos) { j = star + 1; mark++; i = mark; }");
+        emitRaw(out, "        else return false;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    while (j < p.size() && p[j] == '%') j++;");
+        emitRaw(out, "    return j == p.size();");
+        emitRaw(out, "}");
         emitRaw(out, "static std::string ac_iota(long long n) {");
         emitRaw(out, "    std::string r;");
         emitRaw(out, "    for (long long i = 0; i < n; i++) r += std::to_string(i);");
@@ -7621,6 +8327,11 @@ public:
             if (lt == "ilib") {
                 if (ln == "camera") {
                     emitRaw(out, "#include \"" + resolveIlibDir("camera") + "/camera_wrapper.hpp\"");
+                    // Same -I gap as CppStrategy's own camera block (see its comment) — this
+                    // copy never had the Link comment AT ALL, meaning LIB builds using the
+                    // camera ilib always silently compiled against camera.hpp's stub classes,
+                    // regardless of OpenCV version.
+                    emitRaw(out, "// Link: g++ ... -I/usr/include/opencv4 -I/usr/include/opencv5 -I/usr/include/opencv6 -I/usr/local/include/opencv4 -I/usr/local/include/opencv5 -lopencv_core -lopencv_videoio -lopencv_highgui -lopencv_imgproc -lopencv_imgcodecs");
                     emitRaw(out, "namespace AC {");
                     emitRaw(out, "    Camera camera;");
                     emitRaw(out, "    Camera latestFrame;");
@@ -8220,6 +8931,8 @@ class JavaStrategy : public BackendStrategy
         // fully-qualified java.math.* names so no import-ordering dance is needed.
         emitRaw(out, "final class _AcFmtG {");
         emitRaw(out, "    static String fmt(double d) {");
+        emitRaw(out, "        if (Double.isNaN(d)) return \"NaN\";");
+        emitRaw(out, "        if (Double.isInfinite(d)) return d > 0 ? \"Infinity\" : \"-Infinity\";");
         emitRaw(out, "        if (d == 0) return (1/d < 0) ? \"-0\" : \"0\";");
         emitRaw(out, "        boolean neg = d < 0;");
         emitRaw(out, "        java.math.BigDecimal bd = new java.math.BigDecimal(Math.abs(d));");
@@ -8297,6 +9010,142 @@ class JavaStrategy : public BackendStrategy
                 emitRaw(out, "    static long mod_int(long a,long b){ return mod(a,b); }");
                 emitRaw(out, "    static double mod(double a,double b){ double r=a%b; if(r!=0&&((r<0)!=(b<0))) r+=b; long ri=(long)r; return r==ri?ri:r; }");
                 emitRaw(out, "    static long is_prime(long n){ if(n<2) return 0; for(long d=2;d*d<=n;d++) if(n%d==0) return 0; return 1; }");
+                // modular arithmetic (see math.hpp): BigInteger, so products never overflow
+                emitRaw(out, "    static long modpow(long b,long e,long m){ if(m<=0||e<0) return -1; return java.math.BigInteger.valueOf(b).modPow(java.math.BigInteger.valueOf(e), java.math.BigInteger.valueOf(m)).longValue(); }");
+                emitRaw(out, "    static long modinv(long a,long m){ if(m<=1) return -1; try { return java.math.BigInteger.valueOf(a).modInverse(java.math.BigInteger.valueOf(m)).longValue(); } catch(ArithmeticException x){ return -1; } }");
+                emitRaw(out, "    static long modmul(long a,long b,long m){ if(m<=0) return -1; return java.math.BigInteger.valueOf(a).multiply(java.math.BigInteger.valueOf(b)).mod(java.math.BigInteger.valueOf(m)).longValue(); }");
+                emitRaw(out, "    // ── formula evaluator and calculus (port of math.cpp and calculus.hpp) ──");
+                emitRaw(out, "    static final class _Calc {");
+                emitRaw(out, "        final String s; int i = 0; final double x;");
+                emitRaw(out, "        _Calc(String s, double x) { this.s = s; this.x = x; }");
+                emitRaw(out, "        char peek() { return i < s.length() ? s.charAt(i) : '\\0'; }");
+                emitRaw(out, "        void skip() { while (i < s.length() && (s.charAt(i) == ' ' || s.charAt(i) == '\\t')) i++; }");
+                emitRaw(out, "        static boolean alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }");
+                emitRaw(out, "        static boolean digit(char c) { return c >= '0' && c <= '9'; }");
+                emitRaw(out, "        double expr() {");
+                emitRaw(out, "            double v = term(); skip();");
+                emitRaw(out, "            while (peek() == '+' || peek() == '-') { char op = peek(); i++; double r = term(); v = op == '+' ? v + r : v - r; skip(); }");
+                emitRaw(out, "            return v;");
+                emitRaw(out, "        }");
+                emitRaw(out, "        double term() {");
+                emitRaw(out, "            double v = factor(); skip();");
+                emitRaw(out, "            while (peek() == '*' || peek() == '/' || peek() == '%') {");
+                emitRaw(out, "                char op = peek(); i++; double r = factor();");
+                emitRaw(out, "                v = op == '*' ? v * r : op == '/' ? v / r : v % r; skip();");
+                emitRaw(out, "            }");
+                emitRaw(out, "            return v;");
+                emitRaw(out, "        }");
+                emitRaw(out, "        double factor() {");
+                emitRaw(out, "            double b = base(); skip();");
+                emitRaw(out, "            if (peek() == '^') { i++; double e = factor(); return Math.pow(b, e); }");
+                emitRaw(out, "            return b;");
+                emitRaw(out, "        }");
+                emitRaw(out, "        double base() {");
+                emitRaw(out, "            skip(); char c = peek();");
+                emitRaw(out, "            if (c == '(') { i++; double v = expr(); skip(); if (peek() == ')') i++; return v; }");
+                emitRaw(out, "            if (c == '-') { i++; return -factor(); }");
+                emitRaw(out, "            if (c == '+') { i++; return factor(); }");
+                emitRaw(out, "            if (c != '\\0' && alpha(c)) {");
+                emitRaw(out, "                int start = i;");
+                emitRaw(out, "                while (i < s.length() && (alpha(s.charAt(i)) || digit(s.charAt(i)))) i++;");
+                emitRaw(out, "                String name = s.substring(start, i); skip();");
+                emitRaw(out, "                if (name.equals(\"x\") && peek() != '(') return x;");
+                emitRaw(out, "                switch (name) {");
+                emitRaw(out, "                    case \"pi\": return Math.PI;");
+                emitRaw(out, "                    case \"e\": return Math.E;");
+                emitRaw(out, "                    case \"tau\": return 2 * Math.PI;");
+                emitRaw(out, "                    case \"em\": return 0.5772156649015329;");
+                emitRaw(out, "                    case \"phi\": return 1.6180339887498949;");
+                emitRaw(out, "                    case \"inf\": return Double.POSITIVE_INFINITY;");
+                emitRaw(out, "                    default: break;");
+                emitRaw(out, "                }");
+                emitRaw(out, "                if (peek() == '(') {");
+                emitRaw(out, "                    i++; double a = expr(); skip();");
+                emitRaw(out, "                    if (peek() == ',') {");
+                emitRaw(out, "                        i++; double b = expr(); skip();");
+                emitRaw(out, "                        if (peek() == ')') i++;");
+                emitRaw(out, "                        switch (name) {");
+                emitRaw(out, "                            case \"pow\": return Math.pow(a, b);");
+                emitRaw(out, "                            case \"atan2\": return Math.atan2(a, b);");
+                emitRaw(out, "                            case \"log\": return Math.log(b) / Math.log(a);");
+                emitRaw(out, "                            case \"hypot\": return Math.hypot(a, b);");
+                emitRaw(out, "                            case \"mod\": return a % b;");
+                emitRaw(out, "                            case \"min\": return Math.min(a, b);");
+                emitRaw(out, "                            case \"max\": return Math.max(a, b);");
+                emitRaw(out, "                            default: return Double.NaN;");
+                emitRaw(out, "                        }");
+                emitRaw(out, "                    }");
+                emitRaw(out, "                    if (peek() == ')') i++;");
+                emitRaw(out, "                    switch (name) {");
+                emitRaw(out, "                        case \"sin\": return Math.sin(a);");
+                emitRaw(out, "                        case \"cos\": return Math.cos(a);");
+                emitRaw(out, "                        case \"tan\": return Math.tan(a);");
+                emitRaw(out, "                        case \"asin\": return Math.asin(a);");
+                emitRaw(out, "                        case \"acos\": return Math.acos(a);");
+                emitRaw(out, "                        case \"atan\": return Math.atan(a);");
+                emitRaw(out, "                        case \"sqrt\": return Math.sqrt(a);");
+                emitRaw(out, "                        case \"cbrt\": return Math.cbrt(a);");
+                emitRaw(out, "                        case \"abs\": return Math.abs(a);");
+                emitRaw(out, "                        case \"floor\": return Math.floor(a);");
+                emitRaw(out, "                        case \"ceil\": return Math.ceil(a);");
+                emitRaw(out, "                        case \"round\": return Math.signum(a) * Math.round(Math.abs(a));");
+                emitRaw(out, "                        case \"ln\": case \"log\": return Math.log(a);");
+                emitRaw(out, "                        case \"log2\": return Math.log(a) / Math.log(2);");
+                emitRaw(out, "                        case \"log10\": return Math.log10(a);");
+                emitRaw(out, "                        case \"exp\": return Math.exp(a);");
+                emitRaw(out, "                        case \"deg2rad\": return a * Math.PI / 180;");
+                emitRaw(out, "                        case \"rad2deg\": return a * 180 / Math.PI;");
+                emitRaw(out, "                        default: return Double.NaN;");
+                emitRaw(out, "                    }");
+                emitRaw(out, "                }");
+                emitRaw(out, "                return Double.NaN;");
+                emitRaw(out, "            }");
+                emitRaw(out, "            int start = i;");
+                emitRaw(out, "            while (i < s.length() && digit(s.charAt(i))) i++;");
+                emitRaw(out, "            if (peek() == '.') { i++; while (i < s.length() && digit(s.charAt(i))) i++; }");
+                emitRaw(out, "            if (peek() == 'e' || peek() == 'E') {");
+                emitRaw(out, "                int save = i; i++;");
+                emitRaw(out, "                if (peek() == '+' || peek() == '-') i++;");
+                emitRaw(out, "                if (digit(peek())) { while (i < s.length() && digit(s.charAt(i))) i++; } else { i = save; }");
+                emitRaw(out, "            }");
+                emitRaw(out, "            String t = s.substring(start, i);");
+                emitRaw(out, "            if (t.isEmpty() || t.equals(\".\")) return Double.NaN;");
+                emitRaw(out, "            return Double.parseDouble(t);");
+                emitRaw(out, "        }");
+                emitRaw(out, "    }");
+                emitRaw(out, "    interface _Fn { double at(double x); }");
+                emitRaw(out, "    static double evalAt(String f, double x) { return new _Calc(f == null ? \"\" : f, x).expr(); }");
+                emitRaw(out, "    static double _simpson(_Fn g, double a, double b) { double c = (a + b) / 2; return (b - a) / 6 * (g.at(a) + 4 * g.at(c) + g.at(b)); }");
+                emitRaw(out, "    static double _adaptive(_Fn g, double a, double b, double tol, double whole, int depth) {");
+                emitRaw(out, "        double c = (a + b) / 2;");
+                emitRaw(out, "        double l = _simpson(g, a, c), r = _simpson(g, c, b);");
+                emitRaw(out, "        if (depth <= 0 || Math.abs(l + r - whole) <= 15 * tol) return l + r + (l + r - whole) / 15;");
+                emitRaw(out, "        return _adaptive(g, a, c, tol / 2, l, depth - 1) + _adaptive(g, c, b, tol / 2, r, depth - 1);");
+                emitRaw(out, "    }");
+                emitRaw(out, "    static double _golden(_Fn g, double a, double b) {");
+                emitRaw(out, "        double phi = (Math.sqrt(5) - 1) / 2;");
+                emitRaw(out, "        double c = b - phi * (b - a), d = a + phi * (b - a);");
+                emitRaw(out, "        while (Math.abs(b - a) > 1e-9) {");
+                emitRaw(out, "            if (g.at(c) < g.at(d)) b = d; else a = c;");
+                emitRaw(out, "            c = b - phi * (b - a); d = a + phi * (b - a);");
+                emitRaw(out, "        }");
+                emitRaw(out, "        return (a + b) / 2;");
+                emitRaw(out, "    }");
+                emitRaw(out, "    public static double eval(String f) { return evalAt(f, 0); }");
+                emitRaw(out, "    public static double integrate(String f, double a, double b) { _Fn g = x -> evalAt(f, x); return _adaptive(g, a, b, 1e-9, _simpson(g, a, b), 20); }");
+                emitRaw(out, "    public static double derivative(String f, double x) { double h = 1e-7; return (evalAt(f, x + h) - evalAt(f, x - h)) / (2 * h); }");
+                emitRaw(out, "    public static double limit(String f, double x) {");
+                emitRaw(out, "        double l = Double.NaN, r = Double.NaN;");
+                emitRaw(out, "        for (double h = 1e-3; h >= 1e-8 - 1e-20; h /= 10) {");
+                emitRaw(out, "            l = evalAt(f, x - h); r = evalAt(f, x + h);");
+                emitRaw(out, "            if (!Double.isFinite(l) || !Double.isFinite(r)) return Double.NaN;");
+                emitRaw(out, "        }");
+                emitRaw(out, "        double scale = Math.max(1, Math.max(Math.abs(l), Math.abs(r)));");
+                emitRaw(out, "        if (Math.abs(l - r) > 1e-6 * scale) return Double.NaN;");
+                emitRaw(out, "        return (l + r) / 2;");
+                emitRaw(out, "    }");
+                emitRaw(out, "    public static double minima(String f, double a, double b) { return _golden(x -> evalAt(f, x), a, b); }");
+                emitRaw(out, "    public static double maxima(String f, double a, double b) { return _golden(x -> -evalAt(f, x), a, b); }");
                 emitRaw(out, "    static long to_int(double x){return (long)x;} static double deg2rad(double x){return Math.toRadians(x);} static double rad2deg(double x){return Math.toDegrees(x);}");
                 emitRaw(out, "}");
                 continue;
@@ -8376,6 +9225,18 @@ class JavaStrategy : public BackendStrategy
             emitRaw(out, "    }");
         }
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
+        // `subject % pattern`: linear glob, `%` = any run of characters; backtrack to the last `%`.
+        emitRaw(out, "    static boolean ac_wildcard_match(String s, String p) {");
+        emitRaw(out, "        int si = 0, pi = 0, starP = -1, starS = 0;");
+        emitRaw(out, "        while (si < s.length()) {");
+        emitRaw(out, "            if (pi < p.length() && p.charAt(pi) == '%') { starP = pi++; starS = si; }");
+        emitRaw(out, "            else if (pi < p.length() && p.charAt(pi) == s.charAt(si)) { pi++; si++; }");
+        emitRaw(out, "            else if (starP >= 0) { pi = starP + 1; si = ++starS; }");
+        emitRaw(out, "            else return false;");
+        emitRaw(out, "        }");
+        emitRaw(out, "        while (pi < p.length() && p.charAt(pi) == '%') pi++;");
+        emitRaw(out, "        return pi == p.length();");
+        emitRaw(out, "    }");
         emitRaw(out, "    static String ac_iota(long n) {");
         emitRaw(out, "        StringBuilder b = new StringBuilder();");
         emitRaw(out, "        for (long i = 0; i < n; i++) b.append(i);");
@@ -8594,6 +9455,7 @@ class JavaStrategy : public BackendStrategy
     void emitTrueDivision(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &lhs, const std::string &rhs) override
     {
+        emit(out, indent, "if ((double)(" + rhs + ") == 0.0) throw new ArithmeticException(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\");");
         std::string expr = "(double)(" + lhs + ") / (double)(" + rhs + ")";
         bool isNew = declared.insert(res).second;
         if (isNew) { floatVars.insert(res); emit(out, indent, "double " + res + " = " + expr + ";"); }
@@ -8654,6 +9516,14 @@ class JavaStrategy : public BackendStrategy
             emit(out, indent, (declared.insert(var).second ? "AcDynVal " : "") + var + " = " + boxWrap(val, t) + ";");
             return;
         }
+        // A boolean value stays boolean on a store (`r = s % p`). The int-typed path below would
+        // emit `long r = (long)(t)`, which javac rejects for a boolean.
+        if (isBoolVal(val) && (!declared.count(var) || boolVars.count(var))) {
+            bool fresh = declared.insert(var).second;
+            boolVars.insert(var);
+            emit(out, indent, (fresh ? "boolean " : "") + var + " = " + val + ";");
+            return;
+        }
         // Re-typing coercion (#retype): a var ever assigned a string is a String everywhere;
         // non-strings get String.valueOf'd — `x=5; x=$hi$` → `String x=String.valueOf(5); x="hi";`.
         if (isStringVar(var)) {
@@ -8674,6 +9544,13 @@ class JavaStrategy : public BackendStrategy
         // neither branch below ever checked listVars, so it fell to the `long` default and
         // punned an ArrayList<Long> through a scalar ("incompatible types: ArrayList<Long>
         // cannot be converted to long").
+        // A copy of a list of strings (parts = t_0, t_0 from an ilib split) stays a List<String>.
+        if (stringListVars_.count(val)) {
+            listVars.insert(var); stringListVars_.insert(var);
+            if (declared.insert(var).second) emit(out, indent, "java.util.List<String> " + var + " = " + val + ";");
+            else                             emit(out, indent, var + " = " + val + ";");
+            return;
+        }
         if (listVars.count(val)) {
             listVars.insert(var);
             if (declared.insert(var).second) emit(out, indent, "java.util.ArrayList<Long> " + var + " = " + val + ";");
@@ -8758,6 +9635,28 @@ class JavaStrategy : public BackendStrategy
         else if (isFloat && !floatVars.count(res))
                                emit(out, indent, res + " = (long)(" + expr + ");");
         else                   emit(out, indent, res + " = " + expr + ";");
+    }
+    // `dict has key` -> a boolean (Map.containsKey).
+    void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        bool isNew = declared.insert(res).second;
+        boolVars.insert(res);
+        emit(out, indent, (isNew ? "boolean " : "") + res + " = " + dict + ".containsKey(" + key + ");");
+    }
+    // `subject % pattern` -> a Java boolean (matcher is in the prelude).
+    void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        std::string expr = "ac_wildcard_match(" + subject + ", " + pattern + ")";
+        bool isNew = declared.insert(res).second;
+        boolVars.insert(res);   // isBoolVal() sees it, so a later store keeps the boolean type
+        emit(out, indent, (isNew ? "boolean " : "") + res + " = " + expr + ";");
+    }
+    // A runtime bool prints as True/False.
+    void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "System.out.println(" + val + " ? \"True\" : \"False\");");
     }
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
@@ -9032,6 +9931,7 @@ class JavaStrategy : public BackendStrategy
             // `boolean` too — same gap (verified: abu_speaks_ac's lexer, `stringm.ischar(ch)`,
             // "incompatible types: boolean cannot be converted to long").
             "stringm.ischar",
+            "stringm.startswith", "stringm.endswith", "stringm.isws", "stringm.scan",   // boolean in the Java binding
         };
         // native-cpu's carried-over pointer functions are called BARE (ptr_new, not
         // ncpu.ptr_new) — but Java has no free functions, so an unqualified call can't
@@ -9187,6 +10087,10 @@ class JavaStrategy : public BackendStrategy
             emit(out, indent, call + ";");
         } else if ((isAcStrFunc(actualFunc) || userStringFuncs_.count(actualFunc)) && declared.insert(res).second) {
             emit(out, indent, "String " + res + " = " + call + ";");
+        } else if (isAcStrListFunc(actualFunc) && declared.insert(res).second) {
+            // ilib list-of-string calls (regex.split, stringm.split, ...) return a java.util.List<String>
+            listVars.insert(res); stringListVars_.insert(res);
+            emit(out, indent, "java.util.List<String> " + res + " = " + call + ";");
         } else if (isListReturningFunc(actualFunc) && declared.insert(res).second) {
             listVars.insert(res);
             bool isStrList = stringListReturnFuncs_.count(actualFunc) > 0;
@@ -9409,7 +10313,7 @@ class JavaStrategy : public BackendStrategy
             else if (seqOf_.count(collection))
                 emit(out, indent, "for (long " + tmp + " = (" + seqOf_[collection].first + "); " + tmp + " < (" + seqOf_[collection].second + "); ++" + tmp + ") {");
             else
-                emit(out, indent, "for (long " + tmp + " : " + collection + ") {");
+                emit(out, indent, std::string("for (") + (stringListVars_.count(collection) ? "String " : "long ") + tmp + " : " + collection + ") {");
             indent++;
             emit(out, indent, iterVar + " = " + tmp + ";");
             forVarStack_.push_back("");   // nothing to un-declare at loop end: the variable predates the loop
@@ -9435,6 +10339,12 @@ class JavaStrategy : public BackendStrategy
             indent++;
             emit(out, indent, "String " + iterVar + " = String.valueOf(" + raw + ");");
             declared.insert(iterVar); forVarStack_.push_back(iterVar);
+            return;
+        }
+        if (stringListVars_.count(collection)) {   // list of strings: loop variable is a String
+            emit(out, indent, "for (String " + iterVar + " : " + collection + ") {");
+            declared.insert(iterVar); forVarStack_.push_back(iterVar);
+            indent++;
             return;
         }
         emit(out, indent, "for (long " + iterVar + " : " + collection + ") {");
@@ -10020,6 +10930,8 @@ class RustStrategy : public BackendStrategy
     std::map<std::string, IRType> varCastTypes_;
     std::map<std::string, int> funcTypedParams_;
     std::map<std::string, int> userFuncArity_;
+    std::map<std::string, std::vector<bool>> userFuncListArgs_;
+    void setUserFuncListArgs(const std::map<std::string, std::vector<bool>>& m) override { userFuncListArgs_ = m; }
     bool lastWasReturn = false;
     std::vector<std::pair<std::string,std::string>> pendingImports_;
     std::unordered_map<std::string, std::string> rangeOf_;
@@ -10257,7 +11169,25 @@ class RustStrategy : public BackendStrategy
             else                       emitRaw(out, "static mut " + promotedGlobalName(v) + ": i64 = 0;");
         }
         if (!promotedGlobals_.empty()) emitRaw(out, "");
+        // `subject % pattern`: % matches any run of characters (none included); the whole subject
+        // must match. Backtracks to the last %, the same linear-space matcher as the C backend.
+        emitRaw(out, "#[allow(dead_code)]");
+        emitRaw(out, "fn ac_wildcard_match(s: &str, p: &str) -> bool {");
+        emitRaw(out, "    let (s, p) = (s.as_bytes(), p.as_bytes());");
+        emitRaw(out, "    let (mut i, mut j, mut star, mut mark) = (0usize, 0usize, usize::MAX, 0usize);");
+        emitRaw(out, "    while i < s.len() {");
+        emitRaw(out, "        if j < p.len() && p[j] == b'%' { star = j; mark = i; j += 1; }");
+        emitRaw(out, "        else if j < p.len() && p[j] == s[i] { i += 1; j += 1; }");
+        emitRaw(out, "        else if star != usize::MAX { j = star + 1; mark += 1; i = mark; }");
+        emitRaw(out, "        else { return false; }");
+        emitRaw(out, "    }");
+        emitRaw(out, "    while j < p.len() && p[j] == b'%' { j += 1; }");
+        emitRaw(out, "    j == p.len()");
+        emitRaw(out, "}");
         emitRaw(out, "fn ac_iota(n: i64) -> String { (0..n).map(|i| i.to_string()).collect() }");
+        // to_string(someList): Python-style "[1, 2, 3]" / "['a', 'b']" — Vec has no to_string().
+        emitRaw(out, "fn ac_vec_i64_str(v: &Vec<i64>) -> String { format!(\"[{}]\", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(\", \")) }");
+        emitRaw(out, "fn ac_vec_str_str(v: &Vec<String>) -> String { format!(\"[{}]\", v.iter().map(|x| format!(\"'{}'\", x)).collect::<Vec<_>>().join(\", \")) }");
         emitRaw(out, "fn ac_ipow(b: i64, e: i64) -> i64 { let mut r: i64 = 1; let mut k = e; while k > 0 { r *= b; k -= 1; } r }");
         emitRaw(out, "fn ac_rand(n: i64) -> i64 { if n <= 0 { return 0; } let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as u64; let mut x = t | 1; x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x % (n as u64)) as i64 }");
         emitRaw(out, "fn ac_choice(xs: Vec<i64>) -> i64 { xs[ac_rand(xs.len() as i64) as usize] }");
@@ -10378,7 +11308,24 @@ class RustStrategy : public BackendStrategy
         for (auto& [lt, ln] : pendingImports_) {
             if (lt == "ilib") {
                 std::string ffi = readFFIFile(ln, "rs");
-                if (!ffi.empty()) collectFfiLines(ffi);
+                if (!ffi.empty()) {
+                    collectFfiLines(ffi);
+                    // An elib that bundles its own native code (see resolveIlibDir's own
+                    // comment) isn't in the hardcoded math/camera/widgets/.../otherIlibs
+                    // link tables below — this file's own `use ilib <ln>` still found real
+                    // FFI content just above (readFFIFile checks library/elib/<ln>/ too),
+                    // but nothing would tell rustc where its .so actually lives. Reuse the
+                    // exact same FLIB_SO_LINK mechanism flib's own .so linking already uses
+                    // (main.cpp's parser just below), scoped to ONLY the elib case so every
+                    // already-working core ilib's existing hardcoded path is untouched.
+                    std::string dir = resolveIlibDir(ln);
+                    if (dir.find("/elib/") != std::string::npos || dir.find("\\elib\\") != std::string::npos) {
+                        std::string soName = "libac";
+                        for (char c : ln) if (c != '-') soName += c;
+                        soName += ".so";
+                        emitRaw(out, "// FLIB_SO_LINK: " + dir + "/" + soName);
+                    }
+                }
             } else if (lt == "flib") {
                 auto dot = ln.rfind('.');
                 std::string ext = (dot != std::string::npos) ? ln.substr(dot) : "";
@@ -10428,6 +11375,12 @@ class RustStrategy : public BackendStrategy
     }
     std::string formatRef(const IRRef &r, SymbolTable *sym) override
     {
+        // An unsuffixed Rust integer literal defaults to i32, so a 64-bit constant outside that
+        // range (`print 3000000001`) is a hard "literal out of range" error. Suffix only those.
+        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::INT) {
+            int64_t v = std::get<int64_t>(r.value.data);
+            if (v < INT32_MIN || v > INT32_MAX) return std::to_string(v) + "i64";
+        }
         std::string s = commonRef(r, sym, "true", "false", "None", "None");
         if (s.rfind("self.", 0) == 0) return selfLocal_(s);
         // AC identifiers are unreserved (no keyword list of its own), but a plain AC variable
@@ -10626,6 +11579,7 @@ class RustStrategy : public BackendStrategy
     void emitTrueDivision(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &lhs, const std::string &rhs) override
     {
+        emit(out, indent, "if (" + rhs + ") as f64 == 0.0 { eprintln!(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\"); std::process::exit(1); }");
         std::string expr = lhs + " as f64 / " + rhs + " as f64";
         bool isNew = declared.insert(res).second;
         if (isNew) { floatVars.insert(res); emit(out, indent, "let mut " + res + ": f64 = " + expr + ";"); }
@@ -10699,6 +11653,14 @@ class RustStrategy : public BackendStrategy
         // declaration that can't hold this var's genuinely-numeric earlier value.
         if (boxedVars_.count(var)) {
             emit(out, indent, (declared.insert(var).second ? "let mut " + var + ": AcDynVal = " : var + " = ") + boxWrap(val, t) + ";");
+            return;
+        }
+        // A genuine native-bool value (a `%` match, see rustBoolVars_) keeps its bool type on a
+        // store. The i64 path below would emit `val != 0`, which rustc rejects for a bool.
+        if (rustBoolVars_.count(val) && (!declared.count(var) || rustBoolVars_.count(var))) {
+            bool fresh = declared.insert(var).second;
+            rustBoolVars_.insert(var);
+            emit(out, indent, (fresh ? "let mut " + var + ": bool = " : var + " = ") + val + ";");
             return;
         }
         if (declared.insert(var).second) {
@@ -10816,6 +11778,27 @@ class RustStrategy : public BackendStrategy
             emit(out, indent, "let mut " + res + ": i64 = " + expr + ";");
         else
             emit(out, indent, res + " = " + expr + ";");
+    }
+    // `dict has key` -> a bool (HashMap::contains_key, same key form as the index read).
+    void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        std::string expr = dict + ".contains_key(AsRef::<str>::as_ref(&(" + key + ")))";
+        if (declared.insert(res).second) { rustBoolVars_.insert(res); emit(out, indent, "let mut " + res + ": bool = " + expr + ";"); }
+        else { rustBoolVars_.insert(res); emit(out, indent, res + " = " + expr + ";"); }
+    }
+    // `subject % pattern` -> a real Rust bool (the matcher is in the prelude; String derefs to &str).
+    void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        std::string expr = "ac_wildcard_match(&(" + subject + "), &(" + pattern + "))";
+        if (declared.insert(res).second) { rustBoolVars_.insert(res); emit(out, indent, "let mut " + res + ": bool = " + expr + ";"); }
+        else { rustBoolVars_.insert(res); emit(out, indent, res + " = " + expr + ";"); }
+    }
+    // A runtime bool prints as True/False.
+    void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "println!(\"{}\", if " + val + " { \"True\" } else { \"False\" });");
     }
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
@@ -11004,6 +11987,35 @@ class RustStrategy : public BackendStrategy
               args2.clear();
               for (size_t k = 0; k < parts.size(); k++) { if (k) args2 += ","; args2 += parts[k]; }
           } }
+        // List arguments to user functions: the callee takes `&mut Vec<..>` (parameter emitter
+        // above), so pass a borrow. A caller's own list parameter is already a reference and
+        // passes through; a local list is borrowed in place; anything else (a temp, a literal,
+        // a global) is borrowed from a fresh copy. Before this, the list was MOVED: the callee's
+        // writes never reached the caller and a second call with the same list did not compile.
+        auto ulIt = userFuncListArgs_.find(func);
+        if (ulIt != userFuncListArgs_.end() && std::count(ulIt->second.begin(), ulIt->second.end(), true)) {
+            std::vector<std::string> parts; { std::string cur; int depth = 0;
+                for (char c : args2) { if (c=='('||c=='['||c=='{') depth++; else if (c==')'||c==']'||c=='}') depth--;
+                    if (c==',' && depth==0) { parts.push_back(cur); cur.clear(); } else cur += c; }
+                if (!cur.empty()) parts.push_back(cur); }
+            for (size_t k = 0; k < parts.size() && k < ulIt->second.size(); k++) {
+                if (!ulIt->second[k]) continue;
+                size_t s = parts[k].find_first_not_of(' '), e = parts[k].find_last_not_of(' ');
+                if (s == std::string::npos) continue;
+                std::string t = parts[k].substr(s, e - s + 1);
+                // valueArgRef clones every list argument (value semantics); AC lists are shared
+                // references (PY oracle), so take the bare name back out before borrowing it.
+                if (t.size() > 8 && t.compare(t.size() - 8, 8, ".clone()") == 0) t = t.substr(0, t.size() - 8);
+                if (t.rfind("&", 0) == 0) continue;
+                if (listParams_.count(t)) { parts[k] = t; continue; }   // already a `&mut` param
+                bool plainLocal = !t.empty() && !listGlobals_.count(t) && t.rfind("t_", 0) != 0
+                    && std::all_of(t.begin(), t.end(), [](char c){ return std::isalnum((unsigned char)c) || c == '_'; });
+                if (plainLocal) parts[k] = "&mut " + t;
+                else parts[k] = "&mut (" + t + ").clone()";
+            }
+            args2.clear();
+            for (size_t k = 0; k < parts.size(); k++) { if (k) args2 += ","; args2 += parts[k]; }
+        }
         // User functions with a string parameter always declare it `&str` in Rust (owned
         // `String` args never implicitly convert) — a caller passing an already-`String`-typed
         // local (as opposed to a literal, which is natively `&str`) needs an explicit `&`
@@ -11140,9 +12152,12 @@ class RustStrategy : public BackendStrategy
                 "hypot","ln","log","log2","log10","clamp",
             };
             std::string bare = rfunc;
-            if (bare.rfind("math.", 0) == 0) bare = bare.substr(5);
-            else if (bare.rfind("math_", 0) == 0) bare = bare.substr(5);
-            if (mathFloatArgFuncs.count(bare)) {
+            // Only a call that really goes to the math library gets float-cast arguments. A user
+            // function that happens to share a name (`Make clamp func(v, lo, hi)`) must not.
+            bool isMathCall = false;
+            if (bare.rfind("math.", 0) == 0) { bare = bare.substr(5); isMathCall = true; }
+            else if (bare.rfind("math_", 0) == 0) { bare = bare.substr(5); isMathCall = true; }
+            if (isMathCall && mathFloatArgFuncs.count(bare)) {
                 std::string cast, cur; int depth = 0; bool any = false;
                 auto flushArg = [&](std::string t) {
                     size_t s = t.find_first_not_of(' '), e = t.find_last_not_of(' ');
@@ -11279,8 +12294,11 @@ class RustStrategy : public BackendStrategy
             // abu_speaks_ac's `apply_line`, "expected f64, found i64").
             bool needsFloatify = !needsStringify && curFuncReturnIsFloat_
                 && !floatVars.count(val) && !looksFloat(val);
+            // A list parameter is a `&mut Vec` in this function (see the parameter emitter), so
+            // returning it hands back a copy: the caller owns a fresh Vec, as before.
             std::string v = needsStringify ? "(" + val + ").to_string()"
-                : needsFloatify ? "(" + val + ") as f64" : val;
+                : needsFloatify ? "(" + val + ") as f64"
+                : (listParams_.count(val) ? val + ".clone()" : val);
             emit(out, indent, "return " + v + ";");
             lastWasReturn = true;
         }
@@ -11413,7 +12431,7 @@ class RustStrategy : public BackendStrategy
             // MOVED by a plain save, leaving `v` unusable in the loop body. .clone() keeps the
             // original live (#6/#22 loop-sandbox on Rust).
             emit(out, indent, "let mut " + pfx + v + " = " + v
-                              + ((isStringVar(v) || listVars.count(v) || listParams_.count(v) || listGlobals_.count(v)
+                              + ((isStringVar(v) || listVars.count(v) || stringListVars_.count(v) || listParams_.count(v) || listGlobals_.count(v)
                                   || classInstanceVars_.count(v)) ? ".clone();" : ";"));
     }
     void emitScopeExit(std::ostringstream &out, int &indent,
@@ -11496,7 +12514,8 @@ class RustStrategy : public BackendStrategy
         std::string raw = iterVar + "__ref";
         emit(out, indent, "for " + raw + " in " + collection + ".iter() {");
         indent++;
-        emit(out, indent, "let " + iterVar + " = *" + raw + ";");
+        // A String element is not Copy: clone it out of the reference. i64 elements stay a copy.
+        emit(out, indent, "let " + iterVar + (stringListVars_.count(collection) ? " = " + raw + ".clone();" : " = *" + raw + ";"));
     }
     void emitForEnd(std::ostringstream &out, int &indent) override
     {
@@ -11678,6 +12697,14 @@ class RustStrategy : public BackendStrategy
                           const std::string &res, const std::string &func,
                           const std::string &args) override
     {
+        // Widget constructors reach here too (genInstr treats any bare, non-user callee as
+        // indirect). emitCall owns their Rust-specific argument fixes (dropping the trailing
+        // `lazy` sentinel, see its dropdown/textbox branches) — route them there.
+        static const std::set<std::string> rustWidgetCtors = {
+            "Screen", "display", "ask", "btn", "ckbtn", "radbtn", "dropdown",
+            "advance", "slider", "textbox", "sketch", "tabs", "scroller", "listbox", "table",
+        };
+        if (rustWidgetCtors.count(func)) { emitCall(out, indent, res, func, args); return; }
         std::string call = func + "(" + args + ")";
         if (func.rfind("t_", 0) == 0 && !funcValueTable_.empty())   // a function VALUE out of a list: id dispatch
             call = "ac_callfn" + std::to_string(callArgCount(args)) + "(" + func + (args.empty() ? "" : ", " + args) + ")";
@@ -11689,7 +12716,9 @@ class RustStrategy : public BackendStrategy
     {
         emit(out, indent, "print!(\"{}\", " + prompt + ");");
         emit(out, indent, "let mut _buf_" + result + " = String::new();");
-        emit(out, indent, "std::io::stdin().read_line(&mut _buf_" + result + ").unwrap();");
+        // EOF is an error, as in PY's input() (EOFError) and ASM's emitInput: stop instead of looping
+        // on empty lines. Flush first — process::exit skips the stdout buffer's own flush.
+        emit(out, indent, "if std::io::stdin().read_line(&mut _buf_" + result + ").unwrap() == 0 { std::io::Write::flush(&mut std::io::stdout()).ok(); eprintln!(\"EOFError: EOF when reading a line\"); std::process::exit(1); }");
         emit(out, indent, "let " + result + " = _buf_" + result + ".trim().to_string();");
         declared.insert(result);
         // Without this, a later plain copy-through (`name = t_0`, a separate STORE_VAR after
@@ -11779,12 +12808,21 @@ class RustStrategy : public BackendStrategy
                 } else if (isStringVar(pname) || stringParams_.count(pname)) {
                     stringVars_.insert(pname);
                     tparams += pname + ": &str";   // #6: read-only string param (literals pass free)
-                } else if (listParams_.count(pname)) {
+                } else if (listParams_.count(pname) && reboundParams_.count(pname)) {
+                    // Rebound in the body: the callee keeps its own copy, as before the by-ref change.
                     if (stringListVars_.count(pname)) {
                         stringListVars_.insert(pname);
                         tparams += "mut " + pname + ": Vec<String>";
                     } else
-                        tparams += "mut " + pname + ": Vec<i64>";  // array parameter (moved in)
+                        tparams += "mut " + pname + ": Vec<i64>";
+                } else if (listParams_.count(pname)) {
+                    // Borrowed, not moved: the caller passes `&mut` (see the call site's
+                    // userFuncListArgs_ rewrite), so the callee's writes reach the caller's list.
+                    if (stringListVars_.count(pname)) {
+                        stringListVars_.insert(pname);
+                        tparams += pname + ": &mut Vec<String>";
+                    } else
+                        tparams += pname + ": &mut Vec<i64>";  // array parameter (by &mut)
                 } else if (fit != funcTypedParams_.end()) {
                     std::string argList;
                     for (int k = 0; k < fit->second; ++k) { if (k) argList += ", "; argList += "i64"; }
@@ -12089,8 +13127,12 @@ class RustStrategy : public BackendStrategy
             std::string rhs = srcIsStr ? (src + ".parse::<f64>().unwrap_or(0.0)") : (src + " as f64");
             emit(out, indent, (isNew ? "let mut " + var + ": f64 = " : var + " = ") + rhs + ";");
         } else if (t == IRType::STRING) {
+            bool srcIsList = listVars.count(src) || listParams_.count(src) || listGlobals_.count(src);
+            std::string listFmt = stringListVars_.count(src) ? "ac_vec_str_str(&" + src + ");"
+                                                              : "ac_vec_i64_str(&" + src + ");";
             emit(out, indent, (isNew ? "let mut " + var + ": String = " : var + " = ")
-                 + (smartPrint_ ? "ac_smart_double((" + src + ") as f64);"
+                 + (srcIsList ? listFmt
+                    : smartPrint_ ? "ac_smart_double((" + src + ") as f64);"
                     : hardPrint_ ? "ac_fmt_double((" + src + ") as f64);"
                     : src + ".to_string();"));
         } else if (irIntWidth(t)) {
@@ -12146,6 +13188,8 @@ class RustStrategy : public BackendStrategy
 
 class GoStrategy : public BackendStrategy
 {
+    std::set<std::string> floatParams_;   // parameters typed float64 in this function's signature
+    void setFloatParams(const std::set<std::string>& s) override { floatParams_ = s; }
     // Widget ctor calls (`Screen(...)`, `textbox(...)`, etc) had NO special handling at all
     // before this — they fell straight through emitCall's generic fallback to `decl(res,
     // call)`, which has no way to know the real return type is `*AcScreen`/`*AcTextbox`/etc
@@ -12399,13 +13443,13 @@ private:
                     // resolveIlibDir already finds the real absolute directory regardless of
                     // cwd/invocation style (AC_PATH → cwd-search → binary-relative) — substitute
                     // that directly instead of guessing a relative path from the output name.
-                    std::string from = "${SRCDIR}/library/ilib/" + ln;
+                    std::string from = "${SRCDIR}/library/ilib/" + ilibSubdir(ln);
                     std::string absDir = resolveIlibDir(ln);
                     // cgo's #cgo directive tokenizer supports shell-style quoting (needed here:
                     // the resolved absolute path can contain spaces, e.g. a "kiro projects"
                     // directory component — an unquoted path silently splits into two bogus
                     // flag tokens, "invalid flag in #cgo CFLAGS").
-                    std::string to = !absDir.empty() ? ("\"" + absDir + "\"") : ("${SRCDIR}/" + relRoot_ + "/library/ilib/" + ln);
+                    std::string to = !absDir.empty() ? ("\"" + absDir + "\"") : ("${SRCDIR}/" + relRoot_ + "/library/ilib/" + ilibSubdir(ln));
                     size_t pos = 0;
                     while ((pos = cgoBlock.find(from, pos)) != std::string::npos) {
                         cgoBlock.replace(pos, from.size(), to);
@@ -12539,6 +13583,18 @@ private:
             emitRaw(out, "func _acTrigger(key string) { if fn, ok := _acEvents[key]; ok { fn() } }");
         }
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
+        // `subject % pattern`: linear glob, `%` = any run of bytes; backtrack to the last `%`.
+        emitRaw(out, "func ac_wildcard_match(s, p string) bool {");
+        emitRaw(out, "    si, pi, starP, starS := 0, 0, -1, 0");
+        emitRaw(out, "    for si < len(s) {");
+        emitRaw(out, "        if pi < len(p) && p[pi] == '%' { starP = pi; pi++; starS = si } "
+                     "else if pi < len(p) && p[pi] == s[si] { pi++; si++ } "
+                     "else if starP >= 0 { pi = starP + 1; starS++; si = starS } "
+                     "else { return false }");
+        emitRaw(out, "    }");
+        emitRaw(out, "    for pi < len(p) && p[pi] == '%' { pi++ }");
+        emitRaw(out, "    return pi == len(p)");
+        emitRaw(out, "}");
         emitRaw(out, "func ac_iota(n int64) string {");
         emitRaw(out, "    r := \"\"");
         emitRaw(out, "    for i := int64(0); i < n; i++ {");
@@ -12568,6 +13624,176 @@ private:
             emitRaw(out, "func math_min(a, b float64) float64 { return gomath.Min(a, b) }");
             emitRaw(out, "func math_max(a, b float64) float64 { return gomath.Max(a, b) }");
             emitRaw(out, "func math_is_prime(n float64) float64 { m := int64(n); if m < 2 { return 0 }; for d := int64(2); d*d <= m; d++ { if m%d == 0 { return 0 } }; return 1 }");
+            emitRaw(out, "// ── formula evaluator and calculus (port of math.cpp and calculus.hpp) ─────");
+            emitRaw(out, "type _calcParser struct { s string; i int; x float64 }");
+            emitRaw(out, "func (p *_calcParser) skip() { for p.i < len(p.s) && (p.s[p.i] == ' ' || p.s[p.i] == '\\t') { p.i++ } }");
+            emitRaw(out, "func (p *_calcParser) peek() byte { if p.i < len(p.s) { return p.s[p.i] }; return 0 }");
+            emitRaw(out, "func _calcIsAlpha(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' }");
+            emitRaw(out, "func _calcIsDigit(c byte) bool { return c >= '0' && c <= '9' }");
+            emitRaw(out, "func (p *_calcParser) expr() float64 {");
+            emitRaw(out, "	v := p.term(); p.skip()");
+            emitRaw(out, "	for p.peek() == '+' || p.peek() == '-' { op := p.peek(); p.i++; r := p.term(); if op == '+' { v += r } else { v -= r }; p.skip() }");
+            emitRaw(out, "	return v");
+            emitRaw(out, "}");
+            emitRaw(out, "func (p *_calcParser) term() float64 {");
+            emitRaw(out, "	v := p.factor(); p.skip()");
+            emitRaw(out, "	for p.peek() == '*' || p.peek() == '/' || p.peek() == '%' {");
+            emitRaw(out, "		op := p.peek(); p.i++; r := p.factor()");
+            emitRaw(out, "		if op == '*' { v *= r } else if op == '/' { v /= r } else { v = gomath.Mod(v, r) }");
+            emitRaw(out, "		p.skip()");
+            emitRaw(out, "	}");
+            emitRaw(out, "	return v");
+            emitRaw(out, "}");
+            emitRaw(out, "func (p *_calcParser) factor() float64 {");
+            emitRaw(out, "	base := p.base(); p.skip()");
+            emitRaw(out, "	if p.peek() == '^' { p.i++; e := p.factor(); return gomath.Pow(base, e) }");
+            emitRaw(out, "	return base");
+            emitRaw(out, "}");
+            emitRaw(out, "func (p *_calcParser) base() float64 {");
+            emitRaw(out, "	p.skip()");
+            emitRaw(out, "	c := p.peek()");
+            emitRaw(out, "	if c == '(' { p.i++; v := p.expr(); p.skip(); if p.peek() == ')' { p.i++ }; return v }");
+            emitRaw(out, "	if c == '-' { p.i++; return -p.factor() }");
+            emitRaw(out, "	if c == '+' { p.i++; return p.factor() }");
+            emitRaw(out, "	if _calcIsAlpha(c) {");
+            emitRaw(out, "		start := p.i");
+            emitRaw(out, "		for p.i < len(p.s) && (_calcIsAlpha(p.s[p.i]) || _calcIsDigit(p.s[p.i])) { p.i++ }");
+            emitRaw(out, "		name := p.s[start:p.i]");
+            emitRaw(out, "		p.skip()");
+            emitRaw(out, "		if name == \"x\" && p.peek() != '(' { return p.x }");
+            emitRaw(out, "		switch name {");
+            emitRaw(out, "		case \"pi\": return gomath.Pi");
+            emitRaw(out, "		case \"e\": return gomath.E");
+            emitRaw(out, "		case \"tau\": return 2 * gomath.Pi");
+            emitRaw(out, "		case \"em\": return 0.5772156649015329");
+            emitRaw(out, "		case \"phi\": return 1.6180339887498949");
+            emitRaw(out, "		case \"inf\": return gomath.Inf(1)");
+            emitRaw(out, "		}");
+            emitRaw(out, "		if p.peek() == '(' {");
+            emitRaw(out, "			p.i++");
+            emitRaw(out, "			a := p.expr(); p.skip()");
+            emitRaw(out, "			if p.peek() == ',' {");
+            emitRaw(out, "				p.i++; b := p.expr(); p.skip()");
+            emitRaw(out, "				if p.peek() == ')' { p.i++ }");
+            emitRaw(out, "				switch name {");
+            emitRaw(out, "				case \"pow\": return gomath.Pow(a, b)");
+            emitRaw(out, "				case \"atan2\": return gomath.Atan2(a, b)");
+            emitRaw(out, "				case \"log\": return gomath.Log(b) / gomath.Log(a)");
+            emitRaw(out, "				case \"hypot\": return gomath.Hypot(a, b)");
+            emitRaw(out, "				case \"mod\": return gomath.Mod(a, b)");
+            emitRaw(out, "				case \"min\": if a < b { return a }; return b");
+            emitRaw(out, "				case \"max\": if a > b { return a }; return b");
+            emitRaw(out, "				}");
+            emitRaw(out, "				return gomath.NaN()");
+            emitRaw(out, "			}");
+            emitRaw(out, "			if p.peek() == ')' { p.i++ }");
+            emitRaw(out, "			switch name {");
+            emitRaw(out, "			case \"sin\": return gomath.Sin(a)");
+            emitRaw(out, "			case \"cos\": return gomath.Cos(a)");
+            emitRaw(out, "			case \"tan\": return gomath.Tan(a)");
+            emitRaw(out, "			case \"asin\": return gomath.Asin(a)");
+            emitRaw(out, "			case \"acos\": return gomath.Acos(a)");
+            emitRaw(out, "			case \"atan\": return gomath.Atan(a)");
+            emitRaw(out, "			case \"sqrt\": return gomath.Sqrt(a)");
+            emitRaw(out, "			case \"cbrt\": return gomath.Cbrt(a)");
+            emitRaw(out, "			case \"abs\": return gomath.Abs(a)");
+            emitRaw(out, "			case \"floor\": return gomath.Floor(a)");
+            emitRaw(out, "			case \"ceil\": return gomath.Ceil(a)");
+            emitRaw(out, "			case \"round\": return gomath.Round(a)");
+            emitRaw(out, "			case \"ln\", \"log\": return gomath.Log(a)");
+            emitRaw(out, "			case \"log2\": return gomath.Log2(a)");
+            emitRaw(out, "			case \"log10\": return gomath.Log10(a)");
+            emitRaw(out, "			case \"exp\": return gomath.Exp(a)");
+            emitRaw(out, "			case \"deg2rad\": return a * gomath.Pi / 180");
+            emitRaw(out, "			case \"rad2deg\": return a * 180 / gomath.Pi");
+            emitRaw(out, "			}");
+            emitRaw(out, "			return gomath.NaN()");
+            emitRaw(out, "		}");
+            emitRaw(out, "		return gomath.NaN()");
+            emitRaw(out, "	}");
+            emitRaw(out, "	// a number: digits, an optional fraction, an optional exponent");
+            emitRaw(out, "	v := 0.0");
+            emitRaw(out, "	for p.i < len(p.s) && _calcIsDigit(p.s[p.i]) { v = v*10 + float64(p.s[p.i]-'0'); p.i++ }");
+            emitRaw(out, "	if p.peek() == '.' {");
+            emitRaw(out, "		p.i++; scale := 0.1");
+            emitRaw(out, "		for p.i < len(p.s) && _calcIsDigit(p.s[p.i]) { v += float64(p.s[p.i]-'0') * scale; scale /= 10; p.i++ }");
+            emitRaw(out, "	}");
+            emitRaw(out, "	if p.peek() == 'e' || p.peek() == 'E' {");
+            emitRaw(out, "		save := p.i; p.i++");
+            emitRaw(out, "		sign := 1.0");
+            emitRaw(out, "		if p.peek() == '-' { sign = -1; p.i++ } else if p.peek() == '+' { p.i++ }");
+            emitRaw(out, "		if _calcIsDigit(p.peek()) {");
+            emitRaw(out, "			ex := 0.0");
+            emitRaw(out, "			for p.i < len(p.s) && _calcIsDigit(p.s[p.i]) { ex = ex*10 + float64(p.s[p.i]-'0'); p.i++ }");
+            emitRaw(out, "			v *= gomath.Pow(10, sign*ex)");
+            emitRaw(out, "		} else { p.i = save }");
+            emitRaw(out, "	}");
+            emitRaw(out, "	return v");
+            emitRaw(out, "}");
+            emitRaw(out, "// The formula with x set to x. Formulas are text, e.g. \"x*x + sin(x)\".");
+            emitRaw(out, "func _calcEvalAt(f string, x float64) float64 { p := &_calcParser{s: f, x: x}; return p.expr() }");
+            emitRaw(out, "func math_eval_at(f string, x float64) float64 { return _calcEvalAt(f, x) }");
+            emitRaw(out, "func _calcSimpson(f func(float64) float64, a, b float64) float64 {");
+            emitRaw(out, "	c := (a + b) / 2");
+            emitRaw(out, "	return (b - a) / 6 * (f(a) + 4*f(c) + f(b))");
+            emitRaw(out, "}");
+            emitRaw(out, "func _calcAdaptive(f func(float64) float64, a, b, tol, whole float64, depth int) float64 {");
+            emitRaw(out, "	c := (a + b) / 2");
+            emitRaw(out, "	left := _calcSimpson(f, a, c)");
+            emitRaw(out, "	right := _calcSimpson(f, c, b)");
+            emitRaw(out, "	if depth <= 0 || gomath.Abs(left+right-whole) <= 15*tol {");
+            emitRaw(out, "		return left + right + (left+right-whole)/15");
+            emitRaw(out, "	}");
+            emitRaw(out, "	return _calcAdaptive(f, a, c, tol/2, left, depth-1) + _calcAdaptive(f, c, b, tol/2, right, depth-1)");
+            emitRaw(out, "}");
+            emitRaw(out, "// integral of the formula over [a, b] (adaptive Simpson)");
+            emitRaw(out, "func math_integrate(f string, a, b float64) float64 {");
+            emitRaw(out, "	g := func(x float64) float64 { return _calcEvalAt(f, x) }");
+            emitRaw(out, "	return _calcAdaptive(g, a, b, 1e-9, _calcSimpson(g, a, b), 20)");
+            emitRaw(out, "}");
+            emitRaw(out, "// derivative of the formula at x (central difference)");
+            emitRaw(out, "func math_derivative(f string, x float64) float64 {");
+            emitRaw(out, "	h := 1e-7");
+            emitRaw(out, "	return (_calcEvalAt(f, x+h) - _calcEvalAt(f, x-h)) / (2 * h)");
+            emitRaw(out, "}");
+            emitRaw(out, "// two-sided limit at x: both sides must agree at the smallest distance; otherwise NaN");
+            emitRaw(out, "func math_limit(f string, x float64) float64 {");
+            emitRaw(out, "	l := gomath.NaN()");
+            emitRaw(out, "	r := gomath.NaN()");
+            emitRaw(out, "	for h := 1e-3; h >= 1e-8-1e-20; h /= 10 {");
+            emitRaw(out, "		l = _calcEvalAt(f, x-h)");
+            emitRaw(out, "		r = _calcEvalAt(f, x+h)");
+            emitRaw(out, "		if gomath.IsInf(l, 0) || gomath.IsNaN(l) || gomath.IsInf(r, 0) || gomath.IsNaN(r) { return gomath.NaN() }");
+            emitRaw(out, "	}");
+            emitRaw(out, "	scale := gomath.Max(1, gomath.Max(gomath.Abs(l), gomath.Abs(r)))");
+            emitRaw(out, "	if gomath.Abs(l-r) > 1e-6*scale { return gomath.NaN() }");
+            emitRaw(out, "	return (l + r) / 2");
+            emitRaw(out, "}");
+            emitRaw(out, "func _calcGoldenMin(f func(float64) float64, a, b float64) float64 {");
+            emitRaw(out, "	phi := (gomath.Sqrt(5) - 1) / 2");
+            emitRaw(out, "	c := b - phi*(b-a)");
+            emitRaw(out, "	d := a + phi*(b-a)");
+            emitRaw(out, "	for gomath.Abs(b-a) > 1e-9 {");
+            emitRaw(out, "		if f(c) < f(d) { b = d } else { a = c }");
+            emitRaw(out, "		c = b - phi*(b-a)");
+            emitRaw(out, "		d = a + phi*(b-a)");
+            emitRaw(out, "	}");
+            emitRaw(out, "	return (a + b) / 2");
+            emitRaw(out, "}");
+            emitRaw(out, "// x of a minimum / maximum of the formula on [a, b] (golden section; for a unimodal formula)");
+            emitRaw(out, "func math_minima(f string, a, b float64) float64 {");
+            emitRaw(out, "	return _calcGoldenMin(func(x float64) float64 { return _calcEvalAt(f, x) }, a, b)");
+            emitRaw(out, "}");
+            emitRaw(out, "func math_maxima(f string, a, b float64) float64 {");
+            emitRaw(out, "	return _calcGoldenMin(func(x float64) float64 { return -_calcEvalAt(f, x) }, a, b)");
+            emitRaw(out, "}");
+            emitRaw(out, "// math.eval(\"expr\") = the formula at x = 0");
+            emitRaw(out, "func math_eval(f string) float64 { return _calcEvalAt(f, 0) }");
+            // Go math calls pass float64 (like math_is_prime above): these take and return float64.
+            emitRaw(out, "func math_mulmod(a, b, m int64) int64 { r := int64(0); a %= m; if a < 0 { a += m }; b %= m; if b < 0 { b += m }; for b > 0 { if b&1 == 1 { r = (r + a) % m }; a = (a * 2) % m; b >>= 1 }; return r }");
+            emitRaw(out, "func math_modmul(a0, b0, m0 float64) float64 { a, b, m := int64(a0), int64(b0), int64(m0); if m <= 0 { return -1 }; return float64(math_mulmod(a, b, m)) }");
+            emitRaw(out, "func math_modpow(b0, e0, m0 float64) float64 { b, e, m := int64(b0), int64(e0), int64(m0); if m <= 0 || e < 0 { return -1 }; r := int64(1) % m; x := ((b % m) + m) % m; for e > 0 { if e&1 == 1 { r = math_mulmod(r, x, m) }; x = math_mulmod(x, x, m); e >>= 1 }; return float64(r) }");
+            emitRaw(out, "func math_modinv(a0, m0 float64) float64 { a, m := int64(a0), int64(m0); if m <= 1 { return -1 }; r0 := ((a % m) + m) % m; r1 := m; s0 := int64(1); s1 := int64(0); for r1 != 0 { q := r0 / r1; r0, r1 = r1, r0-q*r1; s0, s1 = s1, s0-q*s1 }; if r0 != 1 { return -1 }; return float64(((s0 % m) + m) % m) }");
             // Missing entirely before (verified: examples/calculator.ac — "undefined: math_rad2deg").
             emitRaw(out, "func math_rad2deg(x float64) float64 { return x * 180 / gomath.Pi }");
             emitRaw(out, "func math_deg2rad(x float64) float64 { return x * gomath.Pi / 180 }");
@@ -12731,6 +13957,16 @@ private:
         // Smart-division display (see BackendStrategy::smartPrint_): whole -> integer digits.
         emitRaw(out, "func ac_smart_double(d float64) string { if d > -9.2e18 && d < 9.2e18 && d == float64(int64(d)) { return fmt.Sprintf(\"%d\", int64(d)) }; return ac_fmtg(d) }");
         emitRaw(out, "func _ac_dblprint(d float64) { fmt.Println(ac_fmt_double(d)) }");
+        // Lists print the way PY's repr does ("[2, 3]", strings quoted). fmt.Sprint would give "[2 3]".
+        emitRaw(out, "func _ac_fmt(v interface{}) string {");
+        emitRaw(out, "    switch x := v.(type) {");
+        emitRaw(out, "    case []int64:");
+        emitRaw(out, "        s := \"[\"; for i, e := range x { if i > 0 { s += \", \" }; s += fmt.Sprint(e) }; return s + \"]\"");
+        emitRaw(out, "    case []string:");
+        emitRaw(out, "        s := \"[\"; for i, e := range x { if i > 0 { s += \", \" }; s += \"'\" + e + \"'\" }; return s + \"]\"");
+        emitRaw(out, "    }");
+        emitRaw(out, "    return fmt.Sprint(v)");
+        emitRaw(out, "}");
         if (needsSave_) {
             emitRaw(out, "var _acSaved strings.Builder  // `save as`: accumulates everything printed so far");
         }
@@ -12868,6 +14104,7 @@ private:
     void emitTrueDivision(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &lhs, const std::string &rhs) override
     {
+        emit(out, indent, "if float64(" + rhs + ") == 0 { panic(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\") }");
         std::string expr = "float64(" + lhs + ") / float64(" + rhs + ")";
         declared.insert(res); floatVars.insert(res);
         emit(out, indent, res + " := " + expr);
@@ -12896,6 +14133,14 @@ private:
         // Bundle field write via a typed decl (e.g. `atomic hp = 5` as a field default) — same
         // translation as decl(): real struct field, no `var`-redeclaration.
         if (var.rfind("self.", 0) == 0) { emit(out, indent, decl(var, val)); return; }
+        // A boolean value stays bool on a store (`r = s % p`). The int64 path below would declare
+        // `var r int64 = t` and then `if r` would not compile.
+        if (boolVars.count(val) && (!declared.count(var) || boolVars.count(var))) {
+            bool fresh = declared.insert(var).second;
+            boolVars.insert(var);
+            emit(out, indent, (fresh ? "var " + var + " bool = " : var + " = ") + val);
+            return;
+        }
         // Bundle field WRITE on a NAMED instance, not just `self` — decl()'s own matching fix.
         // The shared driver's STORE_VAR dispatch ALWAYS calls emitTypedStoreVar (never decl()
         // directly), so decl()'s classInstanceVars_ check alone was never reachable for a typed
@@ -13059,6 +14304,26 @@ private:
                                emit(out, indent, res + " = int64(" + expr + ")");
         else                   emit(out, indent, res + " = " + expr);
     }
+    // `dict has key` -> a bool: the comma-ok form of a map read.
+    void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        declared.insert(res); boolVars.insert(res);
+        emit(out, indent, "_, " + res + " := " + dict + "[" + key + "]");
+    }
+    // `subject % pattern` -> a Go bool (matcher is in the prelude).
+    void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        std::string expr = "ac_wildcard_match(" + subject + ", " + pattern + ")";
+        if (declared.insert(res).second) { boolVars.insert(res); emit(out, indent, "var " + res + " bool = " + expr); }
+        else { boolVars.insert(res); emit(out, indent, res + " = " + expr); }
+    }
+    // A runtime bool prints as True/False.
+    void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "if " + val + " { fmt.Println(\"True\") } else { fmt.Println(\"False\") }");
+    }
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
@@ -13091,6 +14356,22 @@ private:
                          const std::string &func, const std::string &args) override
     {
         emit(out, indent, "go " + func + "(" + args + ")");
+    }
+    // Go rejects a local that is declared and never read; AC has no such rule. So every indented
+    // `var NAME ...` line gets `_ = NAME` after it (harmless when the local is read later).
+    std::string postProcess(const std::string &s) override {
+        std::istringstream in(s);
+        std::string line, result;
+        while (std::getline(in, line)) {
+            result += line + "\n";
+            size_t i = line.find_first_not_of(" \t");
+            if (i == std::string::npos || i == 0 || line.compare(i, 4, "var ") != 0) continue;
+            size_t n0 = i + 4, n1 = n0;
+            while (n1 < line.size() && (std::isalnum((unsigned char)line[n1]) || line[n1] == '_')) n1++;
+            if (n1 > n0 && n1 < line.size() && line[n1] == ' ')
+                result += line.substr(0, i) + "_ = " + line.substr(n0, n1 - n0) + "\n";
+        }
+        return result;
     }
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                   const std::string &funcIn, const std::string &args) override
@@ -13220,7 +14501,11 @@ private:
                 for (char c : args) { if (c=='('||c=='[') depth++; else if (c==')'||c==']') depth--;
                     if (c==',' && depth==0) { margs.push_back(cur); cur.clear(); } else cur += c; }
                 if (!cur.empty()) margs.push_back(cur); }
-            std::string cast; for (size_t k = 0; k < margs.size(); k++) { if (k) cast += ", "; cast += "float64(" + margs[k] + ")"; }
+            // the formula functions take their formula as text in the first argument
+            bool formulaFirst = routedFunc == "math.integrate" || routedFunc == "math_integrate" || routedFunc == "math.derivative" || routedFunc == "math_derivative"
+                || routedFunc == "math.limit" || routedFunc == "math_limit" || routedFunc == "math.minima" || routedFunc == "math_minima"
+                || routedFunc == "math.maxima" || routedFunc == "math_maxima" || routedFunc == "math.eval" || routedFunc == "math_eval";
+            std::string cast; for (size_t k = 0; k < margs.size(); k++) { if (k) cast += ", "; cast += (formulaFirst && k == 0) ? margs[k] : "float64(" + margs[k] + ")"; }
             std::string fn2 = routedFunc; for (auto& ch : fn2) if (ch == '.') ch = '_';
             std::string call2 = fn2 + "(" + cast + ")";
             // `math.mod` is TYPE-PRESERVING (int args -> int result, matching PY's dynamic
@@ -13231,8 +14516,11 @@ private:
             // both original args are int, so wrapping the whole call in `int64(...)` recovers
             // the right type without needing a second native function (verified: examples/
             // armstrong.ac / gcd_recursive.ac — "cannot use t_4 (float64) as int64 value").
-            bool modIsInt = forceInt;
-            if (!forceInt && (routedFunc == "math.mod" || routedFunc == "math_mod")) {
+            // modular helpers (see math.hpp) return whole numbers: keep them int64, like gcd/mod
+            bool modIsInt = forceInt || routedFunc.find("modpow") != std::string::npos
+                || routedFunc.find("modinv") != std::string::npos || routedFunc.find("modmul") != std::string::npos
+                || routedFunc == "math.to_int" || routedFunc == "math_to_int" || routedFunc == "math.abs_int" || routedFunc == "math_abs_int";
+            if (!modIsInt && (routedFunc == "math.mod" || routedFunc == "math_mod")) {
                 modIsInt = true;
                 for (auto& a : margs) {
                     std::string t = a; size_t s = t.find_first_not_of(' '), e = t.find_last_not_of(' ');
@@ -13301,6 +14589,7 @@ private:
             stringVars.insert(res);
             emit(out, indent, "var " + res + " string = " + call);
         } else if (isAcStrListFunc(func) && declared.insert(res).second) {
+            goListVars_.insert(res);   // so a later plain copy (parts = t_0) keeps the []string type
             emit(out, indent, "var " + res + " []string = " + call);
         } else if (isListReturningFunc(func) && declared.insert(res).second) {
             emit(out, indent, "var " + res + " []int64 = " + call);
@@ -13342,7 +14631,7 @@ private:
         if (boxedVars_.count(val)) emit(out, indent, "fmt.Println(" + val + ")");   // AcDynVal.String() prints its current tag
         else if (smartPrint_) emit(out, indent, "fmt.Println(ac_smart_double(float64(" + val + ")))");
         else if (hardPrint_ || floatVars.count(val)) emit(out, indent, "_ac_dblprint(float64(" + val + "))");
-        else emit(out, indent, "fmt.Println(" + val + ")");
+        else emit(out, indent, "fmt.Println(_ac_fmt(" + val + "))");
     }
     // Same gap+fix as CStrategy's own emitConfirm (see its comment) — base default never
     // assigns `res`, crashing `result = sure $x$` with "undefined: t_N" on this backend too.
@@ -13484,8 +14773,9 @@ private:
 
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
     {
-        // Go requires bool; int64 conditions always need != 0
-        emit(out, indent, "if " + cond + " != 0 {");
+        // Go requires bool. A genuine bool-typed ilib result (boolVars, see emitCall) is already a
+        // real bool; int64 conditions need the != 0.
+        emit(out, indent, "if " + (boolVars.count(cond) ? cond : cond + " != 0") + " {");
         indent++;
     }
     void emitIfElse(std::ostringstream &out, int &indent) override
@@ -13611,6 +14901,7 @@ private:
                 declared.insert(var);
                 return;
             }
+            goListVars_.insert(var);   // so a later plain copy (b = a) keeps the []int64 type
             emit(out, indent, var + " := []int64{" + content + "}");
             declared.insert(var);
         }
@@ -13639,7 +14930,11 @@ private:
         if (dictVars_.count(arr)) {
             if (dictStrVals_.count(arr)) stringVars.insert(result); else /* int64 */ {}
             declared.insert(result);
-            emit(out, indent, result + " := " + arr + "[" + idx + "]");
+            // A missing key is a hard error (PY raises KeyError); a bare map index would silently give 0 / "".
+            emit(out, indent, "_acv_" + result + ", _acok_" + result + " := " + arr + "[" + idx + "]");
+            emit(out, indent, "if !_acok_" + result + " { panic(\"Preposterous: KeyError: key not found\") }");
+            emit(out, indent, result + " := _acv_" + result);
+            emit(out, indent, "_ = " + result);
             return;
         }
         emit(out, indent, decl(result, arr + "[" + idx + "]"));
@@ -13769,6 +15064,8 @@ private:
                     std::string argList;
                     for (int k = 0; k < fit->second; ++k) { if (k) argList += ", "; argList += "int64"; }
                     tparams += pname + " func(" + argList + ") int64";
+                } else if (floatParams_.count(pname)) {
+                    tparams += pname + " float64";   // the body / its callers treat this parameter as a float
                 } else {
                     tparams += pname + " int64";
                 }
@@ -14431,6 +15728,18 @@ class VStrategy : public BackendStrategy
         emitRaw(out, "fn ac_dyn_lt(a AcDynVal, b AcDynVal) bool { if a.tag == 2 || b.tag == 2 { return a.str() < b.str() }; return a.as_d() < b.as_d() }");
         emitRaw(out, "fn ac_dyn_gt(a AcDynVal, b AcDynVal) bool { if a.tag == 2 || b.tag == 2 { return a.str() > b.str() }; return a.as_d() > b.as_d() }");
         // `iota N`: lazy 0..N-1, displayed as its digits concatenated with no separator
+        // `subject % pattern`: linear glob, `%` = any run of bytes; backtrack to the last `%`.
+        emitRaw(out, "fn ac_wildcard_match(s string, p string) bool {");
+        emitRaw(out, "    mut si := 0");
+        emitRaw(out, "    mut pi := 0");
+        emitRaw(out, "    mut star_p := -1");
+        emitRaw(out, "    mut star_s := 0");
+        emitRaw(out, "    for si < s.len {");
+        emitRaw(out, "        if pi < p.len && p[pi] == `%` { star_p = pi; pi++; star_s = si } else if pi < p.len && p[pi] == s[si] { pi++; si++ } else if star_p >= 0 { pi = star_p + 1; star_s++; si = star_s } else { return false }");
+        emitRaw(out, "    }");
+        emitRaw(out, "    for pi < p.len && p[pi] == `%` { pi++ }");
+        emitRaw(out, "    return pi == p.len");
+        emitRaw(out, "}");
         emitRaw(out, "fn ac_iota(n i64) string {");
         emitRaw(out, "    mut r := ''");
         emitRaw(out, "    for i := i64(0); i < n; i++ { r += i.str() }");
@@ -14551,7 +15860,7 @@ class VStrategy : public BackendStrategy
         if (declared.insert(var).second)
         {
             if (floatVars.count(var)) return "mut " + var + " := f64(" + val + ")";  // #42
-            if (looksString(val))
+            if (looksString(val) || stringVars_.count(val))
                 return "mut " + var + " := " + val;
             // Same plain-copy propagation the other backends needed for dicts (`p1 = pets[1]`
             // — see listOfDictVars_'s comment) — wrapping a map value in `i64(...)` is invalid;
@@ -14717,7 +16026,9 @@ class VStrategy : public BackendStrategy
             if (genuineStringVars_.count(val)) genuineStringVars_.insert(vn);
             return;
         }
-        if (looksString(val) || isStringVar(val)) {   // #retype numeric-unified ← stringified number
+        // #retype numeric-unified ← stringified number. A STRING-typed store (e.g. a scalarized tuple
+        // element `(x, y)` whose shadow var nothing else marks as string) is a real string, not that case.
+        if ((looksString(val) || isStringVar(val)) && t != IRType::STRING) {
             std::string bare = acUnstring(val);
             std::string wrap = (bare.find('.') != std::string::npos) ? "f64(" : "i64(";
             if (declared.insert(vn).second) emit(out, indent, "mut " + vn + " := " + wrap + bare + ")");
@@ -14731,7 +16042,7 @@ class VStrategy : public BackendStrategy
         // the plain-int default and wrapped a map value in `i64(...)`.
         if (declared.insert(vn).second) {
             if (isFloat) { floatVars.insert(vn); emit(out, indent, "mut " + vn + " := f64(" + val + ")"); }
-            else if (t == IRType::STRING) emit(out, indent, "mut " + vn + " := "      + val);
+            else if (t == IRType::STRING) { stringVars_.insert(vn); emit(out, indent, "mut " + vn + " := " + val); }
             else if (t == IRType::BOOL)   emit(out, indent, "mut " + vn + " := bool(" + val + ")");
             else if (looksString(val))    emit(out, indent, "mut " + vn + " := "      + val);
             else if (dictVars_.count(val)) {
@@ -14840,6 +16151,7 @@ class VStrategy : public BackendStrategy
     void emitTrueDivision(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &lhs, const std::string &rhs) override
     {
+        emit(out, indent, "if f64(" + rhs + ") == 0 { eprintln('Preposterous: 3rd grade mathematics violated (ZeroDivisionError)'); exit(1) }");
         std::string expr = "f64(" + lhs + ") / f64(" + rhs + ")";
         floatVars.insert(res);   // division result is f64 — keep the chain float-typed
         if (declared.insert(res).second) emit(out, indent, "mut " + res + " := " + expr);
@@ -14856,6 +16168,27 @@ class VStrategy : public BackendStrategy
     void emitMod(std::ostringstream &out, int &indent,
                  const std::string &res, const std::string &lhs, const std::string &rhs) override
     { emit(out, indent, decl(res, "((i64(" + lhs + ") % i64(" + rhs + ")) + i64(" + rhs + ")) % i64(" + rhs + ")")); }
+    // `dict has key` -> a bool (V's `key in map`).
+    void emitDictHas(std::ostringstream &out, int &indent, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        vBoolVars_.insert(res);
+        emit(out, indent, "mut " + res + " := " + key + " in " + dict);
+    }
+    // `subject % pattern` -> a V bool (matcher is in the prelude).
+    void emitWildcardMatch(std::ostringstream &out, int &indent, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        std::string expr = "ac_wildcard_match(" + subject + ", " + pattern + ")";
+        vBoolVars_.insert(res);
+        if (declared.insert(res).second) emit(out, indent, "mut " + res + " := " + expr);
+        else emit(out, indent, res + " = " + expr);
+    }
+    // A runtime bool prints as True/False (V would print true/false).
+    void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        emit(out, indent, "if " + val + " { println(\"True\") } else { println(\"False\") }");
+    }
     void emitComparison(std::ostringstream &out, int &indent, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
@@ -14906,9 +16239,49 @@ class VStrategy : public BackendStrategy
     std::set<std::string> userStringFuncs_;
     void setStringReturnFuncs(const std::set<std::string>& s) override { userStringFuncs_ = s; }
     bool isUserStringReturningFunc(const std::string& fn) const { return userStringFuncs_.count(fn) > 0; }
+    // Per user function, one flag per parameter position (see the base hook's comment).
+    std::map<std::string, std::vector<bool>> userFuncListArgs_;
+    void setUserFuncListArgs(const std::map<std::string, std::vector<bool>>& m) override { userFuncListArgs_ = m; }
+    int vListArgTmp_ = 0;
     void emitCall(std::ostringstream &out, int &indent, const std::string &res,
                   const std::string &func, const std::string &args) override
     {
+        // List parameters are `mut` (by reference) in the callee — see the signature emitter —
+        // so a list argument is passed as `mut name`. V has no mut for a non-variable, so a
+        // literal or computed list is first bound to a fresh mut temp. Without this a list was
+        // COPIED on the way in (V arrays are values) and the callee's writes were lost.
+        auto ulIt = userFuncListArgs_.find(func);
+        if (ulIt != userFuncListArgs_.end() && std::count(ulIt->second.begin(), ulIt->second.end(), true)) {
+            std::vector<std::string> parts; { std::string cur; int depth = 0; bool inStr = false;
+                for (char c : args) {
+                    if (c == '"' || c == '\'') inStr = !inStr;
+                    if (!inStr && (c=='('||c=='['||c=='{')) depth++; else if (!inStr && (c==')'||c==']'||c=='}')) depth--;
+                    if (c==',' && depth==0 && !inStr) { parts.push_back(cur); cur.clear(); } else cur += c; }
+                if (!cur.empty()) parts.push_back(cur); }
+            bool changed = false;
+            for (size_t k = 0; k < parts.size() && k < ulIt->second.size(); k++) {
+                if (!ulIt->second[k]) continue;
+                size_t s = parts[k].find_first_not_of(' '), e = parts[k].find_last_not_of(' ');
+                if (s == std::string::npos) continue;
+                std::string t = parts[k].substr(s, e - s + 1);
+                if (t.rfind("mut ", 0) == 0) continue;
+                bool plainName = !t.empty() && (std::isalpha((unsigned char)t[0]) || t[0] == '_')
+                    && std::all_of(t.begin(), t.end(), [](char c){ return std::isalnum((unsigned char)c) || c == '_'; });
+                if (plainName) parts[k] = "mut " + t;
+                else {
+                    std::string tmp = "ac_mv_" + std::to_string(vListArgTmp_++);
+                    emit(out, indent, "mut " + tmp + " := " + t);
+                    parts[k] = "mut " + tmp;
+                }
+                changed = true;
+            }
+            if (changed) {
+                std::string joined;
+                for (size_t k = 0; k < parts.size(); k++) { if (k) joined += ", "; joined += parts[k]; }
+                emitCall(out, indent, res, func, joined);
+                return;
+            }
+        }
         // `math.mod` is type-preserving (int args -> int result, like PY): route int args to the int variant so
         // the result is usable as an array index / bitwise operand / i64 parameter.
         if ((func == "math.mod" || func == "math_mod") && !res.empty()
@@ -15144,8 +16517,8 @@ class VStrategy : public BackendStrategy
         // the non-string case (evaluate a real expression directly) is just emitLazyEval, which
         // already works, so eval()'s new default branch is a real capability gain here, not a stub.
         if (!argIsString) { emitLazyEval(out, indent, res, expr); return; }
-        emit(out, indent, "mut " + res + " := f64(0) /* eval(" + expr + ") not supported in V backend */");
-        declared.insert(res);
+        (void)res;
+        throw ACError::backend("eval() of a string (code text) is not implemented in the V backend");
     }
     void emitRaise(std::ostringstream &out, int &indent, const std::string &msg) override
     {
@@ -15250,7 +16623,8 @@ class VStrategy : public BackendStrategy
     void emitIfBegin(std::ostringstream &out, int &indent, const std::string &cond) override
     {
         lastWasReturn = false;
-        emit(out, indent, "if " + cond + " != 0 {");
+        // A genuine bool-typed ilib result (vBoolVars_) is already a V bool; ints need != 0.
+        emit(out, indent, "if " + (vBoolVars_.count(cond) ? cond : cond + " != 0") + " {");
         indent++;
     }
     void emitIfElse(std::ostringstream &out, int &indent) override
@@ -15365,11 +16739,18 @@ class VStrategy : public BackendStrategy
             return;
         }
         if (type == "dict") {
+            // formatRef escaped every `$` for V's string interpolation (`\$`). The dict pair parser
+            // needs the raw `$...$` string spans back, or a value comes out as `"\$Ada\$"`.
+            std::string raw;
+            for (size_t i = 0; i < content.size(); i++) {
+                if (content[i] == '\\' && i + 1 < content.size() && content[i + 1] == '$') continue;
+                raw += content[i];
+            }
             dictVars_.insert(var);
-            bool numeric = dictValsAllNumeric(content);
+            bool numeric = dictValsAllNumeric(raw);
             if (!numeric) dictStrVals_.insert(var);
             emit(out, indent, "mut " + var + " := map[string]" + std::string(numeric ? "i64" : "string") + "{}");
-            for (auto& [k, v] : parseDictPairs(content))
+            for (auto& [k, v] : parseDictPairs(raw))
                 emit(out, indent, var + "[" + fmtDictKey(k) + "] = " + (numeric ? "i64(" + v + ")" : fmtDictValStr(v)));
             declared.insert(var);
         } else {
@@ -15397,7 +16778,9 @@ class VStrategy : public BackendStrategy
             }
             const bool promotedList = promotedGlobals_.count(var) > 0;   // file-scope __global: assign, don't shadow
             if (c.empty()) {
-                emit(out, indent, (promotedList ? var + " = " : "mut " + var + " := ") + "[]i64{}");
+                // A list already in scope (a parameter the body rebinds, `psi = []`) is assigned, not re-declared.
+                const bool inScope = promotedList || declared.count(var) > 0;
+                emit(out, indent, (inScope ? var + " = " : "mut " + var + " := ") + "[]i64{}");
                 declared.insert(var);
             } else {
                 size_t comma = c.find(',');
@@ -15432,7 +16815,8 @@ class VStrategy : public BackendStrategy
         // map-index expression itself, same reasoning as Go's identical fix.
         if (dictVars_.count(arr)) {
             declared.insert(result);
-            emit(out, indent, "mut " + result + " := " + arr + "[" + idx + "]");
+            // A missing key is a hard error (PY raises KeyError); V's bare map index would give 0 / "".
+            emit(out, indent, "mut " + result + " := " + arr + "[" + idx + "] or { panic('Preposterous: KeyError: key not found') }");
             return;
         }
         emit(out, indent, decl(result, arr + "[" + idx + "]"));
@@ -15484,7 +16868,11 @@ class VStrategy : public BackendStrategy
     void emitInput(std::ostringstream &out, int &indent,
                    const std::string &result, const std::string &prompt) override
     {
-        emit(out, indent, decl(result, "os.input(" + prompt + ")"));
+        // Term.ask always yields text (the INPUT rule in detectStringVars), so the result is a string
+        // whatever its IR type says — decl()'s literal-only check would wrap it in i64(...).
+        stringVars_.insert(result);
+        if (declared.insert(result).second) emit(out, indent, "mut " + result + " := os.input(" + prompt + ")");
+        else                                 emit(out, indent, result + " = os.input(" + prompt + ")");
     }
 
     void emitLabel(std::ostringstream &out, int indent, const std::string &label) override
@@ -15570,6 +16958,14 @@ class VStrategy : public BackendStrategy
             auto cit = cpt ? cpt->find((int)i) : std::map<int,std::string>::const_iterator();
             if (cpt && cit != cpt->end()) {
                 tparams += paramNames[i] + "_p " + cit->second;
+            } else if (isList && !isGenerator_ && !reboundParams_.count(paramNames[i])) {
+                // A `mut` array param is passed by reference (see the call site): the body
+                // works on the parameter itself, with no `_p` copy, so writes reach the caller.
+                tparams += "mut " + paramNames[i] + " []i64";
+            } else if (isList && isGenerator_) {
+                // Generator wrapper: it only forwards the list into its goroutine (by value), but
+                // must still accept the `mut` the call site passes.
+                tparams += "mut " + paramNames[i] + "_p []i64";
             } else {
                 tparams += paramNames[i] + "_p " + (isStr ? "string" : isList ? "[]i64" : isFloat ? "f64" : "i64");
             }
@@ -15679,7 +17075,8 @@ class VStrategy : public BackendStrategy
             bool isStr  = isStringVar(p);
             bool isList = !isStr && listParams_.count(p) > 0;
             bool isFloat = !isStr && !isList && floatParams_.count(p) > 0;
-            emit(out, indent, "mut " + p + " := " + p + "_p" + (isList ? ".clone()" : ""));
+            if (isList && !isGenerator_ && !reboundParams_.count(p)) { declared.insert(p); /* aliased by the `mut` param itself */ }
+            else emit(out, indent, "mut " + p + " := " + p + "_p" + (isList ? ".clone()" : ""));
             if (isStr) stringVars_.insert(vName(p));   // keep string-ness for body codegen
             if (isFloat) floatVars.insert(p);          // keep float-ness for body codegen
             // classParamTypes_: pre-seed classInstanceVars_/classInstanceVarNames_ under the
@@ -15874,6 +17271,19 @@ class VStrategy : public BackendStrategy
         lastWasReturn = false;
         emit(out, indent, "fn main() {");
         indent++;
+        // Cross-block mainloop locals (see the hoist scan in generate): V scopes `:=` per block, so a
+        // variable first set in one IF/WHILE branch and read in another must be declared up front.
+        for (const auto& [v, t] : hoistVars_) {
+            std::string vn = VStrategy::vName(v);
+            if (declared.count(vn)) continue;
+            std::string init;
+            if      (t == IRType::FLOAT)  { floatVars.insert(vn); init = "f64(0)"; }
+            else if (t == IRType::STRING)   { init = "''"; stringVars_.insert(vn); }
+            else if (t == IRType::LIST)     init = "[]i64{}";
+            else                            init = "i64(0)";
+            emit(out, indent, "mut " + vn + " := " + init);
+            declared.insert(vn);
+        }
     }
     void emitMainEnd(std::ostringstream &out, int &indent) override
     {
@@ -16278,6 +17688,10 @@ class AsmStrategy : public BackendStrategy
     std::set<std::string> userFloatFuncs_;
     void setFloatReturnFuncs(const std::set<std::string>& s) override { userFloatFuncs_ = s; }
     bool isUserFloatReturningFunc(const std::string &fn) const { return userFloatFuncs_.count(fn) > 0; }
+    std::map<std::string, std::vector<bool>> calleeFloatFlags_;
+    void setCalleeFloatParams(const std::map<std::string, std::vector<bool>>& m) override { calleeFloatFlags_ = m; }
+    std::set<std::string> userListFuncs_;   // user functions that return a list (array pointer)
+    void setListReturnFuncs(const std::set<std::string>& s) override { userListFuncs_ = s; }
     // The shared stringVars_ (base class, populated externally via setStringVars) only tracks
     // NAMED variables — its detectStringVars ADD-case requires `Kind::VAR`, so a concat result
     // that's never assigned to a name (`Term.display label + "!"` — an anonymous print-expression
@@ -16301,6 +17715,7 @@ class AsmStrategy : public BackendStrategy
     // compile-time-constant string key is the only place codegen can know whether to mark its
     // result string-typed (strVars_) for correct Term.display formatting.
     std::map<std::string, std::set<std::string>> dictStrKeys_;
+    std::set<std::string> dictAllStr_;   // dicts whose every value is a string: any read is a string
     // listVars_ only ever grows from a LOCAL `xs = [1,2,3]` literal (emitAlloc). A list-typed
     // function PARAMETER never goes through emitAlloc, so `length arr`/`arr.append(v)`/print on
     // a bare array param fell through to the string/scalar default and produced wrong output
@@ -16383,13 +17798,17 @@ class AsmStrategy : public BackendStrategy
         out << "    lea rdi, [rel _ac_try_stack]\n    add rdi, rax\n    mov esi, 1\n    call longjmp\n";
         calledFuncs_.insert("longjmp");
         out << ".divfatal" << g << ":\n";
-        out << "    lea rdi, [rel _msg_divzero]\n    xor eax, eax\n    call printf\n";
+        // The message goes to stderr (fd 2) like PY's traceback; printf would put it on stdout.
+        out << "    mov edi, 2\n    lea rsi, [rel _msg_divzero]\n    mov edx, 65\n    call write\n";
+        calledFuncs_.insert("write");
         out << "    mov edi, 1\n    call exit\n";
         out << ".divok" << g << ":\n";
     }
     bool needsEvents_ = false;
     bool needsSave_ = false;
     void setNeedsSave(bool v) override { needsSave_ = v; }
+    bool needsWildcard_ = false;
+    void setNeedsWildcard(bool v) override { needsWildcard_ = v; }
     // Fixed 64KB buffer (matches this backend's other fixed-size choices — the 64-slot event
     // table, 32-slot try stack — plenty for AC's toy-scale programs; a real growable buffer
     // would need realloc bookkeeping this backend has no precedent for elsewhere).
@@ -16768,6 +18187,7 @@ class AsmStrategy : public BackendStrategy
             emitRaw(out, "");
         }
         emitRaw(out, "section .text");
+        if (needsWildcard_) emitWildcardRoutine(out);
         if (needsEvents_) {
             definedFuncs_.insert("_ac_bind");
             definedFuncs_.insert("_ac_trigger");
@@ -16892,6 +18312,7 @@ class AsmStrategy : public BackendStrategy
         // int64 OR a string-pool pointer) — mirrors CStrategy's ac_dict too.
         definedFuncs_.insert("_ac_dict_new");
         definedFuncs_.insert("_ac_dict_get");
+        definedFuncs_.insert("_ac_dict_has");
         definedFuncs_.insert("_ac_dict_set");
         calledFuncs_.insert("malloc"); calledFuncs_.insert("strcmp");
         calledFuncs_.insert("printf"); calledFuncs_.insert("exit");
@@ -16901,6 +18322,43 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    mov qword [rax], 8");        // raw[0] = cap
         emitRaw(out, "    add rax, 8");                 // rax = ptr (skip cap word)
         emitRaw(out, "    mov qword [rax], 0");         // ptr[0] = n = 0
+        emitRaw(out, "    ret");
+        emitRaw(out, "");
+        emitRaw(out, "_ac_dict_has:");                 // rdi=ptr, rsi=key -> rax = 1 if present, else 0
+        emitRaw(out, "    push rbx");
+        emitRaw(out, "    push r12");
+        emitRaw(out, "    push r13");
+        emitRaw(out, "    mov r12, rdi");
+        emitRaw(out, "    mov r13, rsi");
+        emitRaw(out, "    xor rbx, rbx");
+        emitRaw(out, ".ac_dh_loop:");
+        emitRaw(out, "    mov rax, [r12]");
+        emitRaw(out, "    cmp rbx, rax");
+        emitRaw(out, "    jge .ac_dh_miss");
+        emitRaw(out, "    lea rcx, [r12+8]");
+        emitRaw(out, "    mov rax, rbx");
+        emitRaw(out, "    imul rax, rax, 16");
+        emitRaw(out, "    add rcx, rax");
+        emitRaw(out, "    mov rdi, [rcx]");
+        emitRaw(out, "    mov rsi, r13");
+        emitRaw(out, "    push rcx");
+        emitRaw(out, "    call strcmp");
+        emitRaw(out, "    pop rcx");
+        emitRaw(out, "    test eax, eax");
+        emitRaw(out, "    jz .ac_dh_hit");
+        emitRaw(out, "    inc rbx");
+        emitRaw(out, "    jmp .ac_dh_loop");
+        emitRaw(out, ".ac_dh_hit:");
+        emitRaw(out, "    mov eax, 1");
+        emitRaw(out, "    pop r13");
+        emitRaw(out, "    pop r12");
+        emitRaw(out, "    pop rbx");
+        emitRaw(out, "    ret");
+        emitRaw(out, ".ac_dh_miss:");
+        emitRaw(out, "    xor eax, eax");
+        emitRaw(out, "    pop r13");
+        emitRaw(out, "    pop r12");
+        emitRaw(out, "    pop rbx");
         emitRaw(out, "    ret");
         emitRaw(out, "");
         emitRaw(out, "_ac_dict_get:");                 // rdi=ptr, rsi=key -> rax=value
@@ -16934,10 +18392,13 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    inc rbx");
         emitRaw(out, "    jmp .ac_dg_loop");
         emitRaw(out, ".ac_dg_miss:");
-        emitRaw(out, "    lea rdi, [rel _msg_keyerror]");
-        emitRaw(out, "    mov rsi, r13");
+        // dprintf(2, ...): the KeyError message belongs on stderr (PY's traceback), not stdout.
+        emitRaw(out, "    mov edi, 2");
+        emitRaw(out, "    lea rsi, [rel _msg_keyerror]");
+        emitRaw(out, "    mov rdx, r13");
         emitRaw(out, "    xor eax, eax");
-        emitRaw(out, "    call printf");
+        emitRaw(out, "    call dprintf");
+        calledFuncs_.insert("dprintf");
         emitRaw(out, "    mov edi, 1");
         emitRaw(out, "    call exit");
         emitRaw(out, "");
@@ -17111,6 +18572,7 @@ class AsmStrategy : public BackendStrategy
             {"math.mod","ac_mod"},{"math.mod_int","ac_mod_int"},
             {"math.to_int","ac_to_int"},{"math.to_dec","ac_to_dec"},
             {"math.gcd","ac_gcd"},{"math.lcm","ac_lcm"},{"math.is_prime","ac_is_prime"},
+            {"math.modpow","ac_modpow"},{"math.modinv","ac_modinv"},{"math.modmul","ac_modmul"},
             {"math.pi","ac_math_pi_const"},{"math.e","ac_math_e_const"},
             {"math.phi","ac_math_phi_const"},{"math.tau","ac_math_tau_const"},
             {"math.em","ac_math_em_const"},{"math.inf","ac_math_inf"},
@@ -17245,6 +18707,7 @@ class AsmStrategy : public BackendStrategy
         if (dictVars_.count(val)) {
             dictVars_.insert(var);
             if (dictStrKeys_.count(val)) dictStrKeys_[var] = dictStrKeys_[val];
+            if (dictAllStr_.count(val)) dictAllStr_.insert(var);
         }
         if (listOfDictVars_.count(val)) {
             listOfDictVars_.insert(var);
@@ -17458,7 +18921,21 @@ class AsmStrategy : public BackendStrategy
         floatVars_.insert(res);
         loadDouble(out, lhs, "xmm0");
         loadDouble(out, rhs, "xmm1");
+        // Zero divisor (ucomisd sets ZF=1, PF=0 on equal non-NaN) -> ZeroDivisionError message on fd 2, exit 1.
+        int idx = strIdx++;
+        std::string okL = "_fdiv_ok" + std::to_string(idx), errL = "_fdiv_err" + std::to_string(idx);
+        std::string msgL = "_fdiv_msg" + std::to_string(idx);
+        dataSec.push_back(msgL + " db \"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\", 10");
+        out << "    xorpd xmm2, xmm2\n    ucomisd xmm1, xmm2\n    jp " << okL << "\n    je " << errL << "\n";
+        out << okL << ":\n";
         out << "    divsd xmm0, xmm1\n";
+        std::string doneL = "_fdiv_done" + std::to_string(idx);
+        out << "    jmp " << doneL << "\n";
+        out << errL << ":\n";
+        out << "    mov edi, 2\n    lea rsi, [rel " << msgL << "]\n    mov edx, " << (sizeof("Preposterous: 3rd grade mathematics violated (ZeroDivisionError)") - 1 + 1) << "\n    call write\n";
+        calledFuncs_.insert("write");
+        out << "    mov edi, 1\n    call exit\n";
+        out << doneL << ":\n";
         storeXMM0(out, res);
     }
     void emitBinaryOp(std::ostringstream &out, int & /*indent*/, const std::string &res,
@@ -17584,6 +19061,143 @@ class AsmStrategy : public BackendStrategy
         storeRAX(out, res);
     }
 
+    // `%` matcher: rdi = subject C-string, rsi = pattern C-string -> rax = 1/0. Pure register code
+    // (no libc), classic linear glob with backtracking to the last `%`. Only emitted when used.
+    void emitWildcardRoutine(std::ostringstream &out)
+    {
+        definedFuncs_.insert("_ac_wildcard_match");
+        const char *lines[] = {
+            "_ac_wildcard_match:",
+            "    xor r8, r8",
+            "    xor r9, r9",
+            "    mov r10, -1",
+            "    xor r11, r11",
+            "_ac_wm_loop:",
+            "    movzx eax, byte [rdi + r8]",
+            "    test al, al",
+            "    jz _ac_wm_tail",
+            "    movzx ecx, byte [rsi + r9]",
+            "    cmp cl, '%'",
+            "    jne _ac_wm_lit",
+            "    mov r10, r9",
+            "    inc r9",
+            "    mov r11, r8",
+            "    jmp _ac_wm_loop",
+            "_ac_wm_lit:",
+            "    test cl, cl",
+            "    jz _ac_wm_backtrack",
+            "    cmp cl, al",
+            "    jne _ac_wm_backtrack",
+            "    inc r9",
+            "    inc r8",
+            "    jmp _ac_wm_loop",
+            "_ac_wm_backtrack:",
+            "    test r10, r10",
+            "    js _ac_wm_fail",
+            "    lea r9, [r10 + 1]",
+            "    inc r11",
+            "    mov r8, r11",
+            "    jmp _ac_wm_loop",
+            "_ac_wm_tail:",
+            "    movzx ecx, byte [rsi + r9]",
+            "    cmp cl, '%'",
+            "    jne _ac_wm_end",
+            "    inc r9",
+            "    jmp _ac_wm_tail",
+            "_ac_wm_end:",
+            "    test cl, cl",
+            "    jnz _ac_wm_fail",
+            "    mov eax, 1",
+            "    ret",
+            "_ac_wm_fail:",
+            "    xor eax, eax",
+            "    ret",
+        };
+        for (const char *l : lines) emitRaw(out, l);
+    }
+    // `subject % pattern`: the matcher returns 1/0 in rax; the result is a plain stored bool.
+    void emitWildcardMatch(std::ostringstream &out, int & /*indent*/, const std::string &res,
+                           const std::string &subject, const std::string &pattern) override
+    {
+        loadRAX(out, subject); out << "    mov rdi, rax\n";
+        loadRAX(out, pattern); out << "    mov rsi, rax\n";
+        out << "    call _ac_wildcard_match\n";
+        storeRAX(out, res);
+    }
+    // A runtime bool prints as True/False (branch on rax, then print the literal).
+    void emitPrintBool(std::ostringstream &out, int &indent, const std::string &val) override
+    {
+        int idx = strIdx++;
+        std::string falseL = "_pbool_f" + std::to_string(idx), doneL = "_pbool_d" + std::to_string(idx);
+        loadRAX(out, val);
+        out << "    test rax, rax\n    jz " << falseL << "\n";
+        emitPrintLiteral(out, indent, "True");
+        out << "    jmp " << doneL << "\n";
+        out << falseL << ":\n";
+        emitPrintLiteral(out, indent, "False");
+        out << doneL << ":\n";
+    }
+    // `Term.ask`: print the prompt with no newline, flush, then read one line from fd 0 with
+    // read(2) into a malloc'd buffer, stopping at '\n' or EOF, and drop the newline. This is
+    // the text PY's input() returns; ASM previously fell through to the base no-op, so the
+    // result was an uninitialized slot and the program segfaulted.
+    void emitInput(std::ostringstream &out, int & /*indent*/, const std::string &result,
+                   const std::string &prompt) override
+    {
+        int idx = strIdx++;
+        std::string loopL = "_input_loop" + std::to_string(idx), doneL = "_input_done" + std::to_string(idx);
+        std::string fmtL = "_input_fmt" + std::to_string(idx);
+        if (!prompt.empty() && prompt != "\"\"") {
+            dataSec.push_back(fmtL + " db \"%s\", 0");
+            if (looksString(prompt)) {
+                std::string lbl = "_str" + std::to_string(strIdx++);
+                dataSec.push_back(lbl + " db " + toNasmDbLit(prompt) + ", 0");
+                out << "    lea rsi, [rel " << lbl << "]\n";
+            } else {
+                loadRAX(out, prompt);
+                out << "    mov rsi, rax\n";
+            }
+            out << "    lea rdi, [rel " << fmtL << "]\n    xor eax, eax\n    call printf\n";
+        }
+        out << "    xor edi, edi\n    call fflush\n";
+        out << "    mov rdi, 4096\n    call malloc\n";
+        calledFuncs_.insert("malloc");
+        out << "    mov rbx, rax\n";                       // rbx = line buffer
+        out << "    xor r12, r12\n";                       // r12 = bytes read so far
+        out << loopL << ":\n";
+        out << "    xor edi, edi\n    lea rsi, [rbx + r12]\n    mov rdx, 1\n";
+        out << "    call read\n";
+        calledFuncs_.insert("read");
+        std::string eofL = "_input_eof" + std::to_string(idx);
+        out << "    cmp rax, 1\n    jne " << eofL << "\n";
+        out << "    movzx eax, byte [rbx + r12]\n";
+        out << "    cmp eax, 10\n    je " << doneL << "\n";
+        out << "    inc r12\n    cmp r12, 4095\n    jl " << loopL << "\n";
+        out << doneL << ":\n";
+        out << "    mov byte [rbx + r12], 0\n";
+        out << "    mov rax, rbx\n";
+        std::string storeL = "_input_store" + std::to_string(idx);
+        out << "    jmp " << storeL << "\n";
+        // EOF before any byte: PY's input() raises EOFError (exit 1). Same here, not an empty string.
+        std::string msgL = "_input_eofmsg" + std::to_string(idx);
+        dataSec.push_back(msgL + " db \"EOFError: EOF when reading a line\", 10");
+        out << eofL << ":\n";
+        out << "    test r12, r12\n    jnz " << doneL << "\n";
+        out << "    mov edi, 2\n    lea rsi, [rel " << msgL << "]\n    mov edx, 33\n    call write\n";
+        calledFuncs_.insert("write");
+        out << "    mov edi, 1\n    call exit\n";
+        out << storeL << ":\n";
+        storeRAX(out, result);
+    }
+    // `dict has key`: _ac_dict_has walks the pairs with strcmp; rax = 1/0 is stored as a bool.
+    void emitDictHas(std::ostringstream &out, int & /*indent*/, const std::string &res,
+                     const std::string &dict, const std::string &key) override
+    {
+        loadRAX(out, dict); out << "    mov rdi, rax\n";
+        loadRAX(out, key); out << "    mov rsi, rax\n";
+        out << "    call _ac_dict_has\n";
+        storeRAX(out, res);
+    }
     void emitComparison(std::ostringstream &out, int & /*indent*/, const std::string &res,
                         const std::string &lhs, const std::string &rhs, const std::string &op) override
     {
@@ -17688,6 +19302,19 @@ class AsmStrategy : public BackendStrategy
             storeRAX(out, res);
             return;
         }
+        // `is` / `#=` on strings is CONTENT equality: two equal strings are different objects
+        // (a dict value vs a literal, a built string vs a literal), so compare with strcmp.
+        if ((op == "==" || op == "!=") && (isStr(lhs) || isStr(rhs))) {
+            loadRAX(out, lhs); out << "    mov rdi, rax\n";
+            loadRAX(out, rhs); out << "    mov rsi, rax\n";
+            out << "    call strcmp\n";
+            calledFuncs_.insert("strcmp");
+            out << "    test eax, eax\n";
+            out << (op == "==" ? "    sete al\n" : "    setne al\n");
+            out << "    movzx rax, al\n";
+            storeRAX(out, res);
+            return;
+        }
         loadRAX(out, lhs);
         if (looksNumeric(rhs))
             out << "    cmp rax, " << rhs << "\n";
@@ -17739,6 +19366,13 @@ class AsmStrategy : public BackendStrategy
             dictVars_.insert(var);
             out << "    call _ac_dict_new\n";
             storeRAX(out, var);
+            {
+                auto pairsAll = parseDictPairs(content);
+                bool allStr = !pairsAll.empty();
+                for (auto &[k2, v2] : pairsAll)
+                    if (!(v2.size() >= 2 && v2.front() == '$' && v2.back() == '$')) allStr = false;
+                if (allStr) dictAllStr_.insert(var);
+            }
             for (auto &[k, v] : parseDictPairs(content)) {
                 std::string key = k;
                 if (key.size() >= 2 && key.front() == '$' && key.back() == '$')
@@ -17844,6 +19478,7 @@ class AsmStrategy : public BackendStrategy
             out << "    call _ac_dict_get\n";
             storeRAX(out, result);
             if (dictStrKeys_.count(arr) && dictStrKeys_[arr].count(idxUnq)) strVars_.insert(result);
+            if (dictAllStr_.count(arr)) strVars_.insert(result);   // variable key: every value is a string
             return;
         }
         loadRAX(out, arr);
@@ -18116,18 +19751,36 @@ class AsmStrategy : public BackendStrategy
         // Values are stack slots / literals, and loadRAX only touches rax, so loading a
         // later arg can't clobber an earlier arg register.
         static const char *argRegs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+        auto flagIt = calleeFloatFlags_.find(func);
         for (size_t i = 0; i < parsed.size() && i < 6; i++) {
             std::string a = parsed[i];
             size_t s = a.find_first_not_of(' '); size_t e = a.find_last_not_of(' ');
             if (s == std::string::npos) continue;
             a = a.substr(s, e - s + 1);
-            loadRAX(out, a);
+            // The callee takes this position as a double (its body treats the parameter as float)
+            // but the value here is an integer: convert, then pass the double's bit pattern.
+            bool wantFloat = flagIt != calleeFloatFlags_.end() && i < flagIt->second.size() && flagIt->second[i];
+            if (!wantFloat && isFloatVal(a) && !looksFloat(a)) {
+                // A float-typed value (a variable that also holds a `/` result) passed to an integer
+                // parameter is truncated, not sent as raw bits.
+                loadDouble(out, a, "xmm0");
+                out << "    cvttsd2si rax, xmm0\n";
+                out << "    mov " << argRegs[i] << ", rax\n";
+                continue;
+            }
+            if (wantFloat && !isFloatVal(a)) {
+                loadDouble(out, a, "xmm0");
+                out << "    movq rax, xmm0\n";
+            } else {
+                loadRAX(out, a);
+            }
             out << "    mov " << argRegs[i] << ", rax\n";
         }
         calledFuncs_.insert(func);
         out << "    call " << func << "\n";
         if (!res.empty()) {
             if (isUserFloatReturningFunc(func)) floatVars_.insert(res);
+            if (userListFuncs_.count(func)) listVars_.insert(res);   // the result is a list pointer
             storeRAX(out, res);
         }
     }
@@ -18159,15 +19812,6 @@ class AsmStrategy : public BackendStrategy
     }
 
     int fltPrintIdx_ = 0;
-    bool emitPrintNullText(std::ostringstream &out, int & /*indent*/, bool isNil) override
-    {
-        std::string lbl = "_str" + std::to_string(strIdx++);
-        dataSec.push_back(lbl + " db \"" + (isNil ? "nil" : "null") + "\", 0");
-        out << "    lea rsi, [rel " << lbl << "]\n";
-        out << "    lea rdi, [rel _fmt_s]\n";
-        out << "    xor eax, eax\n    call printf\n";
-        return true;
-    }
     void emitPrint(std::ostringstream &out, int & /*indent*/, const std::string &val) override
     {
         if (isListVar(val))
@@ -18306,10 +19950,10 @@ class AsmStrategy : public BackendStrategy
     void emitEval(std::ostringstream &out, int & /*indent*/,
                   const std::string &res, const std::string &expr, bool /*argIsString*/, IRType /*resultType*/) override
     {
-        // Neither branch (string-as-code, nor expr+try/catch) is implemented on ASM yet — same
-        // pre-existing "niche, not implemented" gap as before, not backend-specific to which one.
-        out << "    ; eval(" << expr << ") — not implemented in ASM backend\n";
-        if (!res.empty()) out << "    mov qword [" << slotAddr(res) << "], 0\n";
+        // Neither branch (string-as-code, nor expr+try/catch) is implemented on ASM. Emitting a
+        // placeholder 0 printed a wrong answer silently, so this is a compile-time error instead.
+        (void)res; (void)expr;
+        throw ACError::backend("eval() is not implemented in the ASM backend");
     }
     void emitRaise(std::ostringstream &out, int & /*indent*/, const std::string &) override
     {
@@ -18551,6 +20195,16 @@ class AsmStrategy : public BackendStrategy
                            const std::string &name, const std::string &params,
                            const std::string &classOwner = "") override
     {
+        // Only six integer arguments travel in registers. A seventh was dropped silently; refuse it.
+        {
+            size_t count = 0;
+            std::istringstream ps(params);
+            for (std::string p; std::getline(ps, p, ','); )
+                if (p.find_first_not_of(" \t") != std::string::npos) count++;
+            if (count > 6)
+                throw ACError::backend("ASM backend: '" + name + "' takes " + std::to_string(count)
+                                       + " parameters; only 6 fit in registers (stack arguments are not implemented)");
+        }
         // String/float-ness is inferred per NAME as code is emitted and was never reset, so a local `x` that one
         // function used as a string (or float) made every later function's unrelated `x` a string (or float) too —
         // `x + i` compiled as strlen/malloc/strcat (crash). Keep only the promoted (file-scope) globals, whose
@@ -18848,13 +20502,28 @@ static std::set<std::string> detectStringParams(const AC_IR::IRFunction& fn,
 // own convention. stringm.* matches the SAME (already-accepted) "every arg is a string"
 // approximation the LIB_CALL case below already uses for it — imprecise for the rare int-arg
 // tail like split_nth's count, but this whole detector is a heuristic everywhere else too.
-static bool takesStringArgs(const std::string& f) {
+// `argIdx` is 0-based over the CALL's real arguments (excluding the callee itself) —
+// needed for an ilib/elib whose args AREN'T uniformly all-string (unlike os.*/stringm.*,
+// which happen to be): dns.start(address: string, port: int) would wrongly mark `port`
+// string too under the old "every arg is a string" blanket rule once dns.* joined this
+// function (verified: keyword_catalog_modules.ac's `dns.start(address, port)` — Go/Rust/V
+// all correctly left `port` alone once this went per-position instead of per-function).
+static bool takesStringArgs(const std::string& f, size_t argIdx = 0) {
     bool isOs = f.rfind("os.", 0) == 0 || f.rfind("os_", 0) == 0;
     if (isOs) {
         std::string tail = f.substr(f.find_first_of("._") + 1);
         return tail != "wait" && tail != "pid";
     }
-    return f.find("stringm") != std::string::npos;
+    if (f.find("stringm") != std::string::npos) return true;
+    // dns elib (library/elib/dns — see dns_c.h): start(address:str, port:int),
+    // url/backend(str, str), resolve/remove(str). list/stop take no args at all.
+    bool isDns = f.rfind("dns.", 0) == 0 || f.rfind("dns_", 0) == 0;
+    if (isDns) {
+        std::string tail = f.substr(f.find_first_of("._") + 1);
+        if (tail == "start") return argIdx == 0;
+        return tail == "url" || tail == "backend" || tail == "resolve" || tail == "remove";
+    }
+    return false;
 }
 
 // Infer which locals/params are STRINGS from usage (fixpoint). Signals: assigned a string literal
@@ -19100,15 +20769,15 @@ static std::set<std::string> detectStringVars(const std::vector<AC_IR::IRInstruc
                         // os.wait/os.pid take an int) — a result-capturing use of one of these
                         // (`text = os.read(bcpath)`) lowers to CALL, not LIB_CALL, so it never
                         // hit the stringm-only LIB_CALL rule below at all.
-                        if (takesStringArgs(cf))
-                            for (size_t k = 1; k < ins.typedOperands.size(); k++) add(nm(ins.typedOperands[k]));
+                        for (size_t k = 1; k < ins.typedOperands.size(); k++)
+                            if (takesStringArgs(cf, k - 1)) add(nm(ins.typedOperands[k]));
                     }
                     break;
                 case IROpcode::LIB_CALL: {
                     if (ins.typedOperands.empty()) break;
                     std::string f = constFuncName(ins.typedOperands[0]);
-                    if (takesStringArgs(f))
-                        for (size_t k = 1; k < ins.typedOperands.size(); k++) add(nm(ins.typedOperands[k]));
+                    for (size_t k = 1; k < ins.typedOperands.size(); k++)
+                        if (takesStringArgs(f, k - 1)) add(nm(ins.typedOperands[k]));
                     // Same VAR-only gap the CALL case above already had fixed (see its comment) —
                     // this one's result lands in a TEMP just as often (e.g. `low = speech.lower()`
                     // — the string-cheese rewrite emits a LIB_CALL result into a TEMP, not a named
@@ -19475,6 +21144,75 @@ static std::set<std::string> detectListParams(const AC_IR::IRFunction& fn,
 
 // Compiler-synthesized var names (list-repeat, short-circuit, cond scrutinee) must be
 // invisible to the loop save/restore + free-var machinery, like _ac_-prefixed ones.
+// Cross-function list-parameter fixpoint: a parameter passed into a callee's list parameter is itself
+// a list (`energy(psi, xs, h)` forwards `xs` to `hpsi`, which indexes it). detectListParams only sees
+// each body alone, so without this the forwarding function declared `xs` as a scalar.
+static std::map<std::string, std::set<std::string>> g_crossListParams;
+static std::set<std::string> listParamsFor(const AC_IR::IRFunction& fn, const AC_IR::SymbolTable& symbols) {
+    std::set<std::string> s = detectListParams(fn, symbols);
+    auto it = g_crossListParams.find(fn.name);
+    if (it != g_crossListParams.end()) s.insert(it->second.begin(), it->second.end());
+    return s;
+}
+// Parameters the function body assigns to (`psi = []`) — see reboundParams_.
+static std::set<std::string> reboundParamsOf(const AC_IR::IRFunction& fn, const AC_IR::SymbolTable& symbols) {
+    std::set<std::string> params(fn.parameters.begin(), fn.parameters.end()), out;
+    auto noteTarget = [&](const AC_IR::IRRef& tgt) {
+        if (tgt.kind != AC_IR::IRRef::Kind::VAR || tgt.id < 0) return;
+        std::string n = const_cast<AC_IR::SymbolTable&>(symbols).getName(tgt.id);
+        if (params.count(n)) out.insert(n);
+    };
+    // Any instruction whose RESULT is the parameter writes it (`psi = []` lowers this way, not as
+    // STORE_VAR); STORE_VAR's own target encodings are covered as well.
+    for (const auto& ins : fn.instructions) {
+        noteTarget(ins.result);
+        if (ins.opcode == AC_IR::IROpcode::STORE_VAR && ins.typedOperands.size() >= 2)
+            noteTarget(ins.typedOperands[0]);
+    }
+    return out;
+}
+static void computeCrossListParams(const AC_IR::IRProgram& ir) {
+    using namespace AC_IR;
+    g_crossListParams.clear();
+    std::map<std::string, const IRFunction*> byName;
+    for (const auto& f : ir.functions) {
+        byName[f.name] = &f;
+        g_crossListParams[f.name] = detectListParams(f, ir.symbols);
+    }
+    auto nameOf = [&](const IRRef& r) -> std::string {
+        if ((r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::FUNCTION) && r.id >= 0)
+            return const_cast<SymbolTable&>(ir.symbols).getName(r.id);
+        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING)
+            return std::get<std::string>(r.value.data);
+        return "";
+    };
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < 50) {
+        changed = false;
+        for (const auto& f : ir.functions) {
+            std::set<std::string> myParams(f.parameters.begin(), f.parameters.end());
+            for (const auto& ins : f.instructions) {
+                if (ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL) continue;
+                if (ins.typedOperands.empty()) continue;
+                auto cit = byName.find(nameOf(ins.typedOperands[0]));
+                if (cit == byName.end()) continue;
+                const IRFunction* callee = cit->second;
+                const auto& calleeLists = g_crossListParams[callee->name];
+                for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
+                    size_t pidx = ai - 1;
+                    if (pidx >= callee->parameters.size()) break;
+                    if (!calleeLists.count(callee->parameters[pidx])) continue;
+                    const IRRef& arg = ins.typedOperands[ai];
+                    if (arg.kind != IRRef::Kind::VAR) continue;
+                    std::string an = nameOf(arg);
+                    if (myParams.count(an) && g_crossListParams[f.name].insert(an).second) changed = true;
+                }
+            }
+        }
+    }
+}
+
 static bool isSyntheticVar(const std::string& n) {
     // "aac_" catches the SAME `_ac_`-prefixed names after V's formatRef/vName rewrite (a
     // leading `_` becomes `a` — V rejects underscore-led identifiers outright). This free-var
@@ -19626,8 +21364,12 @@ class UnifiedIRCodeGen
             default: return false;
         }
     }
+    // Temps whose value is a real bool in the current block (see PRINT and genInstr).
+    std::set<int> boolTempIds_;
     void genInstr(const IRInstruction &i)
     {
+        if (i.result.kind == IRRef::Kind::TEMP && i.resultType == IRType::BOOL)
+            boolTempIds_.insert(i.result.id);
         if (needsDeadCodeSuppression()) {
             if (isBlockBoundaryOp(i.opcode)) javaDeadCode_ = false;
             else if (javaDeadCode_) return;   // unreachable — see this flag's own comment
@@ -19856,6 +21598,16 @@ class UnifiedIRCodeGen
             if (i.typedOperands.size() >= 2)
                 strategy->emitComparison(out, indentLevel, ref(i.result),
                                          ref(i.typedOperands[0]), ref(i.typedOperands[1]), "xnor");
+            break;
+        case IROpcode::WILDCARD_MATCH:
+            if (i.typedOperands.size() >= 2)
+                strategy->emitWildcardMatch(out, indentLevel, ref(i.result),
+                                            ref(i.typedOperands[0]), ref(i.typedOperands[1]));
+            break;
+        case IROpcode::DICT_HAS:
+            if (i.typedOperands.size() >= 2)
+                strategy->emitDictHas(out, indentLevel, ref(i.result),
+                                      ref(i.typedOperands[0]), ref(i.typedOperands[1]));
             break;
         case IROpcode::XSUB:
             if (i.typedOperands.size() >= 2)
@@ -20239,16 +21991,27 @@ class UnifiedIRCodeGen
             if (!i.typedOperands.empty()) {
                 const auto& pop = i.typedOperands[0];
                 bool handled = false;
+                // Keyword literals print as PY does: null -> None, nil -> set(), True/False. The text is the
+                // reference output, and the save-as capture buffer gets the same text.
+                std::string litText;
                 if (pop.kind == IRRef::Kind::CONST && pop.value.type == IRType::STRING) {
                     std::string s = std::get<std::string>(pop.value.data);
                     if (s.size() >= 2 && s.front() == '$' && s.back() == '$') s = s.substr(1, s.size() - 2);
-                    if (s == "null" || s == "nil") {
-                        handled = strategy->emitPrintNullText(out, indentLevel, s == "nil");
-                        // Feed `save as`'s capture buffer the same real text (a quoted string
-                        // literal satisfies isStr()'s looksString check directly, so the existing
-                        // capture path materializes it exactly like any other string constant).
-                        if (handled) strategy->emitCapture(out, indentLevel, "\"" + s + "\"");
-                    }
+                    if (s == "null") litText = "None";
+                    else if (s == "nil") litText = "set()";
+                } else if (pop.kind == IRRef::Kind::CONST && pop.value.type == IRType::BOOL) {
+                    litText = std::get<bool>(pop.value.data) ? "True" : "False";
+                }
+                if (!litText.empty()) {
+                    strategy->emitPrintLiteral(out, indentLevel, litText);
+                    strategy->emitCapture(out, indentLevel, "\"" + litText + "\"");
+                    handled = true;
+                } else if ((pop.kind == IRRef::Kind::TEMP && boolTempIds_.count(pop.id))
+                           || (pop.kind == IRRef::Kind::VAR && pop.id >= 0
+                               && ir.symbols.getType(pop.id) == IRType::BOOL)) {
+                    // A variable declared bool (`to_bool flag = 1`) or a bool-typed temp prints True/False.
+                    strategy->emitPrintBool(out, indentLevel, ref(pop));
+                    handled = true;
                 }
                 if (!handled) {
                     strategy->setSmartPrint(hasSmartAttr(i));
@@ -20545,6 +22308,7 @@ class UnifiedIRCodeGen
         case IROpcode::FUNC_END:
         case IROpcode::FREE_DECL:  // handled at function-begin time, not inline
         case IROpcode::NOP:
+            strategy->emitNop(out, indentLevel);
             break;
 
         case IROpcode::TAG_BEGIN: {
@@ -20664,8 +22428,30 @@ class UnifiedIRCodeGen
         // Pre-scan: LIST parameters (usage-detected). Without this, typed backends
         // declared array params as plain integers and the target compiler rejected
         // every function that receives an array.
-        std::set<std::string> fnListParams = detectListParams(func, ir.symbols);
+        // Per-callee list-argument flags (see BackendStrategy::setUserFuncListArgs). Built here,
+        // after crossFnStringVars_ is final: a string parameter is never a list, whatever the
+        // list detector said, so its position must not be flagged.
+        {
+            std::map<std::string, std::vector<bool>> listArgs;
+            for (const auto& fn : ir.functions) {
+                auto lp = listParamsFor(fn, ir.symbols);
+                auto sit = crossFnStringVars_.find(fn.name);
+                auto rb = reboundParamsOf(fn, ir.symbols);
+                std::vector<bool> flags;
+                for (const auto& p : fn.parameters)
+                    flags.push_back(lp.count(p) > 0 && !rb.count(p) && !(sit != crossFnStringVars_.end() && sit->second.count(p)));
+                listArgs[fn.name] = std::move(flags);
+            }
+            strategy->setUserFuncListArgs(listArgs);
+        }
+        // A parameter with string evidence is a string even when it is also indexed: `s[i]` on a
+        // string is a one-char read (detectListParams counts every indexed param as a list).
+        // detectStringVars never marks an array name, so this cannot hide a real list.
+        std::set<std::string> fnListParams = listParamsFor(func, ir.symbols);
+        if (auto fsv = crossFnStringVars_.find(func.name); fsv != crossFnStringVars_.end())
+            for (const auto& sv : fsv->second) fnListParams.erase(sv);
         strategy->setListParams(fnListParams);
+        strategy->setReboundParams(reboundParamsOf(func, ir.symbols));
 
         std::set<std::string> fnStringParams = detectStringParams(func, ir.symbols);
         strategy->setStringParams(fnStringParams);
@@ -20747,7 +22533,15 @@ class UnifiedIRCodeGen
                     if (op.kind == IRRef::Kind::CONST && op.value.type == IRType::FLOAT) retFloat = true;
                     if (isVarLike(op) && fnFloatVars.count(refName(op))) retFloat = true; // #floatret
                     if (op.kind == IRRef::Kind::CONST && op.value.type == IRType::STRING) retString = true;
-                    if (op.kind == IRRef::Kind::VAR && fnStringVars.count(refName(op))) retString = true; // #6
+                    // isVarLike (VAR-or-TEMP), not a bare VAR-only check — a return whose value
+                    // is a CALL result held in a TEMP (`return dns.resolve(hostname);`, never
+                    // copied into a named var first) was invisible here even once isAcStrFunc
+                    // correctly marked that TEMP as string in fnStringVars (verified real bug:
+                    // keyword_catalog_modules.ac's `resolve` wrapper — C's own PROTOTYPE pass
+                    // (which already used isVarLike two lines below) correctly said `ac_str
+                    // resolve(...)`, but this REAL DEFINITION still said `ac_int`, a hard
+                    // "conflicting types for 'resolve'" between the two).
+                    if (isVarLike(op) && fnStringVars.count(refName(op))) retString = true; // #6
                     if (isVarLike(op)) {
                         std::string rname = refName(op);
                         if (fnListParams.count(rname)) retList = true; // returning a list param
@@ -20859,6 +22653,7 @@ class UnifiedIRCodeGen
         strategy->emitFunctionBegin(out, indentLevel, func.name, params, func.classOwner);
         strategy->setFloatVarsFull(fnFloatVars);
         inFunctionBody_ = true;
+        boolTempIds_.clear();   // temp ids restart per function: the set is per block
         for (const auto &instr : func.instructions)
             genInstr(instr);
         inFunctionBody_ = false;
@@ -20904,6 +22699,7 @@ public:
         bool hasInput  = false;
         bool hasEvents = false;
         bool hasSave   = false;
+        bool hasWildcard = false;
         libImports_.clear();
         usingHeaders_.clear();
         aliasGroups_.clear();
@@ -20947,7 +22743,7 @@ public:
                         if (aclContent.empty()) {
                             // Try reading the .acl directly from library dir
                             auto tryAcl = [&](const std::string& base) -> std::string {
-                                std::string p = base + "/library/ilib/" + libName + "/" + libName + ".acl";
+                                std::string p = base + "/library/ilib/" + ilibSubdir(libName) + "/" + libName + ".acl";
                                 FILE* f = std::fopen(p.c_str(), "r");
                                 if (!f) return "";
                                 std::string c; char buf[4096];
@@ -21042,6 +22838,7 @@ public:
                 if (ins.opcode == IROpcode::INPUT)      hasInput  = true;
                 if (ins.opcode == IROpcode::EVENT_BIND) hasEvents = true;
                 if (ins.opcode == IROpcode::SAVE_FILE)  hasSave   = true;
+                if (ins.opcode == IROpcode::WILDCARD_MATCH) hasWildcard = true;
                 checkOS(ins);
                 checkBuiltinOps(ins);
                 scanImport(ins);
@@ -21079,6 +22876,7 @@ public:
                 if (ins.opcode == IROpcode::INPUT)      hasInput  = true;
                 if (ins.opcode == IROpcode::EVENT_BIND) hasEvents = true;
                 if (ins.opcode == IROpcode::SAVE_FILE)  hasSave   = true;
+                if (ins.opcode == IROpcode::WILDCARD_MATCH) hasWildcard = true;
                 checkOS(ins);
                 checkBuiltinOps(ins);
                 // NOTE: Do NOT mark mainloop variables as globals — they're local to mainloop!
@@ -21667,6 +23465,28 @@ public:
             std::map<std::string, std::set<int>> userFloatParamIdx;
             std::map<std::string, const AC_IR::IRFunction*> fnByName;
             for (const auto& fn : ir.functions) fnByName[fn.name] = &fn;
+            // The top-level program makes calls too (`x = f(0.5, 1)` in the mainloop), and the loop
+            // below only walks ir.functions. Seed the float constant arguments of those calls first.
+            for (const auto* body : {&ir.globalInit, &ir.mainSection}) {
+                for (const auto& ins : *body) {
+                    if (ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL) continue;
+                    if (ins.typedOperands.empty()) continue;
+                    const auto& cf = ins.typedOperands[0];
+                    std::string callee;
+                    if (cf.kind == IRRef::Kind::VAR && cf.id >= 0) callee = ir.symbols.getName(cf.id);
+                    else if (cf.kind == IRRef::Kind::CONST && cf.value.type == IRType::STRING)
+                        callee = std::get<std::string>(cf.value.data);
+                    auto cit = fnByName.find(callee);
+                    if (cit == fnByName.end()) continue;
+                    for (size_t k = 1; k < ins.typedOperands.size(); k++) {
+                        size_t pidx = k - 1;
+                        if (pidx >= cit->second->parameters.size()) break;
+                        const auto& arg = ins.typedOperands[k];
+                        if (arg.kind == IRRef::Kind::CONST && arg.value.type == IRType::FLOAT)
+                            crossFnFloatParams_[cit->second->name].insert(cit->second->parameters[pidx]);
+                    }
+                }
+            }
             bool fpChanged = true;
             int fpGuard = 0;
             while (fpChanged && fpGuard++ < 50) {
@@ -21765,7 +23585,7 @@ public:
                             std::string rname = gRefName(rv);
                             if (fnFloatVars().count(rname)) floatFuncs.insert(fn.name);   // #floatret
                             if (fnStringVars().count(rname)) stringFuncs.insert(fn.name);  // #6: returns a string var
-                            if (detectListParams(fn, ir.symbols).count(rname))
+                            if (listParamsFor(fn, ir.symbols).count(rname))
                                 listFuncs.insert(fn.name);   // returns a list param
                             for (const auto& ai : fn.instructions) {
                                 bool aiVarLike = ai.result.kind == IRRef::Kind::VAR || ai.result.kind == IRRef::Kind::TEMP;
@@ -21841,30 +23661,70 @@ public:
                 // rather than mutating crossFnStringVars_ mid-scan (a function calling itself,
                 // directly or mutually, would otherwise see a half-updated set this same round).
                 std::map<std::string, std::set<std::string>> extra;
-                for (auto& func : ir.functions) {
-                    for (auto& ins : func.instructions) {
+                // Caller bodies: every function, plus the top-level program. Calls made from main
+                // live in globalInit/mainSection, not ir.functions, so they must be scanned too
+                // (the caller name "" has no entry, so only direction 2 from literals applies there).
+                std::vector<std::pair<std::string, const std::vector<IRInstruction>*>> callerBodies;
+                for (auto& func : ir.functions) callerBodies.push_back({func.name, &func.instructions});
+                callerBodies.push_back({"", &ir.globalInit});
+                callerBodies.push_back({"", &ir.mainSection});
+                // String variables of the top-level program (e.g. `w = $abcde$` before `cnt(w)`).
+                std::set<std::string> topStrs = detectStringVars(ir.globalInit, ir.symbols, {}, protoStringFuncs_);
+                for (auto& n : detectStringVars(ir.mainSection, ir.symbols, {}, protoStringFuncs_)) topStrs.insert(n);
+                for (auto& [callerName, body] : callerBodies) {
+                    // A call argument is often a TEMP copy of a named variable (`t = LOAD_VAR s` then
+                    // `f(t)`), so resolve each temp back to the variable it was loaded from.
+                    std::map<int, std::string> tempSrcVar;
+                    for (auto& ins : *body)
+                        if (ins.opcode == IROpcode::LOAD_VAR && ins.result.kind == IRRef::Kind::TEMP
+                                && !ins.typedOperands.empty() && ins.typedOperands[0].kind == IRRef::Kind::VAR
+                                && ins.typedOperands[0].id >= 0)
+                            tempSrcVar[ins.result.id] = ir.symbols.getName(ins.typedOperands[0].id);
+                    for (auto& ins : *body) {
                         if (ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL) continue;
                         if (ins.typedOperands.empty()) continue;
                         const auto& f0 = ins.typedOperands[0];
                         std::string callee;
-                        if (f0.kind == IRRef::Kind::VAR && f0.id >= 0) callee = ir.symbols.getName(f0.id);
+                        if ((f0.kind == IRRef::Kind::VAR || f0.kind == IRRef::Kind::FUNCTION) && f0.id >= 0)
+                            callee = ir.symbols.getName(f0.id);
                         else if (f0.kind == IRRef::Kind::CONST && f0.value.type == IRType::STRING)
                             callee = std::get<std::string>(f0.value.data);
                         auto cit = byName.find(callee);
                         if (cit == byName.end()) continue;
                         const IRFunction* cf = cit->second;
+                        // A callee with no entry yet still takes part: a literal argument can make its parameter a string.
+                        static const std::set<std::string> noStrs;
                         auto sit = crossFnStringVars_.find(cf->name);
-                        if (sit == crossFnStringVars_.end()) continue;
-                        const auto& calleeStrs = sit->second;
+                        const auto& calleeStrs = sit == crossFnStringVars_.end() ? noStrs : sit->second;
                         for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
                             size_t pidx = ai - 1;
                             if (pidx >= cf->parameters.size()) continue;
-                            if (!calleeStrs.count(cf->parameters[pidx])) continue;
                             const auto& arg = ins.typedOperands[ai];
-                            std::string argName;
-                            if (arg.kind == IRRef::Kind::VAR && arg.id >= 0) argName = ir.symbols.getName(arg.id);
-                            else if (arg.kind == IRRef::Kind::TEMP) argName = "t_" + std::to_string(arg.id);
-                            if (!argName.empty()) extra[func.name].insert(argName);
+                            // Direction 1: the callee's parameter is a string, so the caller's argument is too.
+                            if (calleeStrs.count(cf->parameters[pidx])) {
+                                std::string argName;
+                                if (arg.kind == IRRef::Kind::VAR && arg.id >= 0) argName = ir.symbols.getName(arg.id);
+                                else if (arg.kind == IRRef::Kind::TEMP) argName = "t_" + std::to_string(arg.id);
+                                if (!argName.empty()) extra[callerName].insert(argName);
+                            }
+                            // Direction 2: a string literal, or a caller variable already known to be a string,
+                            // passed in, makes the callee's parameter a string (`cnt($abcd$)` with `FOR c in s`).
+                            bool argIsString = (arg.kind == IRRef::Kind::CONST && arg.value.type == IRType::STRING);
+                            std::string srcVar;
+                            if (arg.kind == IRRef::Kind::VAR && arg.id >= 0) srcVar = ir.symbols.getName(arg.id);
+                            else if (arg.kind == IRRef::Kind::TEMP) {
+                                auto tsv = tempSrcVar.find(arg.id);
+                                if (tsv != tempSrcVar.end()) srcVar = tsv->second;
+                            }
+                            if (!argIsString && !srcVar.empty()) {
+                                const std::set<std::string>* callerStrs = &topStrs;
+                                if (!callerName.empty()) {
+                                    auto ci = crossFnStringVars_.find(callerName);
+                                    callerStrs = ci != crossFnStringVars_.end() ? &ci->second : nullptr;
+                                }
+                                argIsString = callerStrs && callerStrs->count(srcVar);
+                            }
+                            if (argIsString) extra[cf->name].insert(cf->parameters[pidx]);
                         }
                     }
                 }
@@ -21936,8 +23796,12 @@ public:
                             if (have && val.kind == IRRef::Kind::TEMP) {
                                 auto loIt = loadIdxOrigin.find(val.id);
                                 if (loIt != loadIdxOrigin.end()) {
-                                    // backward: target known-string -> the indexed array is a string list
+                                    // backward: target known-string -> the indexed array is a string list.
+                                    // Not when the indexed thing is itself a string: `s[i]` on a
+                                    // string yields a one-char string, so `c = s[i]` says nothing
+                                    // about `s` being a list (Rust then emitted `s[i].clone()`).
                                     if ((isKnownStr(tgt) || ins.resultType == IRType::STRING)
+                                            && !myStrs.count(loIt->second)
                                             && mine.insert(loIt->second).second)
                                         changed = true;
                                     // forward: array already known string-list -> this plain
@@ -21999,6 +23863,7 @@ public:
         strategy->setNeedsEvents(hasEvents);
         strategy->setNeedsOS(hasOS);
         strategy->setNeedsSave(hasSave);
+        strategy->setNeedsWildcard(hasWildcard);
         strategy->setUsedBuiltinOps(hasDivOp, hasIpowOp, hasLengthOp, hasAddOp, hasRandomOp, hasIdivOp, hasEvalOp, hasTryOp);
         strategy->setPendingImports(libImports_);
         strategy->setImportSymbols(importSymbols);
@@ -22249,6 +24114,22 @@ public:
         }
         strategy->setBoxedRetFuncs(boxedRetFuncsDrv_);
 
+        {
+            std::map<std::string, std::vector<bool>> calleeFloatFlags;
+            for (const auto &func : ir.functions) {
+                // The same set the definition uses (body-level float variables ∩ parameters, see
+                // genFunction's fnFloatVars), so a caller converts exactly where the callee expects a double.
+                std::set<std::string> seed = detectFloatParams(func, ir.symbols);
+                auto cfp = crossFnFloatParams_.find(func.name);
+                if (cfp != crossFnFloatParams_.end()) seed.insert(cfp->second.begin(), cfp->second.end());
+                std::set<std::string> bodyFloat = detectFloatVars(func.instructions, ir.symbols, protoFloatFuncs_, seed);
+                std::vector<bool> flags;
+                for (const auto &p : func.parameters) flags.push_back(bodyFloat.count(p) > 0);
+                calleeFloatFlags[func.name] = flags;
+            }
+            strategy->setCalleeFloatParams(calleeFloatFlags);
+        }
+
         // Forward declarations first (C++ requires them for mutual recursion —
         // is_even calling is_odd defined later otherwise fails to compile).
         {
@@ -22276,9 +24157,14 @@ public:
                     params += func.parameters[pi];
                 }
                 // per-function param hints for correct prototype types
-                std::set<std::string> protoListParams = detectListParams(func, ir.symbols);
+                std::set<std::string> protoListParams = listParamsFor(func, ir.symbols);
+        // Same string-over-list precedence as the definition's setup (see fnListParams there), so
+        // the forward declaration and the definition agree on every parameter's type.
+        if (auto psv = crossFnStringVars_.find(func.name); psv != crossFnStringVars_.end())
+            for (const auto& sv : psv->second) protoListParams.erase(sv);
                 std::set<std::string> protoStringParams = detectStringParams(func, ir.symbols);
                 strategy->setListParams(protoListParams);
+                strategy->setReboundParams(reboundParamsOf(func, ir.symbols));
                 strategy->setStringParams(protoStringParams);
                 // #protostrvars: `isStringVar` (consulted by CStrategy's typedParamListC and
                 // likely other backends' prototype-typing) checks the whole-body `stringVars_`
@@ -22293,7 +24179,12 @@ public:
                 // `const char* s`, "conflicting types for 'vowels'"). Compute and set the same
                 // way genFunction does, so both passes agree.
                 {
-                    std::set<std::string> protoStrVars = detectStringVars(func.instructions, ir.symbols, protoStringParams, protoStringFuncs_);
+                    // The definition uses the program-wide string fixpoint (crossFnStringVars_) when it has one, so
+                    // the prototype must too: a parameter the body only indexes is a string there, not a list.
+                    std::set<std::string> protoStrVars;
+                    auto cfsIt = crossFnStringVars_.find(func.name);
+                    if (cfsIt != crossFnStringVars_.end()) protoStrVars = cfsIt->second;
+                    else protoStrVars = detectStringVars(func.instructions, ir.symbols, protoStringParams, protoStringFuncs_);
                     for (const auto& nv : detectNumericRetype(func.instructions, ir.symbols, protoStrVars)) protoStrVars.erase(nv);
                     strategy->setStringVars(protoStrVars);
                 }
@@ -22312,10 +24203,15 @@ public:
                 // i64, found floating-point number". C/C++ never needed this because they cast
                 // `(double)(x)` at every USE regardless of x's declared type; Rust has no
                 // implicit numeric coercion, so it must know the real type up front.)
-                { std::set<std::string> protoFloatParams = detectFloatParams(func, ir.symbols);
+                // Must be exactly the set the definition uses (genFunction's fnFloatVars ∩ params):
+                // a prototype that disagrees with its definition is a C/C++ conflicting-types error.
+                { std::set<std::string> seed = detectFloatParams(func, ir.symbols);
                   auto cfpIt = crossFnFloatParams_.find(func.name);
                   if (cfpIt != crossFnFloatParams_.end())
-                      protoFloatParams.insert(cfpIt->second.begin(), cfpIt->second.end());
+                      seed.insert(cfpIt->second.begin(), cfpIt->second.end());
+                  std::set<std::string> bodyFloat = detectFloatVars(func.instructions, ir.symbols, protoFloatFuncs_, seed);
+                  std::set<std::string> protoFloatParams;
+                  for (const auto& p : func.parameters) if (bodyFloat.count(p)) protoFloatParams.insert(p);
                   strategy->setFloatParams(protoFloatParams); }
                 std::set<std::string> pset(func.parameters.begin(), func.parameters.end());
                 std::map<std::string, int> ftp;
@@ -22355,8 +24251,12 @@ public:
         // genFunction's setStringVars never ran for it. Without this, mainloop string vars are
         // mis-declared (e.g. `.length` vs `.length()`, non-string FOR).
         {
-            std::set<std::string> mlStr = detectStringVars(ir.globalInit, ir.symbols, {}, protoStringFuncs_);
-            for (const auto& nv : detectNumericRetype(ir.globalInit, ir.symbols, mlStr)) mlStr.erase(nv);
+            // The mainloop body can live in mainSection as well as globalInit (a `<mainloop>` program):
+            // infer over both, or a `line = Term.ask ...` inside the loop is mistyped as an integer.
+            std::vector<AC_IR::IRInstruction> mlBody = ir.globalInit;
+            mlBody.insert(mlBody.end(), ir.mainSection.begin(), ir.mainSection.end());
+            std::set<std::string> mlStr = detectStringVars(mlBody, ir.symbols, {}, protoStringFuncs_);
+            for (const auto& nv : detectNumericRetype(mlBody, ir.symbols, mlStr)) mlStr.erase(nv);
             strategy->setStringVars(mlStr);   // #retype
             strategy->setBoxedVars(detectBoxedVars(ir.globalInit, ir.symbols, mlStr, protoStringFuncs_, boxedRetFuncsDrv_));
         }
@@ -22375,10 +24275,12 @@ public:
             };
             std::set<std::string> funcNames;   // callee names aren't hoistable locals (see per-fn scan)
             for (const auto& fn : ir.functions) funcNames.insert(fn.name);
+            std::set<std::string> anyFloat;   // a hoisted var that is ever set to a float is declared float
             auto note = [&](const std::string& v, IRType t) {
                 // Same exclusion as the per-function hoist scan above — see its comment.
                 if (v.empty() || isSyntheticVar(v) || funcNames.count(v)
                     || v.find('.') != std::string::npos) return;
+                if (t == IRType::FLOAT) anyFloat.insert(v);
                 auto it = firstPath.find(v);
                 if (it == firstPath.end()) { firstPath[v] = stk; firstType[v] = t; }
                 else if (!isPrefix(it->second, stk)) {
@@ -22386,8 +24288,11 @@ public:
                     hoist[v] = (ht == IRType::VOID && t != IRType::VOID) ? t : ht;
                 }
             };
+            // A `<mainloop>` body can sit in mainSection as well as globalInit: scan both.
+            std::vector<AC_IR::IRInstruction> hoistAll = ir.globalInit;
+            hoistAll.insert(hoistAll.end(), ir.mainSection.begin(), ir.mainSection.end());
             bool inClassScan = false;
-            for (const auto& ins : ir.globalInit) {
+            for (const auto& ins : hoistAll) {
                 if (ins.opcode == IROpcode::CLASS_BEGIN) { inClassScan = true; continue; }
                 if (ins.opcode == IROpcode::CLASS_END)   { inClassScan = false; continue; }
                 if (inClassScan) continue;
@@ -22414,6 +24319,15 @@ public:
                     default: break;
                 }
             }
+            // String evidence wins over the first assignment's IR type: `line = Term.ask ...` is text
+            // even though its temp was typed INT.
+            std::set<std::string> hoistStr = detectStringVars(hoistAll, ir.symbols, {}, protoStringFuncs_);
+            // Float evidence comes from the value flow (detectFloatVars), not the STORE's own resultType.
+            std::set<std::string> hoistFloat = detectFloatVars(hoistAll, ir.symbols, protoFloatFuncs_);
+            for (auto& [hv, ht] : hoist) {
+                if (anyFloat.count(hv) || hoistFloat.count(hv)) ht = IRType::FLOAT;
+                else if (hoistStr.count(hv)) ht = IRType::STRING;
+            }
             strategy->setHoistVars(hoist);
         }
         strategy->emitMainBegin(out, indentLevel);
@@ -22421,6 +24335,7 @@ public:
         {
             bool inClass = false;
 
+            boolTempIds_.clear();
             for (const auto &instr : ir.globalInit) {
                 if (instr.opcode == IROpcode::CLASS_BEGIN) { inClass = true;  continue; }
                 if (instr.opcode == IROpcode::CLASS_END)   { inClass = false; continue; }
@@ -22465,6 +24380,7 @@ void rejectTypeCyclingVars(const IRProgram &ir, const std::string &backend)
 std::string generateFromIR(const IRProgram &ir, const std::string &stem,
                            const std::string &outputBase)
 {
+    computeCrossListParams(ir);
     UnifiedIRCodeGen gen(ir, stem, outputBase);
     return gen.generate();
 }
