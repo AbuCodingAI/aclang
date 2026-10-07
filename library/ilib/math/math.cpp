@@ -60,6 +60,9 @@ int64_t  ac_mod_int(int64_t a, int64_t b)   { return ac_math::mod_int(a, b); }
 int64_t  ac_to_int(double x)                 { return ac_math::to_int(x); }
 double   ac_to_dec(int64_t x)               { return ac_math::to_dec(x); }
 int64_t  ac_gcd(int64_t a, int64_t b)       { return ac_math::gcd(a, b); }
+int64_t  ac_modpow(int64_t b, int64_t e, int64_t m) { return ac_math::modpow(b, e, m); }
+int64_t  ac_modinv(int64_t a, int64_t m)  { return ac_math::modinv(a, m); }
+int64_t  ac_modmul(int64_t a, int64_t b, int64_t m) { return ac_math::modmul(a, b, m); }
 int64_t  ac_lcm(int64_t a, int64_t b)       { return ac_math::lcm(a, b); }
 int      ac_is_prime(int64_t n)              { return ac_math::is_prime(n) ? 1 : 0; }
 double   ac_clamp(double v, double lo, double hi) { return ac_math::clamp(v, lo, hi); }
@@ -114,7 +117,7 @@ void ac_stat_boxnum(const double* arr, int len, double* out) {
 // ── Expression evaluator ───────────────────────────────────────────────────
 
 namespace {
-    struct EvalCtx { const char* p; };
+    struct EvalCtx { const char* p; double x = 0.0; };   // x: the value of the variable x
     static double ev_expr(EvalCtx& s);
     static double ev_term(EvalCtx& s);
     static double ev_factor(EvalCtx& s);
@@ -132,14 +135,15 @@ namespace {
             if (*s.p == ')') s.p++;
             return v;
         }
-        if (*s.p == '-') { s.p++; return -ev_base(s); }
-        if (*s.p == '+') { s.p++; return ev_base(s); }
+        if (*s.p == '-') { s.p++; return -ev_factor(s); }
+        if (*s.p == '+') { s.p++; return ev_factor(s); }
         if (std::isalpha((unsigned char)*s.p) || *s.p == '_') {
             char name[64]; int ni = 0;
             while ((std::isalnum((unsigned char)*s.p) || *s.p == '_') && ni < 63)
                 name[ni++] = *s.p++;
             name[ni] = 0;
             ev_skip(s);
+            if (!strcmp(name, "x") && *s.p != '(') return s.x;
             if (!strcmp(name, "pi"))  return ac_math::PI_VAL;
             if (!strcmp(name, "e"))   return ac_math::E_VAL;
             if (!strcmp(name, "tau")) return ac_math::TAU_VAL;
@@ -159,7 +163,7 @@ namespace {
                     if (!strcmp(name, "mod"))   return std::fmod(a, b);
                     if (!strcmp(name, "min"))   return a < b ? a : b;
                     if (!strcmp(name, "max"))   return a > b ? a : b;
-                    return 0.0;
+                    return std::nan("");   // unknown function: NaN, not a silent 0
                 }
                 if (*s.p == ')') s.p++;
                 if (!strcmp(name, "sin"))     return std::sin(a);
@@ -181,9 +185,9 @@ namespace {
                 if (!strcmp(name, "exp"))     return std::exp(a);
                 if (!strcmp(name, "deg2rad")) return a * ac_math::PI_VAL / 180.0;
                 if (!strcmp(name, "rad2deg")) return a * 180.0 / ac_math::PI_VAL;
-                return 0.0;
+                return std::nan("");   // unknown function: NaN
             }
-            return 0.0;
+            return std::nan("");   // unknown name: NaN, not a silent 0
         }
         char* end; double v = strtod(s.p, &end); s.p = end; return v;
     }
@@ -198,7 +202,7 @@ namespace {
         double v = ev_factor(s); ev_skip(s);
         while (*s.p == '*' || *s.p == '/' || *s.p == '%') {
             char op = *s.p++; double r = ev_factor(s);
-            v = op == '*' ? v * r : op == '/' ? (r != 0.0 ? v / r : 0.0) : std::fmod(v, r);
+            v = op == '*' ? v * r : op == '/' ? v / r : std::fmod(v, r);   // IEEE: x/0 is inf or nan, not 0
             ev_skip(s);
         }
         return v;
@@ -219,6 +223,36 @@ double ac_eval(const char* expr) {
     if (!expr) return 0.0;
     EvalCtx s{ expr };
     return ev_expr(s);
+}
+
+// The formula with its variable x set to x (the calculus functions evaluate formulas this way).
+double ac_eval_at(const char* expr, double x) {
+    if (!expr) return 0.0;
+    EvalCtx s{ expr, x };
+    return ev_expr(s);
+}
+
+// ── calculus over a formula in x (algorithms in calculus.hpp) ─────────────────
+// Each takes the formula as text, e.g. "x*x + sin(x)". A missing formula gives NaN.
+double ac_integrate(const char* expr, double a, double b) {
+    if (!expr) return NAN;
+    return ac_math::calculus::integrate([expr](double x) { return ac_eval_at(expr, x); }, a, b);
+}
+double ac_derivative(const char* expr, double x) {
+    if (!expr) return NAN;
+    return ac_math::calculus::derivative([expr](double t) { return ac_eval_at(expr, t); }, x);
+}
+double ac_limit(const char* expr, double x) {
+    if (!expr) return NAN;
+    return ac_math::calculus::limit([expr](double t) { return ac_eval_at(expr, t); }, x);
+}
+double ac_minima(const char* expr, double a, double b) {
+    if (!expr) return NAN;
+    return ac_math::calculus::minima([expr](double t) { return ac_eval_at(expr, t); }, a, b);
+}
+double ac_maxima(const char* expr, double a, double b) {
+    if (!expr) return NAN;
+    return ac_math::calculus::maxima([expr](double t) { return ac_eval_at(expr, t); }, a, b);
 }
 
 void ac_print_double(double x) {

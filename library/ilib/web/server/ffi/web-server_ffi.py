@@ -27,7 +27,7 @@ def _ilib_dir(lib):
     return rel
 
 
-_sys.path.insert(0, _os.path.join(_ilib_dir('web-server'), 'jasql_vendor'))
+_sys.path.insert(0, _os.path.join(_ilib_dir('web/server'), 'jasql_vendor'))
 
 import jasql as _jasql          # noqa: E402  (vendored)
 from abudb import Database as _Database  # noqa: E402

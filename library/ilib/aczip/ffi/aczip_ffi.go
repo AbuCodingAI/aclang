@@ -24,6 +24,17 @@ func aczip_decompress(archivePath string, outputPath string) int64 {
     op := C.CString(outputPath); defer C.free(unsafe.Pointer(op))
     return int64(C.ac_zip_decompress_from_file(ap, op))
 }
+func aczip_iso(srcdir string, outIso string, label string) int64 {
+    sd := C.CString(srcdir); defer C.free(unsafe.Pointer(sd))
+    oi := C.CString(outIso); defer C.free(unsafe.Pointer(oi))
+    lb := C.CString(label); defer C.free(unsafe.Pointer(lb))
+    return int64(C.ac_zip_iso(sd, oi, lb))
+}
+func aczip_package(srcdir string, outPath string) int64 {
+    sd := C.CString(srcdir); defer C.free(unsafe.Pointer(sd))
+    op := C.CString(outPath); defer C.free(unsafe.Pointer(op))
+    return int64(C.ac_zip_package(sd, op))
+}
 func aczip_get_ratio(original int64, compressed int64) float64 {
     return float64(C.ac_get_compression_ratio(C.size_t(original), C.size_t(compressed)))
 }
@@ -33,5 +44,7 @@ type acZipNS struct{}
 func (acZipNS) compress(path string, parallel int64, outputPath string) int64 { return aczip_compress(path, parallel, outputPath) }
 func (acZipNS) decompress(archivePath string, outputPath string) int64        { return aczip_decompress(archivePath, outputPath) }
 func (acZipNS) get_ratio(original int64, compressed int64) float64            { return aczip_get_ratio(original, compressed) }
+func (acZipNS) iso(srcdir string, outIso string, label string) int64          { return aczip_iso(srcdir, outIso, label) }
+func (acZipNS) pack(srcdir string, outPath string) int64                      { return aczip_package(srcdir, outPath) }
 
 var aczip = acZipNS{}

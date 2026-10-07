@@ -101,6 +101,13 @@ func math_eval(expr string) float64 {
 	return float64(C.ac_eval(cs))
 }
 
+// calculus over a formula in x: the formula is text, e.g. "x*x + sin(x)"
+func math_integrate(f string, a, b float64) float64 { cs := C.CString(f); defer C.free(unsafe.Pointer(cs)); return float64(C.ac_integrate(cs, C.double(a), C.double(b))) }
+func math_derivative(f string, x float64) float64 { cs := C.CString(f); defer C.free(unsafe.Pointer(cs)); return float64(C.ac_derivative(cs, C.double(x))) }
+func math_limit(f string, x float64) float64 { cs := C.CString(f); defer C.free(unsafe.Pointer(cs)); return float64(C.ac_limit(cs, C.double(x))) }
+func math_minima(f string, a, b float64) float64 { cs := C.CString(f); defer C.free(unsafe.Pointer(cs)); return float64(C.ac_minima(cs, C.double(a), C.double(b))) }
+func math_maxima(f string, a, b float64) float64 { cs := C.CString(f); defer C.free(unsafe.Pointer(cs)); return float64(C.ac_maxima(cs, C.double(a), C.double(b))) }
+
 var math_i = complex(0.0, 1.0)
 func math_re(z complex128) float64 { return real(z) }
 func math_im(z complex128) float64 { return imag(z) }
@@ -155,6 +162,11 @@ func (m _AcMathNS) gradient(lst []float64) []float64 { return math_gradient(lst)
 func (m _AcMathNS) pi_digits(n int) float64  { return math_pi_digits(n) }
 func (m _AcMathNS) e_digits(n int) float64   { return math_e_digits(n)  }
 func (m _AcMathNS) eval(expr string) float64 { return math_eval(expr)   }
+func (m _AcMathNS) integrate(f string, a, b float64) float64 { return math_integrate(f, a, b) }
+func (m _AcMathNS) derivative(f string, x float64) float64 { return math_derivative(f, x) }
+func (m _AcMathNS) limit(f string, x float64) float64 { return math_limit(f, x) }
+func (m _AcMathNS) minima(f string, a, b float64) float64 { return math_minima(f, a, b) }
+func (m _AcMathNS) maxima(f string, a, b float64) float64 { return math_maxima(f, a, b) }
 
 var math = _AcMathNS{
     pi: math_pi, e: math_e, tau: math_tau, em: math_em, inf: math_inf,

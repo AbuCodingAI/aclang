@@ -93,23 +93,38 @@ class StringCheese {
     /**
      * stringm_split - Split string
      */
-    public static String[] split(String s, String sep) {
-        if (s == null) return new String[]{};
+    public static String stripClause(String mode, String clause, String s) {
+        int at = s.indexOf(clause);
+        if (at < 0) return s;
+        if ("before".equals(mode)) return s.substring(at + clause.length());
+        if ("after".equals(mode))  return s.substring(0, at);
+        return s;
+    }
+
+    public static String stripln(String s, String needle) {
+        for (String line : s.split("\n", -1)) {
+            if (line.contains(needle)) return line;
+        }
+        return "";
+    }
+
+    public static java.util.List<String> split(String s, String sep) {
+        if (s == null) return new java.util.ArrayList<>();
 
         if (sep == null || isWsSentinel(sep)) {
-            return s.trim().split("\\s+");
+            return java.util.Arrays.asList(s.trim().split("\\s+"));
         }
 
-        return s.split(Pattern.quote(sep), -1);
+        return java.util.Arrays.asList(s.split(Pattern.quote(sep), -1));
     }
 
     /**
      * stringm_split_nth - Get nth split part
      */
     public static String splitNth(String s, String sep, int n) {
-        String[] parts = split(s, sep);
-        if (n >= 0 && n < parts.length) {
-            return parts[n];
+        java.util.List<String> parts = split(s, sep);
+        if (n >= 0 && n < parts.size()) {
+            return parts.get(n);
         }
         return "";
     }
@@ -204,9 +219,13 @@ class StringCheese {
     /**
      * stringm_getline - Read line from stdin (stub)
      */
+    // One Scanner for all stdin reads: a second one would buffer (and lose) lines the first still needs.
+    private static Scanner _stdin;
+    static Scanner stdinScanner() { if (_stdin == null) _stdin = new Scanner(System.in); return _stdin; }
+
     public static String getline() {
         try {
-            Scanner sc = new Scanner(System.in);
+            Scanner sc = stdinScanner();
             return sc.hasNextLine() ? sc.nextLine() : "";
         } catch (Exception e) {
             return "";
@@ -218,7 +237,7 @@ class StringCheese {
      */
     public static boolean scan(String needle) {
         try {
-            Scanner sc = new Scanner(System.in);
+            Scanner sc = stdinScanner();
             while (sc.hasNextLine()) {
                 if (sc.nextLine().contains(needle)) {
                     return true;
@@ -244,7 +263,15 @@ class stringm {
     public static String strip(String s, String chars)     { return StringCheese.strip(s, chars); }
     public static String strip(String s)                   { return StringCheese.strip(s, " \t\n\r"); }
     public static String replace(String s, String o, String n) { return StringCheese.replace(s, o, n); }
-    public static String[] split(String s, String sep)     { return StringCheese.split(s, sep); }
+    public static java.util.List<String> split(String s, String sep) { return StringCheese.split(s, sep); }
+    public static String strip_clause(String mode, String clause, String s) { return StringCheese.stripClause(mode, clause, s); }
+    public static String stripln(String s, String needle) { return StringCheese.stripln(s, needle); }
+    public static boolean isws(String s) { return StringCheese.isWS(s); }
+    public static String trim(String s) { return StringCheese.trim(s); }
+    public static long   len(String s) { return StringCheese.len(s); }
+    public static String split_nth(String s, String sep, long n) { return StringCheese.splitNth(s, sep, (int)n); }
+    public static String f(String s) { return s; }
+    public static String t(String s) { return s; }
     public static String splitNth(String s, String sep, int n) { return StringCheese.splitNth(s, sep, n); }
     public static String join(String sep, String... parts) { return StringCheese.join(sep, parts); }
     public static long   length(String s)                  { return StringCheese.len(s); }

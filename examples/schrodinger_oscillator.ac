@@ -1,0 +1,79 @@
+/* Schrödinger equation for a particle in a harmonic well, V(x) = x^2 / 2 (units hbar = m = omega = 1).
+
+   The lowest energy state is found by imaginary-time evolution: psi <- psi - dt * H psi, then
+   renormalize. Starting from an EVEN trial function it settles on the ground state (E = 0.5).
+   Starting from an ODD one it settles on the first excited state (E = 1.5). The energies printed
+   here are multiplied by 1000 and rounded: exact values 500 and 1500; the grid gives 500 and 1499.
+   Grid: 201 points on [-8, 8]; H is a finite-difference operator with zero wavefunction outside.
+   AC lists are 1-based: element j (counting from 0) is list[j + 1]. */
+
+use ilib math
+
+Make hpsi func(psi, xs, h)
+    out = []
+    j = 0
+    WHILST j < 201
+        c = psi[j + 1]
+        left = 0.0
+        IF j > 0
+            left = psi[j]
+        right = 0.0
+        IF j < 200
+            right = psi[j + 2]
+        out.append(-0.5 * (left - 2.0 * c + right) / (h * h) + 0.5 * xs[j + 1] * xs[j + 1] * c)
+        j += 1
+    return out
+
+Make energy func(psi, xs, h)
+    hp = hpsi(psi, xs, h)
+    total = 0.0
+    j = 0
+    WHILST j < 201
+        total += psi[j + 1] * hp[j + 1]
+        j += 1
+    return total * h
+
+Make evolve func(psi, xs, h, dt, steps)
+    s = 0
+    WHILST s < steps
+        hp = hpsi(psi, xs, h)
+        newpsi = []
+        j = 0
+        WHILST j < 201
+            newpsi.append(psi[j + 1] - dt * hp[j + 1])
+            j += 1
+        norm2 = 0.0
+        j = 0
+        WHILST j < 201
+            norm2 += newpsi[j + 1] * newpsi[j + 1]
+            j += 1
+        norm = math.sqrt(norm2 * h)
+        psi = []
+        j = 0
+        WHILST j < 201
+            psi.append(newpsi[j + 1] / norm)
+            j += 1
+        s += 1
+    return psi
+
+<mainloop>
+    h = 16.0 / 200.0
+    xs = []
+    psi_even = []
+    psi_odd = []
+    i = 0
+    WHILST i < 201
+        x = -8.0 + i * h
+        xs.append(x)
+        psi_even.append(1.0 / (1.0 + x * x))
+        psi_odd.append(x / (1.0 + x * x))
+        i += 1
+
+    ground = evolve(psi_even, xs, h, 0.002, 5000)
+    e0 = energy(ground, xs, h)
+    Term.display $Ground state energy x1000 = $ + to_string(math.to_int(e0 * 1000.0 + 0.5))  + $  (expect 500)$
+
+    excited = evolve(psi_odd, xs, h, 0.002, 5000)
+    e1 = energy(excited, xs, h)
+    Term.display $First excited state energy x1000 = $ + to_string(math.to_int(e1 * 1000.0 + 0.5))  + $  (expect 1499)$
+<mainloop>

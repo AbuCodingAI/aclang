@@ -6,6 +6,7 @@
 
 fn C.ac_ncpu_ptr_new(value voidptr, value_size i64, type_id i64) i64
 fn C.ac_ncpu_ptr_deref(ptr_id i64, out voidptr, out_size i64) i64
+fn C.ac_ncpu_ptr_deref_str(ptr_id i64) &char
 fn C.ac_ncpu_ptr_is_null(ptr_id i64) int
 fn C.ac_ncpu_ptr_null() i64
 fn C.ac_ncpu_ptr_eq(ptr1 i64, ptr2 i64) int
@@ -35,7 +36,8 @@ fn C.ac_ncpu_recieve(msg &char) int
 // (usually a string literal), and V doesn't auto-coerce string to voidptr; `.str`
 // gives the underlying byte pointer, matching os_ffi.v's string-arg convention.
 pub fn ptr_new(value string, value_size i64, type_id i64) i64 { return C.ac_ncpu_ptr_new(value.str, value_size, type_id) }
-pub fn ptr_deref(ptr_id i64, out voidptr, out_size i64) i64    { return C.ac_ncpu_ptr_deref(ptr_id, out, out_size) }
+pub fn ptr_deref(ptr_id i64) string                             { return unsafe { cstring_to_vstring(C.ac_ncpu_ptr_deref_str(ptr_id)) } }
+pub fn ptr_deref_into(ptr_id i64, out voidptr, out_size i64) i64 { return C.ac_ncpu_ptr_deref(ptr_id, out, out_size) }
 pub fn ptr_null() i64                                          { return C.ac_ncpu_ptr_null() }
 pub fn ptr_is_null(ptr_id i64) i64                              { return C.ac_ncpu_ptr_is_null(ptr_id) }
 pub fn ptr_eq(ptr1 i64, ptr2 i64) i64                            { return C.ac_ncpu_ptr_eq(ptr1, ptr2) }

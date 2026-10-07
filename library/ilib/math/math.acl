@@ -63,12 +63,20 @@ math:to_dec         -> ac_to_dec
 
 # Number theory
 math:gcd            -> ac_gcd
+math:modpow         -> ac_modpow
+math:modinv         -> ac_modinv
+math:modmul         -> ac_modmul
 math:lcm            -> ac_lcm
 math:is_prime       -> ac_is_prime
 
 # Misc
 math:clamp          -> ac_clamp
 math:eval           -> ac_eval
+math:integrate      -> ac_integrate
+math:derivative     -> ac_derivative
+math:limit          -> ac_limit
+math:minima         -> ac_minima
+math:maxima         -> ac_maxima
 
 # Statistics
 math:stat.avg       -> ac_stat_avg

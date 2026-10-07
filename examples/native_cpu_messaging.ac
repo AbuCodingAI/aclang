@@ -1,0 +1,17 @@
+/* native-cpu: quickthread messaging. A message is delivered once; a second recieve fails. */
+
+use ilib native-cpu
+
+<mainloop>
+    header.display $Messages$
+    before = ncpu.recieve($ping$)
+    Term.display $recieve before broadcast = $ + to_string(before) + $  (expect 0)$
+    ncpu.broadcast($ping$)
+    ncpu.broadcast($ping$)
+    first = ncpu.recieve($ping$)
+    Term.display $first recieve after two broadcasts = $ + to_string(first) + $  (expect 1)$
+    second = ncpu.recieve($ping$)
+    Term.display $second recieve = $ + to_string(second) + $  (expect 0, delivered once)$
+    other = ncpu.recieve($pong$)
+    Term.display $recieve of a different message = $ + to_string(other) + $  (expect 0)$
+<mainloop>

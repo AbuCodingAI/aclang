@@ -1,0 +1,29 @@
+/* native-cpu: a frame allocator. Each frame takes its scratch space from one arena, then the
+   whole frame is released at once with arena_abort. Space is reused frame after frame. */
+
+use ilib native-cpu
+
+<mainloop>
+    arena = ncpu.arena_create(96)
+    header.display $Frame 1: three 32-byte scratch blocks$
+    a = ncpu.arena_alloc(arena, 32)
+    b = ncpu.arena_alloc(arena, 32)
+    c = ncpu.arena_alloc(arena, 32)
+    Term.display $frame 1 blocks valid: $ + to_string(ptr_is_null(a) + ptr_is_null(b) + ptr_is_null(c))  + $  (expect 0)$
+    Term.display $frame 1 full: a fourth block fails, is_null = $ + to_string(ptr_is_null(ncpu.arena_alloc(arena, 8)))  + $  (expect 1)$
+
+    ncpu.arena_abort(arena)
+    header.display $Frame 2: the same space is free again$
+    d = ncpu.arena_alloc(arena, 96)
+    Term.display $frame 2 takes the whole arena, is_null = $ + to_string(ptr_is_null(d))  + $  (expect 0)$
+    Term.display $frame 2 is full now, is_null = $ + to_string(ptr_is_null(ncpu.arena_alloc(arena, 1)))  + $  (expect 1)$
+
+    ncpu.arena_abort(arena)
+    header.display $Frame 3: a block from frame 2 is no longer a valid handle$
+    stale = ptr_update(d, $x$, 1)
+    Term.display $ptr_update on a frame-2 block returned $ + to_string(stale)  + $  (expect -1)$
+
+    ncpu.arena_destroy(arena)
+    header.display $Done: the arena is gone$
+    Term.display $allocating from a destroyed arena is_null = $ + to_string(ptr_is_null(ncpu.arena_alloc(arena, 8)))  + $  (expect 1)$
+<mainloop>

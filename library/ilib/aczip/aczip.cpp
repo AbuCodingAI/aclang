@@ -227,19 +227,21 @@ double ACZip::get_ratio(size_t original, size_t compressed) {
 
 Archive ACZip::build_archive(const std::string& path) {
     Archive archive;
-
-    for (const auto& entry : fs::recursive_directory_iterator(path)) {
-        if (entry.is_regular_file()) {
-            std::ifstream file(entry.path(), std::ios::binary);
-            std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
-                                      std::istreambuf_iterator<char>());
-
-            FileEntry fe;
-            fe.path = entry.path().relative_path().string();
-            fe.data = std::move(data);          // move the (possibly large) file buffer, don't copy
-
-            archive.files.push_back(std::move(fe));
-        }
+    auto add = [&](const fs::path& file, const std::string& name) {
+        std::ifstream in(file, std::ios::binary);
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        FileEntry fe;
+        fe.path = name;                         // stored relative to the archived root, so it extracts cleanly
+        fe.data = std::move(data);              // move the (possibly large) file buffer, don't copy
+        archive.files.push_back(std::move(fe));
+    };
+    // A single file is archived under its own name; a directory is archived recursively.
+    if (fs::is_regular_file(path)) {
+        add(path, fs::path(path).filename().string());
+    } else {
+        for (const auto& entry : fs::recursive_directory_iterator(path))
+            if (entry.is_regular_file())
+                add(entry.path(), fs::relative(entry.path(), path).generic_string());
     }
 
     return archive;

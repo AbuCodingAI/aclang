@@ -1,0 +1,32 @@
+/* native-cpu: a three-stage pipeline that signals through messages. Each stage broadcasts a
+   "done" message when it finishes, and the next stage waits for it with recieve. A message is
+   delivered once, so a stage can only start once. */
+
+use ilib native-cpu
+
+<mainloop>
+    header.display $Stage 2 waits for stage 1$
+    early = ncpu.recieve($stage1_done$)
+    Term.display $stage 2 before stage 1 finished = $ + to_string(early)  + $  (expect 0)$
+
+    header.display $Stage 1 finishes and signals$
+    ncpu.broadcast($stage1_done$)
+
+    header.display $Stage 2 starts, then stage 3 waits for it$
+    go2 = ncpu.recieve($stage1_done$)
+    Term.display $stage 2 started = $ + to_string(go2)  + $  (expect 1)$
+    ncpu.broadcast($stage2_done$)
+    go3 = ncpu.recieve($stage2_done$)
+    Term.display $stage 3 started = $ + to_string(go3)  + $  (expect 1)$
+
+    header.display $Delivered once: a second recieve of the same message finds nothing$
+    again = ncpu.recieve($stage2_done$)
+    Term.display $second recieve of stage2_done = $ + to_string(again)  + $  (expect 0)$
+
+    header.display $Duplicate broadcasts are one message$
+    ncpu.broadcast($tick$)
+    ncpu.broadcast($tick$)
+    t1 = ncpu.recieve($tick$)
+    t2 = ncpu.recieve($tick$)
+    Term.display $tick received, then nothing = $ + to_string(t1) + $ $ + to_string(t2)  + $  (expect 1 0)$
+<mainloop>

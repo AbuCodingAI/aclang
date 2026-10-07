@@ -38,7 +38,7 @@ func serverDir() string {
 // so its own source directory isn't meaningful at runtime the way it is in C++'s
 // build-time macro. Resolve the ilib dir the same way the compiler itself does:
 // relative to cwd, then AC_PATH, mirroring resolveIlibDir in ir_codegen.cpp.
-func runtimeCaller() (uintptr, string, int, bool) { return 0, ilibDir("web-server"), 0, true }
+func runtimeCaller() (uintptr, string, int, bool) { return 0, ilibDir("web/server"), 0, true }
 
 // Mirrors resolveIlibDir()'s search order in ir_codegen.cpp (AC_PATH, then cwd,
 // then relative to the running binary's own location) — this FFI file is inlined
@@ -71,7 +71,7 @@ func ensureSQLWorker() bool {
 	if sqlConn != nil {
 		return true
 	}
-	script := filepath.Join(ilibDir("web-server"), "jasql_cli.py")
+	script := filepath.Join(ilibDir("web/server"), "jasql_cli.py")
 	cmd := exec.Command("python3", script, "--serve", sqlSock)
 	if err := cmd.Start(); err != nil {
 		return false

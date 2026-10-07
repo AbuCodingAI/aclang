@@ -1,0 +1,35 @@
+/* math: calculus over a formula written in x. Each line prints the value scaled by a million
+   (rounded), and the exact answer scaled the same way, so the expected text is the exact answer. */
+
+use ilib math
+
+<mainloop>
+    header.display $Integrals$
+    Term.display $integrate(x*x, 0, 1) x1e6 = $ + to_string(math.to_int(math.integrate($x*x$, 0.0, 1.0) * 1000000.0 + 0.5))  + $  (expect 333333)$
+    Term.display $integrate(sin(x), 0, pi) x1e6 = $ + to_string(math.to_int(math.integrate($sin(x)$, 0.0, math.pi) * 1000000.0 + 0.5))  + $  (expect 2000000)$
+
+    header.display $Derivatives$
+    Term.display $derivative(x^3, 2) x1e6 = $ + to_string(math.to_int(math.derivative($x^3$, 2.0) * 1000000.0 + 0.5))  + $  (expect 12000000)$
+    Term.display $derivative(sin(x), 0) x1e6 = $ + to_string(math.to_int(math.derivative($sin(x)$, 0.0) * 1000000.0 + 0.5))  + $  (expect 1000000)$
+
+    header.display $Limits$
+    Term.display $limit(sin(x)/x, 0) x1e6 = $ + to_string(math.to_int(math.limit($sin(x)/x$, 0.0) * 1000000.0 + 0.5))  + $  (expect 1000000)$
+
+    header.display $Extrema$
+    Term.display $minima((x-2)^2, 0, 5) x1000 = $ + to_string(math.to_int(math.minima($(x-2)^2$, 0.0, 5.0) * 1000.0 + 0.5))  + $  (expect 2000)$
+    Term.display $maxima(3-(x-1)^2, -5, 5) x1000 = $ + to_string(math.to_int(math.maxima($3-(x-1)^2$, -5.0, 5.0) * 1000.0 + 0.5))  + $  (expect 1000)$
+
+    header.display $Precedence: -x^2 is -(x^2), so its derivative at 3 is -6$
+    Term.display $derivative(-x^2, 3) + 6 = 0 x1000 = $ + to_string(math.to_int((math.derivative($-x^2$, 3.0) + 6.0) * 1000.0 + 0.5))  + $  (expect 0)$
+    header.display $Undefined: no two-sided limit, unknown name (NaN checked with x #= x)$
+    pole = math.limit($1/x$, 0.0)
+    IF pole #= pole
+        Term.display $limit(1/x, 0) is NaN: yes  (expect yes)$
+    OTHER
+        Term.display $limit(1/x, 0) is NaN: no  (expect yes)$
+    bad = math.eval($foo + 1$)
+    IF bad #= bad
+        Term.display $eval(foo + 1) is NaN: yes  (expect yes)$
+    OTHER
+        Term.display $eval(foo + 1) is NaN: no  (expect yes)$
+<mainloop>

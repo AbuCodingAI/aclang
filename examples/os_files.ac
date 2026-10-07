@@ -1,0 +1,85 @@
+/* os: files, directories and temp paths. Everything happens inside a fresh temp directory
+   that is removed at the end. Each line prints the actual value and the expected one. */
+
+use ilib os
+use ilib string-cheese
+
+<mainloop>
+    header.display $Temp directory and writing$
+    dir = os.mktmpdir()
+    Term.display $mktmpdir made a directory = $ + to_string(os.isdir(dir))  + $  (expect 1)$
+    sub = os.join(dir, $sub$)
+    made = os.mkdir(sub)
+    Term.display $mkdir returned $ + to_string(made) + $  (expect 0)$
+    os.write_to(os.join(sub, $b.txt$), $hello$)
+    os.write_to(os.join(sub, $a.txt$), $abc$)
+
+    header.display $Listing and sizes$
+    names = os.listdir(sub)
+    line = $$
+    FOR n in names
+        line = line + n + $|$
+    Term.display $listdir = $ + line  + $  (expect a.txt|b.txt|)$
+    Term.display $size(a.txt) = $ + to_string(os.size(os.join(sub, $a.txt$)))  + $  (expect 3)$
+    Term.display $size(missing) = $ + to_string(os.size(os.join(sub, $nope$)))  + $  (expect -1)$
+    IF os.mtime(os.join(sub, $a.txt$)) > 0
+        Term.display $mtime is set = yes  (expect yes)$
+    OTHER
+        Term.display $mtime is set = no  (expect yes)$
+
+    header.display $Kinds$
+    IF os.isfile(os.join(sub, $a.txt$))
+        Term.display $isfile(a.txt) = yes  (expect yes)$
+    OTHER
+        Term.display $isfile(a.txt) = no  (expect yes)$
+    IF os.isdir(sub)
+        Term.display $isdir(sub) = yes  (expect yes)$
+    OTHER
+        Term.display $isdir(sub) = no  (expect yes)$
+    IF os.isdir(os.join(sub, $a.txt$))
+        Term.display $isdir(a.txt) = yes  (expect no)$
+    OTHER
+        Term.display $isdir(a.txt) = no  (expect no)$
+
+    header.display $Copy and move$
+    os.copy(os.join(sub, $a.txt$), os.join(sub, $c.txt$))
+    Term.display $copy then read c.txt = $ + os.read(os.join(sub, $c.txt$))  + $  (expect abc)$
+    os.move(os.join(sub, $c.txt$), os.join(sub, $d.txt$))
+    IF os.exists(os.join(sub, $c.txt$))
+        Term.display $c.txt after move exists: yes  (expect no)$
+    OTHER
+        Term.display $c.txt after move exists: no  (expect no)$
+    IF os.exists(os.join(sub, $d.txt$))
+        Term.display $d.txt after move exists: yes  (expect yes)$
+    OTHER
+        Term.display $d.txt after move exists: no  (expect yes)$
+
+    header.display $Paths$
+    Term.display $join(a, b) = $ + os.join($a$, $b$)  + $  (expect a/b)$
+    Term.display $join(a/, b) = $ + os.join($a/$, $b$)  + $  (expect a/b)$
+    Term.display $join(a, /b) = $ + os.join($a$, $/b$)  + $  (expect /b)$
+    Term.display $basename(/x/y.txt) = $ + os.basename($/x/y.txt$)  + $  (expect y.txt)$
+    Term.display $dirname(/x/y.txt) = $ + os.dirname($/x/y.txt$)  + $  (expect /x)$
+    Term.display $dirname(file.txt) = [$ + os.dirname($file.txt$)  + $]  (expect [])$
+
+    header.display $Temp files$
+    tmp = os.tmpfile($.wav$)
+    IF stringm.endswith(tmp, $.wav$)
+        Term.display $tmpfile ends in .wav: yes  (expect yes)$
+    OTHER
+        Term.display $tmpfile ends in .wav: no  (expect yes)$
+    Term.display $tmpfile starts empty, size = $ + to_string(os.size(tmp))  + $  (expect 0)$
+    os.rmfile(tmp)
+    IF os.isdir(os.tmpdir())
+        Term.display $tmpdir is a directory = yes  (expect yes)$
+    OTHER
+        Term.display $tmpdir is a directory = no  (expect yes)$
+
+    header.display $Cleanup$
+    removed = os.rmdir(dir)
+    Term.display $rmdir returned $ + to_string(removed) + $  (expect 0)$
+    IF os.exists(dir)
+        Term.display $temp directory still exists = yes  (expect no)$
+    OTHER
+        Term.display $temp directory still exists = no  (expect no)$
+<mainloop>

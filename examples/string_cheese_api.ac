@@ -1,0 +1,38 @@
+/* string-cheese: every function in the ilib, each called once. Each line prints the actual
+   value and the expected one. getline and scan read stdin; the test feeds two lines:
+   "one" and "hello world". */
+
+use ilib string-cheese
+
+<mainloop>
+    header.display $Trimming and stripping$
+    Term.display $trim(  pad  ) = [$ + stringm.trim($  pad  $)  + $]  (expect [pad])$
+    Term.display $strip_clause(key=value) = $ + stringm.strip_clause($before$, $=$, $key=value$)  + $  (expect value)$
+    Term.display $stripln(line search) = $ + stringm.stripln($foo\nbar baz\nqux$, $bar$)  + $  (expect bar baz)$
+
+    header.display $Splitting$
+    Term.display $split_nth(a,b,c, 1) = $ + stringm.split_nth($a,b,c$, $,$, 1)  + $  (expect b)$
+    Term.display $len(hello) = $ + to_string(stringm.len($hello$))  + $  (expect 5)$
+
+    header.display $Character classes$
+    IF stringm.ischar($abc$)
+        Term.display $ischar(abc) = yes  (expect yes)$
+    OTHER
+        Term.display $ischar(abc) = no  (expect yes)$
+    IF stringm.ischar($ab1$)
+        Term.display $ischar(ab1) = yes  (expect no)$
+    OTHER
+        Term.display $ischar(ab1) = no  (expect no)$
+    IF stringm.isws($   $)
+        Term.display $isws(spaces) = yes  (expect yes)$
+    OTHER
+        Term.display $isws(spaces) = no  (expect yes)$
+
+    header.display $Stdin$
+    first = stringm.getline()
+    Term.display $getline() = $ + first  + $  (expect one)$
+    IF stringm.scan($world$)
+        Term.display $scan(world) = yes  (expect yes)$
+    OTHER
+        Term.display $scan(world) = no  (expect yes)$
+<mainloop>

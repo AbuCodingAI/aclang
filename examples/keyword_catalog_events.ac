@@ -25,11 +25,6 @@ Make hop func()
     bind up to hop
     input up
 
-    /* programLoop is allow-listed as an ASSIGNMENT TARGET despite being a keyword —
-       note: unlike rule/value below, it is NOT allow-listed as a readable expression
-       (Term.display programLoop is a parse error) — a real, narrow asymmetry. */
-    programLoop = 1
-
     /* rule/value are allow-listed as identifiers in BOTH positions (same allowlist
        LineUp's `const value=2` relies on) */
     rule = 2

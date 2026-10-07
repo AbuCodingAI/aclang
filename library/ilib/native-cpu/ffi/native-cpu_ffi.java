@@ -48,6 +48,7 @@ final class AcNcpu {
 
     private static final MethodHandle _ptr_new      = _mh("ac_ncpu_ptr_new",       FunctionDescriptor.of(L8,P,L8,L8));
     private static final MethodHandle _ptr_deref    = _mh("ac_ncpu_ptr_deref",     FunctionDescriptor.of(L8,L8,P,L8));
+    private static final MethodHandle _ptr_deref_str = _mh("ac_ncpu_ptr_deref_str", FunctionDescriptor.of(P,L8));
     private static final MethodHandle _ptr_is_null  = _mh("ac_ncpu_ptr_is_null",   FunctionDescriptor.of(I,L8));
     private static final MethodHandle _ptr_null     = _mh("ac_ncpu_ptr_null",      FunctionDescriptor.of(L8));
     private static final MethodHandle _ptr_eq       = _mh("ac_ncpu_ptr_eq",        FunctionDescriptor.of(I,L8,L8));
@@ -74,14 +75,16 @@ final class AcNcpu {
 
     private static final Arena _arena = Arena.ofAuto();
     @SuppressWarnings("preview")
-    private static MemorySegment _cs(String s) { return _arena.allocateUtf8String(s); }
+    private static MemorySegment _cs(String s) { return _arena.allocateFrom(s); }
 
     // AC source passes ptr_new/ptr_update a plain value expression (usually a string literal) —
     // not a manually-built MemorySegment — so these take String and convert internally. The raw
     // MemorySegment overloads stay available for direct Java callers that already have one.
     static long ptrNew(String value, long size, long typeId) { return ptrNew(_cs(value), size, typeId); }
     static long ptrNew(MemorySegment value, long size, long typeId) { try { return (long)_ptr_new.invoke(value, size, typeId); } catch (Throwable t) { throw new RuntimeException(t); } }
-    static long ptrDeref(long ptrId, MemorySegment out, long outSize) { try { return (long)_ptr_deref.invoke(ptrId, out, outSize); } catch (Throwable t) { throw new RuntimeException(t); } }
+    // AC-facing ptr_deref(p): the stored bytes as a string (up to the first NUL).
+    static String ptrDeref(long ptrId) { try { MemorySegment s = (MemorySegment)_ptr_deref_str.invoke(ptrId); return s.reinterpret(Long.MAX_VALUE).getString(0L); } catch (Throwable t) { throw new RuntimeException(t); } }
+    static long ptrDerefInto(long ptrId, MemorySegment out, long outSize) { try { return (long)_ptr_deref.invoke(ptrId, out, outSize); } catch (Throwable t) { throw new RuntimeException(t); } }
     static int  ptrIsNull(long ptrId)  { try { return (int)_ptr_is_null.invoke(ptrId); } catch (Throwable t) { throw new RuntimeException(t); } }
     static long ptrNull()              { try { return (long)_ptr_null.invoke(); } catch (Throwable t) { throw new RuntimeException(t); } }
     static int  ptrEq(long a, long b)  { try { return (int)_ptr_eq.invoke(a, b); } catch (Throwable t) { throw new RuntimeException(t); } }

@@ -1,0 +1,13 @@
+/* string-cheese: stringm.split returns a list of strings. Each piece is printed between
+   bars, so the expected text is a|b|c| for "a,b,c" split on ",". */
+
+use ilib string-cheese
+
+<mainloop>
+    header.display $Split$
+    parts = stringm.split($a,b,c$, $,$)
+    line = $$
+    FOR p in parts
+        line = line + p + $|$
+    Term.display $split(a,b,c, comma) = $ + line + $  (expect a|b|c|)$
+<mainloop>

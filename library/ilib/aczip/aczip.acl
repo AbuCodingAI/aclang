@@ -19,6 +19,10 @@ aczip:get_ratio           -> ac_get_compression_ratio
 # ACZipByteArray {data, size} that the caller MUST release with this:
 aczip:free_bytes          -> ac_free_bytes
 
+# Packaging: an ISO image or a .tar.gz of a directory (external tools: xorriso/genisoimage/mkisofs, tar)
+aczip:iso                 -> ac_zip_iso
+aczip:pack                -> ac_zip_package
+
 # NOTE (still open, out of scope for this pass): PY and JS do NOT call into
 # libaczip.so at all — aczip.py / aczip.js reimplement an older, incompatible
 # archive format (4-byte truncated tags instead of real paths, zstd-compress /

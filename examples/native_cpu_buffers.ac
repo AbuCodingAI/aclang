@@ -1,0 +1,27 @@
+/* native-cpu: a bare-metal buffer written and read through a pointer handle. ptr_copy makes an
+   independent copy: changing the original does not change the copy. */
+
+use ilib native-cpu
+
+<mainloop>
+    header.display $Bare-metal buffer$
+    buf = ncpu.bmzdha(4096, 0)
+    Term.display $bmzdha(4096) is_null = $ + to_string(ptr_is_null(buf))  + $  (expect 0)$
+    ptr_update(buf, $hello$, 5)
+    Term.display $buffer reads back = $ + ptr_deref(buf)  + $  (expect hello)$
+
+    header.display $Copies are independent$
+    dup = ptr_copy(buf)
+    ptr_update(buf, $HELLO$, 5)
+    Term.display $original now = $ + ptr_deref(buf)  + $  (expect HELLO)$
+    Term.display $copy still = $ + ptr_deref(dup)  + $  (expect hello)$
+
+    header.display $Original and copy differ now; a copy equals itself$
+    Term.display $ptr_eq(original, copy) = $ + to_string(ptr_eq(buf, dup))  + $  (expect 0)$
+    Term.display $ptr_eq(copy, copy) = $ + to_string(ptr_eq(dup, dup))  + $  (expect 1)$
+
+    header.display $Freeing$
+    ptr_free(buf)
+    ptr_free(dup)
+    Term.display $freed buffer, second free = $ + to_string(ptr_free(buf))  + $  (expect -1)$
+<mainloop>

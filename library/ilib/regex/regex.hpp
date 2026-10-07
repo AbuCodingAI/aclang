@@ -58,7 +58,7 @@ inline int count(const std::string& str, const std::string& pat) {
 }
 
 inline std::string escape(const std::string& str) {
-    static const std::string specials = R"(\.^$|?*+()[]{}/)";
+    static const std::string specials = R"(\.^$|?*+()[]{})";   // same set as the JS and Python backends
     std::string out;
     out.reserve(str.size() * 2);
     for (char c : str) {

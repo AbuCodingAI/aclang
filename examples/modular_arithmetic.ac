@@ -1,0 +1,24 @@
+/* math: modular arithmetic. Each line prints the actual value and the expected one.
+   modpow(b, e, m) = b^e mod m, in [0, m). modinv(a, m) = the x with a*x = 1 (mod m), or -1 when
+   gcd(a, m) is not 1. modmul(a, b, m) = a*b mod m, without overflow. Invalid input gives -1. */
+
+use ilib math
+
+<mainloop>
+    header.display $Powers$
+    Term.display $modpow(2, 10, 1000) = $ + to_string(math.modpow(2, 10, 1000))  + $  (expect 24)$
+    Term.display $modpow(3, 200, 13) = $ + to_string(math.modpow(3, 200, 13))  + $  (expect 9)$
+    Term.display $modpow(-2, 3, 5) = $ + to_string(math.modpow(-2, 3, 5))  + $  (expect 2)$
+    Term.display $Fermat: modpow(5, 16, 17) = $ + to_string(math.modpow(5, 16, 17))  + $  (expect 1)$
+    Term.display $modpow(2, -1, 5) = $ + to_string(math.modpow(2, -1, 5))  + $  (expect -1)$
+
+    header.display $Inverses$
+    Term.display $modinv(3, 11) = $ + to_string(math.modinv(3, 11))  + $  (expect 4)$
+    Term.display $modinv(2, 4) = $ + to_string(math.modinv(2, 4))  + $  (expect -1)$
+
+    header.display $Multiplication without overflow$
+    Term.display $modmul(123456789, 987654321, 1000000007) = $ + to_string(math.modmul(123456789, 987654321, 1000000007))  + $  (expect 259106859)$
+
+    header.display $gcd still works$
+    Term.display $gcd(12, 18) = $ + to_string(math.gcd(12, 18))  + $  (expect 6)$
+<mainloop>

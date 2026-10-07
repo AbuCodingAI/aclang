@@ -87,7 +87,7 @@ fn parse_query(qs: &str) -> HashMap<String, String> {
 fn ensure_sql_worker(st: &mut WsState) -> bool {
     if st.sql_conn.is_some() { return true; }
     let sock_path = format!("/tmp/ac_ws_rs_{}.sock", std::process::id());
-    let script = ilib_dir("web-server").join("jasql_cli.py");
+    let script = ilib_dir("web/server").join("jasql_cli.py");
     match Command::new("python3").arg(&script).arg("--serve").arg(&sock_path).spawn() {
         Ok(child) => st.sql_child = Some(child),
         Err(_) => return false,

@@ -51,12 +51,57 @@ function stringm_count(s, sub) {
     return String(s).split(String(sub)).length - 1;
 }
 
+function stringm_trim(s) { return String(s).replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, ''); }
+function stringm_strip_clause(mode, clause, s) {
+    const text = String(s), key = String(clause), at = text.indexOf(key);
+    if (at < 0) return text;
+    if (String(mode) === 'before') return text.slice(at + key.length);
+    if (String(mode) === 'after')  return text.slice(0, at);
+    return text;
+}
+function stringm_stripln(s, needle) {
+    for (const line of String(s).split('\n')) if (line.includes(String(needle))) return line;
+    return '';
+}
+function stringm_split_nth(s, sep, n) {
+    const parts = stringm_split(s, sep), k = Number(n);
+    return k >= 0 && k < parts.length ? parts[k] : '';
+}
+function stringm_format(t) { return String(t); }
+function stringm_ischar(s) { s = String(s); return s.length > 0 && /^[A-Za-z]+$/.test(s) ? 1 : 0; }
+function stringm_isws(s)   { return /^[ \t\n\r\f\v]*$/.test(String(s)) ? 1 : 0; }
+// Stdin, one byte at a time, so a program that asks a question doesn't wait for end-of-file.
+function _readStdinLine() {
+    const fs = require('fs'), buf = Buffer.alloc(1);
+    let line = '', got = false;
+    while (true) {
+        let n;
+        try { n = fs.readSync(0, buf, 0, 1, null); }
+        catch (e) { if (e.code === 'EAGAIN') continue; break; }
+        if (n === 0) break;
+        got = true;
+        const c = buf.toString('utf8');
+        if (c === '\n') break;
+        line += c;
+    }
+    return { line, eof: !got };
+}
+function stringm_getline() { return _readStdinLine().line; }
+function stringm_scan(needle) {
+    const r = _readStdinLine();
+    if (r.eof) return 0;
+    return r.line.includes(String(needle)) ? 1 : 0;
+}
+
 const stringm = {
     f: stringm_f, t: stringm_t, b: stringm_b, endian: stringm_endian,
     upper: stringm_upper, lower: stringm_lower,
     find: stringm_find, strip: stringm_strip,
     replace: stringm_replace, split: stringm_split,
-    join: stringm_join, length: stringm_len,
+    join: stringm_join, length: stringm_len, len: stringm_len,
+    trim: stringm_trim, strip_clause: stringm_strip_clause, stripln: stringm_stripln,
+    split_nth: stringm_split_nth, format: stringm_format,
+    ischar: stringm_ischar, isws: stringm_isws, getline: stringm_getline, scan: stringm_scan,
     startswith: stringm_startswith, endswith: stringm_endswith,
     count: stringm_count,
 };

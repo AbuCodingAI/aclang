@@ -80,6 +80,58 @@ function os_read(p) {
     catch(e) { process.stderr.write(`[os.read] ${e}\n`); return ""; }
 }
 
+
+function os_isdir(p)  { try { return _fs.statSync(String(p)).isDirectory() ? 1 : 0; } catch { return 0; } }
+function os_isfile(p) { try { return _fs.statSync(String(p)).isFile() ? 1 : 0; } catch { return 0; } }
+function os_size(p)   { try { return _fs.statSync(String(p)).size; } catch { return -1; } }
+function os_mtime(p)  { try { return Math.floor(_fs.statSync(String(p)).mtimeMs / 1000); } catch { return -1; } }
+function os_copy(src, dst) {
+    try { _fs.copyFileSync(String(src), String(dst)); return 0; }
+    catch (e) { process.stderr.write(`[os.copy] ${e.message}\n`); return -1; }
+}
+function os_move(src, dst) {
+    try { _fs.renameSync(String(src), String(dst)); return 0; }
+    catch (e) {
+        // rename() fails across filesystems: copy, then remove the original
+        try { _fs.copyFileSync(String(src), String(dst)); _fs.unlinkSync(String(src)); return 0; }
+        catch (e2) { process.stderr.write(`[os.move] ${e2.message}\n`); return -1; }
+    }
+}
+function os_listdir(p) {
+    try { return _fs.readdirSync(String(p)).sort(); }
+    catch (e) { process.stderr.write(`[os.listdir] ${e.message}\n`); return []; }
+}
+function os_tmpdir() { return process.env.TMPDIR || process.env.TEMP || '/tmp'; }
+function os_tmpfile(suffix = '') {
+    const dir = os_tmpdir();
+    for (let tries = 0; tries < 100; tries++) {
+        const p = dir + '/acos_' + Math.random().toString(36).slice(2, 10) + String(suffix);
+        try { _fs.writeFileSync(p, '', { flag: 'wx' }); return p; } catch (e) { if (e.code !== 'EEXIST') return ''; }
+    }
+    return '';
+}
+function os_mktmpdir() { return _fs.mkdtempSync(os_tmpdir() + '/acos_'); }
+function os_chdir(p) {
+    try { process.chdir(String(p)); return 0; }
+    catch (e) { process.stderr.write(`[os.chdir] ${e.message}\n`); return -1; }
+}
+function os_join(a, b) {
+    a = String(a); b = String(b);
+    if (!a) return b;
+    if (!b) return a;
+    if (b[0] === '/') return b;
+    return a.endsWith('/') ? a + b : a + '/' + b;
+}
+function os_basename(p) { p = String(p); return p.slice(p.lastIndexOf('/') + 1); }
+function os_dirname(p) {
+    p = String(p);
+    const cut = p.lastIndexOf('/');
+    if (cut < 0) return '';
+    if (cut === 0) return '/';
+    return p.slice(0, cut);
+}
+function os_homedir() { return process.env.HOME || ''; }
+
 const os = {
     bash:     os_bash,
     sbash:    os_sbash,
@@ -94,4 +146,19 @@ const os = {
     write_to: os_write_to,
     append_to:os_append_to,
     read:     os_read,
+    isdir: os_isdir,
+    isfile: os_isfile,
+    size: os_size,
+    mtime: os_mtime,
+    copy: os_copy,
+    move: os_move,
+    listdir: os_listdir,
+    tmpdir: os_tmpdir,
+    tmpfile: os_tmpfile,
+    mktmpdir: os_mktmpdir,
+    chdir: os_chdir,
+    join: os_join,
+    basename: os_basename,
+    dirname: os_dirname,
+    homedir: os_homedir,
 };

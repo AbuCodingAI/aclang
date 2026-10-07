@@ -13,6 +13,7 @@ native-cpu:ptr_is_null  -> ncpu.ptr_is_null
 native-cpu:ptr_eq       -> ncpu.ptr_eq
 native-cpu:ptr_copy     -> ncpu.ptr_copy
 native-cpu:ptr_update   -> ncpu.ptr_update
+native-cpu:ptr_free     -> ncpu.ptr_free
 
 # Allocation (dha = dynamic heap allocation, z = zeroed, bm = bare-metal/raw mmap)
 native-cpu:dha          -> ncpu.dha

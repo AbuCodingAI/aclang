@@ -100,6 +100,18 @@ int64_t ac_ncpu_ptr_copy(int64_t ptr_id) {
     return new_id;
 }
 
+const char* ac_ncpu_ptr_deref_str(int64_t ptr_id) {
+    static thread_local std::string out;
+    out.clear();
+    std::lock_guard<std::mutex> lock(g_ncpuMutex);
+    auto it = ptr_registry.find(ptr_id);
+    if (it == ptr_registry.end() || !it->second.valid || !it->second.addr) return "";
+    const char* s = (const char*)it->second.addr;
+    size_t n = strnlen(s, (size_t)it->second.size);
+    out.assign(s, n);
+    return out.c_str();
+}
+
 int ac_ncpu_ptr_update(int64_t ptr_id, void* new_value, int64_t size) {
     if (ptr_id == NULL_PTR || !new_value || size <= 0) return -1;
     std::lock_guard<std::mutex> lock(g_ncpuMutex);
@@ -204,6 +216,19 @@ int64_t ac_ncpu_bmrealloc(int64_t ptr_id, int64_t size) {
     return ptr_id;
 }
 
+// Handles returned by arena_alloc point into the arena's buffer. Once that memory is
+// reset (abort) or freed (destroy), those handles must stop resolving instead of reading
+// freed memory or aliasing new allocations. Caller holds g_ncpuMutex.
+static void invalidateArenaHandlesLocked(const ArenaEntry& a) {
+    char* lo = (char*)a.buffer;
+    char* hi = lo + a.capacity;
+    for (auto it = ptr_registry.begin(); it != ptr_registry.end();) {
+        char* p = (char*)it->second.addr;
+        if (!it->second.owns_memory && p >= lo && p < hi) it = ptr_registry.erase(it);
+        else ++it;
+    }
+}
+
 // ============================================================================
 // ARENA ALLOCATOR — bump allocator, bulk free
 // ============================================================================
@@ -224,9 +249,10 @@ int64_t ac_ncpu_arena_alloc(int64_t arena_id, int64_t size) {
     auto ait = arena_registry.find(arena_id);
     if (ait == arena_registry.end()) return NULL_PTR;
     ArenaEntry& a = ait->second;
-    if (a.offset + size > a.capacity) return NULL_PTR;  // arena exhausted
+    int64_t need = (size + 7) & ~int64_t(7);            // 8-byte aligned bumps
+    if (a.offset + need > a.capacity) return NULL_PTR;  // arena exhausted
     void* slot = (char*)a.buffer + a.offset;
-    a.offset += size;
+    a.offset += need;
     int64_t id = next_ptr_id++;
     // Non-owning: the arena's buffer owns this memory, so ptr_free/realloc must not touch it.
     ptr_registry[id] = {slot, size, 0, true, false, false};
@@ -241,6 +267,7 @@ int ac_ncpu_arena_destroy(int64_t arena_id) {
     std::lock_guard<std::mutex> lock(g_ncpuMutex);
     auto ait = arena_registry.find(arena_id);
     if (ait == arena_registry.end()) return -1;
+    invalidateArenaHandlesLocked(ait->second);
     free(ait->second.buffer);
     arena_registry.erase(ait);
     return 0;
@@ -252,6 +279,7 @@ int ac_ncpu_arena_abort(int64_t arena_id) {
     std::lock_guard<std::mutex> lock(g_ncpuMutex);
     auto ait = arena_registry.find(arena_id);
     if (ait == arena_registry.end()) return -1;
+    invalidateArenaHandlesLocked(ait->second);
     ait->second.offset = 0;
     return 0;
 }
@@ -301,13 +329,13 @@ const char* ac_ncpu_version() { return "libacncpu 1.1.0"; }
 // ============================================================================
 
 int64_t ptr_new(const void* value, int64_t value_size, int64_t type_id) { return ac_ncpu_ptr_new(value, value_size, type_id); }
-int64_t ptr_deref(int64_t ptr_id, void* out, int64_t out_size)          { return ac_ncpu_ptr_deref(ptr_id, out, out_size); }
-int     ptr_is_null(int64_t ptr_id)                                    { return ac_ncpu_ptr_is_null(ptr_id); }
+const char* ptr_deref(int64_t ptr_id)                                    { return ac_ncpu_ptr_deref_str(ptr_id); }
+int64_t ptr_is_null(int64_t ptr_id)                                    { return ac_ncpu_ptr_is_null(ptr_id); }
 int64_t ptr_null()                                                     { return ac_ncpu_ptr_null(); }
-int     ptr_eq(int64_t a, int64_t b)                                   { return ac_ncpu_ptr_eq(a, b); }
+int64_t ptr_eq(int64_t a, int64_t b)                                   { return ac_ncpu_ptr_eq(a, b); }
 int64_t ptr_copy(int64_t ptr_id)                                       { return ac_ncpu_ptr_copy(ptr_id); }
-int     ptr_update(int64_t ptr_id, void* new_value, int64_t size)      { return ac_ncpu_ptr_update(ptr_id, new_value, size); }
-int     ptr_free(int64_t ptr_id)                                       { return ac_ncpu_ptr_free(ptr_id); }
+int64_t ptr_update(int64_t ptr_id, void* new_value, int64_t size)      { return ac_ncpu_ptr_update(ptr_id, new_value, size); }
+int64_t ptr_free(int64_t ptr_id)                                       { return ac_ncpu_ptr_free(ptr_id); }
 
 int64_t ncpu_dha(int64_t size, int64_t type_id)          { return ac_ncpu_dha(size, type_id); }
 int64_t ncpu_zdha(int64_t size, int64_t type_id)         { return ac_ncpu_zdha(size, type_id); }
@@ -317,11 +345,11 @@ int64_t ncpu_bmzdha(int64_t size, int64_t type_id)       { return ac_ncpu_bmzdha
 int64_t ncpu_bmrealloc(int64_t ptr_id, int64_t size)     { return ac_ncpu_bmrealloc(ptr_id, size); }
 int64_t ncpu_arena_create(int64_t size)                  { return ac_ncpu_arena_create(size); }
 int64_t ncpu_arena_alloc(int64_t arena_id, int64_t size) { return ac_ncpu_arena_alloc(arena_id, size); }
-int     ncpu_arena_dealloc(int64_t arena_id, int64_t ptr_id) { return ac_ncpu_arena_dealloc(arena_id, ptr_id); }
-int     ncpu_arena_destroy(int64_t arena_id)             { return ac_ncpu_arena_destroy(arena_id); }
-int     ncpu_arena_abort(int64_t arena_id)               { return ac_ncpu_arena_abort(arena_id); }
+int64_t ncpu_arena_dealloc(int64_t arena_id, int64_t ptr_id) { return ac_ncpu_arena_dealloc(arena_id, ptr_id); }
+int64_t ncpu_arena_destroy(int64_t arena_id)             { return ac_ncpu_arena_destroy(arena_id); }
+int64_t ncpu_arena_abort(int64_t arena_id)               { return ac_ncpu_arena_abort(arena_id); }
 void    ncpu_abort()                                     { ac_ncpu_abort(); }
 void    ncpu_broadcast(const char* msg)                  { ac_ncpu_broadcast(msg); }
-int     ncpu_recieve(const char* msg)                    { return ac_ncpu_recieve(msg); }
+int64_t ncpu_recieve(const char* msg)                    { return ac_ncpu_recieve(msg); }
 
 }  // extern "C"

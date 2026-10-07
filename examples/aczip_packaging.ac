@@ -1,0 +1,34 @@
+/* aczip: packaging a directory as an ISO image and as a .tar.gz. The directory is a fresh
+   temp directory with two files; both outputs are checked for existence and size. */
+
+use ilib aczip
+use ilib os
+
+<mainloop>
+    dir = os.mktmpdir()
+    os.write_to(os.join(dir, $readme.txt$), $hello iso$)
+    os.write_to(os.join(dir, $main.c$), $int main() { return 0; }$)
+    iso = os.join(dir, $../pkg.iso$)
+    tgz = os.join(dir, $../pkg.tar.gz$)
+
+    header.display $ISO image$
+    r1 = aczip.iso(dir, iso, $RELEASE$)
+    Term.display $iso returned $ + to_string(r1)  + $  (expect 0)$
+    IF os.exists(iso)
+        Term.display $iso exists: yes  (expect yes)$
+    OTHER
+        Term.display $iso exists: no  (expect yes)$
+
+    header.display $tar.gz package (aczip.pack)$
+    r2 = aczip.pack(dir, tgz)
+    Term.display $package returned $ + to_string(r2)  + $  (expect 0)$
+    IF os.size(tgz) > 0
+        Term.display $package is not empty: yes  (expect yes)$
+    OTHER
+        Term.display $package is not empty: no  (expect yes)$
+
+    header.display $Cleanup$
+    os.rmfile(iso)
+    os.rmfile(tgz)
+    os.rmdir(dir)
+<mainloop>

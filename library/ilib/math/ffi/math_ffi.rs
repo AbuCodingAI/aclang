@@ -6,6 +6,11 @@ use std::ffi::CString;
 #[link(name = "acmath")]
 extern "C" {
     fn ac_eval(expr: *const c_char) -> c_double;
+    fn ac_integrate(expr: *const c_char, a: c_double, b: c_double) -> c_double;
+    fn ac_derivative(expr: *const c_char, x: c_double) -> c_double;
+    fn ac_limit(expr: *const c_char, x: c_double) -> c_double;
+    fn ac_minima(expr: *const c_char, a: c_double, b: c_double) -> c_double;
+    fn ac_maxima(expr: *const c_char, a: c_double, b: c_double) -> c_double;
     fn ac_math_pi_const() -> c_double;
     fn ac_math_e_const()  -> c_double;
     fn ac_math_tau_const()-> c_double;
@@ -47,6 +52,9 @@ extern "C" {
     fn ac_to_dec(x: i64)      -> c_double;
     fn ac_gcd(a: i64, b: i64) -> i64;
     fn ac_lcm(a: i64, b: i64) -> i64;
+    fn ac_modpow(b: i64, e: i64, m: i64) -> i64;
+    fn ac_modinv(a: i64, m: i64) -> i64;
+    fn ac_modmul(a: i64, b: i64, m: i64) -> i64;
     fn ac_is_prime(n: i64)    -> c_int;
     fn ac_clamp(v: c_double, lo: c_double, hi: c_double) -> c_double;
     fn ac_sigma(arr: *const c_double, len: c_int) -> c_double;
@@ -73,6 +81,12 @@ pub fn math_eval(expr: &str) -> f64 {
     let c = CString::new(expr).unwrap_or_default();
     unsafe { ac_eval(c.as_ptr()) }
 }
+// calculus over a formula in x, e.g. "x*x + sin(x)"
+pub fn math_integrate(f: &str, a: f64, b: f64) -> f64 { let c = CString::new(f).unwrap_or_default(); unsafe { ac_integrate(c.as_ptr(), a, b) } }
+pub fn math_derivative(f: &str, x: f64) -> f64 { let c = CString::new(f).unwrap_or_default(); unsafe { ac_derivative(c.as_ptr(), x) } }
+pub fn math_limit(f: &str, x: f64) -> f64 { let c = CString::new(f).unwrap_or_default(); unsafe { ac_limit(c.as_ptr(), x) } }
+pub fn math_minima(f: &str, a: f64, b: f64) -> f64 { let c = CString::new(f).unwrap_or_default(); unsafe { ac_minima(c.as_ptr(), a, b) } }
+pub fn math_maxima(f: &str, a: f64, b: f64) -> f64 { let c = CString::new(f).unwrap_or_default(); unsafe { ac_maxima(c.as_ptr(), a, b) } }
 pub fn math_pi_digits(n: i32) -> f64 { unsafe { ac_math_pi(n) } }
 pub fn math_e_digits(n: i32)  -> f64 { unsafe { ac_math_e(n)  } }
 pub fn math_sin(x: f64) -> f64 { unsafe { ac_sin(x) } }
@@ -109,6 +123,9 @@ pub fn math_to_int(x: f64) -> i64 { unsafe { ac_to_int(x) } }
 pub fn math_to_dec(x: i64) -> f64 { unsafe { ac_to_dec(x) } }
 pub fn math_gcd(a: i64, b: i64) -> i64 { unsafe { ac_gcd(a, b) } }
 pub fn math_lcm(a: i64, b: i64) -> i64 { unsafe { ac_lcm(a, b) } }
+pub fn math_modpow(b: i64, e: i64, m: i64) -> i64 { unsafe { ac_modpow(b, e, m) } }
+pub fn math_modinv(a: i64, m: i64) -> i64 { unsafe { ac_modinv(a, m) } }
+pub fn math_modmul(a: i64, b: i64, m: i64) -> i64 { unsafe { ac_modmul(a, b, m) } }
 pub fn math_is_prime(n: i64) -> i64 { if unsafe { ac_is_prime(n) } != 0 { 1 } else { 0 } }
 pub fn math_clamp(v: f64, lo: f64, hi: f64) -> f64 { unsafe { ac_clamp(v, lo, hi) } }
 pub fn math_sigma(lst: &[f64]) -> f64 {
@@ -145,6 +162,11 @@ pub struct AcMath {
 }
 impl AcMath {
     pub fn eval(&self, expr: &str) -> f64 { math_eval(expr) }
+    pub fn integrate(&self, f: &str, a: f64, b: f64) -> f64 { math_integrate(f, a, b) }
+    pub fn derivative(&self, f: &str, x: f64) -> f64 { math_derivative(f, x) }
+    pub fn limit(&self, f: &str, x: f64) -> f64 { math_limit(f, x) }
+    pub fn minima(&self, f: &str, a: f64, b: f64) -> f64 { math_minima(f, a, b) }
+    pub fn maxima(&self, f: &str, a: f64, b: f64) -> f64 { math_maxima(f, a, b) }
     pub fn sin(&self, x: f64) -> f64    { math_sin(x)    }
     pub fn cos(&self, x: f64) -> f64    { math_cos(x)    }
     pub fn tan(&self, x: f64) -> f64    { math_tan(x)    }
@@ -179,6 +201,9 @@ impl AcMath {
     pub fn to_dec(&self, x: i64) -> f64  { math_to_dec(x)  }
     pub fn gcd(&self, a: i64, b: i64) -> i64 { math_gcd(a, b) }
     pub fn lcm(&self, a: i64, b: i64) -> i64 { math_lcm(a, b) }
+    pub fn modpow(&self, b: i64, e: i64, m: i64) -> i64 { math_modpow(b, e, m) }
+    pub fn modinv(&self, a: i64, m: i64) -> i64 { math_modinv(a, m) }
+    pub fn modmul(&self, a: i64, b: i64, m: i64) -> i64 { math_modmul(a, b, m) }
     pub fn is_prime(&self, n: i64) -> i64 { math_is_prime(n) }
     pub fn clamp(&self, v: f64, lo: f64, hi: f64) -> f64 { math_clamp(v, lo, hi) }
     pub fn sigma(&self, lst: &[f64]) -> f64    { math_sigma(lst)    }

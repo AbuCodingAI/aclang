@@ -38,6 +38,10 @@ double ac_get_compression_ratio(size_t original, size_t compressed);
  * ac_zip_compress_sata. Safe to call on a {NULL, 0} result. */
 void ac_free_bytes(ACZipByteArray arr);
 
+/* packaging (see aczip_c.cpp): 0 on success, -1 on failure */
+int ac_zip_iso(const char* srcdir, const char* out_iso, const char* label);
+int ac_zip_package(const char* srcdir, const char* out_path);
+
 /* File-to-file convenience wrappers — AC's `aczip.compress(path, parallel,
  * output_path)` / `aczip.decompress(archive_path, output_path)` call these (every
  * language's FFI binding routes through them) instead of individually marshaling
@@ -57,6 +61,9 @@ int ac_zip_decompress_from_file(const char* archive_path, const char* output_pat
 #ifndef __cplusplus
 #define aczip_compress    ac_zip_compress_to_file
 #define aczip_decompress  ac_zip_decompress_from_file
+#define aczip_iso         ac_zip_iso
+#define aczip_package     ac_zip_package
+#define aczip_pack        ac_zip_package
 #define aczip_get_ratio   ac_get_compression_ratio
 #endif
 

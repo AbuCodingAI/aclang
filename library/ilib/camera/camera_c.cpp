@@ -24,11 +24,11 @@ int ac_camera_capture(const char* filename) {
 }
 
 int ac_camera_capture_latest(const char* filename) {
-    return AC::latestFrame.capture(filename) ? 1 : 0;
+    return AC::camera.capture_latest(filename) ? 1 : 0;
 }
 
 int ac_camera_capture_first(const char* filename) {
-    return AC::firstFrame.capture(filename) ? 1 : 0;
+    return AC::camera.capture_first(filename) ? 1 : 0;
 }
 
 void ac_camera_release() {

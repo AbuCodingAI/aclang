@@ -248,6 +248,36 @@ inline long long mod_int(long long a, long long b) {
 inline long long to_int(double x)  { return static_cast<long long>(x); }
 inline double    to_dec(long long x) { return static_cast<double>(x); }
 
+// Modular arithmetic. Results are in [0, m). Invalid input (m <= 0, or a negative exponent,
+// or no inverse) gives -1.
+inline long long modmul(long long a, long long b, long long m) {
+    if (m <= 0) return -1;
+    long long am = ((a % m) + m) % m, bm = ((b % m) + m) % m;
+    return (long long)(((__int128)am * bm) % m);
+}
+inline long long modpow(long long b, long long e, long long m) {
+    if (m <= 0 || e < 0) return -1;
+    long long result = 1 % m, base = ((b % m) + m) % m;
+    while (e > 0) {
+        if (e & 1) result = modmul(result, base, m);
+        base = modmul(base, base, m);
+        e >>= 1;
+    }
+    return result;
+}
+// The x with a*x = 1 (mod m), when gcd(a, m) = 1; otherwise -1.
+inline long long modinv(long long a, long long m) {
+    if (m <= 1) return -1;
+    long long old_r = ((a % m) + m) % m, r = m, old_s = 1, s = 0;
+    while (r != 0) {
+        long long q = old_r / r, tmp;
+        tmp = old_r - q * r; old_r = r; r = tmp;
+        tmp = old_s - q * s; old_s = s; s = tmp;
+    }
+    if (old_r != 1) return -1;
+    return ((old_s % m) + m) % m;
+}
+
 // GCD / LCM
 inline long long gcd(long long a, long long b) {
     a = std::llabs(a); b = std::llabs(b);
@@ -357,6 +387,9 @@ inline long long math_mod_int(long long a, long long b) { return ac_math::mod_in
 inline long long math_to_int(double x)           { return ac_math::to_int(x); }
 inline double    math_to_dec(long long x)        { return ac_math::to_dec(x); }
 inline long long math_gcd(long long a, long long b) { return ac_math::gcd(a, b); }
+inline long long math_modpow(long long b, long long e, long long m) { return ac_math::modpow(b, e, m); }
+inline long long math_modinv(long long a, long long m) { return ac_math::modinv(a, m); }
+inline long long math_modmul(long long a, long long b, long long m) { return ac_math::modmul(a, b, m); }
 inline long long math_lcm(long long a, long long b) { return ac_math::lcm(a, b); }
 inline bool      math_is_prime(long long n)      { return ac_math::is_prime(n); }
 
@@ -378,6 +411,12 @@ inline double math_im(ac_complex z) { return z.imag(); }
 
 // Expression evaluator (delegates to ac_eval from shared lib, declared here for header-only use)
 extern "C" double ac_eval(const char* expr);
+extern "C" double ac_eval_at(const char* expr, double x);
+extern "C" double ac_integrate(const char* expr, double a, double b);
+extern "C" double ac_derivative(const char* expr, double x);
+extern "C" double ac_limit(const char* expr, double x);
+extern "C" double ac_minima(const char* expr, double a, double b);
+extern "C" double ac_maxima(const char* expr, double a, double b);
 inline double math_eval(const std::string& expr) { return ac_eval(expr.c_str()); }
 
 using math_LongInt = ac_math::LongInt;
@@ -417,6 +456,9 @@ struct _AcMathNS {
     long long to_int(double x) const { return math_to_int(x); }
     double to_dec(long long x) const { return math_to_dec(x); }
     long long gcd(long long a, long long b) const { return math_gcd(a, b); }
+    long long modpow(long long b, long long e, long long m) const { return math_modpow(b, e, m); }
+    long long modinv(long long a, long long m) const { return math_modinv(a, m); }
+    long long modmul(long long a, long long b, long long m) const { return math_modmul(a, b, m); }
     long long lcm(long long a, long long b) const { return math_lcm(a, b); }
     bool is_prime(long long n) const { return math_is_prime(n); }
     double clamp(double v, double lo, double hi) const { return math_clamp(v, lo, hi); }
@@ -427,6 +469,11 @@ struct _AcMathNS {
     double PI(const std::vector<double>& v) const      { return math_PI(v); }
     std::vector<double> gradient(const std::vector<double>& v) const { return math_gradient(v); }
     double eval(const std::string& expr) const { return math_eval(expr); }
+    double integrate(const std::string& f, double a, double b) const { return ac_integrate(f.c_str(), a, b); }
+    double derivative(const std::string& f, double x) const { return ac_derivative(f.c_str(), x); }
+    double limit(const std::string& f, double x) const { return ac_limit(f.c_str(), x); }
+    double minima(const std::string& f, double a, double b) const { return ac_minima(f.c_str(), a, b); }
+    double maxima(const std::string& f, double a, double b) const { return ac_maxima(f.c_str(), a, b); }
     double pi_digits(int n) const  { return math_pi_digits(n);  }
     double e_digits(int n) const   { return math_e_digits(n);   }
     double phi_digits(int n) const { return math_phi_digits(n); }

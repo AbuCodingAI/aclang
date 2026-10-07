@@ -46,7 +46,7 @@ def ptr_deref(ptr_id):
     with _lock:
         entry = ptr_registry.get(ptr_id)
         if entry is None or not entry.valid:
-            return None
+            return ""   # a missing handle reads as empty text, same as the C/Go/Rust/Java/V cores
         if isinstance(entry.addr, (bytearray, _mmap.mmap)):
             return bytes(entry.addr).rstrip(b"\x00").decode("utf-8", "replace")
         return entry.addr
@@ -80,18 +80,29 @@ def ptr_copy(ptr_id):
         entry = ptr_registry[ptr_id]
         if not entry.valid:
             return NULL_PTR
-        try:
-            dup = _copy.deepcopy(entry.addr)
-        except Exception:
-            dup = entry.addr
+        # An independent copy of the bytes: a byte block or a raw mapping gets its own storage, so
+        # writing through the original never shows up in the copy (the C core does the same).
+        addr = entry.addr
+        bare = entry.bare_metal
+        if isinstance(addr, _mmap.mmap):
+            dup = _mmap.mmap(-1, len(addr)); dup[:] = addr[:]
+        elif isinstance(addr, bytearray):
+            dup = bytearray(addr)
+        else:
+            try:
+                dup = _copy.deepcopy(addr)
+            except Exception:
+                dup = addr
+            bare = False
         pid = _alloc_id()
-        ptr_registry[pid] = PtrEntry(dup, entry.type_id)
+        ptr_registry[pid] = PtrEntry(dup, entry.type_id, bare_metal=bare)
         return pid
 
-def ptr_update(ptr_id, value, offset=0):
-    """Write through a pointer. For byte-buffer-backed pointers, writes bytes
-    at `offset`, growing a plain bytearray as needed; for reference-backed
-    pointers, replaces the stored reference outright."""
+def ptr_update(ptr_id, value, size=None):
+    """Write through a pointer, the same as the C core: the first `size` bytes of `value` are written
+    at the start of the block (all of `value` when size is omitted). A byte block grows if needed;
+    a reference-backed pointer just takes the new reference."""
+    offset = 0
     with _lock:
         entry = ptr_registry.get(ptr_id)
         if entry is None or not entry.valid:
@@ -99,6 +110,7 @@ def ptr_update(ptr_id, value, offset=0):
         try:
             if isinstance(entry.addr, (bytearray, _mmap.mmap)):
                 data = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+                if size is not None: data = data[:int(size)]
                 need = offset + len(data)
                 if isinstance(entry.addr, bytearray) and need > len(entry.addr):
                     entry.addr.extend(b"\x00" * (need - len(entry.addr)))
@@ -175,10 +187,14 @@ def bmrealloc(ptr_id, size):
         if entry is None or not entry.valid or not isinstance(entry.addr, _mmap.mmap):
             return NULL_PTR
         try:
-            entry.addr.resize(size)
-            return ptr_id
+            grown = _mmap.mmap(-1, size)   # anonymous mmap can't be resized in place
         except Exception:
             return NULL_PTR
+        keep = min(size, len(entry.addr))
+        grown[:keep] = entry.addr[:keep]
+        entry.addr.close()
+        entry.addr = grown
+        return ptr_id
 
 # ============================================================================
 # ARENA ALLOCATOR — bump allocator, bulk free
@@ -208,13 +224,14 @@ def arena_alloc(arena_id, size):
         return NULL_PTR
     with _lock:
         arena = arena_registry.get(arena_id)
-        if arena is None or arena.offset + size > arena.capacity:
+        need = (size + 7) // 8 * 8   # 8-byte aligned bumps, same as the C/C++ core
+        if arena is None or arena.offset + need > arena.capacity:
             return NULL_PTR
         pid = _alloc_id()
         # Non-owning view into the arena's own buffer (a Python memoryview slice
         # would detach on write, so store an (arena, start, len) window instead).
         ptr_registry[pid] = PtrEntry(_ArenaView(arena, arena.offset, size), 0)
-        arena.offset += size
+        arena.offset += need
         return pid
 
 class _ArenaView:
@@ -236,10 +253,18 @@ def arena_dealloc(arena_id, ptr_id):
     # Bump allocators don't free individual items — reclaim via arena_abort/destroy.
     return 0
 
+def _invalidate_arena_handles(arena):
+    for pid in [p for p, e in ptr_registry.items()
+                if isinstance(e.addr, _ArenaView) and e.addr.arena is arena]:
+        ptr_registry[pid].valid = False
+        del ptr_registry[pid]
+
 def arena_destroy(arena_id):
     with _lock:
-        if arena_registry.pop(arena_id, None) is None:
+        arena = arena_registry.pop(arena_id, None)
+        if arena is None:
             return -1
+        _invalidate_arena_handles(arena)
         return 0
 
 def arena_abort(arena_id):
@@ -247,6 +272,7 @@ def arena_abort(arena_id):
         arena = arena_registry.get(arena_id)
         if arena is None:
             return -1
+        _invalidate_arena_handles(arena)
         arena.offset = 0
         return 0
 

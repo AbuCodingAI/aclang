@@ -123,6 +123,24 @@ struct AcStringmNS {}
 fn (n AcStringmNS) lower(s string) string       { return stringm_lower(s) }
 fn (n AcStringmNS) upper(s string) string       { return stringm_upper(s) }
 fn (n AcStringmNS) trim(s string) string        { return stringm_trim(s) }
+fn (n AcStringmNS) strip_clause(mode string, clause string, s string) string { return stringm_strip_clause(mode, clause, s) }
+fn (n AcStringmNS) stripln(s string, needle string) string { return stringm_stripln(s, needle) }
+
+// strip_clause: keep the text after ("before") or before ("after") the first clause.
+fn stringm_strip_clause(mode string, clause string, s string) string {
+	at := s.index(clause) or { return s }
+	if mode == 'before' { return s[at + clause.len..] }
+	if mode == 'after' { return s[..at] }
+	return s
+}
+
+// stripln: the first line of s that contains needle, or "".
+fn stringm_stripln(s string, needle string) string {
+	for line in s.split('\n') {
+		if line.contains(needle) { return line }
+	}
+	return ''
+}
 // AC strip = 1-arg trim, same convention as the C header comment ("AC strip = 1-arg
 // trim") and the C/C++ bindings in this ilib.
 fn (n AcStringmNS) strip(s string) string       { return stringm_trim(s) }
@@ -132,6 +150,7 @@ fn (n AcStringmNS) split(s string, sep string) []string { return stringm_split(s
 fn (n AcStringmNS) split_nth(s string, sep string, i int) string { return stringm_split_nth(s, sep, i) }
 fn (n AcStringmNS) join(sep string, parts []string) string { return stringm_join(sep, parts) }
 fn (n AcStringmNS) length(s string) i64         { return stringm_len(s) }
+fn (n AcStringmNS) len(s string) i64            { return stringm_len(s) }
 fn (n AcStringmNS) startswith(s string, p string) bool { return stringm_startswith(s, p) }
 fn (n AcStringmNS) endswith(s string, p string) bool   { return stringm_endswith(s, p) }
 fn (n AcStringmNS) count(s string, sub string) int { return stringm_count(s, sub) }

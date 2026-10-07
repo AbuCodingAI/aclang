@@ -1,0 +1,32 @@
+/* math calculus: finding the best value. A cost curve has its lowest point at x = 3, a profit curve
+   its highest point at x = 5; at those points the slope is zero. Limits and undefined values too. */
+
+use ilib math
+
+<mainloop>
+    header.display $Cheapest point: cost c(x) = (x-3)^2 + 5 on [0, 10]$
+    best = math.minima($(x-3)^2 + 5$, 0.0, 10.0)
+    Term.display $best x, x1000 = $ + to_string(math.to_int(best * 1000.0 + 0.5))  + $  (expect 3000)$
+    Term.display $slope there, x1000 = $ + to_string(math.to_int(math.derivative($(x-3)^2 + 5$, best) * 1000.0 + 0.5))  + $  (expect 0)$
+
+    header.display $Highest point: profit p(x) = x*(10-x) on [0, 10]$
+    top = math.maxima($x*(10-x)$, 0.0, 10.0)
+    Term.display $best x, x1000 = $ + to_string(math.to_int(top * 1000.0 + 0.5))  + $  (expect 5000)$
+
+    header.display $Limit with a removable gap: (x^2-4)/(x-2) as x goes to 2$
+    Term.display $limit x1000 = $ + to_string(math.to_int(math.limit($(x^2-4)/(x-2)$, 2.0) * 1000.0 + 0.5))  + $  (expect 4000)$
+
+    header.display $Limit with a pole: 1/(x-2) at 2 has no two-sided limit (NaN, checked with v #= v)$
+    pole = math.limit($1/(x-2)$, 2.0)
+    IF pole #= pole
+        Term.display $pole is NaN: yes  (expect yes)$
+    OTHER
+        Term.display $pole is NaN: no  (expect yes)$
+
+    header.display $An unknown name in a formula gives NaN$
+    bad = math.eval($price + 1$)
+    IF bad #= bad
+        Term.display $unknown name is NaN: yes  (expect yes)$
+    OTHER
+        Term.display $unknown name is NaN: no  (expect yes)$
+<mainloop>

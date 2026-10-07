@@ -35,19 +35,24 @@ inline double adaptive(Fn f, double a, double b, double tol,
 
 // integrate(f, a, b) — ∫_a^b f(x) dx
 inline double integrate(Fn f, double a, double b, double tol = 1e-9) {
-    return _impl::adaptive(f, a, b, tol, _impl::simpson(f, a, b), 50);
+    // depth 20 caps the work at about 10^6 panels for a formula that never settles (a kink, a pole)
+    return _impl::adaptive(f, a, b, tol, _impl::simpson(f, a, b), 20);
 }
 
 // ── Numerical limit ────────────────────────────────────────────────────────
 
 // limit(f, x) — two-sided numerical limit as t → x
 // Uses Richardson extrapolation with h → 0
-inline double limit(Fn f, double x, double h = 1e-5) {
-    // Try two-sided average; if x is a pole, returns inf/nan
-    double left  = f(x - h);
-    double right = f(x + h);
-    if (std::isinf(left) || std::isnan(left) || std::isinf(right) || std::isnan(right))
-        return std::numeric_limits<double>::quiet_NaN();
+inline double limit(Fn f, double x) {
+    // Both sides are sampled at shrinking distances h. The two-sided limit exists when, at the smallest h,
+    // f(x-h) and f(x+h) agree. A jump or a pole leaves them apart at every h, so the result is NaN.
+    double left = std::numeric_limits<double>::quiet_NaN(), right = left;
+    for (double h = 1e-3; h >= 1e-8 - 1e-20; h /= 10.0) {
+        left = f(x - h); right = f(x + h);
+        if (!std::isfinite(left) || !std::isfinite(right)) return std::numeric_limits<double>::quiet_NaN();
+    }
+    double scale = std::max({1.0, std::fabs(left), std::fabs(right)});
+    if (std::fabs(left - right) > 1e-6 * scale) return std::numeric_limits<double>::quiet_NaN();
     return (left + right) / 2.0;
 }
 

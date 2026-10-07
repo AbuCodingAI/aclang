@@ -40,6 +40,23 @@ fn stringm_split_nth(s: &str, sep: &str, n: usize) -> String {
     parts.get(n).cloned().unwrap_or_default()
 }
 fn stringm_len(s: &str) -> i64 { s.chars().count() as i64 }
+
+// strip_clause: keep the text after ("before") or before ("after") the first clause.
+fn stringm_strip_clause(mode: &str, clause: &str, s: &str) -> String {
+    match s.find(clause) {
+        None => s.to_string(),
+        Some(at) => match mode {
+            "before" => s[at + clause.len()..].to_string(),
+            "after"  => s[..at].to_string(),
+            _ => s.to_string(),
+        },
+    }
+}
+
+// stripln: the first line of s that contains needle, or "".
+fn stringm_stripln(s: &str, needle: &str) -> String {
+    s.split('\n').find(|l| l.contains(needle)).unwrap_or("").to_string()
+}
 fn stringm_startswith(s: &str, prefix: &str) -> bool { s.starts_with(prefix) }
 fn stringm_endswith(s: &str, suffix: &str) -> bool   { s.ends_with(suffix) }
 fn stringm_count(s: &str, sub: &str) -> i64 {
@@ -102,6 +119,9 @@ impl _StringmNS {
     fn lower(&self, s: &str) -> String      { stringm_lower(s) }
     fn upper(&self, s: &str) -> String      { stringm_upper(s) }
     fn trim(&self, s: &str) -> String       { stringm_trim(s) }
+    fn strip_clause(&self, mode: &str, clause: &str, s: &str) -> String { stringm_strip_clause(mode, clause, s) }
+    fn stripln(&self, s: &str, needle: &str) -> String { stringm_stripln(s, needle) }
+    fn len(&self, s: &str) -> i64           { stringm_len(s) }
     // AC strip = 1-arg trim, same convention as the C/C++/V bindings in this ilib
     // (string_cheese_c.h: "AC strip = 1-arg trim") — the 2-arg stringm_strip helper
     // above is still available for anything that wants a real custom-charset strip.

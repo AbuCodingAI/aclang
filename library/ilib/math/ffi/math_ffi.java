@@ -74,6 +74,9 @@ final class AcMath {
     private static final MethodHandle _toDec  = _mh("ac_to_dec", FunctionDescriptor.of(D,L));
     private static final MethodHandle _gcd    = _mh("ac_gcd",    FunctionDescriptor.of(L,L,L));
     private static final MethodHandle _lcm    = _mh("ac_lcm",    FunctionDescriptor.of(L,L,L));
+    private static final MethodHandle _modpow = _mh("ac_modpow", FunctionDescriptor.of(L,L,L,L));
+    private static final MethodHandle _modinv = _mh("ac_modinv", FunctionDescriptor.of(L,L,L));
+    private static final MethodHandle _modmul = _mh("ac_modmul", FunctionDescriptor.of(L,L,L,L));
     private static final MethodHandle _prime  = _mh("ac_is_prime",FunctionDescriptor.of(I,L));
     private static final MethodHandle _clamp  = _mh("ac_clamp",  FunctionDescriptor.of(D,D,D,D));
     private static final MethodHandle _piC    = _mh("ac_math_pi_const",FunctionDescriptor.of(D));
@@ -156,6 +159,9 @@ final class AcMath {
     public static double toDec(long x)  { return _d(_toDec, x); }
     public static long   gcd(long a, long b) { return _l(_gcd, a, b); }
     public static long   lcm(long a, long b) { return _l(_lcm, a, b); }
+    public static long   modpow(long b, long e, long m) { return _l(_modpow, b, e, m); }
+    public static long   modinv(long a, long m)         { return _l(_modinv, a, m); }
+    public static long   modmul(long a, long b, long m) { return _l(_modmul, a, b, m); }
     public static boolean isPrime(long n){ return _i(_prime, n) != 0; }
     public static double clamp(double v, double lo, double hi) { return _d(_clamp, v, lo, hi); }
 
@@ -239,6 +245,9 @@ final class AcMath {
     public static double math_to_dec(long x)   { return toDec(x); }
     public static long   math_gcd(long a, long b) { return gcd(a, b); }
     public static long   math_lcm(long a, long b) { return lcm(a, b); }
+    public static long   math_modpow(long b, long e, long m) { return modpow(b, e, m); }
+    public static long   math_modinv(long a, long m)         { return modinv(a, m); }
+    public static long   math_modmul(long a, long b, long m) { return modmul(a, b, m); }
     public static long    math_is_prime(long n) { return isPrime(n) ? 1L : 0L; }
     public static double math_clamp(double v, double lo, double hi) { return clamp(v, lo, hi); }
     public static double math_sigma(double[] lst)      { return sigma(lst); }
@@ -297,6 +306,9 @@ class math {
     public static double to_dec(long x)    { return AcMath.toDec(x);  }
     public static long   gcd(long a, long b)         { return AcMath.gcd(a, b);    }
     public static long   lcm(long a, long b)         { return AcMath.lcm(a, b);    }
+    public static long   modpow(long b, long e, long m) { return AcMath.modpow(b, e, m); }
+    public static long   modinv(long a, long m)         { return AcMath.modinv(a, m); }
+    public static long   modmul(long a, long b, long m) { return AcMath.modmul(a, b, m); }
     public static long   is_prime(long n)  { return AcMath.isPrime(n) ? 1L : 0L; }
     public static double clamp(double v, double lo, double hi) { return AcMath.clamp(v, lo, hi); }
     public static double sigma(double[] lst)     { return AcMath.sigma(lst);     }

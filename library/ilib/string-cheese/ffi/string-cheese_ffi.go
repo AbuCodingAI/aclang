@@ -242,6 +242,33 @@ func (_AcStringmNS) startswith(s string, prefix string) int64     { return _b(St
 func (_AcStringmNS) endswith(s string, suffix string) int64       { return _b(EndsWith(s, suffix)) }
 func (_AcStringmNS) count(s string, sub string) int64             { return Count(s, sub) }
 func (_AcStringmNS) format(t string) string                       { return Format(t) }
+func (_AcStringmNS) strip_clause(mode string, clause string, s string) string { return StripClause(mode, clause, s) }
+func (_AcStringmNS) stripln(s string, needle string) string       { return Stripln(s, needle) }
+
+// strip_clause: keep the text after ("before") or before ("after") the first clause.
+func StripClause(mode string, clause string, s string) string {
+	at := scstrings.Index(s, clause)
+	if at < 0 {
+		return s
+	}
+	switch mode {
+	case "before":
+		return s[at+len(clause):]
+	case "after":
+		return s[:at]
+	}
+	return s
+}
+
+// stripln: the first line of s that contains needle, or "".
+func Stripln(s string, needle string) string {
+	for _, line := range scstrings.Split(s, "\n") {
+		if scstrings.Contains(line, needle) {
+			return line
+		}
+	}
+	return ""
+}
 func (_AcStringmNS) b(s string) string                            { return B(s) }
 func (_AcStringmNS) f(s string) string                            { return F(s) }
 func (_AcStringmNS) t(s string) string                            { return T(s) }

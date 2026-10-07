@@ -15,6 +15,10 @@ int         ac_ncpu_ptr_eq(int64_t ptr1, int64_t ptr2);
 int64_t     ac_ncpu_ptr_copy(int64_t ptr_id);
 int         ac_ncpu_ptr_update(int64_t ptr_id, void* new_value, int64_t size);
 int         ac_ncpu_ptr_free(int64_t ptr_id);
+/* AC-facing ptr_deref(p): the stored bytes as a NUL-terminated string (valid until the
+   next call on this thread; copy it). Same model as the Python and JS backends. The
+   3-argument ac_ncpu_ptr_deref above stays for raw FFI callers that want a byte buffer. */
+const char* ac_ncpu_ptr_deref_str(int64_t ptr_id);
 
 // Allocation (called as ncpu.dha(...) etc)
 int64_t     ac_ncpu_dha(int64_t size, int64_t type_id);
@@ -51,7 +55,8 @@ const char* ac_ncpu_version(void);
  * BARE on every backend (ptr_new, not ncpu.ptr_new/ncpu_ptr_new), matching the
  * original `pointers` library convention and existing user code. */
 #define ptr_new    ac_ncpu_ptr_new
-#define ptr_deref  ac_ncpu_ptr_deref
+#define ptr_deref  ac_ncpu_ptr_deref_str
+#define ptr_free   ac_ncpu_ptr_free
 #define ptr_null   ac_ncpu_ptr_null
 #define ptr_is_null ac_ncpu_ptr_is_null
 #define ptr_eq     ac_ncpu_ptr_eq

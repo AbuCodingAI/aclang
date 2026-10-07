@@ -28,8 +28,19 @@ function regex_escape(s) {
 function regex_find_all(s, pat) {
     try { return [...s.matchAll(new RegExp(pat, 'g'))].map(m => m[0]); } catch { return []; }
 }
+// Pieces between matches. JS's own String.split would also splice in capture groups,
+// which the C engine (and so every other backend) does not.
 function regex_split(s, pat) {
-    try { return s.split(new RegExp(pat)); } catch { return [s]; }
+    try {
+        const out = [];
+        let last = 0;
+        for (const m of s.matchAll(new RegExp(pat, 'g'))) {
+            out.push(s.slice(last, m.index));
+            last = m.index + m[0].length;
+        }
+        out.push(s.slice(last));
+        return out;
+    } catch { return [s]; }
 }
 function regex_groups(s, pat) {
     try {

@@ -29,7 +29,7 @@ namespace AC {
 class Camera {
 public:
     Camera() {}
-    bool init(int = 0) { return false; }
+    bool init(int = 0) { fprintf(stderr, "[camera] built without OpenCV: init() unavailable (see camera.hpp HAVE_OPENCV)\n"); return false; }
     void release() {}
     bool capture(const std::string&) { return false; }
     bool captureLatest() { return false; }
@@ -41,8 +41,14 @@ public:
     Camera* latestPtr_ = nullptr;
     Camera* firstPtr_ = nullptr;
     void attachAux(Camera* latest, Camera* first) { latestPtr_ = latest; firstPtr_ = first; }
-    bool capture_latest(const std::string& f) { return latestPtr_ ? latestPtr_->capture(f) : false; }
-    bool capture_first(const std::string& f) { return firstPtr_ ? firstPtr_->capture(f) : false; }
+    bool firstTaken_ = false;
+    bool capture_latest(const std::string& f) { return capture(f); }
+    bool capture_first(const std::string& f) {
+        if (firstTaken_) return false;
+        bool ok = capture(f);
+        if (ok) firstTaken_ = true;
+        return ok;
+    }
 };
 
 class SidebarConsole {
@@ -99,6 +105,7 @@ public:
         if (cap.isOpened()) {
             cap.release();
         }
+        firstTaken_ = false;
         cap.open(device_id);
         initialized = cap.isOpened();
         return initialized;
@@ -167,8 +174,14 @@ public:
     Camera* latestPtr_ = nullptr;
     Camera* firstPtr_ = nullptr;
     void attachAux(Camera* latest, Camera* first) { latestPtr_ = latest; firstPtr_ = first; }
-    bool capture_latest(const std::string& f) { return latestPtr_ ? latestPtr_->capture(f) : false; }
-    bool capture_first(const std::string& f) { return firstPtr_ ? firstPtr_->capture(f) : false; }
+    bool firstTaken_ = false;
+    bool capture_latest(const std::string& f) { return capture(f); }
+    bool capture_first(const std::string& f) {
+        if (firstTaken_) return false;
+        bool ok = capture(f);
+        if (ok) firstTaken_ = true;
+        return ok;
+    }
 };
 
 /**

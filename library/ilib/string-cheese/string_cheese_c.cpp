@@ -241,3 +241,46 @@ long long ac_stringm_endian(const char* bytes, const char* order) {
     }
     return (long long)v;
 }
+
+// stringm.split: the pieces between `sep` (a space when empty) as a malloc'd char* array of
+// *out_count entries. The strings are malloc'd too; the array is freed by ac_stringm_free_list.
+char** ac_stringm_split(const char* s, const char* sep, int* out_count) {
+    *out_count = 0;
+    if (!s) return nullptr;
+    std::string str(s);
+    std::vector<std::string> parts;
+    if (sep && std::string(sep) == " \t\n\r") {
+        // whitespace sentinel: split on runs of whitespace, no empty pieces (like str.split())
+        std::string cur;
+        for (char c : str) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (!cur.empty()) parts.push_back(cur);
+                cur.clear();
+            } else cur += c;
+        }
+        if (!cur.empty()) parts.push_back(cur);
+    } else {
+        std::string delim = (!sep || !*sep) ? " " : std::string(sep);
+        size_t pos = 0;
+        while (true) {
+            size_t next = str.find(delim, pos);
+            if (next == std::string::npos) { parts.push_back(str.substr(pos)); break; }
+            parts.push_back(str.substr(pos, next - pos));
+            pos = next + delim.size();
+        }
+    }
+    char** out = (char**)malloc(sizeof(char*) * parts.size());
+    if (!out) return nullptr;
+    for (size_t i = 0; i < parts.size(); i++) {
+        out[i] = (char*)malloc(parts[i].size() + 1);
+        if (out[i]) memcpy(out[i], parts[i].c_str(), parts[i].size() + 1);
+    }
+    *out_count = (int)parts.size();
+    return out;
+}
+
+void ac_stringm_free_list(char** list, int count) {
+    if (!list) return;
+    for (int i = 0; i < count; i++) free(list[i]);
+    free(list);
+}

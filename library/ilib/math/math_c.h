@@ -54,6 +54,9 @@ int64_t  ac_mod_int(int64_t a, int64_t b);
 int64_t  ac_to_int(double x);
 double   ac_to_dec(int64_t x);
 int64_t  ac_gcd(int64_t a, int64_t b);
+int64_t  ac_modpow(int64_t b, int64_t e, int64_t m);   /* b^e mod m in [0,m); -1 if m<=0 or e<0 */
+int64_t  ac_modinv(int64_t a, int64_t m);              /* a^-1 mod m; -1 if gcd(a,m)!=1 */
+int64_t  ac_modmul(int64_t a, int64_t b, int64_t m);   /* a*b mod m in [0,m); -1 if m<=0 */
 int64_t  ac_lcm(int64_t a, int64_t b);
 int      ac_is_prime(int64_t n);
 double   ac_clamp(double v, double lo, double hi);
@@ -75,6 +78,13 @@ void    ac_stat_boxnum(const double* arr, int len, double* out);
 
 /* Expression evaluator */
 double  ac_eval(const char* expr);
+double  ac_eval_at(const char* expr, double x);        /* the formula with x set to the value */
+/* calculus over a formula in x, e.g. "x*x + sin(x)"; NaN for a missing formula */
+double  ac_integrate(const char* expr, double a, double b);   /* integral of f over [a,b] (adaptive Simpson) */
+double  ac_derivative(const char* expr, double x);            /* f'(x), central difference */
+double  ac_limit(const char* expr, double x);                 /* two-sided: average of f(x-h), f(x+h) */
+double  ac_minima(const char* expr, double a, double b);      /* x of a minimum on [a,b] (golden section; unimodal f) */
+double  ac_maxima(const char* expr, double a, double b);      /* x of a maximum on [a,b] */
 
 /* BNY print helper — print double as decimal, used by native binary backend */
 void    ac_print_double(double x);
@@ -127,6 +137,9 @@ static inline double math_im(double _Complex z) { return cimag(z); }
 #define math_to_int  ac_to_int
 #define math_to_dec  ac_to_dec
 #define math_gcd     ac_gcd
+#define math_modpow  ac_modpow
+#define math_modinv  ac_modinv
+#define math_modmul  ac_modmul
 #define math_lcm     ac_lcm
 #define math_is_prime ac_is_prime
 #define math_clamp   ac_clamp
@@ -134,6 +147,11 @@ static inline double math_im(double _Complex z) { return cimag(z); }
 #define math_PI         ac_PI_product
 #define math_gradient   ac_gradient
 #define math_eval    ac_eval
+#define math_integrate ac_integrate
+#define math_derivative ac_derivative
+#define math_limit  ac_limit
+#define math_minima ac_minima
+#define math_maxima ac_maxima
 
 /* Constants — computed once at link time via inline initializer */
 #define math_pi  (ac_math_pi_const())

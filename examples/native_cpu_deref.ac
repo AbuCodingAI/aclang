@@ -1,0 +1,18 @@
+/* native-cpu: reading a pointer back. ptr_deref(p) returns the stored bytes as text
+   (up to the first NUL), the same on every backend. ptr_free then makes the handle
+   unusable. */
+
+use ilib native-cpu
+
+<mainloop>
+    header.display $Reading back$
+    p = ptr_new($hello$, 6, 0)
+    Term.display $ptr_deref(p) = [$ + ptr_deref(p) + $]  (expect [hello])$
+    q = ptr_copy(p)
+    Term.display $ptr_deref(copy) = [$ + ptr_deref(q) + $]  (expect [hello])$
+
+    header.display $After free$
+    ptr_free(p)
+    Term.display $ptr_deref(freed) = [$ + ptr_deref(p) + $]  (expect [])$
+    Term.display $ptr_free(freed) again = $ + to_string(ptr_free(p)) + $  (expect -1)$
+<mainloop>

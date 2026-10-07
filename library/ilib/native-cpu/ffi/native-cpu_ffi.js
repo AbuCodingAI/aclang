@@ -32,6 +32,7 @@ class PtrEntry {
         this.addr = addr;
         this.typeId = typeId;
         this.valid = true;
+        this.bare = false;   // true for bmdha/bmzdha allocations (bare-metal kind)
     }
 }
 
@@ -69,7 +70,7 @@ function ptr_new(value, valueSize, typeId = 0) {
 
 function ptr_deref(ptrId) {
     const entry = ptrRegistry.get(ptrId);
-    if (!entry || !entry.valid) return null;
+    if (!entry || !entry.valid) return "";   // missing handle reads as empty text, same as the C/Go/Rust/Java/V cores
     if (entry.addr instanceof WasmSpan) {
         const bytes = entry.addr.bytes();
         const end = bytes.indexOf(0);
@@ -112,7 +113,9 @@ function ptr_copy(ptrId) {
     return newId;
 }
 
-function ptr_update(ptrId, value, offset = 0) {
+// Same as the C core: the first `size` bytes of value are written at the start (all of value when size is omitted).
+function ptr_update(ptrId, value, size) {
+    const offset = 0;
     const entry = ptrRegistry.get(ptrId);
     if (!entry || !entry.valid) return -1;
     try {
@@ -131,7 +134,8 @@ function ptr_update(ptrId, value, offset = 0) {
             }
             entry.addr.writeBytes(data, offset);
         } else if (Buffer.isBuffer(entry.addr)) {
-            const data = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+            let data = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+            if (size !== undefined) data = data.subarray(0, Number(size));
             const need = offset + data.length;
             if (need > entry.addr.length) {
                 const grown = Buffer.alloc(need);
@@ -178,10 +182,13 @@ function dha(size, typeId = 0) {
 // Buffer.alloc, which is why dha/zdha were two different calls before.
 function zdha(size, typeId = 0) { return dha(size, typeId); }
 
-function ncpu_realloc(ptrId, size) {
+// Heap and bare-metal handles don't mix: realloc rejects bare-metal handles and bmrealloc
+// rejects heap handles, same rule as the C and Python cores.
+function ncpu_realloc(ptrId, size, wantBare = false) {
     if (size <= 0) return NULL_PTR;
     const entry = ptrRegistry.get(ptrId);
     if (!entry || !entry.valid || !(entry.addr instanceof WasmSpan)) return NULL_PTR;
+    if (entry.bare !== wantBare) return NULL_PTR;
     const newOffset = _ncpuMem.alloc(size);
     const grown = new WasmSpan(newOffset, size);
     grown.writeBytes(entry.addr.bytes().subarray(0, Math.min(size, entry.addr.size)));
@@ -189,9 +196,13 @@ function ncpu_realloc(ptrId, size) {
     return ptrId;
 }
 
-function bmdha(size, typeId = 0) { return zdha(size, typeId); }
-function bmzdha(size, typeId = 0) { return zdha(size, typeId); }
-function bmrealloc(ptrId, size) { return ncpu_realloc(ptrId, size); }
+function bmdha(size, typeId = 0) {
+    const id = zdha(size, typeId);
+    if (id !== NULL_PTR) ptrRegistry.get(id).bare = true;
+    return id;
+}
+function bmzdha(size, typeId = 0) { return bmdha(size, typeId); }
+function bmrealloc(ptrId, size) { return ncpu_realloc(ptrId, size, true); }
 
 // ============================================================================
 // ARENA ALLOCATOR — bump allocator, bulk free
@@ -216,9 +227,10 @@ function arena_create(size) {
 function arena_alloc(arenaId, size) {
     if (size <= 0) return NULL_PTR;
     const arena = arenaRegistry.get(arenaId);
-    if (!arena || arena.offset + size > arena.capacity) return NULL_PTR;
+    const need = Math.ceil(size / 8) * 8;   // 8-byte aligned bumps, same as the C/C++ core
+    if (!arena || arena.offset + need > arena.capacity) return NULL_PTR;
     const span = new WasmSpan(arena.baseOffset + arena.offset, size);
-    arena.offset += size;
+    arena.offset += need;
     const ptrId = nextPtrId++;
     ptrRegistry.set(ptrId, new PtrEntry(span, 0));
     return ptrId;
@@ -227,13 +239,26 @@ function arena_alloc(arenaId, size) {
 // Bump allocators don't free individual items — reclaim via arena_abort/destroy.
 function arena_dealloc(arenaId, ptrId) { return 0; }
 
+// Handles into an arena stop resolving once it is reset or destroyed (same rule as C/Python).
+function invalidateArenaHandles(arena) {
+    const lo = arena.baseOffset, hi = arena.baseOffset + arena.capacity;
+    for (const [pid, e] of ptrRegistry) {
+        if (e.addr instanceof WasmSpan && e.addr.offset >= lo && e.addr.offset < hi) ptrRegistry.delete(pid);
+    }
+}
+
 function arena_destroy(arenaId) {
-    return arenaRegistry.delete(arenaId) ? 0 : -1;
+    const arena = arenaRegistry.get(arenaId);
+    if (!arena) return -1;
+    invalidateArenaHandles(arena);
+    arenaRegistry.delete(arenaId);
+    return 0;
 }
 
 function arena_abort(arenaId) {
     const arena = arenaRegistry.get(arenaId);
     if (!arena) return -1;
+    invalidateArenaHandles(arena);
     arena.offset = 0;
     return 0;
 }

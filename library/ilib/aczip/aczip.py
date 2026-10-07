@@ -1,4 +1,5 @@
 import gzip
+import zlib
 import tarfile
 import os
 import io
@@ -14,89 +15,86 @@ except ImportError:
     HAS_ZSTD = False
 
 class ACZip:
-    """ACZip v2 - Fast archiver with per-file compression"""
+    """ACZip v2 archive: the same format as aczip.cpp (ACZ2 magic, then per file: path, original size,
+    compressed size, zlib data). A file or a directory is archived; decompression recreates the paths."""
+
+    MAGIC = b'ACZ2'
 
     @staticmethod
-    def compress(path, parallel=True):
-        """Compress directory: each file compressed individually, then packaged"""
+    def _files(path):
+        if os.path.isfile(path):
+            with open(path, 'rb') as f:
+                return [(os.path.basename(path), f.read())]
         files = []
-        for root, dirs, filenames in os.walk(path):
-            for filename in filenames:
-                filepath = os.path.join(root, filename)
-                with open(filepath, 'rb') as f:
-                    data = f.read()
-                    rel_path = os.path.relpath(filepath, path)
-                    files.append((rel_path, data))
-
-        # Compress each file individually
-        compressed_files = []
-
-        if parallel and len(files) > 1:
-            with ThreadPoolExecutor() as executor:
-                results = executor.map(
-                    lambda f: (f[0], ACZstd.compress(f[1], level=3)),
-                    files
-                )
-                compressed_files = list(results)
-        else:
-            compressed_files = [(f[0], ACZstd.compress(f[1], level=3)) for f in files]
-
-        # Build v2 format
-        result = b'ACZ2'  # Magic header v2
-        result += struct.pack('<I', len(compressed_files))  # File count
-
-        for idx, (filepath, compressed) in enumerate(compressed_files):
-            tag = ACZip._generate_tag(idx)
-            result += tag.encode()  # 4-byte tag
-            result += struct.pack('<I', len(compressed))  # Compressed size
-            result += compressed  # Compressed data
-
-        return result
+        for root, _dirs, names in os.walk(path):
+            for name in names:
+                full = os.path.join(root, name)
+                with open(full, 'rb') as f:
+                    files.append((os.path.relpath(full, path).replace(os.sep, '/'), f.read()))
+        return files
 
     @staticmethod
-    def decompress(data, output_path):
-        """Decompress ACZip v2 archive"""
-        if len(data) < 8 or data[:4] != b'ACZ2':
-            raise ValueError("Invalid ACZip file")
+    def build(path):
+        """The archive bytes for a file or directory."""
+        out = bytearray(ACZip.MAGIC)
+        files = ACZip._files(path)
+        out += struct.pack('<I', len(files))
+        for name, data in files:
+            raw = name.encode('utf-8')
+            comp = zlib.compress(data, 6)
+            out += struct.pack('<I', len(raw)) + raw
+            out += struct.pack('<I', len(data)) + struct.pack('<I', len(comp)) + comp
+        return bytes(out)
 
+    @staticmethod
+    def compress(path, parallel=True, output_path=None):
+        """Archive path into output_path. Returns the archive size in bytes (-1 on failure), like the C side."""
+        try:
+            data = ACZip.build(path)
+        except OSError:
+            return -1
+        if output_path is None:
+            return data
+        with open(output_path, 'wb') as f:
+            f.write(data)
+        return len(data)
+
+    @staticmethod
+    def decompress(archive_path, output_path):
+        """Recreate the archive's files under output_path. Returns 0 on success, -1 on failure."""
+        with open(archive_path, 'rb') as f:
+            data = f.read()
+        if len(data) < 8 or data[:4] != ACZip.MAGIC:
+            return -1
         pos = 4
-        file_count = struct.unpack('<I', data[pos:pos+4])[0]
-        pos += 4
-
-        os.makedirs(output_path, exist_ok=True)
-
-        for _ in range(file_count):
-            # Tag
-            tag = data[pos:pos+4].decode()
-            pos += 4
-
-            # Compressed size
-            comp_size = struct.unpack('<I', data[pos:pos+4])[0]
-            pos += 4
-
-            # Compressed data
-            compressed = data[pos:pos+comp_size]
-            pos += comp_size
-
-            # Decompress
-            file_data = gzip.decompress(compressed)
-
-            # Write file
-            file_path = os.path.join(output_path, tag)
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-            with open(file_path, 'wb') as f:
-                f.write(file_data)
+        count = struct.unpack_from('<I', data, pos)[0]; pos += 4
+        for _ in range(count):
+            plen = struct.unpack_from('<I', data, pos)[0]; pos += 4
+            rel = data[pos:pos + plen].decode('utf-8'); pos += plen
+            orig = struct.unpack_from('<I', data, pos)[0]; pos += 4
+            comp_size = struct.unpack_from('<I', data, pos)[0]; pos += 4
+            body = zlib.decompress(data[pos:pos + comp_size]); pos += comp_size
+            if len(body) != orig:
+                return -1
+            # no absolute paths and no "..": nothing may land outside output_path
+            parts = [p for p in rel.split('/') if p not in ('', '.', '..')]
+            if not parts:
+                parts = ['file']
+            target = os.path.join(output_path, *parts)
+            os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+            with open(target, 'wb') as f:
+                f.write(body)
+        return 0
 
     @staticmethod
-    def compress_hdd(path):
+    def compress_hdd(path, output_path=None):
         """Compress optimized for HDD (sequential)"""
-        return ACZip.compress(path, parallel=False)
+        return ACZip.compress(path, False, output_path)
 
     @staticmethod
-    def compress_sata(path):
+    def compress_sata(path, output_path=None):
         """Compress optimized for SATA (balanced, parallel)"""
-        return ACZip.compress(path, parallel=True)
+        return ACZip.compress(path, True, output_path)
 
     @staticmethod
     def get_ratio(original_size, compressed_size):
@@ -104,15 +102,6 @@ class ACZip:
         if original_size == 0:
             return 0.0
         return (compressed_size * 100.0) / original_size
-
-    @staticmethod
-    def _generate_tag(index):
-        """Generate 4-byte tag for file index"""
-        if index < 15:
-            return f"0x{index:X}".ljust(4)[:4]
-        folder = (index // 15) + 1
-        file_idx = (index % 15) + 1
-        return f"1x{folder:02d}.0x{file_idx:02X}"[:4]
 
 
 class ACTar:

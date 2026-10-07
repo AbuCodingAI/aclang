@@ -1,0 +1,35 @@
+/* native-cpu: heap and bare-metal allocation. Only observable outcomes:
+   success (non-null handle), rejection of non-positive sizes, and realloc rules. */
+
+use ilib native-cpu
+
+<mainloop>
+    header.display $Heap allocation$
+    d = ncpu.dha(64, 0)
+    Term.display $dha(64) is_null = $ + to_string(ptr_is_null(d)) + $  (expect 0)$
+    z = ncpu.zdha(64, 0)
+    Term.display $zdha(64) is_null = $ + to_string(ptr_is_null(z)) + $  (expect 0)$
+    bad = ncpu.dha(0, 0)
+    Term.display $dha(0) is_null = $ + to_string(ptr_is_null(bad)) + $  (expect 1)$
+    neg = ncpu.zdha(-8, 0)
+    Term.display $zdha(-8) is_null = $ + to_string(ptr_is_null(neg)) + $  (expect 1)$
+
+    header.display $Realloc$
+    grown = ncpu.realloc(d, 128)
+    Term.display $realloc(d, 128) is_null = $ + to_string(ptr_is_null(grown)) + $  (expect 0)$
+    Term.display $realloc keeps the handle: $ + to_string(ptr_eq(d, grown)) + $  (expect 1)$
+
+    header.display $Bare-metal allocation$
+    bm = ncpu.bmdha(4096, 0)
+    Term.display $bmdha(4096) is_null = $ + to_string(ptr_is_null(bm)) + $  (expect 0)$
+    bz = ncpu.bmzdha(4096, 0)
+    Term.display $bmzdha(4096) is_null = $ + to_string(ptr_is_null(bz)) + $  (expect 0)$
+    bmgrown = ncpu.bmrealloc(bm, 8192)
+    Term.display $bmrealloc(bm, 8192) is_null = $ + to_string(ptr_is_null(bmgrown)) + $  (expect 0)$
+
+    header.display $Mixing kinds is rejected$
+    wrong = ncpu.realloc(bm, 128)
+    Term.display $realloc on a bare-metal handle is_null = $ + to_string(ptr_is_null(wrong)) + $  (expect 1)$
+    wrong2 = ncpu.bmrealloc(d, 128)
+    Term.display $bmrealloc on a heap handle is_null = $ + to_string(ptr_is_null(wrong2)) + $  (expect 1)$
+<mainloop>

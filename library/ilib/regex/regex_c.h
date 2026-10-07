@@ -9,8 +9,8 @@ extern "C" {
 int         ac_regex_match(const char* str, const char* pat);
 int         ac_regex_test(const char* str, const char* pat);
 
-/* Single-string results — pointer into a static 64 KB thread-local buffer.
-   Copy immediately; value is overwritten on the next call. */
+/* Single-string results — pointer into a per-thread buffer that grows to fit.
+   Copy immediately; value is overwritten on the next call on this thread. */
 const char* ac_regex_search(const char* str, const char* pat);
 const char* ac_regex_replace(const char* str, const char* pat, const char* repl);
 const char* ac_regex_replace_all(const char* str, const char* pat, const char* repl);

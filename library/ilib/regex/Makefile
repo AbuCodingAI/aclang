@@ -4,16 +4,17 @@ SRC      := regex.cpp
 OBJ      := regex.o
 
 # Detect platform
-UNAME := $(shell uname -s 2>/dev/null || echo Windows)
+# uname is missing on plain Windows shells, so an empty result also means Windows.
+# Cross-compiling from Linux: make CXX=x86_64-w64-mingw32-g++
+UNAME := $(shell uname -s 2>/dev/null)
 ifeq ($(UNAME),Linux)
     TARGET  := libacregex.so
     LDFLAGS := -shared -Wl,-soname,$(TARGET)
 else ifeq ($(UNAME),Darwin)
     TARGET  := libacregex.dylib
-    LDFLAGS := -shared -dynamiclib
+    LDFLAGS := -dynamiclib
 else
     TARGET  := acregex.dll
-    CXX     := x86_64-w64-mingw32-g++
     LDFLAGS := -shared -static-libgcc -static-libstdc++
 endif
 

@@ -35,10 +35,10 @@ func regex_replace_all(s, pat, repl string) string {
 	defer C.free(unsafe.Pointer(cs)); defer C.free(unsafe.Pointer(cp)); defer C.free(unsafe.Pointer(cr))
 	return C.GoString(C.ac_regex_replace_all(cs, cp, cr))
 }
-func regex_count(s, pat string) int {
+func regex_count(s, pat string) int64 {
 	cs, cp := C.CString(s), C.CString(pat)
 	defer C.free(unsafe.Pointer(cs)); defer C.free(unsafe.Pointer(cp))
-	return int(C.ac_regex_count(cs, cp))
+	return int64(C.ac_regex_count(cs, cp))
 }
 func regex_escape(s string) string {
 	cs := C.CString(s); defer C.free(unsafe.Pointer(cs))
@@ -82,7 +82,7 @@ func (r _AcRegexNS) test(s, p string) bool               { return regex_test(s, 
 func (r _AcRegexNS) search(s, p string) string           { return regex_search(s, p)       }
 func (r _AcRegexNS) replace(s, p, rep string) string     { return regex_replace(s, p, rep) }
 func (r _AcRegexNS) replace_all(s, p, rep string) string { return regex_replace_all(s, p, rep) }
-func (r _AcRegexNS) count(s, p string) int               { return regex_count(s, p)        }
+func (r _AcRegexNS) count(s, p string) int64              { return regex_count(s, p)        }
 func (r _AcRegexNS) escape(s string) string              { return regex_escape(s)          }
 func (r _AcRegexNS) find_all(s, p string) []string       { return regex_find_all(s, p)     }
 func (r _AcRegexNS) split(s, p string) []string          { return regex_split(s, p)        }

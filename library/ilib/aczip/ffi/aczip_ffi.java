@@ -46,7 +46,7 @@ final class AcAczip {
     private static final MethodHandle _ratio      = _mh("ac_get_compression_ratio",    FunctionDescriptor.of(D, L8, L8));
 
     private static final Arena _arena = Arena.ofAuto();
-    private static MemorySegment _cs(String s) { return _arena.allocateUtf8String(s); }
+    private static MemorySegment _cs(String s) { return _arena.allocateFrom(s); }
 
     static long compress(String path, long parallel, String outputPath) {
         try { return (long)_compress.invoke(_cs(path), (int)(parallel != 0 ? 1 : 0), _cs(outputPath)); }

@@ -1,9 +1,11 @@
 #include "web.hpp"
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <cstring>
 #include <unistd.h>
+#include <fcntl.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -12,16 +14,16 @@
 #include <sys/wait.h>
 #endif
 
-// Only allow http(s) URLs built from safe characters: blocks shell-metacharacter
-// injection before the URL is ever handed to a shell (popen/system).
+// Only http(s) URLs made of characters from a fixed allowlist (letters, digits, and the
+// URL punctuation below). The URL is still handed to a shell (popen), so anything outside
+// this set is rejected rather than escaped.
 static bool web_safe_url(const char* url) {
     if (!url) return false;
     std::string u(url);
     if (u.rfind("http://", 0) != 0 && u.rfind("https://", 0) != 0) return false;
+    static const std::string allowedPunct = "-._~:/?#[]@!&=+,%";
     for (unsigned char c : u) {
-        if (c < 0x20 || c == ' ' || c == '\'' || c == '"' || c == '`' ||
-            c == '\\' || c == ';' || c == '|' || c == '&' || c == '$' ||
-            c == '<' || c == '>' || c == '(' || c == ')' || c == '*' || c == '?')
+        if (!(std::isalnum(c) || allowedPunct.find((char)c) != std::string::npos))
             return false;
     }
     return true;
@@ -126,8 +128,32 @@ const char* ac_web_page_get(const char* url) {
     static std::string buf;          // owns the result; valid until the next page_get call
     buf.clear();
     if (!web_safe_url(url)) return "";
+#ifndef _WIN32
+    // No shell: curl is exec'd directly with the URL as one argv element.
+    int fds[2];
+    if (pipe(fds) != 0) return "";
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return ""; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 1);
+        close(fds[1]);
+        char* const argv[] = { (char*)"curl", (char*)"-sL", (char*)"--max-time", (char*)"15",
+                               (char*)"--", (char*)url, nullptr };
+        execvp("curl", argv);
+        _exit(127);
+    }
+    close(fds[1]);
+    char chunk[4096];
+    ssize_t n;
+    while ((n = read(fds[0], chunk, sizeof(chunk))) > 0) buf.append(chunk, (size_t)n);
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return buf.c_str();
+#else
     std::string cmd = "curl -sL --max-time 15 -- \"";
-    cmd += url;                        // validated above: no shell metacharacters
+    cmd += url;                        // allowlisted above; Windows has no execvp equivalent here
     cmd += "\"";
     FILE* p = popen(cmd.c_str(), "r");
     if (!p) return "";
@@ -136,6 +162,7 @@ const char* ac_web_page_get(const char* url) {
     while ((n = fread(chunk, 1, sizeof(chunk), p)) > 0) buf.append(chunk, n);
     pclose(p);
     return buf.c_str();
+#endif
 }
 
 const char* ac_web_help() {

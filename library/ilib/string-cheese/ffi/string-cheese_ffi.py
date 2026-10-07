@@ -1,6 +1,7 @@
 # AC ilib: string-cheese — Python FFI
 # Inlined by AC->PY compiler when "use ilib string-cheese" is declared.
 import re as _re
+import sys as _sys
 
 _WS = " \t\n\r"  # \ws sentinel resolved to this
 
@@ -53,7 +54,45 @@ def stringm_replace(s, old, new):
 def stringm_split(s, sep=None):
     if sep is None or sep == _WS:
         return str(s).split()
-    return str(s).split(str(sep))
+    sep = str(sep)
+    return str(s).split(sep if sep else " ")
+
+def stringm_trim(s):
+    return str(s).strip(" \t\n\r\f\v")
+
+def stringm_strip_clause(mode, clause, s):
+    text, key = str(s), str(clause)
+    at = text.find(key)
+    if at < 0: return text
+    if str(mode) == "before": return text[at + len(key):]
+    if str(mode) == "after":  return text[:at]
+    return text
+
+def stringm_stripln(s, needle):
+    for line in str(s).split("\n"):
+        if str(needle) in line: return line
+    return ""
+
+def stringm_split_nth(s, sep, n):
+    parts = stringm_split(s, sep)
+    n = int(n)
+    return parts[n] if 0 <= n < len(parts) else ""
+
+def stringm_getline():
+    line = _sys.stdin.readline()
+    return line[:-1] if line.endswith("\n") else line
+
+def stringm_scan(needle):
+    line = _sys.stdin.readline()
+    if not line: return 0
+    return 1 if str(needle) in line.rstrip("\n") else 0
+
+def stringm_ischar(s):
+    s = str(s)
+    return 1 if s and all(("a" <= c <= "z") or ("A" <= c <= "Z") for c in s) else 0
+
+def stringm_isws(s):
+    return 1 if all(c in " \t\n\r\f\v" for c in str(s)) else 0
 
 def stringm_join(sep, parts):
     return str(sep).join(str(p) for p in parts)
@@ -88,6 +127,15 @@ class stringm:
     split      = staticmethod(stringm_split)
     join       = staticmethod(stringm_join)
     length     = staticmethod(stringm_len)
+    len        = staticmethod(stringm_len)
+    trim       = staticmethod(stringm_trim)
+    strip_clause = staticmethod(stringm_strip_clause)
+    stripln    = staticmethod(stringm_stripln)
+    split_nth  = staticmethod(stringm_split_nth)
+    getline    = staticmethod(stringm_getline)
+    scan       = staticmethod(stringm_scan)
+    ischar     = staticmethod(stringm_ischar)
+    isws       = staticmethod(stringm_isws)
     startswith = staticmethod(stringm_startswith)
     endswith   = staticmethod(stringm_endswith)
     count      = staticmethod(stringm_count)

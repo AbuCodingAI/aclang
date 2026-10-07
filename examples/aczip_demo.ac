@@ -27,17 +27,16 @@ use ilib aczip
     Term.display $aczip.decompress(...) status = $ + to_string(status) + $ (0 = success)$
 
     header.display $Verifying the round trip$
-    restored = os.read($aczip_demo_out/aczip_demo_src/hello.txt$)
+    restored = os.read($aczip_demo_out/hello.txt$)
     Term.display $restored hello.txt = $ + restored
 
     header.display $Cleaning up$
     os.rmfile($aczip_demo_src/hello.txt$)
     os.rmfile($aczip_demo_src/poem.txt$)
     os.rmdir($aczip_demo_src$)
-    os.rmfile($aczip_demo_out/aczip_demo_src/hello.txt$)
-    os.rmfile($aczip_demo_out/aczip_demo_src/poem.txt$)
-    os.rmdir($aczip_demo_out/aczip_demo_src$)
-    os.rmdir($aczip_demo_out$)
+    os.rmfile($aczip_demo_out/hello.txt$)
+    os.rmfile($aczip_demo_out/poem.txt$)
+        os.rmdir($aczip_demo_out$)
     os.rmfile($aczip_demo.aczip$)
     Term.display $removed all demo files and directories$
     Term.display $Expected: removed all demo files and directories$

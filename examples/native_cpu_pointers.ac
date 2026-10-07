@@ -1,0 +1,32 @@
+/* native-cpu: pointer handles. Checks only what every backend can observe:
+   null handles, identity vs value equality, copy independence, free. */
+
+use ilib native-cpu
+
+<mainloop>
+    header.display $Null handles$
+    n = ptr_null()
+    Term.display $ptr_is_null(ptr_null()) = $ + to_string(ptr_is_null(n)) + $  (expect 1)$
+
+    header.display $Creation$
+    a = ptr_new($hello$, 6, 0)
+    Term.display $ptr_is_null(ptr_new) = $ + to_string(ptr_is_null(a)) + $  (expect 0)$
+    Term.display $ptr_eq(a, a) = $ + to_string(ptr_eq(a, a)) + $  (expect 1, same handle)$
+
+    header.display $Copies$
+    b = ptr_copy(a)
+    Term.display $ptr_is_null(ptr_copy(a)) = $ + to_string(ptr_is_null(b)) + $  (expect 0)$
+    Term.display $ptr_eq(a, copy) = $ + to_string(ptr_eq(a, b)) + $  (expect 1, equal value)$
+    c = ptr_new($world$, 6, 0)
+    Term.display $ptr_eq(hello, world) = $ + to_string(ptr_eq(a, c)) + $  (expect 0)$
+
+    header.display $Update$
+    upd = ptr_update(b, $world$, 6)
+    Term.display $ptr_update(copy, world) returned $ + to_string(upd) + $  (expect 0)$
+    Term.display $ptr_eq(a, copy) after update = $ + to_string(ptr_eq(a, b)) + $  (expect 0)$
+    Term.display $ptr_eq(copy, c) after update = $ + to_string(ptr_eq(b, c)) + $  (expect 1)$
+
+    header.display $Free$
+    freed = ptr_free(c)
+    Term.display $ptr_free(c) returned $ + to_string(freed) + $  (expect 0)$
+<mainloop>

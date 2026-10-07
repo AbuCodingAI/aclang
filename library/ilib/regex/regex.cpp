@@ -4,15 +4,13 @@
 #include <cstdlib>
 #include <cstring>
 
-// ── Static result buffer (per-thread, 64 KB) ──────────────────────────────
-static thread_local char _rbuf[65536];
+// ── Result buffer (per-thread, grows to fit) ─────────────────────────────
+// Valid until the next call on this thread; copy it if you need it longer.
+static thread_local std::string _rbuf;
 
 static const char* _store(const std::string& s) {
-    size_t n = s.size();
-    if (n >= sizeof(_rbuf)) n = sizeof(_rbuf) - 1;
-    memcpy(_rbuf, s.data(), n);
-    _rbuf[n] = '\0';
-    return _rbuf;
+    _rbuf = s;
+    return _rbuf.c_str();
 }
 
 // ── Heap list helpers ──────────────────────────────────────────────────────

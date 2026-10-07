@@ -93,7 +93,7 @@ fn ensure_sql_worker() bool {
 		return true
 	}
 	sock_path := '/tmp/ac_ws_v_${os.getpid()}.sock'
-	script := '${ilib_dir('web-server')}/jasql_cli.py'
+	script := '${ilib_dir('web/server')}/jasql_cli.py'
 	// os.Process uses execve, not execvp — it does NOT search PATH itself, unlike
 	// python3/subprocess or Go/Rust's exec.Command, so the absolute path must be
 	// resolved first.

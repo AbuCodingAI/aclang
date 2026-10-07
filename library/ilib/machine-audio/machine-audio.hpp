@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 #if defined(AC_MAUDIO_ESPEAK)
 #  include <espeak-ng/speak_lib.h>
@@ -129,15 +130,33 @@ inline std::string listen(int timeout_ms = 5000) {
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
+// Run `prog` with `args` (argv[0] is the program name) via fork/execvp — no shell — with its
+// output discarded. Returns the exit status, or -1 if it could not be started.
+inline int run_quiet(const char* const* argv) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        execvp(argv[0], (char* const*)argv);
+        _exit(127);
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0 || !WIFEXITED(st)) return -1;
+    return WEXITSTATUS(st);
+}
+
 // Check if TTS is available on this system.
 inline bool tts_available() {
-    return std::system("espeak-ng --version >/dev/null 2>&1") == 0 ||
-           std::system("say --version >/dev/null 2>&1") == 0;
+    static const char* espeak[] = {"espeak-ng", "--version", nullptr};
+    static const char* say[]    = {"say", "--version", nullptr};
+    return run_quiet(espeak) == 0 || run_quiet(say) == 0;
 }
 
 // Check if STT/whisper is available.
 inline bool stt_available() {
-    return std::system("whisper --help >/dev/null 2>&1") == 0;
+    static const char* whisper[] = {"whisper", "--help", nullptr};
+    return run_quiet(whisper) == 0;
 }
 
 } // namespace ac_machine_audio

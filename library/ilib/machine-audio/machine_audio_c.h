@@ -48,6 +48,21 @@ void        ac_maudio_stop_all(void);   /* no-arg cleanup — see injectAutoShut
 #define maudio_listen   ac_maudio_listen
 #define maudio_tts_ok   ac_maudio_tts_ok
 #define maudio_stop     ac_maudio_stop_all
+#define maudio_say      ac_maudio_say
+#define maudio_construct ac_maudio_construct
+#define maudio_voice    ac_maudio_set_voice
+#define maudio_rate     ac_maudio_speech_rate
+#define maudio_pitch    ac_maudio_speech_pitch
+#define maudio_amplitude ac_maudio_speech_amplitude
+#define maudio_play     ac_maudio_play
+#define maudio_play_loop ac_maudio_play_loop
+#define maudio_pause    ac_maudio_pause
+#define maudio_reverb   ac_maudio_reverb
+#define maudio_speed    ac_maudio_speed
+#define maudio_decode   ac_maudio_decode
+#define maudio_free     ac_maudio_free
+#define maudio_noise    ac_maudio_static_noise
+#define maudio_load     ac_maudio_load_mp3
 #ifdef __cplusplus
 struct _ac_maudio_ns {
     void        (*speak)(const char*)  = ac_maudio_speak;

@@ -19,6 +19,7 @@ const _m=_ffi.Library(_lib,{
 'ac_mod':[_D,[_D,_D]],'ac_mod_int':[_I,[_I,_I]],
 'ac_to_int':[_I,[_D]],'ac_to_dec':[_D,[_I]],
 'ac_gcd':[_I,[_I,_I]],'ac_lcm':[_I,[_I,_I]],
+'ac_modpow':[_I,[_I,_I,_I]],'ac_modinv':[_I,[_I,_I]],'ac_modmul':[_I,[_I,_I,_I]],
 'ac_is_prime':[_INT,[_I]],'ac_clamp':[_D,[_D,_D,_D]],
 // Aggregates
 'ac_sigma':[_D,['pointer',_INT]],'ac_PI_product':[_D,['pointer',_INT]],
@@ -46,6 +47,7 @@ const math_hypot=(a,b)=>_m.ac_hypot(a,b),math_ln=x=>_m.ac_ln(x),math_log=(b,x)=>
 const math_mod=(a,b)=>_m.ac_mod(a,b),math_mod_int=(a,b)=>_m.ac_mod_int(a,b);
 const math_to_int=x=>_m.ac_to_int(x),math_to_dec=x=>_m.ac_to_dec(x);
 const math_gcd=(a,b)=>_m.ac_gcd(a,b),math_lcm=(a,b)=>_m.ac_lcm(a,b);
+const math_modpow=(b,e,m)=>_m.ac_modpow(b,e,m),math_modinv=(a,m)=>_m.ac_modinv(a,m),math_modmul=(a,b,m)=>_m.ac_modmul(a,b,m);
 const math_is_prime=n=>!!_m.ac_is_prime(n),math_clamp=(v,lo,hi)=>_m.ac_clamp(v,lo,hi);
 function math_sigma(lst){return _m.ac_sigma(_arr(lst),lst.length);}
 function math_PI_product(lst){return _m.ac_PI_product(_arr(lst),lst.length);}
@@ -72,6 +74,7 @@ const math = {
     to_int:math_to_int, to_dec:math_to_dec,
     abs_int:math_abs_int, mod_int:math_mod_int,
     gcd:math_gcd, lcm:math_lcm, is_prime:math_is_prime,
+    modpow:math_modpow, modinv:math_modinv, modmul:math_modmul,
     sigma:math_sigma, PI:math_PI_product, gradient:math_gradient,
     pi:math_PI, e:math_E, tau:math_TAU, phi:math_PHI, inf:math_inf,
     pi_digits:math_pi, e_digits:math_e, phi_digits:math_phi,

@@ -16,3 +16,20 @@ os:write_to     -> os.write_to
 os:append_to    -> os.append_to
 os:read         -> os.read
 os:pid          -> os.pid
+
+# files, directories, temp paths
+os:isdir      -> os.isdir
+os:isfile     -> os.isfile
+os:size       -> os.size
+os:mtime      -> os.mtime
+os:copy       -> os.copy
+os:move       -> os.move
+os:listdir    -> os.listdir
+os:tmpdir     -> os.tmpdir
+os:tmpfile    -> os.tmpfile
+os:mktmpdir   -> os.mktmpdir
+os:chdir      -> os.chdir
+os:join       -> os.join
+os:basename   -> os.basename
+os:dirname    -> os.dirname
+os:homedir    -> os.homedir

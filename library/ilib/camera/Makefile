@@ -3,12 +3,27 @@
 
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -O2
-OPENCV_FLAGS = $(shell pkg-config --cflags --libs opencv4)
+# --cflags alone (not --libs) — `pkg-config --libs opencv5` blanket-links EVERY installed
+# OpenCV module, including opencv_viz, which needs VTK. VTK isn't a dependency this
+# library has any business requiring (camera.hpp only ever calls into VideoCapture/Mat/
+# imread/imwrite/imshow/cvtColor/resize/threshold/absdiff/countNonZero — core, imgproc,
+# imgcodecs, videoio, highgui, nothing else), but the blanket link made it one anyway —
+# verified real failure: `ld: undefined reference to vtkAlgorithm::...` the moment OpenCV
+# was rebuilt against a VTK-less system. Link only the modules actually used instead.
+OPENCV_CFLAGS = $(shell pkg-config --cflags opencv4 2>/dev/null)
+OPENCV_MODULES = core imgproc imgcodecs videoio highgui
 
-# If opencv4 not found, try opencv
-ifeq ($(OPENCV_FLAGS),)
-    OPENCV_FLAGS = $(shell pkg-config --cflags --libs opencv)
+# If opencv4 not found, try opencv5 (the pkg-config name OpenCV 5.x ships under), then
+# the unversioned "opencv" name some distro packages still use.
+ifeq ($(OPENCV_CFLAGS),)
+    OPENCV_CFLAGS = $(shell pkg-config --cflags opencv5 2>/dev/null)
 endif
+ifeq ($(OPENCV_CFLAGS),)
+    OPENCV_CFLAGS = $(shell pkg-config --cflags opencv 2>/dev/null)
+endif
+
+OPENCV_LIBS = $(addprefix -lopencv_,$(OPENCV_MODULES))
+OPENCV_FLAGS = $(OPENCV_CFLAGS) $(OPENCV_LIBS)
 
 INCLUDES = -I.
 LIBS = $(OPENCV_FLAGS)
@@ -17,7 +32,7 @@ LIBS = $(OPENCV_FLAGS)
 TARGET_SO = libaccamera.so
 TARGET_A  = libaccamera.a
 
-all: $(TARGET_SO) $(TARGET_A) motion_tracker_example
+all: $(TARGET_SO) $(TARGET_A)
 
 # The shared/static libs AC's compiled backends actually link against — camera.cpp
 # owns the global Camera/SidebarConsole/Screen instances (camera/sidebar/screen) that

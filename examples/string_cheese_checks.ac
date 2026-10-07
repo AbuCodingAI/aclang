@@ -1,0 +1,42 @@
+/* string-cheese: the everyday string tools. Each line prints the actual value and the
+   expected one. getline and scan read one line from stdin; the test feeds "hello world". */
+
+use ilib string-cheese
+
+<mainloop>
+    header.display $Prefix and suffix$
+    IF stringm.startswith($hello world$, $hello$)
+        Term.display $startswith(hello) = yes  (expect yes)$
+    IF stringm.endswith($hello world$, $world$)
+        Term.display $endswith(world) = yes  (expect yes)$
+    IF stringm.startswith($hello world$, $world$)
+        Term.display $startswith(world) = yes  (expect no)$
+    OTHER
+        Term.display $startswith(world) = no  (expect no)$
+
+    header.display $Find and count$
+    Term.display $find(hello world, o) = $ + to_string(stringm.find($hello world$, $o$))  + $  (expect 4)$
+    Term.display $find(hello world, z) = $ + to_string(stringm.find($hello world$, $z$))  + $  (expect -1)$
+    Term.display $count(hello world, o) = $ + to_string(stringm.count($hello world$, $o$))  + $  (expect 2)$
+    Term.display $len(hello) = $ + to_string(stringm.length($hello$))  + $  (expect 5)$
+
+    header.display $Case and trim$
+    Term.display $upper(hello) = $ + stringm.upper($hello$)  + $  (expect HELLO)$
+    Term.display $lower(HeLLo) = $ + stringm.lower($HeLLo$)  + $  (expect hello)$
+    Term.display $trim(  pad  ) = [$ + stringm.trim($  pad  $)  + $]  (expect [pad])$
+    Term.display $replace(a-b-c) = $ + stringm.replace($a-b-c$, $-$, $+$)  + $  (expect a+b+c)$
+
+    header.display $Interpolated strings$
+    name = $Ada$
+    count = 3
+    Term.display f$hi {name}, you have {count} messages$ + $!$  + $  (expect hi Ada, you have 3 messages!)$
+    Term.display f$braces {{like this}}$  + $  (expect braces {like this})$
+    Term.display t$template {count} x$  + $  (expect template 3 x)$
+    bytes = b$AB$
+    Term.display $b-string AB, first byte = $ + to_string(bytes[1])  + $  (expect 65)$
+    Term.display $b-string AB, second byte = $ + to_string(bytes[2])  + $  (expect 66)$
+
+    header.display $Stdin$
+    line = stringm.getline()
+    Term.display $getline() = $ + line  + $  (expect one)$
+<mainloop>

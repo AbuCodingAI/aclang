@@ -1,0 +1,35 @@
+/* regex ilib: list-valued results (split, find_all, groups). Typed backends
+   (C, C++, Java, Rust, Go) do not yet carry a list of strings from an ilib call
+   through to FOR, the same gap stringm.split has. PY, JS and V pass. */
+
+use ilib regex
+
+<mainloop>
+    header.display $Lists$
+    parts = regex.split($a1b22c$, $[0-9]+$)
+    line = $$
+    FOR p in parts
+        line = line + p + $|$
+    Term.display $split(a1b22c, digits) = $ + line + $  (expect a|b|c|)$
+    gparts = regex.split($a1b22c$, $([0-9]+)$)
+    gline = $$
+    FOR q in gparts
+        gline = gline + q + $|$
+    Term.display $split with a capture group = $ + gline + $  (expect a|b|c|, no captures)$
+    found = regex.find_all($a1b22c333$, $[0-9]+$)
+    fline = $$
+    FOR f in found
+        fline = fline + f + $|$
+    Term.display $find_all(a1b22c333) = $ + fline + $  (expect 1|22|333|)$
+    dates = regex.groups($2024-06-01$, $([0-9]{4})-([0-9]{2})-([0-9]{2})$)
+    dline = $$
+    FOR d in dates
+        dline = dline + d + $|$
+    Term.display $groups(date) = $ + dline + $  (expect 2024|06|01|)$
+    optional = regex.groups($ab$, $a(x)?b$)
+    oline = $$
+    FOR o in optional
+        oline = oline + $[$ + o + $]$
+    Term.display $groups with an unmatched optional group = $ + oline + $  (expect [])$
+
+<mainloop>

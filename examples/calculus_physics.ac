@@ -1,0 +1,19 @@
+/* math calculus: motion and work. Each line prints a value scaled by a thousand (rounded) and the
+   exact answer scaled the same way, so the expected text is the exact answer. */
+
+use ilib math
+
+<mainloop>
+    header.display $Speed from position: position s(x) = x^3, speed at x = 2 is s'(2) = 12$
+    Term.display $speed at x=2, x1000 = $ + to_string(math.to_int(math.derivative($x^3$, 2.0) * 1000.0 + 0.5))  + $  (expect 12000)$
+
+    header.display $Distance from velocity: v(x) = 3x^2, distance over [0, 2] is the integral = 8$
+    Term.display $distance 0 to 2, x1000 = $ + to_string(math.to_int(math.integrate($3*x^2$, 0.0, 2.0) * 1000.0 + 0.5))  + $  (expect 8000)$
+
+    header.display $Work by a spring: force F(x) = 2x, work from x = 0 to 4 is the integral = 16$
+    Term.display $work 0 to 4, x1000 = $ + to_string(math.to_int(math.integrate($2*x$, 0.0, 4.0) * 1000.0 + 0.5))  + $  (expect 16000)$
+
+    header.display $Average value of x^2 on [0, 3] is the integral divided by 3 = 3$
+    avg = math.integrate($x^2$, 0.0, 3.0) / 3.0
+    Term.display $average, x1000 = $ + to_string(math.to_int(avg * 1000.0 + 0.5))  + $  (expect 3000)$
+<mainloop>

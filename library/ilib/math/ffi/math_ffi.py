@@ -33,11 +33,24 @@ math_clamp=_d3('ac_clamp')
 math_to_int=_di('ac_to_int'); math_to_dec=_id('ac_to_dec')
 math_abs_int=_i1('ac_abs_int'); math_mod_int=_ii2('ac_mod_int')
 math_gcd=_ii2('ac_gcd'); math_lcm=_ii2('ac_lcm')
+def _iii(n): f=getattr(_m,n); f.argtypes=[_I,_I,_I]; f.restype=_I; return f
+math_modpow=_iii('ac_modpow'); math_modmul=_iii('ac_modmul'); math_modinv=_ii2('ac_modinv')
 _m.ac_is_prime.argtypes=[_I]; _m.ac_is_prime.restype=_INT
 math_is_prime=lambda n: int(_m.ac_is_prime(int(n)))
 # eval — delegate to C library evaluator (or Python's native eval)
 _m.ac_eval.argtypes=[_CS]; _m.ac_eval.restype=_D
 def math_eval(expr): return _m.ac_eval(str(expr).encode())
+# calculus over a formula in x (see calculus.hpp): integrate(f, a, b), derivative(f, x), limit(f, x), minima/maxima(f, a, b)
+_m.ac_integrate.argtypes=[_CS,_D,_D]; _m.ac_integrate.restype=_D
+_m.ac_derivative.argtypes=[_CS,_D]; _m.ac_derivative.restype=_D
+_m.ac_limit.argtypes=[_CS,_D]; _m.ac_limit.restype=_D
+_m.ac_minima.argtypes=[_CS,_D,_D]; _m.ac_minima.restype=_D
+_m.ac_maxima.argtypes=[_CS,_D,_D]; _m.ac_maxima.restype=_D
+def math_integrate(f, a, b): return _m.ac_integrate(str(f).encode(), float(a), float(b))
+def math_derivative(f, x): return _m.ac_derivative(str(f).encode(), float(x))
+def math_limit(f, x): return _m.ac_limit(str(f).encode(), float(x))
+def math_minima(f, a, b): return _m.ac_minima(str(f).encode(), float(a), float(b))
+def math_maxima(f, a, b): return _m.ac_maxima(str(f).encode(), float(a), float(b))
 # Constants
 math_pi=_c0('ac_math_pi_const')(); math_e=_c0('ac_math_e_const')()
 math_tau=_c0('ac_math_tau_const')(); math_em=_c0('ac_math_em_const')()
@@ -137,7 +150,9 @@ math = _types.SimpleNamespace(
     to_int=math_to_int, to_dec=math_to_dec,
     abs_int=math_abs_int, mod_int=math_mod_int,
     gcd=math_gcd, lcm=math_lcm,
+    modpow=math_modpow, modinv=math_modinv, modmul=math_modmul,
     is_prime=math_is_prime, eval=math_eval,
+    integrate=math_integrate, derivative=math_derivative, limit=math_limit, minima=math_minima, maxima=math_maxima,
     pi=_PrecFloat(math_pi, _pi_prec), e=_PrecFloat(math_e, _e_prec), tau=math_tau, em=math_em,
     phi=_PrecFloat(math_phi, _phi_prec), inf=math_inf,
     PI=math_PI, sigma=math_sigma, gradient=math_gradient,

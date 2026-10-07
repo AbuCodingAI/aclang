@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <numeric>
 #include <random>
 #include <string>
@@ -70,14 +71,14 @@ void add_grad(Tensor& t, const std::vector<double>& g) {
     for (size_t i = 0; i < t.grad.size() && i < g.size(); ++i) t.grad[i] += g[i];
 }
 
-void backward_into(tensor_id_t id, const std::vector<double>& incoming) {
+// Applies one node's local chain rule: its (already complete) gradient flows to its inputs.
+void propagate_node(tensor_id_t id) {
     Tensor* t = get(id);
     if (!t) return;
-    add_grad(*t, incoming);
-
+    const std::vector<double> incoming = t->grad;
     if (t->op == "add") {
-        backward_into(t->a, incoming);
-        backward_into(t->b, incoming);
+        if (Tensor* a = get(t->a)) add_grad(*a, incoming);
+        if (Tensor* b = get(t->b)) add_grad(*b, incoming);
     } else if (t->op == "multiply") {
         Tensor* a = get(t->a);
         Tensor* b = get(t->b);
@@ -87,16 +88,41 @@ void backward_into(tensor_id_t id, const std::vector<double>& incoming) {
             ga[i] = incoming[i] * b->data[i];
             gb[i] = incoming[i] * a->data[i];
         }
-        backward_into(t->a, ga);
-        backward_into(t->b, gb);
+        add_grad(*a, ga);
+        add_grad(*b, gb);
     } else if (t->op == "relu") {
         Tensor* a = get(t->a);
         if (!a) return;
         std::vector<double> ga(incoming.size());
         for (size_t i = 0; i < incoming.size() && i < a->data.size(); ++i)
             ga[i] = a->data[i] > 0.0 ? incoming[i] : 0.0;
-        backward_into(t->a, ga);
+        add_grad(*a, ga);
     }
+}
+
+// Reverse-mode pass over the graph reachable from `loss`. A depth-first post-order gives a
+// topological order (inputs before consumers); walking it backwards visits every node once,
+// after all of its consumers have added their contributions. The old recursive version
+// re-propagated through a shared node once per path to it, which grows exponentially on
+// graphs that reuse intermediate results.
+void backward_graph(tensor_id_t loss, const std::vector<double>& seed) {
+    if (!get(loss)) return;
+    std::vector<tensor_id_t> order;
+    std::set<tensor_id_t> visited;
+    std::vector<std::pair<tensor_id_t, bool>> stack{{loss, false}};
+    while (!stack.empty()) {
+        auto [id, expanded] = stack.back();
+        stack.pop_back();
+        if (expanded) { order.push_back(id); continue; }
+        if (!visited.insert(id).second) continue;
+        Tensor* t = get(id);
+        if (!t) continue;
+        stack.push_back({id, true});
+        if (t->b) stack.push_back({t->b, false});
+        if (t->a) stack.push_back({t->a, false});
+    }
+    add_grad(*get(loss), seed);
+    for (auto it = order.rbegin(); it != order.rend(); ++it) propagate_node(*it);
 }
 
 } // namespace
@@ -193,7 +219,7 @@ int ml_backward(tensor_id_t loss) {
     Tensor* t = get(loss);
     if (!t) return -1;
     std::vector<double> seed(t->data.size(), 1.0);
-    backward_into(loss, seed);
+    backward_graph(loss, seed);
     return 0;
 }
 

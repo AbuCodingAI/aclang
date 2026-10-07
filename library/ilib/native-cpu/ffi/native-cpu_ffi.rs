@@ -64,7 +64,21 @@ pub fn ptr_new(value: &str, value_size: i64, type_id: i64) -> i64 {
     id
 }
 
-pub fn ptr_deref(ptr_id: i64, out: *mut u8, out_size: i64) -> i64 {
+// AC-facing ptr_deref(p): the stored bytes as a string, up to the first NUL. Same model as
+// the C, Python and JS cores.
+pub fn ptr_deref(ptr_id: i64) -> String {
+    let reg = registry().lock().unwrap();
+    match reg.get(&ptr_id) {
+        Some(e) if e.valid => {
+            let end = e.addr.iter().position(|&b| b == 0).unwrap_or(e.addr.len());
+            String::from_utf8_lossy(&e.addr[..end]).into_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+// Raw byte-buffer form, for callers that want the bytes themselves (3-argument C shape).
+pub fn ptr_deref_into(ptr_id: i64, out: *mut u8, out_size: i64) -> i64 {
     if out.is_null() || out_size <= 0 { return -1; }
     let reg = registry().lock().unwrap();
     match reg.get(&ptr_id) {
@@ -177,7 +191,8 @@ pub fn bmrealloc(ptr_id: i64, size: i64) -> i64 {
 // ARENA ALLOCATOR — bump allocator, bulk free
 // ============================================================================
 
-struct Arena { buffer: Vec<u8>, offset: usize }
+// `owned` lists the handles arena_alloc gave out, so abort/destroy can invalidate them.
+struct Arena { buffer: Vec<u8>, offset: usize, owned: Vec<i64> }
 static ARENA_REGISTRY: OnceLock<Mutex<HashMap<i64, Arena>>> = OnceLock::new();
 static NEXT_ARENA_ID: OnceLock<Mutex<i64>> = OnceLock::new();
 fn arenas() -> &'static Mutex<HashMap<i64, Arena>> {
@@ -192,7 +207,7 @@ fn next_arena_id() -> i64 {
 pub fn arena_create(size: i64) -> i64 {
     if size <= 0 { return NULL_PTR; }
     let id = next_arena_id();
-    arenas().lock().unwrap().insert(id, Arena { buffer: vec![0u8; size as usize], offset: 0 });
+    arenas().lock().unwrap().insert(id, Arena { buffer: vec![0u8; size as usize], offset: 0, owned: Vec::new() });
     id
 }
 
@@ -200,10 +215,12 @@ pub fn arena_alloc(arena_id: i64, size: i64) -> i64 {
     if size <= 0 { return NULL_PTR; }
     let mut ar = arenas().lock().unwrap();
     let arena = match ar.get_mut(&arena_id) { Some(a) => a, None => return NULL_PTR };
-    if arena.offset + size as usize > arena.buffer.len() { return NULL_PTR; }
+    let need = ((size + 7) & !7) as usize;   // 8-byte aligned bumps, same as the C/C++ core
+    if arena.offset + need > arena.buffer.len() { return NULL_PTR; }
     let slice = arena.buffer[arena.offset..arena.offset + size as usize].to_vec();
-    arena.offset += size as usize;
+    arena.offset += need;
     let id = next_id();
+    arena.owned.push(id);
     // Registered as an ordinary (owning) entry — a snapshot copy, since the arena's
     // backing buffer isn't addressable through the same i64-handle registry directly.
     registry().lock().unwrap().insert(id, PtrEntry { addr: slice, type_id: 0, valid: true, bare_metal: false });
@@ -213,14 +230,24 @@ pub fn arena_alloc(arena_id: i64, size: i64) -> i64 {
 // Bump allocators don't free individual items — reclaim via arena_abort/destroy.
 pub fn arena_dealloc(_arena_id: i64, _ptr_id: i64) -> i64 { 0 }
 
+// Handles into a reset or destroyed arena stop resolving (same rule as the C/Python/JS cores).
+fn invalidate_owned(arena: &Arena) {
+    let mut reg = registry().lock().unwrap();
+    for id in &arena.owned { reg.remove(id); }
+}
+
 pub fn arena_destroy(arena_id: i64) -> i64 {
-    if arenas().lock().unwrap().remove(&arena_id).is_some() { 0 } else { -1 }
+    let mut ar = arenas().lock().unwrap();
+    match ar.remove(&arena_id) {
+        Some(a) => { invalidate_owned(&a); 0 }
+        None => -1,
+    }
 }
 
 pub fn arena_abort(arena_id: i64) -> i64 {
     let mut ar = arenas().lock().unwrap();
     match ar.get_mut(&arena_id) {
-        Some(a) => { a.offset = 0; 0 }
+        Some(a) => { invalidate_owned(a); a.owned.clear(); a.offset = 0; 0 }
         None => -1,
     }
 }

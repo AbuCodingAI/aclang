@@ -326,4 +326,40 @@ class os {
     public static int    write_to(String path, String c)    { return OSLib.osWriteTo(path, c); }
     public static int    append_to(String path, String c)   { return OSLib.osAppendTo(path, c); }
     public static String read(String path)                  { return OSLib.osRead(path); }
+    public static int    isdir(String p)                    { return OSLib.osIsdir(p); }
+    public static int    isfile(String p)                   { return OSLib.osIsfile(p); }
+    public static long   size(String p)                     { try { return Files.size(Paths.get(p)); } catch (Exception e) { return -1; } }
+    public static long   mtime(String p)                    { try { return Files.getLastModifiedTime(Paths.get(p)).toMillis() / 1000; } catch (Exception e) { return -1; } }
+    public static int    copy(String src, String dst)       { return OSLib.osCopy(src, dst); }
+    public static int    move(String src, String dst)       { return OSLib.osMove(src, dst); }
+    public static java.util.List<String> listdir(String p) {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        try (java.util.stream.Stream<Path> s = Files.list(Paths.get(p))) {
+            s.forEach(q -> names.add(q.getFileName().toString()));
+        } catch (Exception e) { System.err.println("[os.listdir] " + e.getMessage()); }
+        java.util.Collections.sort(names);
+        return names;
+    }
+    public static String tmpdir() {
+        String t = System.getenv("TMPDIR");
+        if (t == null || t.isEmpty()) t = System.getenv("TEMP");
+        return (t == null || t.isEmpty()) ? "/tmp" : t;
+    }
+    public static String tmpfile(String suffix)             { try { return Files.createTempFile(Paths.get(tmpdir()), "acos_", suffix).toString(); } catch (Exception e) { return ""; } }
+    public static String mktmpdir()                         { try { return Files.createTempDirectory(Paths.get(tmpdir()), "acos_").toString(); } catch (Exception e) { return ""; } }
+    public static int    chdir(String p)                    { return OSLib.osChdir(p); }
+    public static String join(String a, String b) {
+        if (a == null || a.isEmpty()) return b;
+        if (b == null || b.isEmpty()) return a;
+        if (b.startsWith("/")) return b;
+        return a.endsWith("/") ? a + b : a + "/" + b;
+    }
+    public static String basename(String p)                 { return p.substring(p.lastIndexOf('/') + 1); }
+    public static String dirname(String p) {
+        int cut = p.lastIndexOf('/');
+        if (cut < 0) return "";
+        if (cut == 0) return "/";
+        return p.substring(0, cut);
+    }
+    public static String homedir()                          { String h = System.getenv("HOME"); return h == null ? "" : h; }
 }

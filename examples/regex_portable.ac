@@ -1,0 +1,39 @@
+/* regex ilib: one dialect (ECMAScript-style patterns, $1 / $& in replacements) that
+   must give the same answers on every backend. Each line prints the actual value and
+   the expected one. Predicates are printed through IF so the output doesn't depend on
+   how each language spells a boolean. */
+
+use ilib regex
+
+<mainloop>
+    header.display $Matching$
+    IF regex.match($hello123$, $[a-z]+[0-9]+$)
+        Term.display $match(hello123, [a-z]+[0-9]+) = yes  (expect yes)$
+    IF regex.match($hello123x$, $[a-z]+[0-9]+$)
+        Term.display $match(hello123x, [a-z]+[0-9]+) = yes  (expect no)$
+    OTHER
+        Term.display $match(hello123x, [a-z]+[0-9]+) = no  (expect no)$
+    IF regex.test($order 66$, $[0-9]+$)
+        Term.display $test(order 66, [0-9]+) = yes  (expect yes)$
+
+    header.display $Search and count$
+    Term.display $search(order 66 confirmed, [0-9]+) = $ + regex.search($order 66 confirmed$, $[0-9]+$)  + $  (expect 66)$
+    Term.display $search(none, [0-9]+) = [$ + regex.search($none$, $[0-9]+$)  + $]  (expect [])$
+    Term.display $count(a1b22c333, [0-9]+) = $ + to_string(regex.count($a1b22c333$, $[0-9]+$))  + $  (expect 3)$
+
+    header.display $Replace$
+    Term.display $replace(a-b-c, -, space) = $ + regex.replace($a-b-c$, $-$, $ $)  + $  (expect a b-c)$
+    Term.display $replace_all(a-b-c, -, space) = $ + regex.replace_all($a-b-c$, $-$, $ $)  + $  (expect a b c)$
+    Term.display $replace_all(John Smith, swap groups) = $ + regex.replace_all($John Smith$, $(\w+) (\w+)$, $\$2, \$1$)  + $  (expect Smith, John)$
+    Term.display $replace(no match) = $ + regex.replace($abc$, $[0-9]$, $X$)  + $  (expect abc)$
+
+    header.display $Escape$
+    Term.display $escape(a.b*c) = $ + regex.escape($a.b*c$)  + $  (expect a\.b\*c)$
+    Term.display $escape(a/b) = $ + regex.escape($a/b$)  + $  (expect a/b)$
+
+    header.display $Invalid pattern$
+    IF regex.match($a$, $[$)
+        Term.display $invalid pattern matched = yes  (expect no)$
+    OTHER
+        Term.display $invalid pattern matched = no  (expect no)$
+<mainloop>

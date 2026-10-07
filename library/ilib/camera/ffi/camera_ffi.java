@@ -56,9 +56,9 @@ final class AcCamera {
 
     private static final Arena _arena = Arena.ofAuto();
     @SuppressWarnings("preview")
-    private static MemorySegment _cs(String s) { return _arena.allocateUtf8String(s); }
+    private static MemorySegment _cs(String s) { return _arena.allocateFrom(s); }
     @SuppressWarnings("preview")
-    private static String _gs(MemorySegment p) { return p == null || p.equals(MemorySegment.NULL) ? "" : p.reinterpret(Long.MAX_VALUE).getUtf8String(0); }
+    private static String _gs(MemorySegment p) { return p == null || p.equals(MemorySegment.NULL) ? "" : p.reinterpret(Long.MAX_VALUE).getString(0); }
 
     static int cameraInit()                     { try { return (int)_camera_init.invoke(); } catch(Throwable t){ throw new RuntimeException(t); } }
     static int cameraCapture(String f)          { try { return (int)_camera_capture.invoke(_cs(f)); } catch(Throwable t){ throw new RuntimeException(t); } }

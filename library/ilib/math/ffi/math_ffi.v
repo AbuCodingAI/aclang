@@ -43,6 +43,16 @@ fn C.ac_mod_int(a i64, b i64) i64
 fn C.ac_to_int(x f64) i64
 fn C.ac_to_dec(x i64) f64
 fn C.ac_gcd(a i64, b i64) i64
+fn C.ac_eval(expr &char) f64
+fn C.ac_eval_at(expr &char, x f64) f64
+fn C.ac_integrate(expr &char, a f64, b f64) f64
+fn C.ac_derivative(expr &char, x f64) f64
+fn C.ac_limit(expr &char, x f64) f64
+fn C.ac_minima(expr &char, a f64, b f64) f64
+fn C.ac_maxima(expr &char, a f64, b f64) f64
+fn C.ac_modpow(b i64, e i64, m i64) i64
+fn C.ac_modinv(a i64, m i64) i64
+fn C.ac_modmul(a i64, b i64, m i64) i64
 fn C.ac_lcm(a i64, b i64) i64
 fn C.ac_is_prime(n i64) int
 fn C.ac_clamp(v f64, lo f64, hi f64) f64
@@ -98,6 +108,9 @@ fn math_mod_int(a i64, b i64) i64 { return C.ac_mod_int(a, b) }
 fn math_to_int(x f64) i64     { return C.ac_to_int(x) }
 fn math_to_dec(x i64) f64     { return C.ac_to_dec(x) }
 fn math_gcd(a i64, b i64) i64 { return C.ac_gcd(a, b) }
+fn math_modpow(b i64, e i64, m i64) i64 { return C.ac_modpow(b, e, m) }
+fn math_modinv(a i64, m i64) i64 { return C.ac_modinv(a, m) }
+fn math_modmul(a i64, b i64, m i64) i64 { return C.ac_modmul(a, b, m) }
 fn math_lcm(a i64, b i64) i64 { return C.ac_lcm(a, b) }
 fn math_is_prime(n i64) bool  { return C.ac_is_prime(n) != 0 }
 fn math_clamp(v f64, lo f64, hi f64) f64 { return C.ac_clamp(v, lo, hi) }
@@ -127,6 +140,14 @@ fn stat_boxnum(lst []f64) []f64 {
 }
 
 // math namespace object — AC-generated V uses math.sin(x), math.pi, etc.
+// Calculus over a formula in x, e.g. "x*x + sin(x)" (see calculus.hpp).
+fn math_eval(expr string) f64 { return C.ac_eval(expr.str) }
+fn math_integrate(f string, a f64, b f64) f64 { return C.ac_integrate(f.str, a, b) }
+fn math_derivative(f string, x f64) f64 { return C.ac_derivative(f.str, x) }
+fn math_limit(f string, x f64) f64 { return C.ac_limit(f.str, x) }
+fn math_minima(f string, a f64, b f64) f64 { return C.ac_minima(f.str, a, b) }
+fn math_maxima(f string, a f64, b f64) f64 { return C.ac_maxima(f.str, a, b) }
+
 struct AcMathNS {
     pi  f64
     e   f64
@@ -135,6 +156,12 @@ struct AcMathNS {
     inf f64
 }
 fn (m AcMathNS) sin(x f64) f64    { return math_sin(x)   }
+fn (m AcMathNS) eval(f string) f64 { return math_eval(f) }
+fn (m AcMathNS) integrate(f string, a f64, b f64) f64 { return math_integrate(f, a, b) }
+fn (m AcMathNS) derivative(f string, x f64) f64 { return math_derivative(f, x) }
+fn (m AcMathNS) limit(f string, x f64) f64 { return math_limit(f, x) }
+fn (m AcMathNS) minima(f string, a f64, b f64) f64 { return math_minima(f, a, b) }
+fn (m AcMathNS) maxima(f string, a f64, b f64) f64 { return math_maxima(f, a, b) }
 fn (m AcMathNS) cos(x f64) f64    { return math_cos(x)   }
 fn (m AcMathNS) tan(x f64) f64    { return math_tan(x)   }
 fn (m AcMathNS) csc(x f64) f64    { return math_csc(x)   }
@@ -167,6 +194,9 @@ fn (m AcMathNS) mod_int(a i64, b i64) i64 { return math_mod_int(a, b) }
 fn (m AcMathNS) to_int(x f64) i64 { return math_to_int(x) }
 fn (m AcMathNS) to_dec(x i64) f64 { return math_to_dec(x) }
 fn (m AcMathNS) gcd(a i64, b i64) i64 { return math_gcd(a, b) }
+fn (m AcMathNS) modpow(b i64, e i64, mod i64) i64 { return math_modpow(b, e, mod) }
+fn (m AcMathNS) modinv(a i64, mod i64) i64 { return math_modinv(a, mod) }
+fn (m AcMathNS) modmul(a i64, b i64, mod i64) i64 { return math_modmul(a, b, mod) }
 fn (m AcMathNS) lcm(a i64, b i64) i64 { return math_lcm(a, b) }
 fn (m AcMathNS) is_prime(n i64) bool { return math_is_prime(n) }
 fn (m AcMathNS) clamp(v f64, lo f64, hi f64) f64 { return math_clamp(v, lo, hi) }

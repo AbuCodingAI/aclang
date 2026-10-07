@@ -44,7 +44,7 @@ class WebServerLib {
     static boolean ensureSqlWorker() {
         if (sqlChannel != null) return true;
         try {
-            Path script = ilibDir("web-server").resolve("jasql_cli.py");
+            Path script = ilibDir("web/server").resolve("jasql_cli.py");
             ProcessBuilder pb = new ProcessBuilder("python3", script.toString(), "--serve", sqlSockPath);
             pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
             pb.redirectError(ProcessBuilder.Redirect.DISCARD);

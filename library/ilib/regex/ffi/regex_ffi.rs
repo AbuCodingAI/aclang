@@ -55,9 +55,9 @@ pub fn regex_replace_all(s: &str, p: &str, r: &str) -> String {
     let (cs, cp, cr) = (_cs(s), _cs(p), _cs(r));
     _gs(unsafe { ac_regex_replace_all(cs.as_ptr(), cp.as_ptr(), cr.as_ptr()) })
 }
-pub fn regex_count(s: &str, p: &str) -> i32 {
+pub fn regex_count(s: &str, p: &str) -> i64 {
     let (cs, cp) = (_cs(s), _cs(p));
-    unsafe { ac_regex_count(cs.as_ptr(), cp.as_ptr()) }
+    unsafe { ac_regex_count(cs.as_ptr(), cp.as_ptr()) as i64 }
 }
 pub fn regex_escape(s: &str) -> String {
     let cs = _cs(s);
@@ -84,7 +84,7 @@ impl AcRegex {
     pub fn search(&self, s: &str, p: &str) -> String     { regex_search(s, p)        }
     pub fn replace(&self, s: &str, p: &str, r: &str) -> String { regex_replace(s,p,r) }
     pub fn replace_all(&self, s: &str, p: &str, r: &str) -> String { regex_replace_all(s,p,r) }
-    pub fn count(&self, s: &str, p: &str) -> i32         { regex_count(s, p)         }
+    pub fn count(&self, s: &str, p: &str) -> i64         { regex_count(s, p)         }
     pub fn escape(&self, s: &str) -> String              { regex_escape(s)           }
     pub fn find_all(&self, s: &str, p: &str) -> Vec<String> { regex_find_all(s, p)  }
     pub fn split(&self, s: &str, p: &str) -> Vec<String> { regex_split(s, p)        }

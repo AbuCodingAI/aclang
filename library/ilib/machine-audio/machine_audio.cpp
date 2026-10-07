@@ -18,6 +18,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -295,10 +299,14 @@ void ac_maudio_static_noise(int duration_ms) {
     return;
 fallback:
 #endif
-    // Fallback: write a WAV to /tmp and play with aplay
+    // Fallback: write a WAV to a private temp file and play it with aplay. mkstemp gives a
+    // unique name created exclusively, so another user can't pre-create or symlink the path.
     int samples = 44100 * duration_ms / 1000;
-    FILE* f = std::fopen("/tmp/ac_static.wav", "wb");
-    if (!f) return;
+    char tmpl[] = "/tmp/ac_static_XXXXXX";
+    int tfd = mkstemp(tmpl);
+    if (tfd < 0) return;
+    FILE* f = fdopen(tfd, "wb");
+    if (!f) { close(tfd); unlink(tmpl); return; }
     // WAV header
     uint32_t dataLen = (uint32_t)(samples * 2);
     uint32_t riffLen = dataLen + 36;
@@ -317,7 +325,16 @@ fallback:
         std::fwrite(&s, 2, 1, f);
     }
     std::fclose(f);
-    std::system("aplay -q /tmp/ac_static.wav 2>/dev/null");
+    const char* play[] = {"aplay", "-q", tmpl, nullptr};
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        execvp(play[0], (char* const*)play);
+        _exit(127);
+    }
+    if (pid > 0) { int st = 0; waitpid(pid, &st, 0); }
+    unlink(tmpl);
     (void)u16; (void)u32;
 }
 

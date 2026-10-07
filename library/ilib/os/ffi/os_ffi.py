@@ -109,6 +109,90 @@ def os_read(path):
         _sys.stderr.write(f"[os.read] {e}\n")
         return ""
 
+def os_isdir(p):
+    return 1 if _os.path.isdir(str(p)) else 0
+
+def os_isfile(p):
+    return 1 if _os.path.isfile(str(p)) else 0
+
+def os_size(p):
+    try:
+        return _os.path.getsize(str(p))
+    except OSError:
+        return -1
+
+def os_mtime(p):
+    try:
+        return int(_os.path.getmtime(str(p)))
+    except OSError:
+        return -1
+
+def os_copy(src, dst):
+    try:
+        _sh.copyfile(str(src), str(dst))
+        return 0
+    except OSError as e:
+        _sys.stderr.write(f"[os.copy] {e}\n")
+        return -1
+
+def os_move(src, dst):
+    try:
+        _sh.move(str(src), str(dst))
+        return 0
+    except OSError as e:
+        _sys.stderr.write(f"[os.move] {e}\n")
+        return -1
+
+def os_listdir(p):
+    try:
+        return sorted(_os.listdir(str(p)))
+    except OSError as e:
+        _sys.stderr.write(f"[os.listdir] {e}\n")
+        return []
+
+def os_tmpdir():
+    for var in ("TMPDIR", "TEMP"):
+        if _os.environ.get(var):
+            return _os.environ[var]
+    return "/tmp"
+
+def os_tmpfile(suffix=""):
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="acos_", suffix=str(suffix), dir=os_tmpdir())
+    _os.close(fd)
+    return path
+
+def os_mktmpdir():
+    import tempfile
+    return tempfile.mkdtemp(prefix="acos_", dir=os_tmpdir())
+
+def os_chdir(p):
+    try:
+        _os.chdir(str(p))
+        return 0
+    except OSError as e:
+        _sys.stderr.write(f"[os.chdir] {e}\n")
+        return -1
+
+def os_join(a, b):
+    a, b = str(a), str(b)
+    if not a: return b
+    if not b: return a
+    return _os.path.join(a, b)
+
+def os_basename(p):
+    return str(p).rsplit("/", 1)[-1]
+
+def os_dirname(p):
+    p = str(p)
+    cut = p.rfind("/")
+    if cut < 0: return ""
+    if cut == 0: return "/"
+    return p[:cut]
+
+def os_homedir():
+    return _os.environ.get("HOME", "")
+
 class os:
     bash      = staticmethod(os_bash)
     sbash     = staticmethod(os_sbash)
@@ -123,3 +207,18 @@ class os:
     write_to  = staticmethod(os_write_to)
     append_to = staticmethod(os_append_to)
     read      = staticmethod(os_read)
+    isdir = staticmethod(os_isdir)
+    isfile = staticmethod(os_isfile)
+    size = staticmethod(os_size)
+    mtime = staticmethod(os_mtime)
+    copy = staticmethod(os_copy)
+    move = staticmethod(os_move)
+    listdir = staticmethod(os_listdir)
+    tmpdir = staticmethod(os_tmpdir)
+    tmpfile = staticmethod(os_tmpfile)
+    mktmpdir = staticmethod(os_mktmpdir)
+    chdir = staticmethod(os_chdir)
+    join = staticmethod(os_join)
+    basename = staticmethod(os_basename)
+    dirname = staticmethod(os_dirname)
+    homedir = staticmethod(os_homedir)

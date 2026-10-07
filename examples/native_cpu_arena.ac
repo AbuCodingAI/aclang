@@ -1,0 +1,39 @@
+/* native-cpu: arena (bump) allocator. Exhaustion, bulk reset, and destroy.
+   Arena sizes are chosen so 4 x 16-byte allocations fill a 64-byte arena. */
+
+use ilib native-cpu
+
+<mainloop>
+    header.display $Exhaustion$
+    arena = ncpu.arena_create(64)
+    Term.display $arena_create(64) is_null = $ + to_string(ptr_is_null(arena)) + $  (expect 0)$
+    a1 = ncpu.arena_alloc(arena, 16)
+    a2 = ncpu.arena_alloc(arena, 16)
+    a3 = ncpu.arena_alloc(arena, 16)
+    a4 = ncpu.arena_alloc(arena, 16)
+    Term.display $four 16-byte allocs, none null: $ + to_string(ptr_is_null(a1)) + $ $ + to_string(ptr_is_null(a2)) + $ $ + to_string(ptr_is_null(a3)) + $ $ + to_string(ptr_is_null(a4)) + $  (expect 0 0 0 0)$
+    a5 = ncpu.arena_alloc(arena, 16)
+    Term.display $fifth 16-byte alloc is_null = $ + to_string(ptr_is_null(a5)) + $  (expect 1, arena full)$
+
+    header.display $Bulk reset$
+    reset = ncpu.arena_abort(arena)
+    Term.display $arena_abort returned $ + to_string(reset) + $  (expect 0)$
+    b1 = ncpu.arena_alloc(arena, 64)
+    Term.display $64-byte alloc after reset is_null = $ + to_string(ptr_is_null(b1)) + $  (expect 0)$
+    stale = ptr_update(a1, $x$, 1)
+    Term.display $ptr_update through a handle from before the reset = $ + to_string(stale) + $  (expect -1, handle invalidated)$
+    b2 = ncpu.arena_alloc(arena, 1)
+    Term.display $1-byte alloc after full reset is_null = $ + to_string(ptr_is_null(b2)) + $  (expect 1)$
+
+    header.display $Single free is a no-op$
+    dealloc = ncpu.arena_dealloc(arena, b1)
+    Term.display $arena_dealloc returned $ + to_string(dealloc) + $  (expect 0)$
+    b3 = ncpu.arena_alloc(arena, 1)
+    Term.display $still full after dealloc, 1-byte alloc is_null = $ + to_string(ptr_is_null(b3)) + $  (expect 1)$
+
+    header.display $Destroy$
+    gone = ncpu.arena_destroy(arena)
+    Term.display $arena_destroy returned $ + to_string(gone) + $  (expect 0)$
+    late = ncpu.arena_alloc(arena, 8)
+    Term.display $alloc from destroyed arena is_null = $ + to_string(ptr_is_null(late)) + $  (expect 1)$
+<mainloop>

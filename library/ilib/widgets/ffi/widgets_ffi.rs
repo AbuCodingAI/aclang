@@ -163,9 +163,15 @@ impl AcWidgetExt for i64 {
 // ── Callback wrapper: AC fn(i64)->i64 → extern "C" fn(*mut c_void) ────────────
 extern "C" fn _ac_btn_cb(userdata: *mut std::ffi::c_void) {
     if userdata.is_null() { return; }
-    let cb = unsafe { &*(userdata as *const fn(i64) -> i64) };
-    cb(0);
+    let cb = unsafe { &*(userdata as *const Box<dyn Fn()>) };
+    cb();
 }
+// AC callbacks come in two shapes: zero-arg (`Make OnSubmit func()`) and one-arg
+// (`Make OnClick func(_)`). Both are accepted; the one-arg form is called with 0.
+pub trait AcBtnCb<A> { fn into_boxed(self) -> Box<dyn Fn()>; }
+impl<F: Fn() + 'static> AcBtnCb<()> for F { fn into_boxed(self) -> Box<dyn Fn()> { Box::new(self) } }
+impl<F: Fn(i64) + 'static> AcBtnCb<(i64,)> for F { fn into_boxed(self) -> Box<dyn Fn()> { Box::new(move || self(0)) } }
+impl<F: Fn(i64) -> i64 + 'static> AcBtnCb<(i64, i64)> for F { fn into_boxed(self) -> Box<dyn Fn()> { Box::new(move || { self(0); }) } }
 // fps's callback is a boxed trait object (Box<dyn Fn()>), not a bare fn pointer — see
 // AcWidgetExt::fps's own comment for why it can't share _ac_btn_cb's fixed shape.
 extern "C" fn _ac_fps_cb(userdata: *mut std::ffi::c_void) {
@@ -207,10 +213,11 @@ pub fn ask(master: i64, width: i64) -> i64 {
     unsafe { ac_widgets_pack(h as AcW) }; h
 }
 
-pub fn btn(master: i64, text: &str, cmd: fn(i64) -> i64) -> i64 {
+pub fn btn<A, F: AcBtnCb<A>>(master: i64, text: &str, cmd: F) -> i64 {
     let ct = _cs(text);
     let h = unsafe { ac_widgets_btn_new(master as AcW, ct.as_ptr()) as i64 };
-    let cb_ptr = Box::leak(Box::new(cmd)) as *mut fn(i64) -> i64;
+    let boxed: Box<Box<dyn Fn()>> = Box::new(cmd.into_boxed());
+    let cb_ptr = Box::leak(boxed) as *mut Box<dyn Fn()>;
     unsafe { ac_widgets_btn_on_click(h as AcW, _ac_btn_cb, cb_ptr as *mut std::ffi::c_void) }
     unsafe { ac_widgets_pack(h as AcW) }; h
 }

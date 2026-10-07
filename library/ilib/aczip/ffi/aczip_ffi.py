@@ -24,6 +24,8 @@ if _c:
     class _ACZipByteArray(_ct.Structure):
         _fields_ = [("data", _ct.POINTER(_ct.c_char)), ("size", _ct.c_size_t)]
 
+    _c.ac_zip_compress_to_file.argtypes = [_ct.c_char_p, _ct.c_int, _ct.c_char_p]
+    _c.ac_zip_compress_to_file.restype = _ct.c_longlong
     _c.ac_zip_compress.argtypes = [_ct.c_char_p, _ct.c_int]
     _c.ac_zip_compress.restype = _ACZipByteArray
     _c.ac_zip_compress_hdd.argtypes = [_ct.c_char_p]
@@ -36,6 +38,10 @@ if _c:
     _c.ac_get_compression_ratio.restype = _ct.c_double
     _c.ac_free_bytes.argtypes = [_ACZipByteArray]
     _c.ac_free_bytes.restype = None
+    _c.ac_zip_iso.argtypes = [_ct.c_char_p, _ct.c_char_p, _ct.c_char_p]
+    _c.ac_zip_iso.restype = _ct.c_int
+    _c.ac_zip_package.argtypes = [_ct.c_char_p, _ct.c_char_p]
+    _c.ac_zip_package.restype = _ct.c_int
 
     def _b(s): return s.encode() if isinstance(s, str) else s
 
@@ -50,10 +56,7 @@ if _c:
         return raw
 
     def aczip_compress(path, parallel, output_path):
-        raw = _write_result(_c.ac_zip_compress(_b(path), 1 if parallel else 0))
-        if raw == -1: return -1
-        with open(output_path, 'wb') as f: f.write(raw)
-        return len(raw)
+        return _c.ac_zip_compress_to_file(_b(path), 1 if parallel else 0, _b(output_path))
 
     def aczip_compress_hdd(path, output_path):
         raw = _write_result(_c.ac_zip_compress_hdd(_b(path)))
@@ -74,6 +77,12 @@ if _c:
     def aczip_get_ratio(original, compressed):
         return _c.ac_get_compression_ratio(int(original), int(compressed))
 
+    def aczip_iso(srcdir, out_iso, label=''):
+        return _c.ac_zip_iso(_b(srcdir), _b(out_iso), _b(label))
+
+    def aczip_package(srcdir, out_path):
+        return _c.ac_zip_package(_b(srcdir), _b(out_path))
+
 else:
     import sys as _sys
     _sys.stderr.write("[aczip] WARNING: libaczip.so not found — stub mode\n")
@@ -82,9 +91,11 @@ else:
     def aczip_compress_sata(path, output_path): return -1
     def aczip_decompress(archive_path, output_path): return -1
     def aczip_get_ratio(original, compressed): return 0.0
+    def aczip_iso(srcdir, out_iso, label=''): return -1
+    def aczip_package(srcdir, out_path): return -1
 
 aczip = _types.SimpleNamespace(
     compress=aczip_compress, compress_hdd=aczip_compress_hdd,
     compress_sata=aczip_compress_sata, decompress=aczip_decompress,
-    get_ratio=aczip_get_ratio,
+    get_ratio=aczip_get_ratio, iso=aczip_iso, pack=aczip_package,
 )

@@ -16,6 +16,8 @@ func ptr_new(value string, size int64, typeID int64) int64 {
 	defer C.free(unsafe.Pointer(cs))
 	return int64(C.ac_ncpu_ptr_new(unsafe.Pointer(cs), C.int64_t(size), C.int64_t(typeID)))
 }
+// AC-facing ptr_deref(p): the stored bytes as a string (up to the first NUL).
+func ptr_deref(ptrID int64) string { return C.GoString(C.ac_ncpu_ptr_deref_str(C.int64_t(ptrID))) }
 func ptr_deref_into(ptrID int64, out []byte) int64 {
 	return int64(C.ac_ncpu_ptr_deref(C.int64_t(ptrID), unsafe.Pointer(&out[0]), C.int64_t(len(out))))
 }
