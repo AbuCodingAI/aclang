@@ -1,7 +1,0 @@
-dns:start       -> dns.start
-dns:url         -> dns.url
-dns:backend     -> dns.backend
-dns:resolve     -> dns.resolve
-dns:remove      -> dns.remove
-dns:list        -> dns.list
-dns:stop        -> dns.stop
