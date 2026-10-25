@@ -23,6 +23,14 @@ inline bool acCallReturnsFloat(const std::string& irName) {
     static const std::set<std::string> intValued = {
         "math.to_int", "math.abs_int", "math.mod_int", "math.gcd", "math.lcm", "math.is_prime",
         "math_to_int", "math_abs_int", "math_mod_int", "math_gcd", "math_lcm", "math_is_prime",
+        // modpow/modinv/modmul are int64_t in the real C ABI (library/ilib/math/math.cpp) —
+        // unlike integrate/derivative/limit/minima/maxima/eval/eval_at, which take a string
+        // expression and genuinely return double. Found missing while wiring these functions
+        // into BNY's own dynamic-symbol table for the first time (they were never callable on
+        // BNY before — undefined-symbol at load time — so no backend had ever exercised this
+        // specific return-type classification against a REAL run until now).
+        "math.modpow", "math.modinv", "math.modmul",
+        "math_modpow", "math_modinv", "math_modmul",
     };
     return intValued.find(irName) == intValued.end();
 }

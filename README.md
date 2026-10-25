@@ -138,6 +138,12 @@ recursion, and bundles/classes/tuples, printing floats exactly like the other ba
 missing: `try`/`catch`, `atomic`, generators (`yield`), and ilib calls (the dynamic-linking path
 has a known bug). Anything unimplemented is a compile-time error, never silent wrong output.
 
+**`AC->BNY` vs `AC->PY` float formatting.** Both use the same `%.16g`-style convention and print
+identical output for everyday values, including ilib-returned floats (`ml.take`, `aczip.get_ratio`,
+etc.) and large magnitudes (both switch to `3.344024546978682e+17`-style exponential form past 16
+significant digits). The one known gap: `AC->BNY` doesn't yet implement the *small*-magnitude side
+of that switch-over (values like `1e-10`) — see [Known Limitations](#known-limitations-not-in-v1).
+
 ---
 
 ## Lexical Rules
@@ -1192,6 +1198,47 @@ Use `--force` or `--no-cache` when working on compiler internals.
 **Operators:** `not`, `#`, `overlap`, `xsub`, `and`, `AND`, `or`, `OR`, `band`, `bor`, `bxor`, `bnot`, `~`, `ptm`, `ptd`, `///`, `~>` (proposed)
 
 **Reserved / partial:** `programLoop`, `temp`, `at`, `save`, `type`
+
+---
+
+## Platform Notes
+
+AC's text backends (PY, JS, HTML, C, C++, Java, RS, GO, V) run anywhere their own toolchain is
+installed — Linux, macOS, Windows. AC's native backends (BNY, ASM, ARM) emit Linux ELF binaries and
+only run on Linux; `AC->ARM` additionally needs an AArch64 Linux host (or `qemu-aarch64`). The
+`widgets` ilib (GUI) is GTK3-only, so it has no macOS/Windows backing — write GUI programs with a
+text backend in mind if portability matters.
+
+A few ilibs need something beyond what `install.sh` provisions by default:
+
+| ilib / feature | Needs | Notes |
+|---|---|---|
+| `widgets` | GTK3 (installed by default) | See [Known Limitations](#known-limitations-not-in-v1) for one open GUI crash |
+| `camera` | Your user in the `video` group | `sudo usermod -aG video $USER`, then log out/in. Without it, `/dev/video0` exists but is unreadable — a permissions issue, not an AC bug |
+| `maudio` (speech-to-text fallback) | The `whisper` CLI | `pacman -S python-openai-whisper` (Arch) or `pip install openai-whisper` elsewhere. Text-to-speech works without it; only STT needs it |
+| `aczip` (`aczip.iso`, ISO image packaging) | `xorriso` on `PATH` | Most distros package it separately from base dev tools |
+| `web` (`web-server`, HTTP half) | A real client | `server.accept()` blocks for an actual connection — run the program, then `curl` it from another terminal. The JaSQL database half needs no client and runs standalone |
+| `V` backend | The V compiler | <https://vlang.io> — not packaged by most distros |
+
+---
+
+## Known Limitations (not in v1)
+
+- **GTK widgets crash.** A program combining many `widgets` types in one window (tabs + listbox +
+  table + drawing canvas, as in `examples/widgets_test2.ac`) can intermittently crash inside GTK's
+  own internals (`Gtk-CRITICAL: _gtk_style_provider_private_get_settings` followed by a segfault in
+  `libgtk-3.so`, not in AC-generated code). The crash is non-deterministic — the same program
+  crashes on some runs and not others — which rules out a single bad widget call as the cause;
+  pinning it down needs a memory debugger (Valgrind/ASan) against the widgets ilib, not further AC
+  source bisection. Simpler widget programs are unaffected. Planned for a later release.
+- **`AC->ARM` (AArch64) is experimental.** No `try`/`catch`, `atomic`, generators (`yield`), or ilib
+  calls yet (the dynamic-linking path has a known bug). Anything unimplemented is a compile-time
+  error, never silent wrong output.
+- **`AC->BNY` float formatting**: the small-magnitude side of `%g`'s fixed-vs-exponential
+  switch-over (values like `1e-10`) isn't implemented yet — only the large-magnitude side is.
+  Doesn't affect everyday values.
+- **RISC-V backend** and **BNY/ASM ELF+PE polyglot binaries** (one binary valid as both a Linux ELF
+  and a Windows PE) are not implemented.
 
 ---
 

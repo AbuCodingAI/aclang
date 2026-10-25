@@ -575,6 +575,24 @@ static bool isAllStringListContent(const std::string& content) {
         if (!(e.size() >= 2 && e.front() == '$' && e.back() == '$')) return false;
     return true;
 }
+// Same idea, for a FLOAT list literal: at least one element is a float literal, and every
+// other element is either a float literal too or a bare int literal (promoted to float — AC
+// has no tagged numeric-list type, so losing a float's fraction, the plain-int default's old
+// behavior, is strictly worse than an int literal losing its ".0" suffix). A string element,
+// or any element that isn't a bare numeric literal (a variable, an expression — e.g. `[1.5,
+// someVar]`), falls through: cross-function evidence (.append/return/param propagation, see
+// crossFnFloatListVars_) is the only source for those, same as a non-literal string list.
+static bool isAllFloatListContent(const std::string& content) {
+    auto elems = splitListElements(content);
+    if (elems.empty()) return false;
+    bool anyFloat = false;
+    for (auto& e : elems) {
+        if (e.size() >= 2 && e.front() == '$' && e.back() == '$') return false;
+        if (looksFloat(e)) { anyFloat = true; continue; }
+        if (!looksNumeric(e)) return false;
+    }
+    return anyFloat;
+}
 static std::string escapeStr(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -975,6 +993,11 @@ public:
     // crossFnStringListVars_'s own comment in the shared driver. Base no-op; only backends
     // whose array representation actually distinguishes the two need to override this.
     virtual void setStringListVars(const std::set<std::string>&) {}
+    // Same idea, one element type over: crossFnFloatListVars_'s own comment in the shared
+    // driver. A list that's homogeneously float (built via `.append(floatExpr)` or a literal
+    // whose elements all look like floats) needs a `double`-backed array, not the plain int64
+    // default — the same silent-truncation bug class stringListVars_ already fixed for strings.
+    virtual void setFloatListVars(const std::set<std::string>&) {}
 
     // Vars that need a genuine boxed/tagged runtime value instead of one fixed declared type
     // (Abu's real retype spec — see ac_true_flow_sensitive_retype_spec memory): detected when a
@@ -1323,6 +1346,8 @@ public:
     // Which of THOSE list-returning functions specifically return a STRING list, not an int
     // one — see crossFnStringListVars_/stringListReturnFuncs_'s own comment in the driver.
     virtual void setStringListReturnFuncs(const std::set<std::string>&) {}
+    // Same, for a FLOAT list — see crossFnFloatListVars_/floatListReturnFuncs_'s own comment.
+    virtual void setFloatListReturnFuncs(const std::set<std::string>&) {}
     virtual void setStringReturnFuncs(const std::set<std::string>&) {}  // #6: funcs that return string
     // Function has zero `return <value>;` statements anywhere (only bare `return;`, if any) — a
     // genuinely void function. Backends that pick a numeric type by default (Java: "long") need
@@ -3999,6 +4024,17 @@ private:
     }
     std::set<std::string> stringListReturnFuncs_;
     void setStringListReturnFuncs(const std::set<std::string>& s) override { stringListReturnFuncs_ = s; }
+    // Same idea, one element type over (see BackendStrategy::setFloatListVars' own comment):
+    // a homogeneously-float array gets a `double`-backed ac_arr_new_float/push_float runtime
+    // (see emitHeader) instead of the plain `ac_int*` default, which silently truncated every
+    // element to its integer part (verified: schrodinger_oscillator.ac's `psi.append(1.0 /
+    // (1.0 + x*x))` printed `0` for every element instead of the real fraction).
+    std::set<std::string> floatListVars_;
+    void setFloatListVars(const std::set<std::string>& s) override {
+        floatListVars_.insert(s.begin(), s.end());
+    }
+    std::set<std::string> floatListReturnFuncs_;
+    void setFloatListReturnFuncs(const std::set<std::string>& s) override { floatListReturnFuncs_ = s; }
     IRType castDeclType(const std::string& var, IRType def) const {
         auto it = varCastTypes_.find(var); return it != varCastTypes_.end() ? it->second : def;
     }
@@ -4256,6 +4292,51 @@ private:
         emitRaw(out, "    ((ac_int*)a)[-2] = len + 1;");
         emitRaw(out, "    return a;");
         emitRaw(out, "}");
+        // Third parallel array runtime, for a homogeneously-float list (see floatListVars_'s
+        // own comment) — identical stretchy-buffer shape again, sized in `double` units
+        // (8 bytes, same as ac_int/ac_str, so the header-before-pointer trick lines up the
+        // same way a third time).
+        emitRaw(out, "static double* ac_arr_new_float(ac_int n) {");
+        emitRaw(out, "    ac_int cap = n > 4 ? n : 4;");
+        emitRaw(out, "    double* p = (double*)malloc((size_t)(2 + cap) * sizeof(double));");
+        emitRaw(out, "    ((ac_int*)p)[0] = n;");
+        emitRaw(out, "    ((ac_int*)p)[1] = cap;");
+        emitRaw(out, "    return p + 2;");
+        emitRaw(out, "}");
+        emitRaw(out, "static ac_int ac_arr_len_float(const double* a) {");
+        emitRaw(out, "    return a ? ((const ac_int*)a)[-2] : 0;");
+        emitRaw(out, "}");
+        emitRaw(out, "static double* ac_arr_push_float(double* a, double v) {");
+        emitRaw(out, "    if (!a) a = ac_arr_new_float(0);");
+        emitRaw(out, "    ac_int len = ((ac_int*)a)[-2], cap = ((ac_int*)a)[-1];");
+        emitRaw(out, "    if (len == cap) {");
+        emitRaw(out, "        cap *= 2;");
+        emitRaw(out, "        a = (double*)realloc((double*)a - 2, (size_t)(2 + cap) * sizeof(double)) + 2;");
+        emitRaw(out, "        ((ac_int*)a)[-1] = cap;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    a[len] = v;");
+        emitRaw(out, "    ((ac_int*)a)[-2] = len + 1;");
+        emitRaw(out, "    return a;");
+        emitRaw(out, "}");
+        // Same %.16g-plus-forced-".0" formatting _ac_dblprint uses for a scalar float, applied
+        // per element — matches PY's list repr (`[1.5, 2.25]`, never `[1, 2]`).
+        emitRaw(out, "static void ac_fmt_double_elem(char* buf, size_t bufsz, double d) {");
+        emitRaw(out, "    snprintf(buf, bufsz, \"%.16g\", d);");
+        emitRaw(out, "    if (!strpbrk(buf, \".eEnN\")) {");
+        emitRaw(out, "        size_t l = strlen(buf);");
+        emitRaw(out, "        snprintf(buf + l, bufsz - l, \".0\");");
+        emitRaw(out, "    }");
+        emitRaw(out, "}");
+        emitRaw(out, "static void ac_arr_print_float(const double* a) {");
+        emitRaw(out, "    ac_int n = ac_arr_len_float(a);");
+        emitRaw(out, "    printf(\"[\");");
+        emitRaw(out, "    for (ac_int i = 0; i < n; i++) {");
+        emitRaw(out, "        char buf[64];");
+        emitRaw(out, "        ac_fmt_double_elem(buf, sizeof(buf), a[i]);");
+        emitRaw(out, "        printf(i ? \", %s\" : \"%s\", buf);");
+        emitRaw(out, "    }");
+        emitRaw(out, "    printf(\"]\\n\");");
+        emitRaw(out, "}");
         // Takes ownership of an ilib char** list (regex.split, stringm.split, ...): the string
         // pointers move into the AC array and the container is freed. The strings are kept
         // for the life of the program, like any other AC string.
@@ -4267,8 +4348,11 @@ private:
         emitRaw(out, "}");
         emitRaw(out, "static void ac_arr_print_str(const ac_str* a) {");
         emitRaw(out, "    printf(\"[\");");
+        // Quoted, like PY's list repr (`['a', 'b']`) — ac_arr_to_str_str (the to_string() path)
+        // already quotes; this print path never actually ran before this was wired up (nothing
+        // called it), so it never got the same fix.
         emitRaw(out, "    for (ac_int i = 0; i < ac_arr_len_str(a); i++)");
-        emitRaw(out, "        printf(i ? \", %s\" : \"%s\", a[i]);");
+        emitRaw(out, "        printf(i ? \", '%s'\" : \"'%s'\", a[i] ? a[i] : \"\");");
         emitRaw(out, "    printf(\"]\\n\");");
         emitRaw(out, "}");
         // `try`/`catch`: real via setjmp/longjmp, not `exit()` — exit() terminates the whole
@@ -4365,6 +4449,19 @@ private:
         emitRaw(out, "        r[pos++] = '\\'';");
         emitRaw(out, "        memcpy(r + pos, s, sl); pos += sl;");
         emitRaw(out, "        r[pos++] = '\\'';");
+        emitRaw(out, "    }");
+        emitRaw(out, "    r[pos++] = ']'; r[pos] = '\\0';");
+        emitRaw(out, "    return r;");
+        emitRaw(out, "}");
+        // Same idea for a float list — matches PY's repr (`[1.5, 2.25]`, never `[1, 2]`).
+        emitRaw(out, "static const char* ac_arr_to_str_float(const double* a) {");
+        emitRaw(out, "    ac_int n = ac_arr_len_float(a);");
+        emitRaw(out, "    char* r = (char*)malloc((size_t)n * 40 + 3);");
+        emitRaw(out, "    size_t pos = 0; r[pos++] = '[';");
+        emitRaw(out, "    for (ac_int i = 0; i < n; i++) {");
+        emitRaw(out, "        if (i) { r[pos++] = ','; r[pos++] = ' '; }");
+        emitRaw(out, "        char buf[64]; ac_fmt_double_elem(buf, sizeof(buf), a[i]);");
+        emitRaw(out, "        size_t bl = strlen(buf); memcpy(r + pos, buf, bl); pos += bl;");
         emitRaw(out, "    }");
         emitRaw(out, "    r[pos++] = ']'; r[pos] = '\\0';");
         emitRaw(out, "    return r;");
@@ -4688,6 +4785,11 @@ private:
             if (declared.insert(var).second) return "ac_str* " + var + " = " + val + ";";
             return var + " = " + val + ";";
         }
+        if (floatListVars_.count(val)) {   // same gap, for a homogeneously-float array
+            listVars.insert(var); floatListVars_.insert(var);
+            if (declared.insert(var).second) return "double* " + var + " = " + val + ";";
+            return var + " = " + val + ";";
+        }
         if (listVars.count(val) || listGlobals_.count(val)) {
             listVars.insert(var);
             if (declared.insert(var).second) return "ac_int* " + var + " = " + val + ";";
@@ -4750,8 +4852,16 @@ private:
     void emitTrueDivision(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &lhs, const std::string &rhs) override
     {
-        // Division by zero is a hard error (PY raises ZeroDivisionError); C's float `/` would yield inf/nan.
-        emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
+        // Division by zero is a hard error (PY raises ZeroDivisionError); C's float `/` would
+        // yield inf/nan. Unlike ac_idiv (`//`), this NEVER checked `_ac_try_depth` at all — a
+        // real, separate gap from ac_idiv's (verified: `try: x = 10.0 / 0.0 catch: ...` escaped
+        // uncaught on C even though PY/ac_idiv both treat `/`-by-zero as the same catchable
+        // ZeroDivisionError). Only emit the longjmp check when hasTryOp_ declared the stack
+        // (see its own gating comment) — with no `try` anywhere, there's nothing to jump to.
+        if (hasTryOp_)
+            emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { if (_ac_try_depth > 0) longjmp(_ac_try_stack[_ac_try_depth - 1], 1); fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
+        else
+            emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
         std::string expr = "(double)(" + lhs + ") / (double)(" + rhs + ")";
         bool isNew = declared.insert(res).second;
         if (isNew) { floatVars.insert(res); emit(out, indent, "double " + res + " = " + expr + ";"); }
@@ -5286,6 +5396,8 @@ private:
                 emit(out, indent, pre + res + " = (ac_int)strlen(" + args + ");");
             else if (stringListVars_.count(args))  // ac_str* stretchy buffer — same header shape, different element size
                 emit(out, indent, pre + res + " = ac_arr_len_str(" + args + ");");
+            else if (floatListVars_.count(args))  // double* stretchy buffer, same header shape again
+                emit(out, indent, pre + res + " = ac_arr_len_float(" + args + ");");
             else  // lists are stretchy buffers — len rides at p[-2] (sizeof(ptr) was always 1)
                 emit(out, indent, pre + res + " = ac_arr_len(" + args + ");");
             return; }
@@ -5299,6 +5411,8 @@ private:
                     if (listVars.count(recv) || listParams_.count(recv) || listGlobals_.count(recv)) {
                         if (stringListVars_.count(recv))
                             emit(out, indent, recv + " = ac_arr_push_str(" + recv + ", " + args + ");");
+                        else if (floatListVars_.count(recv))
+                            emit(out, indent, recv + " = ac_arr_push_float(" + recv + ", " + args + ");");
                         else
                             emit(out, indent, recv + " = ac_arr_push(" + recv + ", " + args + ");");
                         return;
@@ -5337,6 +5451,9 @@ private:
             if (stringListReturnFuncs_.count(func)) {
                 stringListVars_.insert(res);
                 emit(out, indent, "ac_str* " + res + " = " + call + ";");
+            } else if (floatListReturnFuncs_.count(func)) {
+                floatListVars_.insert(res);
+                emit(out, indent, "double* " + res + " = " + call + ";");
             } else
                 emit(out, indent, "ac_int* " + res + " = " + call + ";");
         } else if (isUserStringReturningFunc(func) && declared.insert(res).second) {
@@ -5394,6 +5511,14 @@ private:
             emit(out, indent, "_ac_smartprint((double)(" + val + "));");
         else if (looksString(val) || strVars.count(val) || isStringVar(val))
             emit(out, indent, "printf(\"%s\\n\", " + val + ");");
+        else if (stringListVars_.count(val))
+            // pre-existing gap, fixed alongside the float-list work: this branch was never
+            // reached for a string list (it fell to the plain ac_arr_print below, printing
+            // each ac_str pointer's bit pattern as a bogus integer) because ac_arr_print_str,
+            // defined in emitHeader, was never actually called from anywhere.
+            emit(out, indent, "ac_arr_print_str(" + val + ");");  // ['a', 'b'] — matches PY
+        else if (floatListVars_.count(val))
+            emit(out, indent, "ac_arr_print_float(" + val + ");");  // [1.5, 2.25] — matches PY
         else if (listVars.count(val) || listParams_.count(val))
             emit(out, indent, "ac_arr_print(" + val + ");");  // [2, 3, 5] — matches PY
         else if (isFloatVal(val))
@@ -5581,6 +5706,14 @@ private:
             indent++;
             return;
         }
+        if (floatListVars_.count(collection)) {   // list of floats: double elements
+            emit(out, indent, "for (ac_int _fi = 0; _fi < ac_arr_len_float(" + collection + "); _fi++) {");
+            emit(out, indent + 1, "double " + iterVar + " = " + collection + "[_fi];");
+            floatVars.insert(iterVar);
+            declared.insert(iterVar); forVarStack_.push_back(iterVar);
+            indent++;
+            return;
+        }
         emit(out, indent, "for (ac_int _fi = 0; _fi < ac_arr_len(" + collection + "); _fi++) {");
         emit(out, indent + 1, "ac_int " + iterVar + " = " + collection + "[_fi];");
         declared.insert(iterVar); forVarStack_.push_back(iterVar);
@@ -5664,7 +5797,15 @@ private:
                 emit(out, indent, elemT + " " + var + "[" + std::to_string(parts.size()) + "] = {" + joined + "};");
                 return;
             }
-            listVars.insert(var); declared.insert(var);
+            listVars.insert(var);
+            // A rebound parameter (`psi = []` inside the function that owns `psi`) is ALREADY
+            // declared — re-declaring it with a type prefix either shadows it (if this literal
+            // sits in a nested block: every later read of `psi` in the SAME textual position as
+            // this call, including on the NEXT loop iteration, keeps seeing the stale value —
+            // verified: schrodinger_oscillator's `evolve` silently computed with the un-updated
+            // `psi` every iteration) or is a flat "redefinition" compile error (if it's at the
+            // function's own top level). Either way, a rebound list needs a plain assignment.
+            bool alreadyDeclared = !declared.insert(var).second;
             // Count elements to determine array size
             int n = content.empty() ? 0 : 1;
             for (char c : content) if (c == ',') n++;
@@ -5672,11 +5813,18 @@ private:
             // comment) needs the parallel ac_str* runtime, especially for an EMPTY literal
             // (`result = []`) where there's no element text here to infer the type from.
             bool isStrList = stringListVars_.count(var) > 0;
-            std::string elemT = isStrList ? "ac_str* " : "ac_int* ";
-            std::string newFn = isStrList ? "ac_arr_new_str(" : "ac_arr_new(";
+            // Float list: cross-function evidence (append/return/param — crossFnFloatListVars_)
+            // OR the literal's own content (isAllFloatListContent, for the no-append case this
+            // list's only occurrence IS the literal). Direct index assignment below (`var[i] =
+            // elem;`) promotes a bare int literal element into the `double` slot for free —
+            // no extra cast needed at the element-write site.
+            bool isFloatList = !isStrList && (floatListVars_.count(var) > 0 || isAllFloatListContent(content));
+            if (isFloatList) floatListVars_.insert(var);   // so later uses (print, append, LOAD_INDEX) see it
+            std::string elemT = isStrList ? "ac_str* " : isFloatList ? "double* " : "ac_int* ";
+            std::string newFn = isStrList ? "ac_arr_new_str(" : isFloatList ? "ac_arr_new_float(" : "ac_arr_new(";
             // Length-tracked heap array (stretchy buffer) — len rides at p[-2], safe to return.
             // A promoted list GLOBAL is already declared ac_int*/ac_str* at file scope — assign it (#C4).
-            if (listGlobals_.count(var))
+            if (listGlobals_.count(var) || alreadyDeclared)
                 emit(out, indent, var + " = " + newFn + std::to_string(n) + ");");
             else
                 emit(out, indent, elemT + var + " = " + newFn + std::to_string(n) + ");");
@@ -5723,6 +5871,13 @@ private:
             // `auto` to fall back on (unlike C++'s decl()), so this needs its own explicit case.
             strVars.insert(result); declared.insert(result);
             emit(out, indent, "ac_str " + result + " = " + arr + "[" + (floatVars.count(idx) ? "(ac_int)(" + idx + ")" : idx) + "];");
+            return;
+        }
+        if (floatListVars_.count(arr)) {
+            // A float-list element is a real `double`, not `ac_int` — same reasoning as the
+            // string-list case just above (C has no `auto` to infer it through decl()).
+            floatVars.insert(result); declared.insert(result);
+            emit(out, indent, "double " + result + " = " + arr + "[" + (floatVars.count(idx) ? "(ac_int)(" + idx + ")" : idx) + "];");
             return;
         }
         // math.mod / float arithmetic yields a `double` temp; a C array subscript must be an integer.
@@ -5834,7 +5989,8 @@ private:
                 } else if (isStringVar(pname)) {
                     tparams += "const char* " + pname;   // #6: inferred string param (char-iterable)
                 } else if (listParams_.count(pname)) {
-                    tparams += stringListVars_.count(pname) ? "ac_str* " + pname   // string-array parameter
+                    tparams += stringListVars_.count(pname) ? "ac_str* " + pname    // string-array parameter
+                             : floatListVars_.count(pname)  ? "double* " + pname    // float-array parameter
                                                              : "ac_int* " + pname;   // array parameter
                 } else if (floatParams_.count(pname)) {
                     tparams += "double " + pname;   // float parameter (its callers pass real doubles)
@@ -5862,7 +6018,7 @@ private:
         auto cf = classReturnFuncs_.find(name);
         std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
                          : boxedRetFuncs_.count(name) ? "AcDynVal "
-                         : retKind == 4 ? "void " : retKind == 5 ? "ac_str* " : retKind == 2 ? "ac_int* " : retKind == 3 ? "ac_str " : retKind == 1 ? "double " : "ac_int ";
+                         : retKind == 4 ? "void " : retKind == 5 ? "ac_str* " : retKind == 6 ? "double* " : retKind == 2 ? "ac_int* " : retKind == 3 ? "ac_str " : retKind == 1 ? "double " : "ac_int ";
         emit(out, 0, ret + cEscape(name) + "(" + typedParamListC(params, name) + ");");
     }
     // Per-param (name, C type) breakdown — same type inference as typedParamListC, just not
@@ -5934,7 +6090,7 @@ private:
                 std::string line;
                 if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
                 else if (t == IRType::STRING)   line = "const char* " + v + " = 0;";
-                else if (t == IRType::LIST)     line = stringListVars_.count(v) ? "ac_str* " + v + " = 0;" : "ac_int* " + v + " = 0;";
+                else if (t == IRType::LIST)     line = stringListVars_.count(v) ? "ac_str* " + v + " = 0;" : floatListVars_.count(v) ? "double* " + v + " = 0;" : "ac_int* " + v + " = 0;";
                 else if (isNarrowInt(t))        line = std::string(acIntTy(t)) + " " + v + " = 0;";
                 else                            line = "ac_int " + v + " = 0;";
                 emit(out, indent, line);
@@ -5980,7 +6136,8 @@ private:
         // used it) but a real bug for event callbacks: `_ac_bind` takes `ac_evfn` = `void
         // (*)(void)`, and `ac_int (*)(void)` is an incompatible pointer type.
         std::string retT = returnIsVoid_ ? "void"
-            : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "ac_str*" : "ac_int*")
+            : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "ac_str*"
+                              : floatListReturnFuncs_.count(name) ? "double*" : "ac_int*")
             : baseReturnIsString_ ? "ac_str" : returnIsFloat_ ? "double" : "ac_int";
         // A free function whose every `return` traces to one directly-constructed bundle
         // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that class BY
@@ -6001,7 +6158,7 @@ private:
             if      (boxedVars_.count(v))  line = "AcDynVal " + v + " = ac_dyn_i(0);";
             else if (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
             else if (t == IRType::STRING)   line = "const char* " + v + " = 0;";
-            else if (t == IRType::LIST)     line = stringListVars_.count(v) ? "ac_str* " + v + " = 0;" : "ac_int* " + v + " = 0;";
+            else if (t == IRType::LIST)     line = stringListVars_.count(v) ? "ac_str* " + v + " = 0;" : floatListVars_.count(v) ? "double* " + v + " = 0;" : "ac_int* " + v + " = 0;";
             else if (isNarrowInt(t))        line = std::string(acIntTy(t)) + " " + v + " = 0;";
             else                            line = "ac_int " + v + " = 0;";
             emit(out, indent, line);
@@ -6195,7 +6352,9 @@ private:
             // this function already casts; this one just never did. Reuses the exact
             // "already-a-string?" heuristic decl()/emitTypedStoreVar use elsewhere in this class.
             bool srcIsList = listVars.count(src) || listParams_.count(src) || listGlobals_.count(src);
-            std::string rhs = srcIsList ? (stringListVars_.count(src) ? "ac_arr_to_str_str(" + src + ")" : "ac_arr_to_str(" + src + ")")
+            std::string rhs = srcIsList ? (stringListVars_.count(src) ? "ac_arr_to_str_str(" + src + ")"
+                                          : floatListVars_.count(src) ? "ac_arr_to_str_float(" + src + ")"
+                                                                       : "ac_arr_to_str(" + src + ")")
                             : srcIsStringLiteral ? src
                             : smartPrint_ ? "ac_smart_to_str((double)(" + src + "))"
                             : hardPrint_  ? "ac_hard_to_str((double)(" + src + "))"
@@ -6243,7 +6402,7 @@ private:
             std::string line;
             if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double " + v + " = 0;"; }
             else if (t == IRType::STRING)   line = "const char* " + v + " = 0;";
-            else if (t == IRType::LIST)     line = stringListVars_.count(v) ? "ac_str* " + v + " = 0;" : "ac_int* " + v + " = 0;";
+            else if (t == IRType::LIST)     line = stringListVars_.count(v) ? "ac_str* " + v + " = 0;" : floatListVars_.count(v) ? "double* " + v + " = 0;" : "ac_int* " + v + " = 0;";
             else if (isNarrowInt(t))        line = std::string(acIntTy(t)) + " " + v + " = 0;";
             else                            line = "ac_int " + v + " = 0;";
             emit(out, indent, line);
@@ -6367,6 +6526,16 @@ protected:
     }
     std::set<std::string> stringListReturnFuncs_;
     void setStringListReturnFuncs(const std::set<std::string>& s) override { stringListReturnFuncs_ = s; }
+    // Same idea, one element type over (see BackendStrategy::setFloatListVars' own comment):
+    // a homogeneously-float array needs `std::vector<double>`, not the plain `<long long>`
+    // default — `.push_back(1.5)` onto a `vector<long long>` compiles (an implicit narrowing
+    // conversion in a function-call argument, unlike list-init) and silently truncates.
+    std::set<std::string> floatListVars_;
+    void setFloatListVars(const std::set<std::string>& s) override {
+        floatListVars_.insert(s.begin(), s.end());
+    }
+    std::set<std::string> floatListReturnFuncs_;
+    void setFloatListReturnFuncs(const std::set<std::string>& s) override { floatListReturnFuncs_ = s; }
     IRType castDeclType(const std::string& var, IRType def) const {
         auto it = varCastTypes_.find(var); return it != varCastTypes_.end() ? it->second : def;
     }
@@ -6444,6 +6613,7 @@ protected:
     {
         emitRaw(out, "// Generated by AC Compiler (AC->CPP)");
         emitRaw(out, "#include <iostream>");
+        emitRaw(out, "#include <stdexcept>");   // std::runtime_error — ac_idiv's real throw (see its own comment)
         emitRaw(out, "#include <string>");
         emitRaw(out, "#include <vector>");
         emitRaw(out, "#include <map>");
@@ -6555,7 +6725,13 @@ protected:
         if (hasIdivOp_) {
             // `//` truncating integer division
             emitRaw(out, "static long long ac_idiv(long long a, long long b) {");
-            emitRaw(out, "    if (!b) { std::cout.flush(); fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
+            // A real C++ throw, not exit(1): emitTryBegin/emitCatchBegin wrap this in a genuine
+            // try/catch (unlike C's setjmp/longjmp), but a bare exit(1) never gave that catch
+            // anything to catch — `try_catch.ac`/`showcase.ac` printed the UNCAUGHT message and
+            // exited even from inside a `try` block. main()'s own top-level catch (see
+            // emitMainBegin/emitMainEnd) turns an uncaught instance of this back into the same
+            // "Preposterous: ..." text, so top-level behavior is unchanged.
+            emitRaw(out, "    if (!b) throw std::runtime_error(\"division by zero\");");
             emitRaw(out, "    return a / b;");
             emitRaw(out, "}");
         }
@@ -6641,6 +6817,32 @@ protected:
         emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) {");
         emitRaw(out, "        if (i) std::cout << \", \";");
         emitRaw(out, "        std::cout << v[i];");
+        emitRaw(out, "    }");
+        emitRaw(out, "    std::cout << \"]\\n\";");
+        emitRaw(out, "}");
+        // A STRING overload was missing entirely — `ac_print_list(someStringList)` picked the
+        // `long long` overload above (the only one that existed) and failed to even COMPILE
+        // ("invalid initialization of reference... from vector<string>"), not just printed
+        // wrong. Quoted, like PY's list repr (`['a', 'b']`).
+        emitRaw(out, "static void ac_print_list(const std::vector<std::string>& v) {");
+        emitRaw(out, "    std::cout << \"[\";");
+        emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) {");
+        emitRaw(out, "        if (i) std::cout << \", \";");
+        emitRaw(out, "        std::cout << \"'\" << v[i] << \"'\";");
+        emitRaw(out, "    }");
+        emitRaw(out, "    std::cout << \"]\\n\";");
+        emitRaw(out, "}");
+        // Same gap, for a homogeneously-float list (see floatListVars_'s own comment): same
+        // %.16g-plus-forced-".0" formatting every OTHER float-print path in this file uses
+        // (ac_hard_str isn't declared yet at this point in the generated file, so inlined here
+        // rather than called).
+        emitRaw(out, "static void ac_print_list(const std::vector<double>& v) {");
+        emitRaw(out, "    std::cout << \"[\";");
+        emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) {");
+        emitRaw(out, "        if (i) std::cout << \", \";");
+        emitRaw(out, "        char b[48]; std::snprintf(b, sizeof(b), \"%.16g\", v[i]);");
+        emitRaw(out, "        if (!std::strpbrk(b, \".eEnN\")) std::strcat(b, \".0\");");
+        emitRaw(out, "        std::cout << b;");
         emitRaw(out, "    }");
         emitRaw(out, "    std::cout << \"]\\n\";");
         emitRaw(out, "}");
@@ -6909,6 +7111,7 @@ protected:
         // a vector ("no match for operator<<").
         if (cppListVars_.count(val)) cppListVars_.insert(var);
         if (stringListVars_.count(val)) stringListVars_.insert(var);   // a copy of a list of strings
+        if (floatListVars_.count(val)) floatListVars_.insert(var);     // a copy of a list of floats
         if (declared.insert(var).second)
         {
             IRType ct = castDeclType(var, isStringVar(var) ? IRType::STRING : (floatVars.count(var) ? IRType::FLOAT : IRType::VOID));
@@ -6985,7 +7188,8 @@ protected:
     void emitTrueDivision(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &lhs, const std::string &rhs) override
     {
-        emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
+        // Real throw, not exit(1) — same fix and reasoning as ac_idiv's own comment.
+        emit(out, indent, "if ((double)(" + rhs + ") == 0.0) throw std::runtime_error(\"division by zero\");");
         std::string expr = "(double)(" + lhs + ") / (double)(" + rhs + ")";
         bool isNew = declared.insert(res).second;
         if (isNew) { floatVars.insert(res); emit(out, indent, "double " + res + " = " + expr + ";"); }
@@ -7196,6 +7400,9 @@ protected:
             if (stringListReturnFuncs_.count(func)) {
                 stringListVars_.insert(res);
                 emit(out, indent, "std::vector<std::string> " + res + " = " + call + ";");
+            } else if (floatListReturnFuncs_.count(func)) {
+                floatListVars_.insert(res);
+                emit(out, indent, "std::vector<double> " + res + " = " + call + ";");
             } else
                 emit(out, indent, "std::vector<long long> " + res + " = " + call + ";");
         } else if (isUserFloatReturningFunc(func) && declared.insert(res).second) {
@@ -7436,6 +7643,13 @@ protected:
             indent++;
             return;
         }
+        if (floatListVars_.count(collection)) {   // list of floats: double elements
+            emit(out, indent, "for (double " + iterVar + " : " + collection + ") {");
+            floatVars.insert(iterVar);
+            declared.insert(iterVar); forVarStack_.push_back(iterVar);
+            indent++;
+            return;
+        }
         emit(out, indent, "for (long long " + iterVar + " : " + collection + ") {");
         indent++;
     }
@@ -7512,7 +7726,23 @@ protected:
             // needs `std::vector<std::string>`, especially for an EMPTY literal (`result = []`)
             // where there's no element text here to infer the type from at all.
             bool isStrList = stringListVars_.count(var) > 0;
-            emit(out, indent, std::string(promotedGlobals_.count(var) ? "" : (isStrList ? "std::vector<std::string> " : "std::vector<long long> "))
+            // Float list: cross-function evidence OR the literal's own content (same two
+            // sources as C's emitAlloc). A braced-init-list, unlike a plain assignment, treats
+            // a float-into-`vector<long long>` narrowing conversion as a hard compile error
+            // (not a silent truncation) — so a pure literal `v = [1.5, 2.25]` with no append
+            // anywhere actually failed to build at all, not just printed wrong.
+            bool isFloatList = !isStrList && (floatListVars_.count(var) > 0 || isAllFloatListContent(content));
+            if (isFloatList) floatListVars_.insert(var);
+            // A rebound parameter (`psi = []` inside the function that owns `psi`, passed by
+            // `&` reference) is ALREADY declared — re-declaring it here shadows the reference
+            // parameter with a brand-new local for the rest of this block, so a later read in
+            // the SAME textual position (including the next loop iteration, which re-enters
+            // this same lexical scope) keeps seeing the stale value through the real parameter,
+            // never the rebound one (verified: schrodinger_oscillator's `evolve` — same root
+            // cause as the promotedGlobals_ case just below, which this now shares its guard with).
+            bool alreadyDeclared = declared.count(var) > 0;
+            emit(out, indent, std::string((promotedGlobals_.count(var) || alreadyDeclared) ? "" : (isStrList ? "std::vector<std::string> "
+                                  : isFloatList ? "std::vector<double> " : "std::vector<long long> "))
                               + var + " = {" + content + "};");
             declared.insert(var);
         }
@@ -7638,6 +7868,9 @@ protected:
                     if (stringListVars_.count(pname)) {
                         tparams += "std::vector<std::string>& " + pname;
                         stringListVars_.insert(pname);
+                    } else if (floatListVars_.count(pname)) {
+                        tparams += "std::vector<double>& " + pname;
+                        floatListVars_.insert(pname);
                     } else
                         tparams += "std::vector<long long>& " + pname;  // array parameter (by ref)
                     cppListVars_.insert(pname);
@@ -7664,6 +7897,7 @@ protected:
                         : boxedRetFuncs_.count(name) ? "AcDynVal "
                         : retKind == 4 ? "void "
                         : retKind == 5 ? "std::vector<std::string> "
+                        : retKind == 6 ? "std::vector<double> "
                         : retKind == 2 ? "std::vector<long long> "
                         : retKind == 3 ? "std::string "
                         : retKind == 1 ? "double " : "long long ";
@@ -7770,7 +8004,7 @@ protected:
                 std::string line;
                 if      (t == IRType::FLOAT)  { floatVars.insert(v); line = "double "  + v + " = 0;"; }
                 else if (t == IRType::STRING)   line = "std::string " + v + ";";
-                else if (t == IRType::LIST)     line = stringListVars_.count(v) ? "std::vector<std::string> " + v + ";" : "std::vector<long long> " + v + ";";
+                else if (t == IRType::LIST)     line = stringListVars_.count(v) ? "std::vector<std::string> " + v + ";" : floatListVars_.count(v) ? "std::vector<double> " + v + ";" : "std::vector<long long> " + v + ";";
                 else                            line = "long long "  + v + " = 0;";
                 emit(out, indent, line);
                 declared.insert(v);
@@ -7813,7 +8047,8 @@ protected:
         curFuncReturnIsVoid_ = isVoidFn;
         std::string retType = (!classOwner.empty() && name == "init") ? ""
             : isVoidFn ? "void "
-            : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "std::vector<std::string> " : "std::vector<long long> ")
+            : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "std::vector<std::string> "
+                              : floatListReturnFuncs_.count(name) ? "std::vector<double> " : "std::vector<long long> ")
             : baseReturnIsString_ ? "std::string "
             : returnIsFloat_ ? "double " : "long long ";
         // A free function whose every `return` traces to one directly-constructed bundle
@@ -8035,10 +8270,30 @@ protected:
             emit(out, indent, line);
             declared.insert(v);
         }
+        // Wraps the ENTIRE mainloop body: a real throw from ac_idiv/emitTrueDivision reaches
+        // here uncaught whenever the user's own `try` doesn't cover the call site (or there is
+        // no user `try` at all) — without this, an uncaught exception called std::terminate(),
+        // printing "terminate called after throwing an instance of..." instead of matching
+        // every other backend's "Preposterous: ..." text and exit code 1.
+        emit(out, indent, "try {");
+        indent++;
     }
     void emitMainEnd(std::ostringstream &out, int &indent) override
     {
         emit(out, indent, "return 0;");
+        indent--;
+        emit(out, indent, "} catch (const std::exception&) {");
+        indent++;
+        // Ignores what() on purpose: AC's uncaught-error text is its own "Preposterous: ..."
+        // brand, never PY's raw traceback — the SAME fixed text this printed before ac_idiv/
+        // emitTrueDivision threw instead of calling exit(1) directly. Division by zero is the
+        // only catchable runtime error this backend ever throws (see ac_idiv's own comment),
+        // so there's only ever one real message to reconstruct here.
+        emit(out, indent, "std::cout.flush();");
+        emit(out, indent, "fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr);");
+        emit(out, indent, "return 1;");
+        indent--;
+        emit(out, indent, "}");
         indent--;
         emit(out, indent, "}");
     }
@@ -8065,6 +8320,7 @@ public:
         std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
                         : retKind == 4 ? "void "
                         : retKind == 5 ? "std::vector<std::string> "
+                        : retKind == 6 ? "std::vector<double> "
                         : retKind == 2 ? "std::vector<long long> "
                         : retKind == 3 ? "std::string "
                         : retKind == 1 ? "double " : "long long ";
@@ -8084,6 +8340,7 @@ public:
         emitRaw(out, "// Generated by AC Compiler (AC->LIB)");
         emitRaw(out, "// Compile: g++ -std=c++17 -shared -fPIC <file>.cpp -o <file>.so");
         emitRaw(out, "#include <iostream>");
+        emitRaw(out, "#include <stdexcept>");   // std::runtime_error — ac_idiv's real throw (see its own comment)
         emitRaw(out, "#include <string>");
         emitRaw(out, "#include <vector>");
         emitRaw(out, "#include <map>");
@@ -8128,6 +8385,26 @@ public:
         emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) {");
         emitRaw(out, "        if (i) std::cout << \", \";");
         emitRaw(out, "        std::cout << v[i];");
+        emitRaw(out, "    }");
+        emitRaw(out, "    std::cout << \"]\\n\";");
+        emitRaw(out, "}");
+        // Same two missing overloads as CppStrategy's own copy (see its comment) — a string or
+        // float list hit the same "not declared in this scope" class of gap on --target LIB.
+        emitRaw(out, "static void ac_print_list(const std::vector<std::string>& v) {");
+        emitRaw(out, "    std::cout << \"[\";");
+        emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) {");
+        emitRaw(out, "        if (i) std::cout << \", \";");
+        emitRaw(out, "        std::cout << \"'\" << v[i] << \"'\";");
+        emitRaw(out, "    }");
+        emitRaw(out, "    std::cout << \"]\\n\";");
+        emitRaw(out, "}");
+        emitRaw(out, "static void ac_print_list(const std::vector<double>& v) {");
+        emitRaw(out, "    std::cout << \"[\";");
+        emitRaw(out, "    for (size_t i = 0; i < v.size(); i++) {");
+        emitRaw(out, "        if (i) std::cout << \", \";");
+        emitRaw(out, "        char b[48]; std::snprintf(b, sizeof(b), \"%.16g\", v[i]);");
+        emitRaw(out, "        if (!std::strpbrk(b, \".eEnN\")) std::strcat(b, \".0\");");
+        emitRaw(out, "        std::cout << b;");
         emitRaw(out, "    }");
         emitRaw(out, "    std::cout << \"]\\n\";");
         emitRaw(out, "}");
@@ -8448,9 +8725,24 @@ public:
             emit(out, indent, line);
             declared.insert(v);
         }
+        // Same reasoning as CppStrategy::emitMainBegin's own try wrap — ac_idiv/emitTrueDivision
+        // now throw instead of calling exit(1); an uncaught throw reaching across this
+        // function's `extern "C"` boundary (crossing into whatever loaded this .so) would be
+        // undefined behavior, not just a wrong message.
+        emit(out, indent, "try {");
+        indent++;
     }
     void emitMainEnd(std::ostringstream &out, int &indent) override
     {
+        indent--;
+        emit(out, indent, "} catch (const std::exception&) {");
+        indent++;
+        // Same "only one real message" reasoning as CppStrategy::emitMainEnd — no exit() here:
+        // a library must not kill its host process on a caught runtime error.
+        emit(out, indent, "std::cout.flush();");
+        emit(out, indent, "fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr);");
+        indent--;
+        emit(out, indent, "}");
         indent--;
         emit(out, indent, "}");
         emitRaw(out, "#ifdef __cplusplus");
@@ -8513,6 +8805,14 @@ class JavaStrategy : public BackendStrategy
     }
     std::set<std::string> stringListReturnFuncs_;
     void setStringListReturnFuncs(const std::set<std::string>& s) override { stringListReturnFuncs_ = s; }
+    // Same idea, one element type over (see BackendStrategy::setFloatListVars' own comment):
+    // a homogeneously-float list needs `ArrayList<Double>`, not the plain `<Long>` default.
+    std::set<std::string> floatListVars_;
+    void setFloatListVars(const std::set<std::string>& s) override {
+        floatListVars_.insert(s.begin(), s.end());
+    }
+    std::set<std::string> floatListReturnFuncs_;
+    void setFloatListReturnFuncs(const std::set<std::string>& s) override { floatListReturnFuncs_ = s; }
     std::map<std::string, std::set<int>> userFloatParamIdx_;
     void setUserFloatParams(const std::map<std::string, std::set<int>>& m) override { userFloatParamIdx_ = m; }
     std::set<std::string> floatVars;
@@ -8933,7 +9233,10 @@ class JavaStrategy : public BackendStrategy
         emitRaw(out, "    static String fmt(double d) {");
         emitRaw(out, "        if (Double.isNaN(d)) return \"NaN\";");
         emitRaw(out, "        if (Double.isInfinite(d)) return d > 0 ? \"Infinity\" : \"-Infinity\";");
-        emitRaw(out, "        if (d == 0) return (1/d < 0) ? \"-0\" : \"0\";");
+        // PY's repr keeps the ".0" on zero too (`str(0.0)` == "0.0", `str(-0.0)` == "-0.0") —
+        // this returned the bare "0"/"-0" (verified: math.ac's `math.clamp(-3.0, 0.0, 10.0)`
+        // printed `0` instead of `0.0`).
+        emitRaw(out, "        if (d == 0) return (1/d < 0) ? \"-0.0\" : \"0.0\";");
         emitRaw(out, "        boolean neg = d < 0;");
         emitRaw(out, "        java.math.BigDecimal bd = new java.math.BigDecimal(Math.abs(d));");
         emitRaw(out, "        java.math.BigDecimal rounded = bd.round(new java.math.MathContext(16, java.math.RoundingMode.HALF_UP));");
@@ -8967,6 +9270,18 @@ class JavaStrategy : public BackendStrategy
         emitRaw(out, "    static String smart(double d) {");
         emitRaw(out, "        if (d > -9.2e18 && d < 9.2e18 && d == (double)(long)d) return Long.toString((long)d);");
         emitRaw(out, "        return fmt(d);");
+        emitRaw(out, "    }");
+        // `List<String>.toString()` prints each element bare (`[a, b]`) — Java has no
+        // "quote strings" formatting option built in, unlike PY's repr (`['a', 'b']`). Used
+        // by emitPrint's stringListVars_ branch, closing the same gap fixed for C/C++ this
+        // session (ac_arr_print_str/ac_print_list's own missing quoting).
+        emitRaw(out, "    static String strList(java.util.List<String> v) {");
+        emitRaw(out, "        StringBuilder sb = new StringBuilder(\"[\");");
+        emitRaw(out, "        for (int i = 0; i < v.size(); i++) {");
+        emitRaw(out, "            if (i > 0) sb.append(\", \");");
+        emitRaw(out, "            sb.append('\\'').append(v.get(i)).append('\\'');");
+        emitRaw(out, "        }");
+        emitRaw(out, "        return sb.append(']').toString();");
         emitRaw(out, "    }");
         emitRaw(out, "}");
         emitRaw(out, "class AcGenResult { long value; boolean done; AcGenResult(long v, boolean d) { value = v; done = d; } }");
@@ -9551,6 +9866,12 @@ class JavaStrategy : public BackendStrategy
             else                             emit(out, indent, var + " = " + val + ";");
             return;
         }
+        if (floatListVars_.count(val)) {   // same gap, for a copy of a homogeneously-float list
+            listVars.insert(var); floatListVars_.insert(var);
+            if (declared.insert(var).second) emit(out, indent, "java.util.List<Double> " + var + " = " + val + ";");
+            else                             emit(out, indent, var + " = " + val + ";");
+            return;
+        }
         if (listVars.count(val)) {
             listVars.insert(var);
             if (declared.insert(var).second) emit(out, indent, "java.util.ArrayList<Long> " + var + " = " + val + ";");
@@ -9827,7 +10148,12 @@ class JavaStrategy : public BackendStrategy
               // A string-list receiver (stringListVars_ — literal or the whole-program
               // fixpoint, see setStringListVars) needs the raw String arg, not force-cast
               // through `(long)`, which doesn't even compile against a String argument.
-              emit(out, indent, recv + ".add(" + (stringListVars_.count(recv) ? args : "(long)(" + args + ")") + ");");  // #23: mutates the SHARED list
+              // Same for a float-list receiver (floatListVars_): `(long)(1.5)` truncates to 1
+              // before autoboxing, the exact silent-truncation bug this whole fix closes.
+              std::string addArg = stringListVars_.count(recv) ? args
+                                  : floatListVars_.count(recv) ? "(double)(" + args + ")"
+                                                                : "(long)(" + args + ")";
+              emit(out, indent, recv + ".add(" + addArg + ");");  // #23: mutates the SHARED list
               return; } }
         // Dot-chain string methods (`speech.lower()`) — Java's dotCallSyntax()==true means AC's
         // dotted method calls translate DIRECTLY to Java's native dot-call with no rewriting, an
@@ -10094,8 +10420,10 @@ class JavaStrategy : public BackendStrategy
         } else if (isListReturningFunc(actualFunc) && declared.insert(res).second) {
             listVars.insert(res);
             bool isStrList = stringListReturnFuncs_.count(actualFunc) > 0;
+            bool isFloatList = !isStrList && floatListReturnFuncs_.count(actualFunc) > 0;
             if (isStrList) stringListVars_.insert(res);
-            emit(out, indent, (isStrList ? "java.util.ArrayList<String> " : "java.util.ArrayList<Long> ") + res + " = " + call + ";");
+            else if (isFloatList) floatListVars_.insert(res);
+            emit(out, indent, (isStrList ? "java.util.ArrayList<String> " : isFloatList ? "java.util.ArrayList<Double> " : "java.util.ArrayList<Long> ") + res + " = " + call + ";");
         } else if (modIsInt) {
             emit(out, indent, decl(res, call));
         } else if ((isFloatReturningFunc(actualFunc) || isUserFloatReturningFunc(actualFunc))
@@ -10156,6 +10484,7 @@ class JavaStrategy : public BackendStrategy
         else if (boxedVars_.count(val)) emit(out, indent, "System.out.println(" + val + ");");   // AcDynVal.toString() prints its current tag
         else if (smartPrint_) emit(out, indent, "System.out.println(_AcFmtG.smart(" + val + "));");
         else if (isFloatVal(val)) emit(out, indent, "System.out.println(_AcFmtG.fmt(" + val + "));");
+        else if (stringListVars_.count(val)) emit(out, indent, "System.out.println(_AcFmtG.strList(" + val + "));");
         else emit(out, indent, "System.out.println(" + val + ");");
     }
     // Same gap+fix as CStrategy's own emitConfirm (see its comment) — base default never
@@ -10313,8 +10642,10 @@ class JavaStrategy : public BackendStrategy
             else if (seqOf_.count(collection))
                 emit(out, indent, "for (long " + tmp + " = (" + seqOf_[collection].first + "); " + tmp + " < (" + seqOf_[collection].second + "); ++" + tmp + ") {");
             else
-                emit(out, indent, std::string("for (") + (stringListVars_.count(collection) ? "String " : "long ") + tmp + " : " + collection + ") {");
+                emit(out, indent, std::string("for (") + (stringListVars_.count(collection) ? "String "
+                                     : floatListVars_.count(collection) ? "double " : "long ") + tmp + " : " + collection + ") {");
             indent++;
+            if (floatListVars_.count(collection)) floatVars.insert(iterVar);
             emit(out, indent, iterVar + " = " + tmp + ";");
             forVarStack_.push_back("");   // nothing to un-declare at loop end: the variable predates the loop
             return;
@@ -10343,6 +10674,13 @@ class JavaStrategy : public BackendStrategy
         }
         if (stringListVars_.count(collection)) {   // list of strings: loop variable is a String
             emit(out, indent, "for (String " + iterVar + " : " + collection + ") {");
+            declared.insert(iterVar); forVarStack_.push_back(iterVar);
+            indent++;
+            return;
+        }
+        if (floatListVars_.count(collection)) {   // list of floats: loop variable is a double
+            emit(out, indent, "for (double " + iterVar + " : " + collection + ") {");
+            floatVars.insert(iterVar);
             declared.insert(iterVar); forVarStack_.push_back(iterVar);
             indent++;
             return;
@@ -10400,6 +10738,12 @@ class JavaStrategy : public BackendStrategy
                 emit(out, indent, var + ".put(" + fmtDictKey(k) + ", " + (numeric ? v + "L" : fmtDictValStr(v)) + ");");
             declared.insert(var);
         } else {
+            // A rebound parameter (`psi = []` inside the function that owns `psi`) is ALREADY
+            // declared — Java flatly FORBIDS redeclaring a local with a parameter's name in the
+            // same method ("variable psi is already defined in method ..."), a hard compile
+            // error, not silent shadowing (verified: schrodinger_oscillator's `evolve`, same
+            // root cause the C/C++ codegen had — see CStrategy's matching emitAlloc comment).
+            bool alreadyDeclared = declared.count(var) > 0;
             auto dElems = splitCommaTrimmed(content);
             bool allDicts = !dElems.empty();
             for (auto& e : dElems) if (!dictVars_.count(e)) { allDicts = false; break; }
@@ -10432,8 +10776,40 @@ class JavaStrategy : public BackendStrategy
                 if (promotedGlobals_.count(var)) {
                     listGlobalTypes_[var] = "String";
                     emit(out, indent, var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + elems + "));");
-                } else
+                } else if (alreadyDeclared)
+                    emit(out, indent, var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + elems + "));");
+                else
                     emit(out, indent, "java.util.ArrayList<String> " + var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + elems + "));");
+                return;
+            }
+            // Float list: cross-function evidence OR the literal's own content (same two
+            // sources as C's emitAlloc) — needs ArrayList<Double>, not the default <Long>,
+            // and no "L" suffix on its elements (a bare int literal promotes to Double for
+            // free when autoboxed into the list).
+            bool isFloatList = floatListVars_.count(var) > 0 || isAllFloatListContent(content);
+            if (isFloatList) {
+                floatListVars_.insert(var); listVars.insert(var); declared.insert(var);
+                // `Arrays.asList(1, 2.5)` infers `List<Number>`, not `List<Double>` — a bare
+                // int literal element must be cast to `double` explicitly, not just promoted
+                // by context, or the assignment to `ArrayList<Double>` fails to compile.
+                std::string elems;
+                {   std::istringstream iss(content); std::string tok; bool first = true;
+                    while (std::getline(iss, tok, ',')) {
+                        size_t a = tok.find_first_not_of(' '), b = tok.find_last_not_of(' ');
+                        std::string e = (a == std::string::npos) ? "" : tok.substr(a, b - a + 1);
+                        if (e.empty()) continue;
+                        if (!first) elems += ", ";
+                        elems += "(double)(" + e + ")";
+                        first = false;
+                    }
+                }
+                if (promotedGlobals_.count(var)) {
+                    listGlobalTypes_[var] = "Double";
+                    emit(out, indent, var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Double[0]" : elems) + "));");
+                } else if (alreadyDeclared)
+                    emit(out, indent, var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Double[0]" : elems) + "));");
+                else
+                    emit(out, indent, "java.util.ArrayList<Double> " + var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Double[0]" : elems) + "));");
                 return;
             }
             listVars.insert(var); declared.insert(var);
@@ -10453,7 +10829,9 @@ class JavaStrategy : public BackendStrategy
                 // file-scope (class-level) global already declared by the footer: assign, don't shadow it
                 listGlobalTypes_[var] = "Long";
                 emit(out, indent, var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Long[0]" : elems) + "));");
-            } else
+            } else if (alreadyDeclared)
+                emit(out, indent, var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Long[0]" : elems) + "));");
+            else
                 emit(out, indent, "java.util.ArrayList<Long> " + var + " = new java.util.ArrayList<>(java.util.Arrays.asList(" + (elems.empty() ? "new Long[0]" : elems) + "));");
         }
     }
@@ -10490,6 +10868,12 @@ class JavaStrategy : public BackendStrategy
             declared.insert(result);
             stringListVars_.insert(result);
             emit(out, indent, "String " + result + " = " + arr + ".get((int)(" + idx + "));");
+            return;
+        }
+        if (floatListVars_.count(arr)) {   // same gap, for a homogeneously-float list element
+            declared.insert(result);
+            floatVars.insert(result);
+            emit(out, indent, "double " + result + " = " + arr + ".get((int)(" + idx + "));");
             return;
         }
         // #23: lists are ArrayList<Long> — .get() auto-unboxes to long
@@ -10613,6 +10997,7 @@ class JavaStrategy : public BackendStrategy
                     ptype = "String";    // #6: inferred string param
                 } else if (listParams_.count(pname)) {
                     if (stringListVars_.count(pname)) { ptype = "java.util.ArrayList<String>"; stringListVars_.insert(pname); }
+                    else if (floatListVars_.count(pname)) { ptype = "java.util.ArrayList<Double>"; floatListVars_.insert(pname); }
                     else ptype = "java.util.ArrayList<Long>";   // #23: shared reference
                     listVars.insert(pname);
                 } else if (fit != funcTypedParams_.end()) {
@@ -10683,7 +11068,8 @@ class JavaStrategy : public BackendStrategy
         }
         stringParams_.clear();
         funcTypedParams_.clear();
-        std::string retT = returnIsList_ ? (stringListReturnFuncs_.count(name) ? "java.util.ArrayList<String>" : "java.util.ArrayList<Long>")
+        std::string retT = returnIsList_ ? (stringListReturnFuncs_.count(name) ? "java.util.ArrayList<String>"
+                              : floatListReturnFuncs_.count(name) ? "java.util.ArrayList<Double>" : "java.util.ArrayList<Long>")
                          : baseReturnIsString_ ? "String"
                          : returnIsFloat_ ? "double"
                          : returnIsVoid_ ? "void" : "long";
@@ -10924,6 +11310,17 @@ class RustStrategy : public BackendStrategy
     }
     std::set<std::string> stringListReturnFuncs_;
     void setStringListReturnFuncs(const std::set<std::string>& s) override { stringListReturnFuncs_ = s; }
+    // Same idea, one element type over (see BackendStrategy::setFloatListVars' own comment):
+    // closes the gap documented in ac_list_args_by_reference_and_eval_20261006's memory — Rust
+    // only ever emitted `Vec<i64>`/`Vec<String>` for a list-returning function, never
+    // `Vec<f64>`, so `hpsi`'s own return type mismatched its `Vec<f64>` body (schrodinger_
+    // oscillator's `let mut out = vec![]; out.push(<float>); return out;`).
+    std::set<std::string> floatListVars_;
+    void setFloatListVars(const std::set<std::string>& s) override {
+        floatListVars_.insert(s.begin(), s.end());
+    }
+    std::set<std::string> floatListReturnFuncs_;
+    void setFloatListReturnFuncs(const std::set<std::string>& s) override { floatListReturnFuncs_ = s; }
     void setFloatVarsFull(const std::set<std::string>& s) override {
         for (const auto& v : s) floatVars.insert(v);   // #42: pre-inferred float locals
     }
@@ -12007,7 +12404,11 @@ class RustStrategy : public BackendStrategy
                 // references (PY oracle), so take the bare name back out before borrowing it.
                 if (t.size() > 8 && t.compare(t.size() - 8, 8, ".clone()") == 0) t = t.substr(0, t.size() - 8);
                 if (t.rfind("&", 0) == 0) continue;
-                if (listParams_.count(t)) { parts[k] = t; continue; }   // already a `&mut` param
+                // A param of THIS function is already `&mut` — UNLESS it's one of this
+                // function's own rebound params, which are held BY VALUE (verified:
+                // schrodinger_oscillator's `evolve` passes its own rebound `psi` into `hpsi`,
+                // which needs `&mut psi` just like any other plain local would).
+                if (listParams_.count(t) && !reboundParams_.count(t)) { parts[k] = t; continue; }
                 bool plainLocal = !t.empty() && !listGlobals_.count(t) && t.rfind("t_", 0) != 0
                     && std::all_of(t.begin(), t.end(), [](char c){ return std::isalnum((unsigned char)c) || c == '_'; });
                 if (plainLocal) parts[k] = "&mut " + t;
@@ -12240,6 +12641,9 @@ class RustStrategy : public BackendStrategy
             if (stringListReturnFuncs_.count(func)) {
                 stringListVars_.insert(res);
                 emit(out, indent, "let mut " + res + ": Vec<String> = " + call + ";");
+            } else if (floatListReturnFuncs_.count(func)) {
+                floatListVars_.insert(res);
+                emit(out, indent, "let mut " + res + ": Vec<f64> = " + call + ";");
             } else {
                 listVars.insert(res);
                 emit(out, indent, "let mut " + res + ": Vec<i64> = " + call + ";");
@@ -12602,11 +13006,19 @@ class RustStrategy : public BackendStrategy
             // function's own OWN `-> Vec<i64>`/`Vec<String>` return type (verified: abu_speaks_ac's
             // `tokenize`'s `result = []` + `result.append(numbuf)` in a loop — "expected
             // `Vec<i64>`, found `Vec<&String>`").
+            // A rebound by-value parameter (`psi = []` inside the function that owns `psi`,
+            // held `mut psi: Vec<..>` not `&mut`, per reboundParams_) is ALREADY declared —
+            // `let mut psi = ...;` here would shadow it for the rest of this block, so a read
+            // at the SAME textual position on the next loop iteration keeps seeing the stale
+            // value through the original binding (verified: schrodinger_oscillator's `evolve`).
+            // Plain reassignment (no `let`) reuses the existing `mut` binding correctly.
+            bool alreadyDeclared = declared.count(var) > 0;
+            std::string floatAnn = floatListVars_.count(var) ? ": Vec<f64>" : "";
             if (stringListVars_.count(var)) {
-                emit(out, indent, "let mut " + var + ": Vec<String> = vec![" + content + "];");
+                emit(out, indent, (alreadyDeclared ? var + " = vec![" : "let mut " + var + ": Vec<String> = vec![") + content + "];");
                 stringListVars_.insert(var);
             } else {
-                emit(out, indent, "let mut " + var + " = vec![" + content + "];");
+                emit(out, indent, (alreadyDeclared ? var + " = vec![" : "let mut " + var + floatAnn + " = vec![") + content + "];");
             }
             listVars.insert(var);
             declared.insert(var);
@@ -12646,6 +13058,14 @@ class RustStrategy : public BackendStrategy
         if (isStringVar(arr)) {
             declared.insert(result);
             emit(out, indent, "let " + result + " = (" + arr + ".as_bytes()[(" + idx + ") as usize] as char).to_string();");
+            return;
+        }
+        if (floatListVars_.count(arr)) {
+            // f64 is Copy — no `.clone()` needed, unlike the String case above. decl()'s own
+            // generic inference doesn't know the vector's element type, so without this the
+            // temp was explicitly typed `i64` (verified: schrodinger_oscillator's `psi[j+1]`).
+            floatVars.insert(result); declared.insert(result);
+            emit(out, indent, "let " + result + ": f64 = " + arr + "[(" + idx + ") as usize];");
             return;
         }
         { std::string bare;
@@ -12813,6 +13233,9 @@ class RustStrategy : public BackendStrategy
                     if (stringListVars_.count(pname)) {
                         stringListVars_.insert(pname);
                         tparams += "mut " + pname + ": Vec<String>";
+                    } else if (floatListVars_.count(pname)) {
+                        floatListVars_.insert(pname);
+                        tparams += "mut " + pname + ": Vec<f64>";
                     } else
                         tparams += "mut " + pname + ": Vec<i64>";
                 } else if (listParams_.count(pname)) {
@@ -12821,6 +13244,9 @@ class RustStrategy : public BackendStrategy
                     if (stringListVars_.count(pname)) {
                         stringListVars_.insert(pname);
                         tparams += pname + ": &mut Vec<String>";
+                    } else if (floatListVars_.count(pname)) {
+                        floatListVars_.insert(pname);
+                        tparams += pname + ": &mut Vec<f64>";
                     } else
                         tparams += pname + ": &mut Vec<i64>";  // array parameter (by &mut)
                 } else if (fit != funcTypedParams_.end()) {
@@ -12896,7 +13322,8 @@ class RustStrategy : public BackendStrategy
         curFuncIsConstructor_ = isNew;
         curFuncReturnIsVoid_ = returnIsVoid_ && !isNew;
         std::string retT = curFuncReturnIsVoid_ ? ""
-            : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "-> Vec<String> " : "-> Vec<i64> ")
+            : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "-> Vec<String> "
+                              : floatListReturnFuncs_.count(name) ? "-> Vec<f64> " : "-> Vec<i64> ")
             : baseReturnIsString_ ? "-> String " : returnIsFloat_ ? "-> f64 " : "-> i64 ";
         // A free function whose every `return` traces to one directly-constructed bundle
         // instance (classFuncs_'s prescan, see setClassReturnFuncs) returns that struct
@@ -13275,6 +13702,16 @@ private:
     // comment) — decl()/emitTypedStoreVar need this to know a plain copy (`y := t_0`) should
     // infer via Go's own `:=` instead of declaring `int64` and punning a slice through it.
     std::set<std::string> goListVars_;
+    // See BackendStrategy::setFloatListVars' own comment: a homogeneously-float list needs
+    // `[]float64`, not the plain `[]int64` emitAlloc always wrote — `append(v, 1.5)` onto
+    // `[]int64` is a hard compile error on Go ("cannot use 1.5 (untyped float constant) as
+    // int64 value"), the loudest of the three silent/loud ways this bug showed up per backend.
+    std::set<std::string> floatListVars_;
+    void setFloatListVars(const std::set<std::string>& s) override {
+        floatListVars_.insert(s.begin(), s.end());
+    }
+    std::set<std::string> floatListReturnFuncs_;
+    void setFloatListReturnFuncs(const std::set<std::string>& s) override { floatListReturnFuncs_ = s; }
     std::set<std::string> pendingFreeVars_;
     // Relative path from output file's directory to project root (e.g. ".." for examples/)
     std::string relRoot_ = ".";
@@ -13964,6 +14401,8 @@ private:
         emitRaw(out, "        s := \"[\"; for i, e := range x { if i > 0 { s += \", \" }; s += fmt.Sprint(e) }; return s + \"]\"");
         emitRaw(out, "    case []string:");
         emitRaw(out, "        s := \"[\"; for i, e := range x { if i > 0 { s += \", \" }; s += \"'\" + e + \"'\" }; return s + \"]\"");
+        emitRaw(out, "    case []float64:");
+        emitRaw(out, "        s := \"[\"; for i, e := range x { if i > 0 { s += \", \" }; s += ac_fmt_double(e) }; return s + \"]\"");
         emitRaw(out, "    }");
         emitRaw(out, "    return fmt.Sprint(v)");
         emitRaw(out, "}");
@@ -14592,7 +15031,11 @@ private:
             goListVars_.insert(res);   // so a later plain copy (parts = t_0) keeps the []string type
             emit(out, indent, "var " + res + " []string = " + call);
         } else if (isListReturningFunc(func) && declared.insert(res).second) {
-            emit(out, indent, "var " + res + " []int64 = " + call);
+            if (floatListReturnFuncs_.count(func)) {
+                floatListVars_.insert(res);
+                emit(out, indent, "var " + res + " []float64 = " + call);
+            } else
+                emit(out, indent, "var " + res + " []int64 = " + call);
         } else if ((isFloatReturningFunc(func) || isUserFloatReturningFunc(func))
                    && declared.insert(res).second) {
             floatVars.insert(res);
@@ -14832,6 +15275,7 @@ private:
             emit(out, indent, "_ = " + iterVar);
             return;
         }
+        if (floatListVars_.count(collection)) floatVars.insert(iterVar);
         emit(out, indent, "for _, " + iterVar + " := range " + collection + " {");
         indent++;
     }
@@ -14901,8 +15345,21 @@ private:
                 declared.insert(var);
                 return;
             }
-            goListVars_.insert(var);   // so a later plain copy (b = a) keeps the []int64 type
-            emit(out, indent, var + " := []int64{" + content + "}");
+            // A rebound parameter (`psi = []` inside the function that owns `psi`) is ALREADY
+            // declared — Go's `:=` either shadows it (inside a nested block: a later read at
+            // the SAME textual position, including the next loop iteration which re-enters this
+            // same block, keeps seeing the stale value through the real parameter) or is a flat
+            // "no new variables on left side of :=" compile error (at the function's own top
+            // level) — same root cause as the C/C++/Java codegen had for this exact pattern
+            // (verified: schrodinger_oscillator's `evolve`). Plain `=` reuses the parameter.
+            bool alreadyDeclared = declared.count(var) > 0;
+            // Float list: cross-function evidence OR the literal's own content (same two
+            // sources as C's emitAlloc).
+            bool isFloatList = floatListVars_.count(var) > 0 || isAllFloatListContent(content);
+            if (isFloatList) floatListVars_.insert(var);
+            std::string elemT = isFloatList ? "[]float64{" : "[]int64{";
+            goListVars_.insert(var);   // so a later plain copy (b = a) keeps the []int64/[]float64 type
+            emit(out, indent, var + (alreadyDeclared ? " = " : " := ") + elemT + content + "}");
             declared.insert(var);
         }
     }
@@ -14935,6 +15392,15 @@ private:
             emit(out, indent, "if !_acok_" + result + " { panic(\"Preposterous: KeyError: key not found\") }");
             emit(out, indent, result + " := _acv_" + result);
             emit(out, indent, "_ = " + result);
+            return;
+        }
+        if (floatListVars_.count(arr)) {
+            // Go's `:=` correctly infers `float64` from `[]float64` indexing on its own, but
+            // AC's OWN downstream codegen (print/arithmetic) decides float-ness from the
+            // `floatVars` tracking set, not from Go's compile-time type — decl()'s generic
+            // fallback never sees `arr`, so it can't mark this without an explicit branch here.
+            floatVars.insert(result); declared.insert(result);
+            emit(out, indent, result + " := " + arr + "[" + idx + "]");
             return;
         }
         emit(out, indent, decl(result, arr + "[" + idx + "]"));
@@ -15059,7 +15525,8 @@ private:
                 } else if (isStringVar(pname)) {
                     tparams += pname + " string";    // #6: inferred string param
                 } else if (listParams_.count(pname)) {
-                    tparams += pname + " []int64";   // array parameter (slice: mutations visible)
+                    if (floatListVars_.count(pname)) { tparams += pname + " []float64"; floatListVars_.insert(pname); }
+                    else tparams += pname + " []int64";   // array parameter (slice: mutations visible)
                 } else if (fit != funcTypedParams_.end()) {
                     std::string argList;
                     for (int k = 0; k < fit->second; ++k) { if (k) argList += ", "; argList += "int64"; }
@@ -15116,7 +15583,7 @@ private:
         // `return <value>` either — it always returns `self` via its own dedicated line below.
         curFuncReturnIsVoid_ = returnIsVoid_ && !isNew;
         std::string retT = curFuncReturnIsVoid_ ? ""
-                         : returnIsList_ ? "[]int64"
+                         : returnIsList_ ? (floatListReturnFuncs_.count(name) ? "[]float64" : "[]int64")
                          : baseReturnIsString_ ? "string"
                          : returnIsFloat_ ? "float64" : "int64";
         // A free function whose every `return` traces to one directly-constructed bundle
@@ -16228,6 +16695,14 @@ class VStrategy : public BackendStrategy
     // `.clone()` or V refuses to compile ("use `x = y.clone()` instead of `x = y`"). Consulted
     // by emitScopeEnter/emitScopeExit's loop save/restore (see their own comment).
     std::set<std::string> listVars_;
+    // See BackendStrategy::setFloatListVars' own comment: a homogeneously-float list needs
+    // `[]f64`, not the plain `[]i64` emitAlloc always wrote.
+    std::set<std::string> floatListVars_;
+    void setFloatListVars(const std::set<std::string>& s) override {
+        floatListVars_.insert(s.begin(), s.end());
+    }
+    std::set<std::string> floatListReturnFuncs_;
+    void setFloatListReturnFuncs(const std::set<std::string>& s) override { floatListReturnFuncs_ = s; }
     void setReturnIsFloat(bool v) override { returnIsFloat_ = v; }
     void setFloatReturnFuncs(const std::set<std::string>& s) override { userFloatFuncs_ = s; }
     bool isUserFloatReturningFunc(const std::string& fn) const { return userFloatFuncs_.count(fn) > 0; }
@@ -16401,7 +16876,10 @@ class VStrategy : public BackendStrategy
         }
         if (!res.empty() && userListFuncs_.count(func) && declared.insert(res).second) {
             listVars_.insert(res); // same reasoning as stringVars_.insert above, for []i64
-            emit(out, indent, "mut " + res + " := " + call); // []i64 result, no i64() wrap
+            // AC's own downstream codegen (print/for-loop/index) decides float-ness from
+            // floatListVars_, not from V's compile-time `:=`-inferred type.
+            if (floatListReturnFuncs_.count(func)) floatListVars_.insert(res);
+            emit(out, indent, "mut " + res + " := " + call); // []i64/[]f64 result, type-inferred
             return;
         }
         if (!res.empty() && (isUserFloatReturningFunc(func) || isMLFloatReturningFunc(func)
@@ -16671,7 +17149,8 @@ class VStrategy : public BackendStrategy
             else if (seqOf_.count(collection))   emit(out, indent, "for " + tmp + " in " + seqOf_[collection].first + ".." + seqOf_[collection].second + " {");
             else                                 emit(out, indent, "for " + tmp + " in " + collection + " {");
             indent++;
-            emit(out, indent, iterVar + " = i64(" + tmp + ")");
+            if (floatListVars_.count(collection)) { floatVars.insert(iterVar); emit(out, indent, iterVar + " = f64(" + tmp + ")"); }
+            else emit(out, indent, iterVar + " = i64(" + tmp + ")");
             return;
         }
         if (rangeOf_.count(collection)) {
@@ -16696,6 +17175,7 @@ class VStrategy : public BackendStrategy
             declared.insert(iterVar);
             return;
         }
+        if (floatListVars_.count(collection)) floatVars.insert(iterVar);
         emit(out, indent, "for " + iterVar + " in " + collection + " {");
         indent++;
     }
@@ -16780,14 +17260,38 @@ class VStrategy : public BackendStrategy
             if (c.empty()) {
                 // A list already in scope (a parameter the body rebinds, `psi = []`) is assigned, not re-declared.
                 const bool inScope = promotedList || declared.count(var) > 0;
-                emit(out, indent, (inScope ? var + " = " : "mut " + var + " := ") + "[]i64{}");
+                // Float list: only cross-function evidence is possible here — an empty literal
+                // has no element text to infer from.
+                bool isFloatList = floatListVars_.count(var) > 0;
+                emit(out, indent, (inScope ? var + " = " : "mut " + var + " := ") + (isFloatList ? "[]f64{}" : "[]i64{}"));
                 declared.insert(var);
             } else {
-                size_t comma = c.find(',');
-                std::string vContent = comma != std::string::npos
-                                           ? "i64(" + c.substr(0, comma) + ")" + c.substr(comma)
-                                           : "i64(" + c + ")";
-                emit(out, indent, (promotedList ? var + " = " : "mut " + var + " := ") + "[" + vContent + "]");
+                // Float list: cross-function evidence OR the literal's own content (same two
+                // sources as C's emitAlloc) — needs `[]f64`, not the plain `[]i64` every
+                // element here used to get force-cast into via `i64(...)` (verified: a bare
+                // `.append(1.5)` elsewhere compiled, since V has no static check tying append's
+                // argument type to a LITERAL's inferred type the way a mismatched element here
+                // would, but silently truncated the value).
+                bool isFloatList = floatListVars_.count(var) > 0 || isAllFloatListContent(content);
+                if (isFloatList) floatListVars_.insert(var);
+                std::string castFn = isFloatList ? "f64(" : "i64(";
+                std::string vContent;
+                {   std::istringstream iss(c); std::string tok; bool first = true;
+                    while (std::getline(iss, tok, ',')) {
+                        size_t a2 = tok.find_first_not_of(' '), b2 = tok.find_last_not_of(' ');
+                        std::string e = (a2 == std::string::npos) ? "" : tok.substr(a2, b2 - a2 + 1);
+                        if (e.empty()) continue;
+                        if (!first) vContent += ", ";
+                        vContent += castFn + e + ")";
+                        first = false;
+                    }
+                }
+                // A list already in scope (a parameter the body rebinds, `psi = [...]`) is
+                // assigned, not re-declared — same rebound-param guard as the empty-list case
+                // just above (verified: schrodinger_oscillator's `evolve`, same root cause the
+                // other 5 backends had for this exact pattern).
+                bool inScope = promotedList || declared.count(var) > 0;
+                emit(out, indent, (inScope ? var + " = " : "mut " + var + " := ") + "[" + vContent + "]");
                 declared.insert(var);
             }
         }
@@ -16817,6 +17321,16 @@ class VStrategy : public BackendStrategy
             declared.insert(result);
             // A missing key is a hard error (PY raises KeyError); V's bare map index would give 0 / "".
             emit(out, indent, "mut " + result + " := " + arr + "[" + idx + "] or { panic('Preposterous: KeyError: key not found') }");
+            return;
+        }
+        if (floatListVars_.count(arr)) {
+            // V's `:=` correctly infers `f64` from `[]f64` indexing on its own, but AC's own
+            // downstream codegen (print/arithmetic) decides float-ness from the `floatVars`
+            // tracking set, not from V's compile-time type — decl()'s generic fallback never
+            // sees `arr`, so it can't mark this without an explicit branch here (same fix as
+            // Go's identical gap).
+            floatVars.insert(result); declared.insert(result);
+            emit(out, indent, "mut " + result + " := " + arr + "[" + idx + "]");
             return;
         }
         emit(out, indent, decl(result, arr + "[" + idx + "]"));
@@ -16961,11 +17475,17 @@ class VStrategy : public BackendStrategy
             } else if (isList && !isGenerator_ && !reboundParams_.count(paramNames[i])) {
                 // A `mut` array param is passed by reference (see the call site): the body
                 // works on the parameter itself, with no `_p` copy, so writes reach the caller.
-                tparams += "mut " + paramNames[i] + " []i64";
+                if (floatListVars_.count(paramNames[i])) { tparams += "mut " + paramNames[i] + " []f64"; floatListVars_.insert(paramNames[i]); }
+                else tparams += "mut " + paramNames[i] + " []i64";
             } else if (isList && isGenerator_) {
                 // Generator wrapper: it only forwards the list into its goroutine (by value), but
                 // must still accept the `mut` the call site passes.
-                tparams += "mut " + paramNames[i] + "_p []i64";
+                if (floatListVars_.count(paramNames[i])) tparams += "mut " + paramNames[i] + "_p []f64";
+                else tparams += "mut " + paramNames[i] + "_p []i64";
+            } else if (isList && floatListVars_.count(paramNames[i])) {
+                // Rebound by value (reboundParams_): same `[]f64` need as the by-ref case above.
+                floatListVars_.insert(paramNames[i]);
+                tparams += paramNames[i] + "_p []f64";
             } else {
                 tparams += paramNames[i] + "_p " + (isStr ? "string" : isList ? "[]i64" : isFloat ? "f64" : "i64");
             }
@@ -17028,7 +17548,8 @@ class VStrategy : public BackendStrategy
         curFuncReturnIsVoid_ = returnIsVoid_ && !isNew;
         std::string vret = curFuncReturnIsVoid_ ? ""
                          : baseReturnIsString_ ? "string"
-                         : baseReturnIsList_ ? "[]i64" : returnIsFloat_ ? "f64" : "i64";
+                         : baseReturnIsList_ ? (floatListReturnFuncs_.count(name) ? "[]f64" : "[]i64")
+                         : returnIsFloat_ ? "f64" : "i64";
         curFuncReturnsDyn_ = !isNew && classOwner.empty() && boxedRetFuncs_.count(name) > 0;
         if (curFuncReturnsDyn_) vret = "AcDynVal";   // returns a var whose type cycles (see detectBoxedVars)
         // A free function whose every `return` traces to one directly-constructed bundle
@@ -17677,6 +18198,15 @@ class AsmStrategy : public BackendStrategy
     std::set<std::string> floatVars_;
     void setFloatVarsFull(const std::set<std::string>& s) override { floatVars_ = s; }
     bool isFloatVal(const std::string &v) const { return floatVars_.count(v) > 0 || looksFloat(v); }
+    // Same side-table idea, one level up (see BackendStrategy::setFloatListVars' own comment):
+    // which ARRAYS hold float bit patterns. The array STORAGE itself needs no change at all —
+    // loadRAX already produces the right bits for a float literal/expression element, append
+    // just copies 8 bytes regardless of what they mean — this is purely about which arrays
+    // PRINT as floats and which LOAD_INDEX results get marked float for downstream arithmetic.
+    std::set<std::string> floatListVars_;
+    void setFloatListVars(const std::set<std::string>& s) override { floatListVars_.insert(s.begin(), s.end()); }
+    std::set<std::string> floatListReturnFuncs_;
+    void setFloatListReturnFuncs(const std::set<std::string>& s) override { floatListReturnFuncs_ = s; }
     // Same gap as floatVars_ above, one level up: the shared pre-pass already knows WHICH
     // user-defined functions return a float (e.g. `mean` after emitTrueDivision's fix below makes
     // `/` a real float op) and hands it to every backend via setFloatReturnFuncs — every other
@@ -19417,6 +19947,10 @@ class AsmStrategy : public BackendStrategy
                 }
             }
         }
+        // Float list: cross-function evidence (append/return/param — crossFnFloatListVars_) OR
+        // the literal's own content (isAllFloatListContent, for the no-append case this list's
+        // only occurrence IS the literal) — same two sources as every other backend's emitAlloc.
+        if (floatListVars_.count(var) > 0 || isAllFloatListContent(content)) floatListVars_.insert(var);
         auto elems = splitElems(content);
         int n = (int)elems.size();
         // Layout: [cap][len][e0][e1]...  — a hidden capacity word one slot before the len
@@ -19492,6 +20026,10 @@ class AsmStrategy : public BackendStrategy
         out << "    mov rcx, rax\n";
         out << "    mov rax, qword [rbx + 8 + rcx*8]\n";
         storeRAX(out, result);
+        // The loaded 8-byte slot is already the right bits whether it's a float or an int — this
+        // just propagates the array's own float-ness onto the result, same as the dict-ness
+        // propagation just below, so downstream arithmetic/print on `result` uses FP ops.
+        if (floatListVars_.count(arr)) floatVars_.insert(result);
         // A list-of-dicts element read (e.g. `p1 = pets[1]`, datac multi-row import) yields a
         // dict-block pointer — the value itself was already stored correctly by the generic
         // list ALLOC above (loadRAX resolves a plain var name like any other), this just
@@ -19817,7 +20355,11 @@ class AsmStrategy : public BackendStrategy
         if (isListVar(val))
         {
             // "[e0, e1, ...]" — matches PY's list repr. Elements are plain ints (same scope as
-            // CStrategy's own ac_arr_print — nested/mixed-type arrays aren't a demonstrated case).
+            // CStrategy's own ac_arr_print — nested/mixed-type arrays aren't a demonstrated case),
+            // UNLESS floatListVars_ marks this array's elements as float bit patterns — same
+            // per-element %.16g-plus-forced-".0" formatting the scalar float print already uses
+            // (see its own comment), just run once per element inside this loop instead of once.
+            bool isFloatList = floatListVars_.count(val) > 0;
             int idx = strIdx++;
             std::string loopL = "_arrprint_loop" + std::to_string(idx);
             std::string skipL = "_arrprint_noskip" + std::to_string(idx);
@@ -19825,7 +20367,7 @@ class AsmStrategy : public BackendStrategy
             loadRAX(out, val);
             out << "    mov rbx, rax\n";              // rbx = array base
             out << "    mov r12, qword [rbx]\n";       // r12 = length
-            out << "    mov rdi, 4096\n    call malloc\n";
+            out << "    mov rdi, " << (isFloatList ? 8192 : 4096) << "\n    call malloc\n";
             calledFuncs_.insert("malloc");
             out << "    mov r13, rax\n";               // r13 = output buffer
             out << "    mov byte [r13], '['\n";
@@ -19837,11 +20379,31 @@ class AsmStrategy : public BackendStrategy
             out << "    mov byte [r14], ','\n    inc r14\n";
             out << "    mov byte [r14], ' '\n    inc r14\n";
             out << skipL << ":\n";
-            out << "    mov rdi, r14\n    mov rsi, 24\n    lea rdx, [rel _fmt_dbare]\n";
-            out << "    mov rcx, qword [rbx + 8 + r15*8]\n";
-            out << "    xor eax, eax\n    call snprintf\n";
-            calledFuncs_.insert("snprintf");
-            out << "    add r14, rax\n";
+            if (isFloatList) {
+                // r12/r13/r14/r15 are SysV callee-saved — every call below preserves them with
+                // no manual save/restore needed, same as the rest of this loop already assumes.
+                std::string haveDotL = "_arrprint_havedot" + std::to_string(idx);
+                out << "    mov rax, qword [rbx + 8 + r15*8]\n";
+                out << "    movq xmm0, rax\n";
+                out << "    mov rdi, r14\n    mov rsi, 24\n    lea rdx, [rel _fmt_fbare]\n";
+                out << "    mov al, 1\n    call snprintf\n";
+                calledFuncs_.insert("snprintf");
+                out << "    mov r8, rax\n";   // chars written (excludes null terminator)
+                out << "    mov rdi, r14\n    lea rsi, [rel _fmt_dotcheck]\n    call strpbrk\n";
+                calledFuncs_.insert("strpbrk");
+                out << "    test rax, rax\n    jnz " << haveDotL << "\n";
+                out << "    mov byte [r14 + r8], '.'\n";
+                out << "    mov byte [r14 + r8 + 1], '0'\n";
+                out << "    add r8, 2\n";
+                out << haveDotL << ":\n";
+                out << "    add r14, r8\n";
+            } else {
+                out << "    mov rdi, r14\n    mov rsi, 24\n    lea rdx, [rel _fmt_dbare]\n";
+                out << "    mov rcx, qword [rbx + 8 + r15*8]\n";
+                out << "    xor eax, eax\n    call snprintf\n";
+                calledFuncs_.insert("snprintf");
+                out << "    add r14, rax\n";
+            }
             out << "    inc r15\n    jmp " << loopL << "\n";
             out << doneL << ":\n";
             out << "    mov byte [r14], ']'\n    inc r14\n";
@@ -21297,6 +21859,14 @@ class UnifiedIRCodeGen
     // return-type propagation needed it (see the floatFuncs/stringFuncs fixpoint comment).
     std::map<std::string, std::set<std::string>> crossFnStringListVars_;
     std::set<std::string> stringListReturnFuncs_;   // fn names whose returned array is a string list
+    // Same two rules, for a homogeneously FLOAT array instead of a string one — see the
+    // "Float-LIST detection" block (right after the string one) for the fixpoint itself, which
+    // also adds a third rule strings don't need: a caller's known-float-list ARGUMENT makes the
+    // callee's matching parameter a float list too (schrodinger_oscillator's `psi`/`xs`, never
+    // appended to or returned inside the functions that only index them, need this to propagate
+    // at all — mirrors crossFnFloatParams_'s own caller->callee direction for scalars).
+    std::map<std::string, std::set<std::string>> crossFnFloatListVars_;
+    std::set<std::string> floatListReturnFuncs_;   // fn names whose returned array is a float list
     // Which of a function's OWN parameters are float, from CALL-SITE evidence — a param whose
     // only evidence of being float is that EVERY caller passes a known-float value (e.g.
     // apply_line's `x`, only ever combined with `val` in a division/pow, never with a literal
@@ -22471,6 +23041,10 @@ class UnifiedIRCodeGen
             auto slIt = crossFnStringListVars_.find(func.name);
             if (slIt != crossFnStringListVars_.end()) strategy->setStringListVars(slIt->second);
         }
+        {
+            auto flIt = crossFnFloatListVars_.find(func.name);
+            if (flIt != crossFnFloatListVars_.end()) strategy->setFloatListVars(flIt->second);
+        }
         strategy->setBoxedVars(detectBoxedVars(func.instructions, ir.symbols, fnStringVars, protoStringFuncs_, boxedRetFuncsDrv_));
 
         // Pre-scan: detect function return type (float or list)
@@ -23459,14 +24033,32 @@ public:
         // param already supports exactly this — it just always got an empty `{}` here before)
         // converges regardless of function order, same fix shape as crossFnStringVars_ above.
         {
-            std::set<std::string> floatFuncs;
+            // Seed with the known ilib float-returning calls (type.hpp's acCallReturnsFloat
+            // authority covers these, but this whole-program fixpoint only ever tracked USER
+            // function returns via `return` statements — an external ilib call never has one in
+            // the AC source, so it was invisible here no matter how many fixpoint rounds ran.
+            // Without this, `t = ml.take(w)` never got added to floatVars_, so Term.display fell
+            // through to PY's raw print() instead of the %.16g-matching _ac_dblprint path —
+            // verified real bug: ml_autodiff.ac/ml_scalar.ac printed Python's full-precision
+            // repr() (e.g. "1.6400000000000001") instead of matching every other backend's
+            // "1.64". math.* is deliberately NOT included here: C's own isIntReturningMathFunc
+            // already special-cases the few genuinely-int math.* names per-backend, and most of
+            // ir_codegen.cpp's backends consult that directly rather than through this generic
+            // mechanism — widening the net here risks double-counting/conflicting with those.
+            std::set<std::string> floatFuncs = {"ml.take", "ml_take", "aczip.get_ratio", "aczip_get_ratio"};
             std::set<std::string> listFuncs;
             std::set<std::string> stringFuncs;
             std::map<std::string, std::set<int>> userFloatParamIdx;
             std::map<std::string, const AC_IR::IRFunction*> fnByName;
             for (const auto& fn : ir.functions) fnByName[fn.name] = &fn;
             // The top-level program makes calls too (`x = f(0.5, 1)` in the mainloop), and the loop
-            // below only walks ir.functions. Seed the float constant arguments of those calls first.
+            // below only walks ir.functions. Seed the float constant arguments of those calls first
+            // — PLUS a top-level VARIABLE whose own float-ness comes from arithmetic rather than a
+            // literal (`h = 16.0 / 200.0; evolve(psi, xs, h, ...)` — verified: schrodinger_
+            // oscillator's `h`, invisible to the CONST-only check, left `evolve`'s own `h: i64`).
+            std::vector<AC_IR::IRInstruction> topBodyForFloatSeed = ir.globalInit;
+            topBodyForFloatSeed.insert(topBodyForFloatSeed.end(), ir.mainSection.begin(), ir.mainSection.end());
+            std::set<std::string> topFloatVarsForSeed = detectFloatVars(topBodyForFloatSeed, ir.symbols, {});
             for (const auto* body : {&ir.globalInit, &ir.mainSection}) {
                 for (const auto& ins : *body) {
                     if (ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL) continue;
@@ -23482,7 +24074,10 @@ public:
                         size_t pidx = k - 1;
                         if (pidx >= cit->second->parameters.size()) break;
                         const auto& arg = ins.typedOperands[k];
-                        if (arg.kind == IRRef::Kind::CONST && arg.value.type == IRType::FLOAT)
+                        bool argIsTopFloat = (arg.kind == IRRef::Kind::CONST && arg.value.type == IRType::FLOAT)
+                            || (arg.kind == IRRef::Kind::VAR && arg.id >= 0 && topFloatVarsForSeed.count(ir.symbols.getName(arg.id)))
+                            || (arg.kind == IRRef::Kind::TEMP && topFloatVarsForSeed.count("t_" + std::to_string(arg.id)));
+                        if (argIsTopFloat)
                             crossFnFloatParams_[cit->second->name].insert(cit->second->parameters[pidx]);
                     }
                 }
@@ -23753,13 +24348,32 @@ public:
                 if (r.kind == IRRef::Kind::TEMP) return "t_" + std::to_string(r.id);
                 return "";
             };
+            // A `<mainloop>` program's own body (mainSection + globalInit) makes append/CALL
+            // instructions too, but is not a named IRFunction — scanned under the empty-name
+            // key "" as a caller/source only, same convention as the float-list block below
+            // (verified real bug: `v = []; v.append($a$); Term.display v` at top level never
+            // marked `v` a string list at all — C then pushed the ac_str pointer through
+            // ac_arr_push, the plain-int variant, "makes integer from pointer without a cast").
+            std::vector<IRInstruction> slTopBody = ir.globalInit;
+            slTopBody.insert(slTopBody.end(), ir.mainSection.begin(), ir.mainSection.end());
+            // Seed crossFnStringVars_[""] once (operator[] creates it) — the loop below then
+            // mutates it in place exactly like a named function's own entry (the forward rule,
+            // `first = tokens[1]`, needs to write new evidence back into it, not just read it).
+            {
+                auto topStrs0 = detectStringVars(slTopBody, ir.symbols, {}, protoStringFuncs_);
+                crossFnStringVars_[""].insert(topStrs0.begin(), topStrs0.end());
+            }
+            std::vector<std::pair<std::string, const std::vector<IRInstruction>*>> slScanBodies;
+            slScanBodies.push_back({"", &slTopBody});
+            for (auto& fn : ir.functions) slScanBodies.push_back({fn.name, &fn.instructions});
             bool changed = true;
             int guard = 0;
             while (changed && guard++ < 50) {
                 changed = false;
-                for (auto& func : ir.functions) {
-                    auto& mine = crossFnStringListVars_[func.name];
-                    auto& myStrs = crossFnStringVars_[func.name];
+                for (auto& [ownerName, instrsPtr] : slScanBodies) {
+                    const auto& instrs = *instrsPtr;
+                    auto& mine = crossFnStringListVars_[ownerName];
+                    auto& myStrs = crossFnStringVars_[ownerName];
                     auto isKnownStr = [&](const IRRef& r) {
                         return (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING)
                             || myStrs.count(refName(r)) > 0;
@@ -23770,14 +24384,14 @@ public:
                     // backward onto the temp. Track temp-id -> source-array so the STORE_VAR
                     // case below can make that backward connection.
                     std::map<int, std::string> loadIdxOrigin;
-                    for (auto& ins : func.instructions) {
+                    for (auto& ins : instrs) {
                         if (ins.opcode == IROpcode::LOAD_INDEX && !ins.typedOperands.empty()
                                 && ins.result.kind == IRRef::Kind::TEMP) {
                             std::string arrName = refName(ins.typedOperands[0]);
                             if (!arrName.empty()) loadIdxOrigin[ins.result.id] = arrName;
                         }
                     }
-                    for (auto& ins : func.instructions) {
+                    for (auto& ins : instrs) {
                         // `v = t` (STORE_VAR) where t came from indexing an array and v is a
                         // known string -> the array itself must be a string list. Needed for a
                         // READ-ONLY array param that's only ever indexed, never appended to
@@ -23850,13 +24464,146 @@ public:
                         // the function itself is a string-list-returning function.
                         if (ins.opcode == IROpcode::RETURN && !ins.typedOperands.empty()) {
                             std::string rn = refName(ins.typedOperands[0]);
-                            if (!rn.empty() && mine.count(rn) && stringListReturnFuncs_.insert(func.name).second)
+                            if (!rn.empty() && mine.count(rn) && !ownerName.empty()
+                                    && stringListReturnFuncs_.insert(ownerName).second)
                                 changed = true;
                         }
                     }
                 }
             }
             if (!stringListReturnFuncs_.empty()) strategy->setStringListReturnFuncs(stringListReturnFuncs_);
+        }
+
+        // Float-LIST detection — mirrors the String-LIST block just above (same LOAD_INDEX
+        // backward/forward rule, same .append/CALL/RETURN rules), plus one more rule strings
+        // don't need: a caller's known-float-list ARGUMENT makes the callee's matching
+        // parameter a float list too. Needed when a param is only ever indexed or passed
+        // through — never appended to or returned — inside the function that owns it
+        // (schrodinger_oscillator's hpsi/energy take `psi`/`xs` exactly this way; the list's
+        // only real evidence, `.append(floatExpr)`, happens in a DIFFERENT function entirely).
+        // crossFnFloatParams_/protoFloatFuncs_ are already stable by this point (computed by
+        // the scalar float fixpoint earlier in generate()) — treated as fixed inputs here,
+        // exactly like crossFnStringVars_ is treated as fixed input to the string-list block.
+        {
+            crossFnFloatListVars_.clear();
+            floatListReturnFuncs_.clear();
+            auto refName = [&](const IRRef& r) -> std::string {
+                if (r.kind == IRRef::Kind::VAR && r.id >= 0) return ir.symbols.getName(r.id);
+                if (r.kind == IRRef::Kind::TEMP) return "t_" + std::to_string(r.id);
+                return "";
+            };
+            std::map<std::string, const IRFunction*> byNameFL;
+            for (auto& fn : ir.functions) byNameFL[fn.name] = &fn;
+            // A `<mainloop>` program's own body (mainSection + globalInit) makes append/CALL
+            // instructions too, but is not a named IRFunction — scanned under the empty-name key
+            // "" (same convention the scalar cross-function fixpoint already uses for callerBodies),
+            // as a caller/source only: nothing calls "" as a callee, so it never needs a RETURN rule.
+            std::vector<IRInstruction> topBody = ir.globalInit;
+            topBody.insert(topBody.end(), ir.mainSection.begin(), ir.mainSection.end());
+            std::vector<std::pair<std::string, const std::vector<IRInstruction>*>> scanBodies;
+            scanBodies.push_back({"", &topBody});
+            for (auto& fn : ir.functions) scanBodies.push_back({fn.name, &fn.instructions});
+            bool changed = true;
+            int guard = 0;
+            while (changed && guard++ < 50) {
+                changed = false;
+                std::map<std::string, std::set<std::string>> extraFloatListParams;
+                for (auto& [ownerName, instrsPtr] : scanBodies) {
+                    const auto& instrs = *instrsPtr;
+                    auto& mine = crossFnFloatListVars_[ownerName];
+                    auto cfpIt = crossFnFloatParams_.find(ownerName);
+                    std::set<std::string> seed = cfpIt != crossFnFloatParams_.end() ? cfpIt->second : std::set<std::string>();
+                    std::set<std::string> myFloats = detectFloatVars(instrs, ir.symbols, protoFloatFuncs_, seed);
+                    auto isKnownFloat = [&](const IRRef& r) {
+                        return (r.kind == IRRef::Kind::CONST && r.value.type == IRType::FLOAT)
+                            || myFloats.count(refName(r)) > 0;
+                    };
+                    std::map<int, std::string> loadIdxOrigin;
+                    for (auto& ins : instrs) {
+                        if (ins.opcode == IROpcode::LOAD_INDEX && !ins.typedOperands.empty()
+                                && ins.result.kind == IRRef::Kind::TEMP) {
+                            std::string arrName = refName(ins.typedOperands[0]);
+                            if (!arrName.empty()) loadIdxOrigin[ins.result.id] = arrName;
+                        }
+                    }
+                    for (auto& ins : instrs) {
+                        // backward: a LOAD_INDEX'd value later found known-float -> the array
+                        // it came from is a float list (same shape as the string rule).
+                        if (ins.opcode == IROpcode::STORE_VAR) {
+                            IRRef tgt, val; bool have = false;
+                            if (ins.typedOperands.size() >= 2) { tgt = ins.typedOperands[0]; val = ins.typedOperands[1]; have = true; }
+                            else if (ins.result.isValid() && !ins.typedOperands.empty()) { tgt = ins.result; val = ins.typedOperands[0]; have = true; }
+                            if (have && val.kind == IRRef::Kind::TEMP) {
+                                auto loIt = loadIdxOrigin.find(val.id);
+                                if (loIt != loadIdxOrigin.end()
+                                        && (isKnownFloat(tgt) || ins.resultType == IRType::FLOAT)
+                                        && mine.insert(loIt->second).second)
+                                    changed = true;
+                            }
+                        }
+                        // `arr.append(x)` where x is known-float -> arr is a float list.
+                        if (ins.opcode == IROpcode::LIB_CALL && !ins.typedOperands.empty()) {
+                            std::string fn;
+                            const auto& f0 = ins.typedOperands[0];
+                            if (f0.kind == IRRef::Kind::CONST && f0.value.type == IRType::STRING)
+                                fn = std::get<std::string>(f0.value.data);
+                            else if (f0.kind == IRRef::Kind::VAR) fn = refName(f0);
+                            for (const char* suf : {".append", "_append"}) {
+                                size_t sl = strlen(suf);
+                                if (fn.size() > sl && fn.compare(fn.size() - sl, sl, suf) == 0
+                                        && ins.typedOperands.size() >= 2 && isKnownFloat(ins.typedOperands[1])) {
+                                    std::string recv = fn.substr(0, fn.size() - sl);
+                                    if (!recv.empty() && mine.insert(recv).second) changed = true;
+                                }
+                            }
+                        }
+                        // `y = someFunc(...)` where someFunc's own returned array is float -> y is too.
+                        if (ins.opcode == IROpcode::CALL
+                                && (ins.result.kind == IRRef::Kind::VAR || ins.result.kind == IRRef::Kind::TEMP)
+                                && !ins.typedOperands.empty()) {
+                            std::string callee = refName(ins.typedOperands[0]);
+                            if (callee.empty() && ins.typedOperands[0].kind == IRRef::Kind::CONST
+                                    && ins.typedOperands[0].value.type == IRType::STRING)
+                                callee = std::get<std::string>(ins.typedOperands[0].value.data);
+                            if (floatListReturnFuncs_.count(callee)) {
+                                std::string rn = refName(ins.result);
+                                if (!rn.empty() && mine.insert(rn).second) changed = true;
+                            }
+                        }
+                        // This function's own RETURN traces to a known float-list var -> the
+                        // function itself is a float-list-returning function.
+                        if (ins.opcode == IROpcode::RETURN && !ins.typedOperands.empty()) {
+                            std::string rn = refName(ins.typedOperands[0]);
+                            if (!rn.empty() && mine.count(rn) && !ownerName.empty()
+                                    && floatListReturnFuncs_.insert(ownerName).second)
+                                changed = true;
+                        }
+                        // Caller argument -> callee parameter (the extra rule strings don't
+                        // need): collected into a side table and merged after the full scan,
+                        // same self/mutual-recursion safety as crossFnFloatParams_'s own `extra`.
+                        if (ins.opcode == IROpcode::CALL && !ins.typedOperands.empty()) {
+                            std::string callee = refName(ins.typedOperands[0]);
+                            if (callee.empty() && ins.typedOperands[0].kind == IRRef::Kind::CONST
+                                    && ins.typedOperands[0].value.type == IRType::STRING)
+                                callee = std::get<std::string>(ins.typedOperands[0].value.data);
+                            auto cit = byNameFL.find(callee);
+                            if (cit != byNameFL.end()) {
+                                for (size_t k = 1; k < ins.typedOperands.size(); k++) {
+                                    size_t pidx = k - 1;
+                                    if (pidx >= cit->second->parameters.size()) break;
+                                    std::string argName = refName(ins.typedOperands[k]);
+                                    if (!argName.empty() && mine.count(argName))
+                                        extraFloatListParams[cit->second->name].insert(cit->second->parameters[pidx]);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (auto& kv : extraFloatListParams)
+                    for (auto& p : kv.second)
+                        if (crossFnFloatListVars_[kv.first].insert(p).second) changed = true;
+            }
+            if (!floatListReturnFuncs_.empty()) strategy->setFloatListReturnFuncs(floatListReturnFuncs_);
         }
 
         strategy->setNeedsInput(hasInput);
@@ -24195,6 +24942,8 @@ public:
                 // setStringListVars ran) correctly said `std::vector<std::string>&`.
                 { auto slIt = crossFnStringListVars_.find(func.name);
                   if (slIt != crossFnStringListVars_.end()) strategy->setStringListVars(slIt->second); }
+                { auto flIt = crossFnFloatListVars_.find(func.name);
+                  if (flIt != crossFnFloatListVars_.end()) strategy->setFloatListVars(flIt->second); }
                 // detectFloatParams (built for ASM's untyped bit-slot model — see its own
                 // comment) is equally the right "infer from local usage" signal for a
                 // STATICALLY-TYPED param whose type is never explicit in the AC source
@@ -24225,6 +24974,7 @@ public:
                 strategy->setFuncTypedParams(ftp);
                 int retKind = 0;
                 if (stringListReturnFuncs_.count(func.name)) retKind = 5;
+                else if (floatListReturnFuncs_.count(func.name)) retKind = 6;
                 else if (protoListFuncs_.count(func.name))  retKind = 2;
                 else if (protoFloatFuncs_.count(func.name)) retKind = 1;
                 else if (protoStringFuncs_.count(func.name)) retKind = 3;
@@ -24247,6 +24997,14 @@ public:
             strategy->emitFuncValueDispatch(out, indentLevel);
 
         // Second pass: emit main body (skip class blocks).
+        // listParams_/reboundParams_ are only ever set inside the per-function loops above —
+        // left over from whichever function was emitted LAST by the time the mainloop body
+        // (never a "function", never anyone's parameter) gets its turn. A mainloop-level call
+        // whose argument happens to share a name with that leftover function's own param/rebound
+        // set got the WRONG by-ref/by-value decision (verified: schrodinger_oscillator's
+        // `evolve(psi_even, xs, ...)` at mainloop scope — `xs` needed `&mut` and didn't get it).
+        strategy->setListParams({});
+        strategy->setReboundParams({});
         // #6: the mainloop (globalInit) needs its own string inference — it's not a function, so
         // genFunction's setStringVars never ran for it. Without this, mainloop string vars are
         // mis-declared (e.g. `.length` vs `.length()`, non-string FOR).
@@ -24258,6 +25016,8 @@ public:
             std::set<std::string> mlStr = detectStringVars(mlBody, ir.symbols, {}, protoStringFuncs_);
             for (const auto& nv : detectNumericRetype(mlBody, ir.symbols, mlStr)) mlStr.erase(nv);
             strategy->setStringVars(mlStr);   // #retype
+            { auto slIt = crossFnStringListVars_.find(""); if (slIt != crossFnStringListVars_.end()) strategy->setStringListVars(slIt->second); }
+            { auto flIt = crossFnFloatListVars_.find(""); if (flIt != crossFnFloatListVars_.end()) strategy->setFloatListVars(flIt->second); }
             strategy->setBoxedVars(detectBoxedVars(ir.globalInit, ir.symbols, mlStr, protoStringFuncs_, boxedRetFuncsDrv_));
         }
         // Mainloop cross-block hoist (block-scoped backends: JS/C/C++/V/Java/Rust) — the mainloop

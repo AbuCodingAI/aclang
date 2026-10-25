@@ -323,6 +323,7 @@ public:
     void rdtsc() { emit(0x0F); emit(0x31); }                   // rdtsc → edx:eax
     void shl_r_i8(R r, uint8_t n) { rex(true,0,(int)r); emit(0xC1); modrm(3,4,(int)r); emit(n); } // shl r64, imm8
     void shr_r_i8(R r, uint8_t n) { rex(true,0,(int)r); emit(0xC1); modrm(3,5,(int)r); emit(n); } // shr r64, imm8
+    void sar_r_i8(R r, uint8_t n) { rex(true,0,(int)r); emit(0xC1); modrm(3,7,(int)r); emit(n); } // sar r64, imm8 (arithmetic, sign-preserving)
     // shl/shr r64, cl — variable shift count (the shift amount must be in CL; the shift-target
     // register itself can be any GPR, unlike shl_rax_cl/sar_rax_cl above which are RAX-only).
     void shl_r_cl(R r) { rex(true,0,(int)r); emit(0xD3); modrm(3,4,(int)r); }
@@ -785,6 +786,9 @@ static bool isIntReturningMathCall(const std::string& irName) {
     static const std::set<std::string> intReturning = {
         "math.to_int", "math.abs_int", "math.mod_int",
         "math.gcd",    "math.lcm",     "math.is_prime",
+        // modpow/modinv/modmul are int64_t in the real C ABI (math.cpp) — unlike
+        // integrate/derivative/limit/minima/maxima/eval, which are genuinely double.
+        "math.modpow", "math.modinv",  "math.modmul",
     };
     return intReturning.find(irName) != intReturning.end();
 }
@@ -792,6 +796,43 @@ static bool isIntReturningMathCall(const std::string& irName) {
 // Returns true if an external call returns a double in XMM0 (System V ABI float return)
 // ilib functions returning char* — their PRINT must go through __ac_print_cstr__,
 // otherwise the pointer prints as an integer (the classic stack-address output).
+// Real exported C functions that return a plain 32-bit `int` (not int64_t/long long like
+// almost every other ilib function) AND can genuinely return a negative value — the SysV ABI
+// only guarantees the callee filled EAX; the upper 32 bits of RAX are whatever garbage was
+// there before, so a caller that wants the full 64-bit register (every caller here does, since
+// BNY has no narrower-than-64-bit value representation) must sign-extend EAX→RAX itself.
+// Functions that only ever return 0/1/a small count (startswith/endswith/count/scan/ischar/
+// isws) happen to "work" without this (their non-negative low 32 bits read fine as long as the
+// stale upper bits happen to be zero), but stringm.find's -1 "not found" sentinel made the gap
+// visible immediately: printed 4294967295 (0xFFFFFFFF zero-extended) instead of -1 — verified
+// real bug via string_cheese_checks.ac.
+static bool returnsInt32NeedingSignExtend(const std::string& irName) {
+    // native-cpu's ptr_update/ptr_free are also plain `int` in the real C ABI and can return
+    // -1 (ptr_update on a bad handle, a second ptr_free) — same gap as stringm.find, verified
+    // real bug via native_cpu_frames.ac printing 4294967295 instead of -1.
+    return irName == "stringm.find" || irName == "ptr_update" || irName == "ptr_free";
+}
+
+// Ilib calls whose real C export is semantically bool (0/1, never negative) but have no
+// runtime type tag telling PRINT so — without this they printed "0"/"1" instead of PY's
+// "False"/"True". Combined from the equivalent canonical lists already proven on Go
+// (goBoolFuncs) and Java (glBoolFuncs) in ir_codegen.cpp, plus web.pdf/text/inspect (confirmed
+// via web.pdf's pure-Python reimplementation returning a real bool — verified real bug via
+// web_check.ac printing "0" instead of "False").
+static bool isBoolReturningIlibCall(const std::string& irName) {
+    static const std::set<std::string> boolFuncs = {
+        "os.exists",
+        "regex.match", "regex.test",
+        "maudio.tts_ok", "maudio.stt_ok",
+        "stringm.ischar", "stringm.startswith", "stringm.endswith", "stringm.isws", "stringm.scan",
+        "web.pdf", "web.text", "web.inspect",
+        "gl.init", "gl.obj_circle_fell", "gl.is_obj", "gl.is_draw", "gl.hitbox_overlap",
+        "gl.hitbox_many_overlap", "gl.hitbox_overlap_boundary", "gl.hitbox_overlap_pattern",
+        "gl.frame_begin", "gl.key_pressed", "gl.key_just_pressed",
+    };
+    return boolFuncs.count(irName) > 0;
+}
+
 static bool returnsCString(const std::string& irName) {
     static const std::set<std::string> cstr = {
         "os.cwd", "os.env", "os.read",
@@ -831,6 +872,19 @@ static bool callArgTakesDouble(const std::string& irName, int argIndex) {
         return argIndex == 0;
     if (irName == "ml.optimize" || irName == "ml_optimize")
         return argIndex == 0;
+    // Symbolic calculus: arg 0 is always the expression STRING (const char*, an int-register
+    // arg), never a double — every OTHER arg is a real double. The generic "every arg of a
+    // float-returning math.* call takes double" rule below got this exactly backwards for
+    // these: it put the STRING POINTER itself into XMM0 (misread as a double bit pattern) and
+    // left nothing in RDI for the real C function's `const char* expr` parameter, corrupting
+    // every argument's register slot after it too — verified real bug: math.integrate/
+    // derivative/limit/minima/maxima all returned garbled huge numbers instead of real
+    // results (calculus.ac/calculus_optimize.ac/calculus_physics.ac).
+    if (irName == "math.integrate" || irName == "math.derivative" || irName == "math.limit" ||
+        irName == "math.minima" || irName == "math.maxima" || irName == "math.eval_at")
+        return argIndex != 0;
+    if (irName == "math.eval")
+        return false;
     if (irName.rfind("math.", 0) == 0)
         return !isIntReturningMathCall(irName);
     return false;
@@ -886,10 +940,12 @@ public:
     std::set<std::string>*  floatFuncs_ = nullptr; // set by BinaryCompiler; shared across funcs
     std::set<std::string>*  stringFuncs_ = nullptr; // user fns returning char* (shared)
     std::set<std::string>*  arrayFuncs_ = nullptr;  // user fns returning list blocks (shared)
+    std::set<std::string>*  floatArrayFuncs_ = nullptr; // user fns returning a float-element list block (shared)
     std::set<std::string>*  strListFuncs_ = nullptr; // user fns returning a list of strings (shared)
     const GlobalKinds*      globalKinds_ = nullptr;  // kinds of the program's global names (read-only)
     std::set<std::string>   forcedStringParams_;
     std::set<std::string>   forcedFloatParams_;   // params a caller passes a float to (→ load as double)
+    std::set<std::string>   forcedFloatArrayParams_;  // params a caller passes a float ARRAY to
     // NA→free: free-var names that live in shared global slots, and the name→slot map (shared).
     std::set<std::string>*       promotedGlobals_ = nullptr;
     std::map<std::string,int>*   gvarSlots_       = nullptr;
@@ -1061,9 +1117,22 @@ private:
         };
         for (auto& ins : instrs) { add(ins.result); for (auto& op : ins.typedOperands) add(op); }
     }
+    // Parameter names of whichever function is currently being compiled (empty for mainloop/
+    // globalInit, which has none) — set once near the top of compileFn/compileGeneratorFn.
+    std::set<std::string> currentParams_;
     // Slot id for a VAR that is a promoted free var, or -1 if it's an ordinary stack local.
+    // A function's OWN PARAMETER always shadows a same-named promoted global — computePromoted
+    // Globals()'s decision is purely name-based across the WHOLE program (a free-scoped "d" in
+    // mainloop can promote some UNRELATED function's own local "d"), with no concept of a
+    // DIFFERENT function's parameter of the same name taking precedence. Without this check,
+    // `risky(d)` (`return 10 // d`) silently read a stray global slot instead of its own
+    // parameter the moment anything ELSE in the program had a free/top-level var ALSO named
+    // "d" — verified real bug via keyword_catalog_core.ac's `to_dec d = 7` (mainloop) plus
+    // eval()'s auto-synthesized `ac_evp_factor`'s own unrelated local `d`, which promoted the
+    // name for every function, including risky's actual parameter.
     int gvarSlotOf(const std::string& name) const {
         if (!promotedGlobals_ || !gvarSlots_ || name.empty()) return -1;
+        if (currentParams_.count(name)) return -1;
         if (!promotedGlobals_->count(name)) return -1;
         auto it = gvarSlots_->find(name);
         return it == gvarSlots_->end() ? -1 : it->second;
@@ -1100,12 +1169,36 @@ private:
         return funcName(m);
     }
     std::set<int>           boolTempIds_;    // temp IDs holding a real bool (reset with localVarIds_, per block)
+    std::set<std::string>   boolVarNames_;   // var names holding a real bool (same idea, VAR-keyed)
     std::set<std::string>   arrayVarNames_;  // var names holding list blocks ([len][e0]…)
     std::set<int>           arrayTempIds_;   // temp IDs holding list blocks
+    // Same side-table idea, one level up (see floatVarNames_'s own comment): which ARRAYS hold
+    // float bit patterns in their elements. The array block itself needs no change at all —
+    // `.append`/the literal-element store already copy whatever bits `load()` produces,
+    // float or int alike — this is purely about which arrays PRINT as floats and which
+    // LOAD_INDEX results get marked float for downstream arithmetic (see preScanFloatLists).
+    std::set<std::string>   floatArrayVarNames_;
+    std::set<int>           floatArrayTempIds_;
     std::set<std::string>   dictVarNames_;   // var names holding dict blocks ([n][k0][v0]…)
     std::set<int>           dictTempIds_;    // temp IDs holding dict blocks
     std::set<std::string>   listOfDictVarNames_; // list vars whose elements are dict-block pointers
     std::set<int>           listOfDictTempIds_;
+    // Aggregate size of every type-tracking side table — used to drive an ALTERNATING
+    // preScanFloats/preScanStrings fixpoint (see compileFn): preScanFloats's arithmetic rules
+    // (SUB/ADD/MUL on an array-loaded element) can only fire once preScanStrings has marked the
+    // array float, and preScanStrings's `.append(floatExpr)` rule can only fire once
+    // preScanFloats has marked that expression float — each pass alone converges to a LOCAL
+    // fixpoint that can still be missing marks only the OTHER pass would supply. All member sets
+    // here grow monotonically (nothing is ever erased), so comparing this sum before/after a
+    // round of both passes is a safe, cheap "did anything change" signal without threading a
+    // return value through either function.
+    size_t trackingChecksum() const {
+        return floatTempIds_.size() + floatVarNames_.size() + stringVarNames_.size()
+             + stringTempIds_.size() + strListTempIds_.size() + strListVarNames_.size()
+             + arrayVarNames_.size() + arrayTempIds_.size() + floatArrayVarNames_.size()
+             + floatArrayTempIds_.size() + dictVarNames_.size() + dictTempIds_.size()
+             + listOfDictVarNames_.size() + listOfDictTempIds_.size();
+    }
     // Per-dict-var (and per-dict-TEMP) set of keys whose LITERAL value is a `$..$` string —
     // a dict is naturally heterogeneous at runtime (every value slot is just an int64), but a
     // LOAD_INDEX with a compile-time-constant string key ("name") needs to know statically
@@ -1199,7 +1292,39 @@ private:
         else if (func == "ckbtn" || func == "radbtn") { newFn = "ac_widgets_ckbtn_new"; specs = {{false,"0"},{true,""}}; }
         else if (func == "dropdown") { newFn = "ac_widgets_dropdown_new"; specs = {{false,"0"}}; }
         else if (func == "advance") { newFn = "ac_widgets_advance_new"; specs = {{false,"0"},{false,"200"}}; }
-        else if (func == "slider") { newFn = "ac_widgets_slider_new"; specs = {{false,"0"},{false,"0"},{false,"100"},{true,"horizontal"}}; }
+        else if (func == "slider") {
+            // ac_widgets_slider_new(intptr_t master, double from, double to, const char* orient)
+            // — "from"/"to" are REAL doubles in the C ABI (see ir_codegen.cpp's CppStrategy,
+            // `(double)(from)`), but every OTHER widget ctor's numeric args are genuine
+            // integers, so the generic specs-loop below only ever loads via loadArgOrInt into
+            // plain GPRs. For slider that put from/to in RSI/RDX (int registers) and the orient
+            // STRING in RCX — SysV float args need their OWN XMM0/XMM1 sequence, independent of
+            // the int sequence (same class of bug as math.integrate's string+double mix, fixed
+            // earlier this session) — so the real function read garbage for from/to and treated
+            // "0" (from's raw int value, landing in RSI) as the orient pointer. Verified real
+            // bug: widgets_test.ac's `slider(root, 0, 100, "horizontal")` produced a cascade of
+            // GTK-CRITICAL "min < max"/"GTK_IS_WIDGET" assertion failures.
+            bool isLazy2 = !args.empty() && funcName(args.back()) == "lazy";
+            std::vector<AC_IR::IRRef> sa = isLazy2
+                ? std::vector<AC_IR::IRRef>(args.begin(), args.end() - 1) : args;
+            load(sa.size() > 0 ? sa[0] : AC_IR::IRRef(), R::RDI);
+            if (sa.size() > 1) {
+                load(sa[1], R::RAX);
+                if (isFloatRef(sa[1])) em.movq_xmm0_from_gpr(R::RAX); else em.cvtsi2sd_xmm0_from_gpr(R::RAX);
+            } else { em.mov_ri32(R::RAX, 0); em.cvtsi2sd_xmm0_from_gpr(R::RAX); }
+            if (sa.size() > 2) {
+                load(sa[2], R::RAX);
+                if (isFloatRef(sa[2])) em.movq_xmmN_from_gpr(1, R::RAX); else em.cvtsi2sd_xmmN_from_gpr(1, R::RAX);
+            } else { em.mov_ri32(R::RAX, 100); em.cvtsi2sd_xmmN_from_gpr(1, R::RAX); }
+            loadArgOrStr(sa, 3, "horizontal", R::RSI);
+            em.call("ac_widgets_slider_new");
+            store(ins.result, R::RAX);
+            std::string resName2 = varName(ins.result);
+            if (!resName2.empty() && widgetVarKind_) (*widgetVarKind_)[resName2] = func;
+            if (isLazy2) { load(ins.result, R::RDI); em.call("ac_widgets_set_lazy"); }
+            else { load(ins.result, abi.argRegs[0]); em.call(widgetPackFn(func)); }
+            return true;
+        }
         else if (func == "group") { newFn = "ac_widgets_group_new"; specs = {{false,"0"},{true,""}}; }
         else if (func == "tabs") { newFn = "ac_widgets_tabs_new"; specs = {{false,"0"}}; }
         else if (func == "scroller") { newFn = "ac_widgets_scroller_new"; specs = {{false,"0"},{true,"vertical"}}; }
@@ -1432,6 +1557,19 @@ private:
             em.mov_r_ptr(R::RAX, R::RCX);
             em.test_rr(R::RAX, R::RAX);
             em.je(fatalL);                       // depth == 0 → no active try
+
+            // Record the caught message for CATCH_BEGIN's `report <var>` to bind, matching
+            // PY's `str(ZeroDivisionError(...))`. R9/R10 only — RAX/RCX/RDX/R8 are all live
+            // across this whole restore sequence (RAX=depth value, RCX=&depthSlot right now).
+            {
+                int excSlot = (*gvarSlots_)["__exc_msg_ptr"];
+                static const std::string divZeroMsg = "division by zero";
+                int msid = sp.add(divZeroMsg);
+                em.mov_ri64_str(R::R9, msid);
+                em.mov_ri64_gvar(R::R10, excSlot);
+                em.mov_ptr_r(R::R10, R::R9);
+            }
+
             em.dec_r(R::RAX);
             em.mov_ptr_r(R::RCX, R::RAX);         // depth--
             em.mov_rr(R::RDX, R::RAX);            // rdx = slot index to use (post-decrement)
@@ -1483,6 +1621,18 @@ private:
         if (r.kind == AC_IR::IRRef::Kind::TEMP && arrayTempIds_.count(r.id)) return true;
         if (r.kind == AC_IR::IRRef::Kind::VAR && arrayVarNames_.count(varName(r))) return true;
         return isGlobalNamed(r, &GlobalKinds::arr);
+    }
+    bool isFloatArrRef(const AC_IR::IRRef& r) const {
+        if (r.kind == AC_IR::IRRef::Kind::TEMP && floatArrayTempIds_.count(r.id)) return true;
+        if (r.kind == AC_IR::IRRef::Kind::VAR && floatArrayVarNames_.count(varName(r))) return true;
+        return false;
+    }
+    void markDstFloatArray(const AC_IR::IRRef& r) {
+        if (r.kind == AC_IR::IRRef::Kind::TEMP) floatArrayTempIds_.insert(r.id);
+        else if (r.kind == AC_IR::IRRef::Kind::VAR) {
+            std::string vn = varName(r);
+            if (!vn.empty()) floatArrayVarNames_.insert(vn);
+        }
     }
     bool isDictRef(const AC_IR::IRRef& r) const {
         if (r.kind == AC_IR::IRRef::Kind::TEMP && dictTempIds_.count(r.id)) return true;
@@ -1716,7 +1866,10 @@ private:
     // through its third argument. BNY copies the pointers into a fresh list block with the layout
     // ALLOC "list" uses: [cap][len][e0][e1]... (each piece is a NUL-terminated pointer, one slot).
     // The callee-saved registers are pushed and restored, because the register allocator owns them.
-    void emitStringListCall(const AC_IR::IRInstruction& ins) {
+    // extFn: the real (str, pat, int* out_count) -> char** export to call — stringm.split and
+    // regex.split/find_all/groups all share this exact shape (verified via their real headers,
+    // string-cheese.hpp / regex_c.h), so one adapter covers all four instead of four near-copies.
+    void emitStringListCall(const AC_IR::IRInstruction& ins, const std::string& extFn = "stringm.split") {
         using namespace AC_IR;
         const int k = strListSeq_++;
         const std::string capL  = "__sl_cap_"  + std::to_string(k);
@@ -1734,7 +1887,7 @@ private:
         else
             load(sep, R::RSI);
         em.mov_rr(R::RDX, R::RBX);
-        emitExtCall("stringm.split");
+        emitExtCall(extFn);
         em.mov_rr(R::R12, R::RAX);                        // r12 = char** pieces
         em.mov_r_ptr(R::R13, R::RBX);                     // r13 = n
         em.mov_rr(R::R14, R::R13);                        // r14 = cap = max(n, 8)
@@ -1774,6 +1927,71 @@ private:
         store(ins.result, R::RAX);
     }
 
+    // os.listdir(path) -> char** (+ an out_count pointer arg, see os.hpp's
+    // ac_os_listdir(path, int* out_count)) — the EXACT same "C array + out-param count" shape
+    // stringm.split returns, just with no separator argument. Reuses emitStringListCall's own
+    // block-building loop (adapt a char**/count pair into AC's native [cap][len][e0]...
+    // list format) rather than duplicating it. Without any of this, `FOR n in os.listdir(...)`
+    // treated each raw char* as a plain int and tried to numerically concat it into a string,
+    // reading garbage memory — verified real crash via os_files.ac.
+    void emitOsListdirCall(const AC_IR::IRInstruction& ins) {
+        using namespace AC_IR;
+        const int k = strListSeq_++;
+        const std::string capL  = "__old_cap_"  + std::to_string(k);
+        const std::string loopL = "__old_loop_" + std::to_string(k);
+        const std::string doneL = "__old_done_" + std::to_string(k);
+        em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14);
+        em.mov_ri32(R::RDI, 8);
+        em.call("__ac_alloc__");
+        em.mov_rr(R::RBX, R::RAX);                        // rbx = out_count cell
+        load(ins.typedOperands[1], R::RDI);               // path
+        em.mov_rr(R::RSI, R::RBX);
+        emitExtCall("os.listdir");
+        em.mov_rr(R::R12, R::RAX);                        // r12 = char** pieces
+        em.mov_r_ptr(R::R13, R::RBX);                     // r13 = n
+        em.mov_rr(R::R14, R::R13);                        // r14 = cap = max(n, 8)
+        em.mov_ri32(R::RCX, 8);
+        em.cmp_rr(R::R14, R::RCX);
+        em.jge(capL);
+        em.mov_rr(R::R14, R::RCX);
+        em.label(capL);
+        em.mov_rr(R::RDI, R::R14);
+        em.mov_ri32(R::RCX, 8);
+        em.imul_rr(R::RDI, R::RCX);
+        em.add_ri32(R::RDI, 16);
+        em.call("__ac_alloc__");
+        em.mov_ptr_r(R::RAX, R::R14);
+        em.add_ri32(R::RAX, 8);
+        em.mov_ptr_r(R::RAX, R::R13);
+        em.mov_rr(R::R14, R::RAX);
+        em.mov_ri32(R::RCX, 0);
+        em.label(loopL);
+        em.cmp_rr(R::RCX, R::R13);
+        em.jge(doneL);
+        em.mov_rr(R::RDX, R::RCX);
+        em.mov_ri32(R::RSI, 8);
+        em.imul_rr(R::RDX, R::RSI);
+        em.mov_rr(R::RSI, R::R12);
+        em.add_rr(R::RSI, R::RDX);
+        em.mov_r_ptr(R::R8, R::RSI);
+        em.mov_rr(R::R9, R::R14);
+        em.add_rr(R::R9, R::RDX);
+        em.add_ri32(R::R9, 8);
+        em.mov_ptr_r(R::R9, R::R8);
+        em.add_ri32(R::RCX, 1);
+        em.jmp(loopL);
+        em.label(doneL);
+        em.mov_rr(R::RAX, R::R14);
+        em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+        store(ins.result, R::RAX);
+        markDstArray(ins.result);
+        if (ins.result.kind == IRRef::Kind::TEMP) strListTempIds_.insert(ins.result.id);
+        else if (ins.result.kind == IRRef::Kind::VAR) {
+            std::string vn = varName(ins.result);
+            if (!vn.empty()) strListVarNames_.insert(vn);
+        }
+    }
+
     void emitLibCall(const AC_IR::IRInstruction& ins) {
         if (ins.typedOperands.empty()) return;
         using namespace AC_IR;
@@ -1793,6 +2011,65 @@ private:
 
         // import — handled via PLT/GOT; nothing to emit at runtime
         if (method == "import") return;
+
+        // `alert $msg$` / `result = sure $msg$` — real browser dialogs with no terminal
+        // equivalent on BNY (same "no UI to ask through" situation ir_codegen.cpp's PY/C/C++/
+        // etc. strategies already document on their own emitAlert/emitConfirm). Neither of
+        // these has a "." in its name and neither matches any check above, so without this
+        // both fell through into the generic 2-operand "method, arg" fallback much further
+        // down — which is shaped for result-less Term.display-style calls, so `alert` ended
+        // up printing its own message text (verified real bug: html_page.ac's alert() line
+        // appeared in BNY's output when PY correctly shows nothing) and `sure`'s result temp
+        // was never written at all, left holding whatever garbage was already in that slot
+        // (verified: `sure returned: 140557020040549`, a raw stack value). Matches PY's own
+        // fix exactly: alert is silent, sure prints the prompt for visibility and auto-declines
+        // (result = False) since there's no real UI to confirm through outside a browser.
+        if (method == "alert") return;
+        if (method == "sure") {
+            if (ins.typedOperands.size() >= 2) {
+                load(ins.typedOperands[1], R::RAX);
+                std::string vn2 = varName(ins.typedOperands[1]);
+                bool argIsStr = (ins.typedOperands[1].kind == IRRef::Kind::CONST
+                                  && ins.typedOperands[1].value.type == IRType::STRING)
+                              || (ins.typedOperands[1].kind == IRRef::Kind::TEMP
+                                  && stringTempIds_.count(ins.typedOperands[1].id))
+                              || (!vn2.empty() && stringVarNames_.count(vn2));
+                if (argIsStr) { em.mov_rr(R::RDI, R::RAX); em.call("__ac_print_cstr__"); }
+                else           { em.mov_rr(R::RDI, R::RAX); em.call("__ac_print_int__"); }
+            }
+            if (ins.result.isValid()) {
+                em.mov_ri32(R::RAX, 0); store(ins.result, R::RAX);
+                if (ins.result.kind == IRRef::Kind::TEMP) boolTempIds_.insert(ins.result.id);
+                else if (ins.result.kind == IRRef::Kind::VAR) {
+                    std::string rvn = varName(ins.result);
+                    if (!rvn.empty()) boolVarNames_.insert(rvn);
+                }
+            }
+            return;
+        }
+
+        // native-cpu's bare `ptr_update(buf, value, size)` / `ptr_free(buf)` statement forms
+        // (result discarded) — no "." in the name, so without this they fell straight through
+        // every namespace check into the generic 2-operand "Term.display" fallback further
+        // down, which printed typedOperands[1] (the HANDLE value, e.g. "1000") as if it were a
+        // display call — so ptr_update's real side effect (writing the buffer) never happened
+        // at all, and ptr_free never actually freed anything either. Verified real bug:
+        // native_cpu_buffers.ac printed stray "1000"/"1001" lines and `ptr_deref` kept reading
+        // back the ORIGINAL (never-updated) buffer content. The expression form (`x =
+        // ptr_free(buf)`) already reaches the generic CALL-opcode path correctly on its own —
+        // only the bare-statement LIB_CALL form needed this.
+        if (method == "ptr_update" && ins.typedOperands.size() >= 4) {
+            load(ins.typedOperands[1], R::RDI);
+            load(ins.typedOperands[2], R::RSI);
+            load(ins.typedOperands[3], R::RDX);
+            em.call("ptr_update");
+            return;
+        }
+        if (method == "ptr_free" && ins.typedOperands.size() >= 2) {
+            load(ins.typedOperands[1], R::RDI);
+            em.call("ptr_free");
+            return;
+        }
 
         // widgets method call (`lang_drop.add(...)`, `bar.set(42)`, `root.mainloop`) — must run
         // before the generic dotted-method fallbacks below, same ordering CStrategy/AsmStrategy
@@ -1916,6 +2193,25 @@ private:
             return;
         }
 
+        // regex.split/find_all/groups(str, pat): same (str, pat, int* out_count) -> char**
+        // shape as stringm.split — a documented, pre-existing gap (see regex_lists.ac's own
+        // header comment: "Typed backends ... do not yet carry a list of strings from an ilib
+        // call through to FOR, the same gap stringm.split has" — BNY wasn't named there either,
+        // but crashed the exact same way, verified real segfault on `FOR p in regex.split(...)`).
+        if ((method == "regex.split" || method == "regex.find_all" || method == "regex.groups")
+                && ins.typedOperands.size() == 3) {
+            emitStringListCall(ins, method);
+            return;
+        }
+
+        // os.listdir(path): same char**+out_count shape as stringm.split (see emitOsListdirCall)
+        // — must run before the generic "os." namespace fallback just below, which would
+        // otherwise call it as a plain single-return-value ilib function.
+        if (method == "os.listdir" && ins.typedOperands.size() == 2) {
+            emitOsListdirCall(ins);
+            return;
+        }
+
         // Namespaced ilib calls — ml.tensor(2), os.mkfile(p), regex.match(s,p),
         // stringm.upper(s), web.open(u), ncpu.dha(n) — all route through their .so PLT stubs.
         if (method.rfind("ml.", 0) == 0 || method.rfind("os.", 0) == 0 || method.rfind("dns.", 0) == 0 ||
@@ -1959,12 +2255,35 @@ private:
                     }
                     fltIdx++;
                 } else {
-                    if (intIdx < (int)abi.argRegs.size())
-                        load(argRef, abi.argRegs[intIdx]);
+                    if (intIdx < (int)abi.argRegs.size()) {
+                        // The callee wants a plain int here, but the AC-level value might
+                        // currently be float-classified (AC's "sticky retype": once a var is
+                        // ever float, later int-valued reassignments coerce INTO the float
+                        // storage rather than un-floating it — see ir.cpp's AssignStmt comment
+                        // on stickyKeep). A plain load() would copy the raw double BITS as if
+                        // they were already an int64 — garbage, not the intended value. Must
+                        // truncate through XMM first. Verified real bug: math_number.ac's
+                        // `collatz`, where `n` goes sticky-float after `n = n/2`, then
+                        // `math.mod_int(n, 2)` received n's raw double bits as its int64
+                        // argument instead of the real (small) integer value — happened to
+                        // read as even every time, so the loop never saw the odd branch and
+                        // never reached n==1.
+                        if (isFloatRef(argRef)) {
+                            load(argRef, R::RAX);
+                            em.movq_xmm0_from_gpr(R::RAX);
+                            em.cvttsd2si_rax_xmm0();
+                            em.mov_rr(abi.argRegs[intIdx], R::RAX);
+                        } else {
+                            load(argRef, abi.argRegs[intIdx]);
+                        }
+                    }
                     intIdx++;
                 }
             }
             emitExtCall(method);
+            if (returnsInt32NeedingSignExtend(method)) {
+                em.shl_r_i8(R::RAX, 32); em.sar_r_i8(R::RAX, 32);
+            }
             if (isFloatReturningCall(method)) {
                 em.movq_gpr_from_xmm0(R::RAX);
                 if (ins.result.isValid()) {
@@ -2020,6 +2339,29 @@ private:
     void compileInstr(const AC_IR::IRInstruction& ins) {
         if (ins.result.kind == AC_IR::IRRef::Kind::TEMP && ins.resultType == AC_IR::IRType::BOOL)
             boolTempIds_.insert(ins.result.id);
+        // Ilib calls with no IR-level bool type info at all (ir.cpp just sees an opaque
+        // external call) — same workaround Go/Java already carry locally for this exact gap
+        // (see isBoolReturningIlibCall's own comment). Covers both CALL and LIB_CALL shapes.
+        if ((ins.opcode == AC_IR::IROpcode::CALL || ins.opcode == AC_IR::IROpcode::LIB_CALL)
+                && ins.result.isValid() && !ins.typedOperands.empty()
+                && isBoolReturningIlibCall(libMethodName(ins))) {
+            if (ins.result.kind == AC_IR::IRRef::Kind::TEMP) boolTempIds_.insert(ins.result.id);
+            else if (ins.result.kind == AC_IR::IRRef::Kind::VAR) {
+                std::string vn = varName(ins.result);
+                if (!vn.empty()) boolVarNames_.insert(vn);
+            }
+        }
+        // A plain copy (`safe = t_0`) of an already-bool-tracked TEMP makes the VAR bool too —
+        // boolTempIds_ is already populated for anything EARLIER in this same linear codegen
+        // pass (compileInstr runs in program order), so this is a simple forward propagation,
+        // not a fixpoint. Verified real bug: `safe = web.pdf(...); Term.display safe` printed
+        // "0" instead of "False" (web_check.ac) because `safe` itself was never marked.
+        if (ins.opcode == AC_IR::IROpcode::STORE_VAR && ins.result.kind == AC_IR::IRRef::Kind::VAR
+                && !ins.typedOperands.empty() && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::TEMP
+                && boolTempIds_.count(ins.typedOperands[0].id)) {
+            std::string vn = varName(ins.result);
+            if (!vn.empty()) boolVarNames_.insert(vn);
+        }
         using namespace AC_IR;
         auto& ops = ins.typedOperands;
 
@@ -2252,6 +2594,30 @@ private:
             default:
                 if (srcIsStr) {
                     load(ops[0], R::RAX);          // already a string — copy the pointer
+                } else if (isFloatArrRef(ops[0])) {
+                    load(ops[0], R::RDI);
+                    em.call("__ac_arr_to_str_float__");
+                } else if (isArrRef(ops[0])) {
+                    load(ops[0], R::RDI);
+                    em.call("__ac_arr_to_str__");
+                } else if ((ops[0].kind == IRRef::Kind::TEMP && boolTempIds_.count(ops[0].id))
+                           || (ops[0].kind == IRRef::Kind::VAR && ops[0].id >= 0
+                               && prog.symbols.getType(ops[0].id) == IRType::BOOL)
+                           || (ops[0].kind == IRRef::Kind::VAR && !varName(ops[0]).empty()
+                               && boolVarNames_.count(varName(ops[0])))) {
+                    // to_string(boolExpr) — PY's str(True)/str(False), not itoa's "1"/"0".
+                    // Verified real bug: html_page.ac's
+                    // `to_string(regex.match(...))` printed "1" instead of "True".
+                    load(ops[0], R::RAX);
+                    em.test_rr(R::RAX, R::RAX);
+                    std::string fL = uniq("__ac_t2sb_f_" + std::to_string(catchCounter_++) + "__");
+                    std::string dL = uniq("__ac_t2sb_d_" + std::to_string(catchCounter_++) + "__");
+                    em.je(fL);
+                    em.mov_ri64_str(R::RAX, sp.add("True"));
+                    em.jmp(dL);
+                    em.label(fL);
+                    em.mov_ri64_str(R::RAX, sp.add("False"));
+                    em.label(dL);
                 } else if (isFloatRef(ops[0])) {
                     // float→string. The smart-division pass (ir.cpp) tells a
                     // whole `/` result (or math.mod) from a real float, so to_string formats
@@ -2452,12 +2818,33 @@ private:
                 if (isFloatRef(op1())) em.movq_xmm1_from_gpr(R::RCX);
                 else                   em.cvtsi2sd_xmm1_from_gpr(R::RCX);
                 em.ucomisd_xmm0_xmm1();
+                // ucomisd's "unordered" result (either operand NaN) sets ZF=PF=CF=1 — the SAME
+                // bit pattern as "equal" (ZF=1) and "less-than-or-equal"/"below-or-equal"
+                // (CF=1), so a bare sete/setne/setb/setbe silently treats any NaN compare as
+                // true for ==/<=/< and false for != — backwards from IEEE 754 (every NaN
+                // comparison is false EXCEPT !=, which is always true, even NaN != NaN).
+                // GT/GTE need no extra check: unordered's CF=1 already makes seta/setae false,
+                // which happens to already match IEEE semantics for > and >=. Verified real
+                // bug: calculus.ac's `v #= v` (NaN self-inequality check) returned false
+                // instead of true, since plain setne saw ZF=1 (unordered) and reported "equal".
+                if (ins.opcode == IROpcode::EQ || ins.opcode == IROpcode::NEQ
+                        || ins.opcode == IROpcode::LT || ins.opcode == IROpcode::LTE) {
+                    uint8_t primary, combine; // combine: 0x0B=NP(ordered)/AND, 0x0A=P(unordered)/OR
+                    bool useAnd;
+                    switch (ins.opcode) {
+                        case IROpcode::EQ:  primary = 0x04; combine = 0x0B; useAnd = true;  break; // ZF==1 AND ordered
+                        case IROpcode::LT:  primary = 0x02; combine = 0x0B; useAnd = true;  break; // CF==1 AND ordered
+                        case IROpcode::LTE: primary = 0x06; combine = 0x0B; useAnd = true;  break; // (CF==1 or ZF==1) AND ordered
+                        default:             primary = 0x05; combine = 0x0A; useAnd = false; break; // NEQ: ZF==0 OR unordered
+                    }
+                    em.setcc_r(primary, R::RAX);
+                    em.setcc_r(combine, R::RCX);
+                    if (useAnd) em.and_rr(R::RAX, R::RCX); else em.or_rr(R::RAX, R::RCX);
+                    store(ins.result, R::RAX);
+                    break;
+                }
                 switch (ins.opcode) {
-                case IROpcode::EQ:  cc=0x04; break; // sete
-                case IROpcode::NEQ: cc=0x05; break; // setne
-                case IROpcode::LT:  cc=0x02; break; // setb  (CF)
                 case IROpcode::GT:  cc=0x07; break; // seta  (!CF & !ZF)
-                case IROpcode::LTE: cc=0x06; break; // setbe
                 default:            cc=0x03; break; // setae (GTE)
                 }
             } else {
@@ -2615,6 +3002,22 @@ private:
                 emitStringListCall(ins);
                 break;
             }
+            // regex.split/find_all/groups(str, pat): same shape, see emitLibCall's own copy
+            // of this check for the full story.
+            if ((rawFn == "regex.split" || rawFn == "regex.find_all" || rawFn == "regex.groups")
+                    && ops.size() == 3) {
+                emitStringListCall(ins, rawFn);
+                break;
+            }
+            // os.listdir(path): same char**+out_count shape (see emitOsListdirCall). Reaching
+            // here (the generic CALL path, not LIB_CALL) is in fact the real shape ir.cpp
+            // lowers `os.listdir(...)` to — verified via os_files.ac's IR dump (`call
+            // os.listdir, sub`, never `lib_call`); the LIB_CALL-side check added alongside
+            // emitLibCall's own stringm.split check never actually fires for this function.
+            if (rawFn == "os.listdir" && ops.size() == 2) {
+                emitOsListdirCall(ins);
+                break;
+            }
             // math.mod(a,b) with two non-float operands is ALWAYS exact — PY's own math_mod
             // wrapper ("int-exact when operands and result are whole") always returns a real int
             // in this case, since integer modulo can never be fractional. The real ac_mod (the
@@ -2763,18 +3166,60 @@ private:
                 if (ins.result.isValid()) store(ins.result, R::RAX);
                 break;
             }
-            // Load args into integer registers first, then fix up for float-taking functions
-            for (int i = 1; i < (int)ops.size() && (i-1) < (int)abi.argRegs.size(); i++) {
-                load(ops[i], abi.argRegs[i-1]);
-            }
+            // SysV AMD64: integer and float args use INDEPENDENT register sequences (see the
+            // identical comment on the LIB_CALL path above, which already had this fix). The
+            // old version here loaded every arg into an int register by raw POSITION, then
+            // "fixed up" float args into XMM[same position] — wrong whenever a non-float arg
+            // (most commonly a string) comes before a float one, since the real XMM sequence
+            // only counts FLOAT args: `math.integrate(expr, a, b)` needs RDI=expr, XMM0=a,
+            // XMM1=b, but this put a/b in XMM1/XMM2 (verified real bug, same incident as
+            // callArgTakesDouble's own fix: calculus.ac's integrate/derivative/limit/minima/
+            // maxima all returned garbled numbers).
             int argCount = (int)ops.size() - 1;
-            for (int ai = 0; ai < argCount && ai < 6 && ai < (int)abi.argRegs.size(); ++ai) {
-                if (!callArgTakesDouble(fn, ai)) continue;   // #41: was capped at 2 args
-                R arg = abi.argRegs[ai];
-                if (isFloatRef(ops[1 + ai])) em.movq_xmmN_from_gpr(ai, arg);
-                else                         em.cvtsi2sd_xmmN_from_gpr(ai, arg);
+            int intIdx = 0, fltIdx = 0;
+            for (int ai = 0; ai < argCount; ++ai) {
+                const auto& argRef = ops[1 + ai];
+                if (callArgTakesDouble(fn, ai)) {
+                    if (fltIdx < 8) {
+                        load(argRef, R::RAX);                                   // scratch
+                        if (isFloatRef(argRef)) em.movq_xmmN_from_gpr(fltIdx, R::RAX);
+                        else                     em.cvtsi2sd_xmmN_from_gpr(fltIdx, R::RAX);
+                    }
+                    fltIdx++;
+                } else {
+                    if (intIdx < (int)abi.argRegs.size()) {
+                        // See the identical fix + comment on the LIB_CALL path above (sticky
+                        // retype can leave an AC-level "int" value stored as float bits) — same
+                        // gap, same fix, different dispatch path. BUT this path (unlike the
+                        // LIB_CALL one) is shared with ordinary USER FUNCTION calls, where
+                        // callArgTakesDouble's "false" is just its default fallthrough for any
+                        // unrecognized name — it means "no opinion", NOT "this arg is a genuine
+                        // int". BNY's own user-function calling convention passes EVERY arg as
+                        // raw bits via GPRs regardless of type (it never routes user floats
+                        // through XMM registers at all), so converting here for a user function
+                        // truncates a real float argument into garbage. Verified real
+                        // regression: gating this ONLY on math.*-prefixed callees (the one
+                        // family callArgTakesDouble actually has real int/float knowledge for)
+                        // was missing at first — `nsqrt(2.0)` truncated 2.0 to the integer 2
+                        // before passing it, corrupting every call to a user function with any
+                        // float-classified argument (newton_sqrt.ac, schrodinger_oscillator.ac).
+                        bool calleeIsKnownNumericIlib = fn.rfind("math.", 0) == 0 || fn.rfind("math_", 0) == 0;
+                        if (calleeIsKnownNumericIlib && isFloatRef(argRef)) {
+                            load(argRef, R::RAX);
+                            em.movq_xmm0_from_gpr(R::RAX);
+                            em.cvttsd2si_rax_xmm0();
+                            em.mov_rr(abi.argRegs[intIdx], R::RAX);
+                        } else {
+                            load(argRef, abi.argRegs[intIdx]);
+                        }
+                    }
+                    intIdx++;
+                }
             }
             if (fn.find('.') != std::string::npos) emitExtCall(fn); else em.call(fn);
+            if (returnsInt32NeedingSignExtend(fn)) {
+                em.shl_r_i8(R::RAX, 32); em.sar_r_i8(R::RAX, 32);
+            }
             // Float-returning calls put result in XMM0 per System V ABI — move to GPR for storage
             if (floatReturn) {
                 em.movq_gpr_from_xmm0(R::RAX);
@@ -2950,6 +3395,9 @@ private:
                     load(v, abi.argRegs[0]);
                     em.call("__ac_print_cstr__");
                     if (usesSave_) { load(v, R::RDI); em.call("__ac_save_append_cstr__"); }
+                } else if (isFloatArrRef(v)) {
+                    load(v, abi.argRegs[0]);
+                    em.call("__ac_print_arr_float__");   // [1.5, 2.25] — matches PY's float repr
                 } else if (isArrRef(v)) {
                     load(v, abi.argRegs[0]);
                     em.call("__ac_print_arr__");   // [e0, e1, …] — matches PY
@@ -2958,7 +3406,9 @@ private:
                     // scalar/string is the demonstrated, verified case).
                 } else if ((v.kind == AC_IR::IRRef::Kind::TEMP && boolTempIds_.count(v.id))
                            || (v.kind == AC_IR::IRRef::Kind::VAR && v.id >= 0
-                               && prog.symbols.getType(v.id) == AC_IR::IRType::BOOL)) {
+                               && prog.symbols.getType(v.id) == AC_IR::IRType::BOOL)
+                           || (v.kind == AC_IR::IRRef::Kind::VAR && !varName(v).empty()
+                               && boolVarNames_.count(varName(v)))) {
                     // A bool prints as True/False (PY); the operand is 0 or 1 at run time.
                     load(v, R::RAX);
                     em.test_rr(R::RAX, R::RAX);
@@ -3182,6 +3632,27 @@ private:
             em.jmp(skipL);
             catchSkip_.push_back(skipL);
             if (!catchEntry_.empty()) { em.label(catchEntry_.back()); catchEntry_.pop_back(); }
+
+            // `report <var>` (CATCH_BEGIN's own exVar operand) — bind the caught message into
+            // it, same as every other backend's native exception value. Only reached via the
+            // real jmp_r landing just above, never the "try succeeded" fallthrough skip, so
+            // `err` is left untouched (not re-zeroed) when no exception actually occurred.
+            if (!ins.typedOperands.empty()
+                && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::CONST
+                && ins.typedOperands[0].value.type == AC_IR::IRType::STRING
+                && (*gvarSlots_).count("__exc_msg_ptr")) {
+                std::string exVarName = std::get<std::string>(ins.typedOperands[0].value.data);
+                int symId = prog.symbols.lookupAnyScope(exVarName);
+                if (symId >= 0) {
+                    int excSlot = (*gvarSlots_)["__exc_msg_ptr"];
+                    em.mov_ri64_gvar(R::RAX, excSlot);
+                    em.mov_r_ptr(R::RAX, R::RAX);
+                    AC_IR::IRRef exVarRef;
+                    exVarRef.kind = AC_IR::IRRef::Kind::VAR;
+                    exVarRef.id = symId;
+                    store(exVarRef, R::RAX);
+                }
+            }
             break;
         }
         case IROpcode::AFTER_BEGIN:          // after-block always runs — close pending skip here
@@ -3379,6 +3850,7 @@ private:
             // at runtime rather than treating the name as an unparseable placeholder).
             struct Elem { int64_t val; std::string funcLabel; std::string varLoad; };
             std::vector<Elem> elems;
+            bool anyFloatElem = false;
             if (ops.size() >= 2 && ops[1].kind == AC_IR::IRRef::Kind::CONST
                     && ops[1].value.type == AC_IR::IRType::STRING) {
                 const std::string& s = std::get<std::string>(ops[1].value.data);
@@ -3395,7 +3867,21 @@ private:
                             if (fn.name == tok) { isFn = true; break; }
                         if (isFn) elems.push_back({0, tok, ""});
                         else if (dictVarNames_.count(tok)) elems.push_back({0, "", tok});
-                        else {
+                        // `std::stoll("1.5")` doesn't throw — it silently parses the leading "1"
+                        // and stops at the "." (verified: a pure float literal list printed its
+                        // elements' truncated integer parts, not 0 — "typically overwritten via
+                        // STORE_INDEX" below never actually fires for a LITERAL's own elements,
+                        // only for non-numeric-token cases like a variable reference). Parse as a
+                        // double and store its raw IEEE-754 bits instead, same representation a
+                        // real float var/temp already uses everywhere else in this file.
+                        else if (tok.find_first_of(".eE") != std::string::npos
+                                 && tok.find_first_of("0123456789") != std::string::npos) {
+                            double d = 0.0;
+                            try { d = std::stod(tok); } catch (...) {}
+                            int64_t bits; std::memcpy(&bits, &d, sizeof(bits));
+                            elems.push_back({bits, "", ""});
+                            anyFloatElem = true;
+                        } else {
                             try { elems.push_back({std::stoll(tok), "", ""}); }
                             catch (...) { elems.push_back({0, "", ""}); }
                         }
@@ -3432,7 +3918,10 @@ private:
                 em.mov_ptr_r(R::RDX, R::RCX);
                 em.add_ri32(R::RDX, 8);
             }
-            if (ins.result.isValid()) store(ins.result, R::RAX);
+            if (ins.result.isValid()) {
+                store(ins.result, R::RAX);
+                if (anyFloatElem) markDstFloatArray(ins.result);
+            }
             break;
         }
 
@@ -3645,8 +4134,38 @@ public:
                 if (ins.opcode == IROpcode::TYPE_CAST && ins.resultType == IRType::FLOAT
                     && ins.result.isValid())
                     markDstFloat(ins.result);
+                // NOTE: a TYPE_CAST to a non-float numeric type (INT/SHORT/MINI) is a genuine
+                // retype AWAY from float, and BNY's float classification has no corresponding
+                // "unmark" — once a var is EVER seen float here, it stays float-tagged for the
+                // rest of the function, even past an explicit cast back to int. This is a real,
+                // known gap (verified via math_number.ac's `collatz`: `n=n/2; n=math.to_int(n)`
+                // leaves `n` float-tagged, so the loop's own `WHILST n #= 1` check compares a
+                // float-bit-reinterpretation against 1 and never terminates) — but adding a
+                // removal here breaks this fixpoint's monotonicity guarantee and the compiler's
+                // own `while(changed)` loop can genuinely never terminate (confirmed: hung the
+                // COMPILER itself, not just the generated program, on a close variant of this
+                // same test). A real fix needs flow-sensitive, program-point-specific type
+                // tracking (the var is float HERE, int THERE, within the same function), not a
+                // single whole-function boolean per var name — left as a known limitation
+                // rather than risk a compiler hang.
                 // DIV always produces float
                 if ((ins.opcode == IROpcode::DIV || ins.opcode == IROpcode::FDIV) && ins.result.isValid()) markDstFloat(ins.result);
+                // LOAD_INDEX into a float array (`v[i]`) → the loaded element is a plain float
+                // scalar. Duplicated from preScanStrings' own copy of this rule (which fires the
+                // moment preScanStrings itself discovers an array is float, e.g. via `.append`)
+                // — needed HERE too so arithmetic on the loaded element (SUB/ADD/MUL, just below)
+                // sees it as float within THIS same pass, for array-ness already known when
+                // preScanFloats starts (e.g. a forced float-array param). Must exclude the
+                // "__len__" sentinel index exactly like the
+                // real LOAD_INDEX codegen does — verified real bug: without this exclusion the
+                // loop bound (length, a genuine int) got misclassified float too, corrupting the
+                // FOR-loop's own comparison (BNY only ran the loop body once instead of N times).
+                if (ins.opcode == IROpcode::LOAD_INDEX && ins.result.isValid()
+                        && ins.typedOperands.size() >= 2 && isFloatArrRef(ins.typedOperands[0])
+                        && !(ins.typedOperands[1].kind == IRRef::Kind::CONST
+                             && ins.typedOperands[1].value.type == IRType::STRING
+                             && std::get<std::string>(ins.typedOperands[1].value.data) == "__len__"))
+                    markDstFloat(ins.result);
                 // Arithmetic with any float operand → float result
                 if ((ins.opcode == IROpcode::ADD || ins.opcode == IROpcode::SUB
                   || ins.opcode == IROpcode::MUL || ins.opcode == IROpcode::PMUL)
@@ -3740,6 +4259,15 @@ public:
                     std::string callee = funcName(ins.typedOperands[0]);
                     if ((stringFuncs_ && stringFuncs_->count(callee)) || returnsCString(callee))
                         mark(ins.result);
+                } else if (ins.opcode == OP::CATCH_BEGIN && !ins.typedOperands.empty()
+                           && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::CONST
+                           && ins.typedOperands[0].value.type == AC_IR::IRType::STRING) {
+                    // `report <var>` binds the caught error's message (a string) into this name.
+                    std::string exVarName = std::get<std::string>(ins.typedOperands[0].value.data);
+                    if (!exVarName.empty() && !stringVarNames_.count(exVarName)) {
+                        stringVarNames_.insert(exVarName);
+                        changed = true;
+                    }
                 }
                 // ── array kind (list-print dispatch) ──
                 auto markA = [&](const AC_IR::IRRef& r) {
@@ -3747,6 +4275,38 @@ public:
                     markDstArray(r);
                     if (arrayVarNames_.size() != v || arrayTempIds_.size() != t) changed = true;
                 };
+                // ── float-array kind, one level up (see floatArrayVarNames_'s own comment):
+                // which arrays hold float bit patterns. `.append(floatExpr)` is the key evidence
+                // source here — a pure literal's own elements are already handled directly in
+                // the ALLOC case (anyFloatElem), with no fixpoint needed for that part.
+                auto markFA = [&](const AC_IR::IRRef& r) {
+                    size_t v = floatArrayVarNames_.size(), t = floatArrayTempIds_.size();
+                    markDstFloatArray(r);
+                    if (floatArrayVarNames_.size() != v || floatArrayTempIds_.size() != t) changed = true;
+                };
+                if ((ins.opcode == OP::LIB_CALL || ins.opcode == OP::CALL)) {
+                    std::string mn = libMethodName(ins);
+                    auto ap = mn.rfind(".append");
+                    if (ap != std::string::npos && ap == mn.size() - 7 && ap > 0
+                            && ins.typedOperands.size() >= 2 && isFloatRef(ins.typedOperands[1])) {
+                        std::string recv = mn.substr(0, ap);
+                        if (!recv.empty()) {
+                            if (!floatArrayVarNames_.count(recv)) changed = true;
+                            floatArrayVarNames_.insert(recv);
+                        }
+                    }
+                }
+                if (ins.opcode == OP::STORE_VAR && ins.result.isValid()
+                        && !ins.typedOperands.empty() && isFloatArrRef(ins.typedOperands[0])) {
+                    markFA(ins.result);
+                } else if (ins.opcode == OP::LOAD_VAR && ins.result.isValid()
+                        && !ins.typedOperands.empty() && isFloatArrRef(ins.typedOperands[0])) {
+                    markFA(ins.result);
+                }
+                if (ins.opcode == OP::CALL && ins.result.isValid() && !ins.typedOperands.empty()
+                        && floatArrayFuncs_ && floatArrayFuncs_->count(funcName(ins.typedOperands[0]))) {
+                    markFA(ins.result);
+                }
                 if (ins.opcode == OP::ALLOC && ins.result.isValid() && !ins.typedOperands.empty()
                     && ins.typedOperands[0].kind == AC_IR::IRRef::Kind::CONST
                     && ins.typedOperands[0].value.type == AC_IR::IRType::STRING
@@ -3759,7 +4319,32 @@ public:
                     // new ALLOC case below) — they need the same array-print/length/index
                     // dispatch as "list", so they must be recognized here too.
                     markA(ins.result);
-                } else if (ins.opcode == OP::STORE_VAR && ins.result.isValid()
+                }
+                // LOAD_INDEX into a float array (`FOR x in v` / `v[i]`) → the loaded element is a
+                // plain float scalar, not a float array itself. Must live in THIS fixpoint (not
+                // preScanFloats, which runs once, earlier, before floatArrayVarNames_ exists at
+                // all) so it stabilizes together with markFA above — e.g. `.append(1.5)` marking
+                // `v` a float array on this pass lets a LATER pass see `isFloatArrRef(v)` and mark
+                // `x` float too. Without this, `x` in `FOR x in v` stayed classified as int, so
+                // `t += x` added v's raw IEEE-754 bits as an integer instead of fadd-ing them —
+                // verified real bug on fl1.ac (3.75 expected, printed a huge garbage
+                // int-reinterpreted-as-double value instead).
+                {
+                    bool isLenIdx = ins.typedOperands.size() >= 2
+                        && ins.typedOperands[1].kind == AC_IR::IRRef::Kind::CONST
+                        && ins.typedOperands[1].value.type == AC_IR::IRType::STRING
+                        && std::get<std::string>(ins.typedOperands[1].value.data) == "__len__";
+                    if (ins.opcode == OP::LOAD_INDEX && !isLenIdx && ins.result.isValid()
+                            && !ins.typedOperands.empty() && isFloatArrRef(ins.typedOperands[0])) {
+                        if (ins.result.kind == AC_IR::IRRef::Kind::TEMP) {
+                            if (!floatTempIds_.count(ins.result.id)) { floatTempIds_.insert(ins.result.id); changed = true; }
+                        } else if (ins.result.kind == AC_IR::IRRef::Kind::VAR) {
+                            std::string vn = varName(ins.result);
+                            if (!vn.empty() && !floatVarNames_.count(vn)) { floatVarNames_.insert(vn); changed = true; }
+                        }
+                    }
+                }
+                if (ins.opcode == OP::STORE_VAR && ins.result.isValid()
                            && !ins.typedOperands.empty() && isArrRef(ins.typedOperands[0])) {
                     markA(ins.result);
                 } else if (ins.opcode == OP::LOAD_VAR && ins.result.isValid()
@@ -3903,6 +4488,12 @@ public:
             if (ins.opcode == AC_IR::IROpcode::RETURN && !ins.typedOperands.empty()
                 && isArrRef(ins.typedOperands[0])) { arrayFuncs_->insert(fname); return; }
     }
+    void recordFloatArrayReturn(const std::vector<AC_IR::IRInstruction>& instrs, const std::string& fname) {
+        if (!floatArrayFuncs_) return;
+        for (const auto& ins : instrs)
+            if (ins.opcode == AC_IR::IROpcode::RETURN && !ins.typedOperands.empty()
+                && isFloatArrRef(ins.typedOperands[0])) { floatArrayFuncs_->insert(fname); return; }
+    }
 
     void compileFn(const AC_IR::IRFunction& fn) {
         // Bundle methods need a class-qualified label — was just the bare method name (`greet`,
@@ -3917,6 +4508,7 @@ public:
                                    + " fit in registers (stack arguments are not implemented)");
         currentClass_ = fn.classOwner;
         labelPrefix_ = "__fn_" + label + "_";
+        currentParams_ = std::set<std::string>(fn.parameters.begin(), fn.parameters.end());
         buildLocalVarIds(fn.instructions);
         // A bundle/tuple-instance parameter referenced ONLY via dotted field access
         // ("p.x"/"p.y", each its own separate symbol) never appears as a bare "p" VAR anywhere
@@ -3932,10 +4524,17 @@ public:
             int sid = prog.symbols.lookupAnyScope(pname);
             if (sid >= 0) localVarIds_.emplace(pname, sid);
         }
-        // Pass 0: pre-scan to identify float-typed variables (needed for correct loop codegen)
-        preScanFloats(fn.instructions);
+        // Forced param types must be in place BEFORE the float pre-scan (matches
+        // compileGeneratorFn's order): `psi[j+1]` needs `psi` known as a float ARRAY before
+        // preScanFloats' own SUB/ADD/MUL rules can tell the loaded element is float — moving
+        // this seeding to AFTER preScanFloats (as this function used to) left it running its
+        // one-shot fixpoint on zero array-param knowledge, so arithmetic on an array PARAM's
+        // elements (a value with no other local float evidence) never got marked float at all —
+        // verified real bug: `evolve`'s `newpsi.append(psi[j+1] - dt*hp[j+1])` printed raw
+        // integer bit patterns instead of floats (schrodinger_oscillator.ac).
         for (const auto& p : forcedStringParams_) stringVarNames_.insert(p);
         for (const auto& p : forcedFloatParams_)  floatVarNames_.insert(p);
+        for (const auto& p : forcedFloatArrayParams_) floatArrayVarNames_.insert(p);
         // Seed cross-method string-field knowledge BEFORE preScanStrings runs its fixpoint (see
         // classStringFields_'s comment) — a field this class assigns a string to in ANY method
         // (commonly `init`) must print as a string in every OTHER method too (`self.field`), not
@@ -3947,10 +4546,22 @@ public:
         // raw pointer as a decimal integer, "4202497", not "unnamed").
         if (!fn.classOwner.empty() && classStringFields_ && classStringFields_->count(fn.classOwner))
             for (auto& f : classStringFields_->at(fn.classOwner)) stringVarNames_.insert("self." + f);
-        preScanStrings(fn.instructions);
+        // Pass 0: pre-scan to identify float/array/string-typed variables. preScanFloats and
+        // preScanStrings each converge to their OWN local fixpoint alone, but each one's rules
+        // can depend on marks only the OTHER pass supplies (an array-loaded element's floatness
+        // needs preScanStrings' array-ness marks; a `.append(floatExpr)`'s array-ness needs
+        // preScanFloats' expression-floatness marks) — alternate both until a full round of
+        // both leaves every side table unchanged (see trackingChecksum's comment).
+        size_t checkBefore;
+        do {
+            checkBefore = trackingChecksum();
+            preScanFloats(fn.instructions);
+            preScanStrings(fn.instructions);
+        } while (trackingChecksum() != checkBefore);
         recordFloatReturn(fn.instructions, fn.name);
         recordStringReturn(fn.instructions, fn.name);
         recordArrayReturn(fn.instructions, fn.name);
+        recordFloatArrayReturn(fn.instructions, fn.name);
         recordStrListReturn(fn.instructions, fn.name);
         // Pass 1: register allocation (must know N callee-saves before frame layout)
         regAlloc.run(fn.instructions);
@@ -4018,8 +4629,27 @@ public:
             // name regardless of body usage (`prog.symbols.intern(p)`), so a plain name lookup
             // always finds the real symbol id here — just needs to be tried explicitly.
             if (symId < 0 && instanceClass_ && instanceClass_->count(pname)) symId = prog.symbols.lookupAnyScope(pname);
-            if (symId >= 0)
-                em.mov_rbp_r(frame.varOffset(symId), abi.argRegs[i]);
+            if (symId >= 0) {
+                // A param the CALLER passes as a plain int but that goes "sticky float" LATER
+                // in the body (e.g. `n = n / 2` — AC's automatic retype keeps n float for the
+                // rest of the function, see ir.cpp's AssignStmt stickyKeep comment) is
+                // float-classified for its ENTIRE lifetime by this prescan, including this very
+                // first read — but the incoming register still holds a raw int (the SysV ABI
+                // puts ints in GPRs regardless; only forcedFloatParams_ params get a genuine
+                // double here, because the CALL SITE itself already knew to pass one). Without
+                // converting, "n"'s slot held int 6's raw bits, and every later float-aware read
+                // reinterpreted those bits as a double — an almost-zero denormal, not 6.0.
+                // Verified real bug: math_number.ac's `collatz(6)` read n as 0 from the very
+                // first loop condition check, before any computation at all ran.
+                bool stickyFloatParam = floatVarNames_.count(pname) > 0 && !forcedFloatParams_.count(pname);
+                if (stickyFloatParam) {
+                    em.cvtsi2sd_xmm0_from_gpr(abi.argRegs[i]);
+                    em.movq_gpr_from_xmm0(R::RAX);
+                    em.mov_rbp_r(frame.varOffset(symId), R::RAX);
+                } else {
+                    em.mov_rbp_r(frame.varOffset(symId), abi.argRegs[i]);
+                }
+            }
             else if (i == 0 && !fn.classOwner.empty() && pname == "self")
                 em.mov_rbp_r(frame.varOffset(kSelfSymId_), abi.argRegs[i]);
         }
@@ -4057,19 +4687,27 @@ public:
         currentClass_.clear();
         curFnIsGenerator_ = true;
         labelPrefix_ = "__fn_" + label + "_";
+        currentParams_ = std::set<std::string>(fn.parameters.begin(), fn.parameters.end());
         buildLocalVarIds(fn.instructions);
         // Forced param types must be in place BEFORE the float pre-scan: `a + b` with a float
         // parameter `a` is only float-marked if `a` already is when preScanFloats runs.
         for (const auto& p : forcedStringParams_) stringVarNames_.insert(p);
         for (const auto& p : forcedFloatParams_)  floatVarNames_.insert(p);
-        preScanFloats(fn.instructions);
+        for (const auto& p : forcedFloatArrayParams_) floatArrayVarNames_.insert(p);
+        {
+            size_t checkBefore;
+            do {
+                checkBefore = trackingChecksum();
+                preScanFloats(fn.instructions);
+                preScanStrings(fn.instructions);
+            } while (trackingChecksum() != checkBefore);
+        }
         // Re-check after preScanFloats: the return temp is only float-marked there, so the check
         // above (which runs first) missed a float-returning function and callers printed its bits.
         recordFloatReturn(fn.instructions, fn.name);
-        preScanStrings(fn.instructions);
-        recordFloatReturn(fn.instructions, fn.name);
         recordStringReturn(fn.instructions, fn.name);
         recordArrayReturn(fn.instructions, fn.name);
+        recordFloatArrayReturn(fn.instructions, fn.name);
         recordStrListReturn(fn.instructions, fn.name);
 
         regAlloc.run(fn.instructions);
@@ -4128,8 +4766,14 @@ public:
     void compileGlobal(const std::vector<AC_IR::IRInstruction>& globalInit) {
         labelPrefix_ = "__start_";
         buildLocalVarIds(globalInit);
-        preScanFloats(globalInit);
-        preScanStrings(globalInit);
+        {
+            size_t checkBefore;
+            do {
+                checkBefore = trackingChecksum();
+                preScanFloats(globalInit);
+                preScanStrings(globalInit);
+            } while (trackingChecksum() != checkBefore);
+        }
         regAlloc.run(globalInit);
         calleeSaves.clear();
         for (int i = 0; i < LinearScanAlloc::POOL_SIZE; i++)
@@ -4245,32 +4889,66 @@ static void emitSysExit(X64Emitter& em) {
     }
 }
 
-// global slot (__heap_cursor). No free — adequate for AC array/list programs.
+// global slots (__heap_cursor / __heap_limit). No free — adequate for AC array/list programs.
 //   __ac_alloc__(rdi = bytes) -> rax = pointer
-static void emitAllocLinux(X64Emitter& em, int cursorSlot) {
+//
+// A single fixed 16MB mmap with no bounds check used to be the whole allocator: once the bump
+// cursor walked past the end of that one mapping, every later alloc still "succeeded" (just
+// bumping a pointer, no page-fault check of its own) and returned a pointer into UNMAPPED
+// memory — the segfault only happened later, whenever that pointer was actually read/written
+// (store()/LOAD_INDEX/etc.), far from the real cause. Verified real crash on
+// schrodinger_oscillator.ac (a single `evolve` call past ~1300-1400 steps of 201-element list
+// churn) and reproduced minimally with a tight allocate-and-discard loop past ~16MB of total
+// (never-freed, by design — see the comment above) bump traffic. Fixed with real multi-region
+// growth: __heap_limit tracks the END of the CURRENTLY mapped region, and once a request would
+// cross it, a FRESH region is mmap'd (sized to comfortably cover the one request that triggered
+// growth) and the cursor/limit pair moves onto it — old regions are simply abandoned (same
+// "never free" policy as every allocation already had; old pointers already returned stay
+// valid since their pages are still mapped, just no longer where new allocations land).
+static void emitAllocLinux(X64Emitter& em, int cursorSlot, int limitSlot) {
     em.label("__ac_alloc__");
     em.push_rbp(); em.mov_rbp_rsp();
-    em.mov_ri64_gvar(R::RCX, cursorSlot);   // rcx = &cursor
-    em.mov_r_ptr(R::RAX, R::RCX);           // rax = *cursor
+    em.mov_ri64_gvar(R::RCX, cursorSlot);    // rcx = &cursor
+    em.mov_r_ptr(R::RAX, R::RCX);            // rax = *cursor (0 if no region mapped yet)
     em.test_rr(R::RAX, R::RAX);
-    em.jne("__ac_alloc_have__");
-    // First call: reserve+commit 16MB of fresh zeroed pages. RSP is 16-aligned here (only the
-    // push_rbp prologue so far), so both branches below keep it aligned at their own call/syscall.
+    em.je("__ac_alloc_grow__");
+    // Existing region: still room for this request?
+    em.mov_ri64_gvar(R::R8, limitSlot);      // r8 = &limit
+    em.mov_r_ptr(R::R9, R::R8);              // r9 = *limit
+    em.mov_rr(R::R10, R::RAX);
+    em.add_rr(R::R10, R::RDI);               // r10 = cursor + bytes (candidate new cursor)
+    em.cmp_rr(R::R10, R::R9);
+    em.jg("__ac_alloc_grow__");
+    em.jmp("__ac_alloc_have__");
+    em.label("__ac_alloc_grow__");
+    // RSP is 16-aligned here (only the push_rbp prologue so far), so both branches below keep
+    // it aligned at their own call/syscall.
     em.push_r(R::RDI);                       // save requested bytes
     em.push_r(R::RCX);                       // save &cursor (clobbered by the call/syscall below)
+    // Region size: a flat 64MB, or (bytes + 64MB) on the rare request that alone exceeds that —
+    // always leaves slack after satisfying the triggering request, same spirit as the old flat
+    // 16MB just bigger and now actually enforced instead of silently overrun.
+    em.mov_rr(R::RSI, R::RDI);               // rsi = bytes
+    em.mov_ri32(R::RDX, 0x4000000);          // rdx = 64 MB
+    em.cmp_rr(R::RSI, R::RDX);
+    em.jl("__ac_alloc_sizeok__");
+    em.add_rr(R::RDX, R::RSI);               // rdx = bytes + 64MB
+    em.label("__ac_alloc_sizeok__");
+    em.mov_rr(R::RSI, R::RDX);               // rsi = region size (survives the call/syscall below)
     if (g_bnyTargetWindows) {
-        // VirtualAlloc(NULL, 16MB, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) -> base in rax
+        // VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE) -> base in rax.
+        // RSI is callee-saved under the Win64 convention, so it still holds `size` after this.
         em.mov_ri32(R::RCX, 0);
-        em.mov_ri32(R::RDX, 0x1000000);      // 16 MB
+        em.mov_rr(R::RDX, R::RSI);
         em.mov_ri32(R::R8,  0x3000);         // MEM_COMMIT(0x1000)|MEM_RESERVE(0x2000)
         em.mov_ri32(R::R9,  0x04);           // PAGE_READWRITE
         em.sub_rsp_i32(32);                  // Win64 shadow space
         em.call_rip_rel("VirtualAlloc");
         em.add_rsp_i32(32);
     } else {
-        // mmap(NULL, 16MB, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0) -> base in rax
+        // mmap(NULL, size, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0) -> base in rax.
+        // The `syscall` instruction only clobbers RCX/R11 (not RSI), so `size` survives.
         em.mov_ri32(R::RDI, 0);
-        em.mov_ri32(R::RSI, 0x1000000);      // 16 MB
         em.mov_ri32(R::RDX, 3);              // PROT_READ|PROT_WRITE
         em.mov_ri32(R::R10, 0x22);           // MAP_PRIVATE|MAP_ANONYMOUS
         em.mov_ri32(R::R8,  -1);             // fd
@@ -4281,6 +4959,11 @@ static void emitAllocLinux(X64Emitter& em, int cursorSlot) {
     em.pop_r(R::RCX);                        // &cursor
     em.pop_r(R::RDI);                        // bytes
     em.mov_ptr_r(R::RCX, R::RAX);            // *cursor = base
+    em.mov_rr(R::RDX, R::RAX);
+    em.add_rr(R::RDX, R::RSI);               // rdx = base + size = new limit
+    em.mov_ri64_gvar(R::R8, limitSlot);
+    em.mov_ptr_r(R::R8, R::RDX);             // *limit = new limit
+    em.mov_r_ptr(R::RAX, R::RCX);            // rax = *cursor (reload: base, for the common tail below)
     em.label("__ac_alloc_have__");
     // rax = current cursor (result), rcx = &cursor, rdi = bytes
     em.mov_rr(R::RDX, R::RAX);               // rdx = result (old cursor)
@@ -5036,6 +5719,117 @@ static void emitPrintIntLinux(X64Emitter& em) {
 }
 
 // __ac_print_arr__(rdi = list block [len][e0][e1]…): print "[e0, e1, …]\n" (matches PY)
+// __ac_arr_to_str__(rdi = int list block) -> rax = heap "[e0, e1, …]" string, NO trailing
+// newline — backs `to_string(intArray)` (and therefore `+`-concatenation of an array into a
+// bigger string). Same element layout/addressing as __ac_print_arr__ just below, but builds
+// into a heap buffer via byte-copy instead of writing straight to stdout. Allocates a generous
+// flat (not grown) buffer sized off the element count — 24 bytes/element comfortably covers
+// a 64-bit int's longest decimal form (20 digits + sign) plus its ", " separator, so this
+// never needs __ac_append__-style regrowth. Verified real bug this closes: `to_string(primes)`
+// printed the raw block POINTER as a decimal integer instead of the array's contents
+// (html_page.ac's `primes` sieve result).
+static void emitArrToStrLinux(X64Emitter& em) {
+    em.label("__ac_arr_to_str__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
+    em.mov_rr(R::RBX, R::RDI);               // rbx = block
+    em.mov_r_ptr(R::R12, R::RBX);            // r12 = len
+    em.mov_rr(R::RDI, R::R12);
+    em.mov_ri32(R::RDX, 24); em.imul_rr(R::RDI, R::RDX); em.add_ri32(R::RDI, 8);
+    em.call("__ac_alloc__");                 // rax = fresh buffer
+    em.mov_rr(R::R13, R::RAX);               // r13 = buffer start (return value)
+    em.mov_rr(R::R14, R::RAX);               // r14 = write cursor
+    em.mov_ri32(R::RCX, '[');
+    em.mov_ptr_r8(R::R14, R::RCX); em.inc_r(R::R14);
+    em.mov_ri32(R::R15, 1);                  // r15 = idx (1-based)
+    em.label("__ac_a2s_loop__");
+    em.cmp_rr(R::R15, R::R12);
+    em.jg("__ac_a2s_done__");
+    em.cmp_r_i32(R::R15, 1);
+    em.je("__ac_a2s_elem__");
+    em.mov_ri32(R::RCX, ','); em.mov_ptr_r8(R::R14, R::RCX); em.inc_r(R::R14);
+    em.mov_ri32(R::RCX, ' '); em.mov_ptr_r8(R::R14, R::RCX); em.inc_r(R::R14);
+    em.label("__ac_a2s_elem__");
+    em.mov_rr(R::RCX, R::R15); em.mov_ri32(R::RDX, 8); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::RAX, R::RBX); em.add_rr(R::RAX, R::RCX);
+    em.mov_r_ptr(R::RDI, R::RAX);             // rdi = block[idx]
+    em.call("__ac_itoa__");                   // rax = fresh heap decimal string
+    em.push_r(R::RAX);
+    em.mov_rr(R::RDI, R::RAX);
+    em.call("__ac_strlen__");                 // rax = length
+    em.mov_rr(R::RCX, R::RAX);
+    em.pop_r(R::RSI);                         // rsi = itoa string ptr
+    em.label("__ac_a2s_copy__");
+    em.test_rr(R::RCX, R::RCX);
+    em.jz("__ac_a2s_copydone__");
+    em.movzx_r64_ptr8(R::RDX, R::RSI);
+    em.mov_ptr_r8(R::R14, R::RDX);
+    em.inc_r(R::RSI); em.inc_r(R::R14); em.dec_r(R::RCX);
+    em.jmp("__ac_a2s_copy__");
+    em.label("__ac_a2s_copydone__");
+    em.inc_r(R::R15);
+    em.jmp("__ac_a2s_loop__");
+    em.label("__ac_a2s_done__");
+    em.mov_ri32(R::RCX, ']'); em.mov_ptr_r8(R::R14, R::RCX); em.inc_r(R::R14);
+    em.mov_ri32(R::RCX, 0);   em.mov_ptr_r8(R::R14, R::RCX);
+    em.mov_rr(R::RAX, R::R13);
+    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+}
+
+// Float-array counterpart of __ac_arr_to_str__ — identical shape, element formatting goes
+// through ac_double_to_str (the hard formatter, matching __ac_print_arr_float__'s own choice)
+// instead of __ac_itoa__.
+static void emitArrToStrFloatLinux(X64Emitter& em) {
+    em.label("__ac_arr_to_str_float__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
+    em.mov_rr(R::RBX, R::RDI);
+    em.mov_r_ptr(R::R12, R::RBX);
+    em.mov_rr(R::RDI, R::R12);
+    em.mov_ri32(R::RDX, 32); em.imul_rr(R::RDI, R::RDX); em.add_ri32(R::RDI, 8);
+    em.call("__ac_alloc__");
+    em.mov_rr(R::R13, R::RAX);
+    em.mov_rr(R::R14, R::RAX);
+    em.mov_ri32(R::RCX, '[');
+    em.mov_ptr_r8(R::R14, R::RCX); em.inc_r(R::R14);
+    em.mov_ri32(R::R15, 1);
+    em.label("__ac_a2sf_loop__");
+    em.cmp_rr(R::R15, R::R12);
+    em.jg("__ac_a2sf_done__");
+    em.cmp_r_i32(R::R15, 1);
+    em.je("__ac_a2sf_elem__");
+    em.mov_ri32(R::RCX, ','); em.mov_ptr_r8(R::R14, R::RCX); em.inc_r(R::R14);
+    em.mov_ri32(R::RCX, ' '); em.mov_ptr_r8(R::R14, R::RCX); em.inc_r(R::R14);
+    em.label("__ac_a2sf_elem__");
+    em.mov_rr(R::RCX, R::R15); em.mov_ri32(R::RDX, 8); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX);
+    em.mov_r_ptr(R::RDI, R::RDI);
+    em.movq_xmm0_from_gpr(R::RDI);
+    em.call("ac_double_to_str");
+    em.push_r(R::RAX);
+    em.mov_rr(R::RDI, R::RAX);
+    em.call("__ac_strlen__");
+    em.mov_rr(R::RCX, R::RAX);
+    em.pop_r(R::RSI);
+    em.label("__ac_a2sf_copy__");
+    em.test_rr(R::RCX, R::RCX);
+    em.jz("__ac_a2sf_copydone__");
+    em.movzx_r64_ptr8(R::RDX, R::RSI);
+    em.mov_ptr_r8(R::R14, R::RDX);
+    em.inc_r(R::RSI); em.inc_r(R::R14); em.dec_r(R::RCX);
+    em.jmp("__ac_a2sf_copy__");
+    em.label("__ac_a2sf_copydone__");
+    em.inc_r(R::R15);
+    em.jmp("__ac_a2sf_loop__");
+    em.label("__ac_a2sf_done__");
+    em.mov_ri32(R::RCX, ']'); em.mov_ptr_r8(R::R14, R::RCX); em.inc_r(R::R14);
+    em.mov_ri32(R::RCX, 0);   em.mov_ptr_r8(R::R14, R::RCX);
+    em.mov_rr(R::RAX, R::R13);
+    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+}
+
 static void emitPrintArrLinux(X64Emitter& em) {
     em.label("__ac_print_arr__");
     em.push_rbp(); em.mov_rbp_rsp();
@@ -5070,6 +5864,54 @@ static void emitPrintArrLinux(X64Emitter& em) {
     em.call("__ac_sys_write__");
     em.add_rsp_i32(24);
     em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+}
+
+// __ac_print_arr_float__(rdi = list block [len][e0][e1]…, elements are float bit patterns):
+// print "[1.5, 2.25]\n" — same shape as emitPrintArrLinux just above, but each element goes
+// through ac_double_to_str (the hard %.16g-plus-forced-".0" formatter, never the smart one —
+// a list element always matches PY's repr, which never applies the smart-division truncation)
+// instead of __ac_print_int_raw__.
+static void emitPrintArrFloatLinux(X64Emitter& em) {
+    em.label("__ac_print_arr_float__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14);
+    em.sub_rsp_i32(24);                      // small char buffer below saved regs
+    em.mov_rr(R::RBX, R::RDI);               // rbx = block
+    em.mov_r_ptr(R::R12, R::RBX);            // r12 = len
+    em.mov_ri32(R::R13, 1);                  // r13 = idx (1-based words)
+    em.mov_rbp8_imm8(-33, '[');
+    em.lea_r_rbp8(R::RSI, -33); em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RDX, 1);
+    em.call("__ac_sys_write__");
+    em.label("__ac_parrf_loop__");
+    em.cmp_rr(R::R13, R::R12);
+    em.jg("__ac_parrf_done__");
+    em.cmp_r_i32(R::R13, 1);
+    em.je("__ac_parrf_elem__");
+    em.mov_rbp8_imm8(-33, ','); em.mov_rbp8_imm8(-32, ' ');
+    em.lea_r_rbp8(R::RSI, -33); em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RDX, 2);
+    em.call("__ac_sys_write__");
+    em.label("__ac_parrf_elem__");
+    em.mov_rr(R::RCX, R::R13); em.mov_ri32(R::RDX, 8); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX);
+    em.mov_r_ptr(R::RDI, R::RDI);            // rdi = block[idx] (raw double bits)
+    em.movq_xmm0_from_gpr(R::RDI);
+    em.call("ac_double_to_str");             // rax = heap string ptr, no newline
+    em.mov_rr(R::R14, R::RAX);               // save across the strlen call
+    em.mov_rr(R::RDI, R::R14);
+    em.call("__ac_strlen__");                // rax = length
+    em.mov_rr(R::RDX, R::RAX);
+    em.mov_rr(R::RSI, R::R14);
+    em.mov_ri32(R::RDI, 1);
+    em.call("__ac_sys_write__");
+    em.inc_r(R::R13);
+    em.jmp("__ac_parrf_loop__");
+    em.label("__ac_parrf_done__");
+    em.mov_rbp8_imm8(-33, ']'); em.mov_rbp8_imm8(-32, '\n');
+    em.lea_r_rbp8(R::RSI, -33); em.mov_ri32(R::RDI, 1); em.mov_ri32(R::RDX, 2);
+    em.call("__ac_sys_write__");
+    em.add_rsp_i32(24);
+    em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
 }
 
@@ -5193,6 +6035,43 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     // r12 = write pointer into main output buffer at rbp-180
     em.lea_r_rbp32(R::R12, -180);
 
+    // NaN/Infinity: cvttsd2si (just below) and every digit-extraction step after it assume a
+    // normal finite double; feeding them a NaN/Inf bit pattern produces unreadable byte-garbage
+    // instead of text — verified real bug: calculus.ac's `limit(1/x, 0)` / `eval(foo + 1)`
+    // (both genuinely NaN, by design — "no two-sided limit"/"unknown name") printed garbage
+    // instead of "nan". PY's str(float('nan'))/str(float('inf')) is the oracle: lowercase
+    // "nan"/"inf"/"-inf", matching Python, not C's "nan"/"inf" formatting.
+    em.movq_gpr_from_xmm0(R::RAX);              // rax = raw bits of the value
+    em.mov_ri64(R::RCX, 0x7FF0000000000000ULL); // exponent-all-ones mask
+    em.mov_rr(R::RDX, R::RAX);
+    em.and_rr(R::RDX, R::RCX);
+    em.cmp_rr(R::RDX, R::RCX);
+    em.jne("__acd_finite__");                   // exponent not all-ones -> ordinary finite value
+    {
+        em.mov_ri64(R::RCX, 0x000FFFFFFFFFFFFFULL); // mantissa mask
+        em.mov_rr(R::RDX, R::RAX);
+        em.and_rr(R::RDX, R::RCX);
+        em.test_rr(R::RDX, R::RDX);
+        em.jne("__acd_isnan__");                    // mantissa nonzero -> NaN
+        // Infinity: sign bit decides "inf" vs "-inf"
+        em.mov_ri64(R::RCX, 0x8000000000000000ULL);
+        em.and_rr(R::RAX, R::RCX);
+        em.test_rr(R::RAX, R::RAX);
+        em.je("__acd_infpos__");
+        em.mov_ri32(R::RAX, '-'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.label("__acd_infpos__");
+        em.mov_ri32(R::RAX, 'i'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.mov_ri32(R::RAX, 'n'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.mov_ri32(R::RAX, 'f'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.jmp("__acd_nl__");
+        em.label("__acd_isnan__");
+        em.mov_ri32(R::RAX, 'n'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.mov_ri32(R::RAX, 'a'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.mov_ri32(R::RAX, 'n'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.jmp("__acd_nl__");
+    }
+    em.label("__acd_finite__");
+
     // ── Integer part + sign ─────────────────────────────────────────────────
     em.cvttsd2si_r13_xmm0();            // r13 = trunc(value)   [xmm0 still = ORIGINAL value]
 
@@ -5248,6 +6127,17 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
       em.inc_r(R::R14);
       em.test_rr(R::RAX, R::RAX);
       em.jne("__acd_cntloop__");        // r14 = digit count (>=1; 0 itself counts as 1 digit)
+
+      // Scientific notation: intpart alone already has >16 significant digits, so no fixed-point
+      // rendering can show it within the %.16g budget at all — matches PY's own '%.16g' % d
+      // convention switching to exponential form past this threshold (e.g. a value whose intpart
+      // is 334402454697868224 prints as 3.344024546978682e+17, not the raw 18-digit integer).
+      // Only the large-magnitude side of %g's switch-over is implemented (intpart digit count >
+      // precision); the small-magnitude side (|value| < 1e-4) still falls through to the ordinary
+      // fixed-point path below, since no failing example currently exercises it.
+      em.cmp_r_i32(R::R14, 16);
+      em.jg("__acd_sci__");
+
       em.mov_ri32(R::RAX, 16);
       em.sub_rr(R::RAX, R::R14);        // rax = 16 - digitcount
       em.cmp_r_i32(R::RAX, 0);
@@ -5473,6 +6363,156 @@ static void emitPrintDoubleLinux(X64Emitter& em) {
     em.add_ri32(R::RAX, '0');
     em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12); em.inc_r(R::R14);
     em.dec_r(R::RBX); em.test_rr(R::RBX, R::RBX); em.jne("__acd_fcpy__");
+    em.jmp("__acd_nl__");
+
+    // ── Scientific notation (intpart digit count > 16) ────────────────────────────────────
+    // Reached only via the early jg("__acd_sci__") branch right after the digit-count loop
+    // above; rbx = |intpart| (exact int64, untouched since that loop only consumed a COPY of
+    // it in rax) and r14 = digit count (DC). [rbp-78] sign flag was already set, far above,
+    // before any of this — reuse it directly rather than recomputing.
+    em.label("__acd_sci__");
+    {
+        em.lea_r_rbp32(R::RAX, -78);
+        em.movzx_r64_ptr8(R::RAX, R::RAX);
+        em.test_rr(R::RAX, R::RAX);
+        em.je("__acd_snosign__");
+        em.mov_ri32(R::RAX, '-');
+        em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.label("__acd_snosign__");
+
+        // Stash DC at rbp-244 (free space inside the otherwise-unused 42-byte fraction-digit
+        // buffer, well clear of the 16-byte mantissa buffer this path plants at rbp-260).
+        em.lea_r_rbp32(R::RCX, -244);
+        em.mov_ptr_r(R::RCX, R::R14);
+
+        // Extract every decimal digit of rbx (LSB-first) into the reverse-digit area the
+        // ordinary integer path uses (unreachable from here, so safe to reuse) — same technique
+        // as __acd_idig__ above, just landing in a scratch buffer instead of printing directly.
+        em.lea_r_rbp32(R::R14, -190);
+        em.label("__acd_sdig__");
+        em.mov_rr(R::RAX, R::RBX);
+        em.mov_ri32(R::RCX, 10);
+        em.cqo(); em.idiv_rcx();
+        em.add_ri32(R::RDX, '0');
+        em.dec_r(R::R14);
+        em.mov_ptr_r8(R::R14, R::RDX);
+        em.mov_rr(R::RBX, R::RAX);
+        em.test_rr(R::RBX, R::RBX);
+        em.jne("__acd_sdig__");
+        // r14 = address of the most-significant digit; the run ends just before rbp-191.
+
+        // Copy the first 16 digits (MSB-first) into the mantissa buffer at rbp-260; rcx is left
+        // pointing at the 17th digit (the rounding guard digit), since DC > 16 always holds here.
+        em.lea_r_rbp32(R::RAX, -260);
+        em.mov_rr(R::RCX, R::R14);
+        em.mov_ri32(R::RBX, 16);
+        em.label("__acd_scopy__");
+        em.movzx_r64_ptr8(R::RDX, R::RCX);
+        em.mov_ptr_r8(R::RAX, R::RDX);
+        em.inc_r(R::RAX); em.inc_r(R::RCX);
+        em.dec_r(R::RBX); em.test_rr(R::RBX, R::RBX); em.jne("__acd_scopy__");
+
+        // Round-half-up using that guard digit, carrying right-to-left through the 16 mantissa
+        // digits (same convention as the fixed-point path's own rounding above — a simple
+        // guard>=5 threshold, not a full round-to-nearest-even over the remaining digits).
+        em.movzx_r64_ptr8(R::RDX, R::RCX);
+        em.mov_ri32(R::R9, 0);                 // r9 = mantissa-overflowed-to-"1.0...0" flag
+        em.cmp_r_i32(R::RDX, '5');
+        em.jl("__acd_snoround__");
+        em.lea_r_rbp32(R::R14, -245);           // &mantissa[15] (last digit)
+        em.label("__acd_scarry__");
+        em.movzx_r64_ptr8(R::RAX, R::R14);
+        em.inc_r(R::RAX);
+        em.cmp_r_i32(R::RAX, '0' + 10);
+        em.jl("__acd_snooverflow__");
+        em.mov_ri32(R::RAX, '0');
+        em.mov_ptr_r8(R::R14, R::RAX);
+        em.dec_r(R::R14);
+        {
+            std::string cont = "__acd_scarrycont__";
+            em.lea_r_rbp32(R::RAX, -261);        // one before mantissa[0]
+            em.cmp_rr(R::R14, R::RAX);
+            em.jne(cont);
+            em.lea_r_rbp32(R::RAX, -260);
+            em.mov_ri32(R::RDX, '1');
+            em.mov_ptr_r8(R::RAX, R::RDX);        // mantissa[0] = '1' (rest already zeroed above)
+            em.mov_ri32(R::R9, 1);
+            em.jmp("__acd_snoround__");
+            em.label(cont);
+        }
+        em.jmp("__acd_scarry__");
+        em.label("__acd_snooverflow__");
+        em.mov_ptr_r8(R::R14, R::RAX);
+        em.label("__acd_snoround__");
+
+        // Final exponent = DC - 1 (+1 if rounding overflowed the mantissa to "1.000...0").
+        em.lea_r_rbp32(R::RCX, -244); em.mov_r_ptr(R::RCX, R::RCX);
+        em.dec_r(R::RCX);
+        em.add_rr(R::RCX, R::R9);
+        em.lea_r_rbp32(R::RAX, -236); em.mov_ptr_r(R::RAX, R::RCX);
+
+        // Print mantissa[0], then '.' + mantissa[1..15] with trailing zeros stripped (bare
+        // "3e+17" when 1..15 are all zero, matching %g's own trimming convention).
+        em.lea_r_rbp32(R::RAX, -260);
+        em.movzx_r64_ptr8(R::RAX, R::RAX);
+        em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+
+        em.mov_ri32(R::RCX, 15);
+        em.label("__acd_sstriploop__");
+        em.test_rr(R::RCX, R::RCX);
+        em.je("__acd_sstripdone__");
+        em.lea_r_rbp32(R::RAX, -260);
+        em.add_rr(R::RAX, R::RCX);
+        em.movzx_r64_ptr8(R::RDX, R::RAX);
+        em.cmp_r_i32(R::RDX, '0');
+        em.jne("__acd_sstripdone__");
+        em.dec_r(R::RCX);
+        em.jmp("__acd_sstriploop__");
+        em.label("__acd_sstripdone__");
+
+        em.test_rr(R::RCX, R::RCX);
+        em.je("__acd_snodot__");
+        em.mov_ri32(R::RAX, '.'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.mov_rr(R::RBX, R::RCX);
+        em.lea_r_rbp32(R::R14, -259);           // &mantissa[1]
+        em.label("__acd_sfcpy__");
+        em.movzx_r64_ptr8(R::RAX, R::R14);
+        em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12); em.inc_r(R::R14);
+        em.dec_r(R::RBX); em.test_rr(R::RBX, R::RBX); em.jne("__acd_sfcpy__");
+        em.label("__acd_snodot__");
+
+        // 'e' + sign (always '+': this large-magnitude path never produces a negative exponent)
+        // + the exponent's own decimal digits, padded to a 2-digit minimum (matches C/Python's
+        // %e convention, e.g. "e+05", "e+17", "e+100").
+        em.mov_ri32(R::RAX, 'e'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+        em.mov_ri32(R::RAX, '+'); em.mov_ptr_r8(R::R12, R::RAX); em.inc_r(R::R12);
+
+        em.lea_r_rbp32(R::RAX, -236); em.mov_r_ptr(R::RCX, R::RAX); // rcx = exponent value
+        em.mov_rr(R::RAX, R::RCX);
+        em.lea_r_rbp32(R::R14, -190);
+        em.mov_ri32(R::RBX, 0);
+        em.label("__acd_sedig__");
+        em.mov_ri32(R::RCX, 10);
+        em.cqo(); em.idiv_rcx();
+        em.add_ri32(R::RDX, '0');
+        em.dec_r(R::R14);
+        em.mov_ptr_r8(R::R14, R::RDX);
+        em.inc_r(R::RBX);
+        em.test_rr(R::RAX, R::RAX);
+        em.jne("__acd_sedig__");
+        em.cmp_r_i32(R::RBX, 2);
+        em.jge("__acd_senopad__");
+        em.mov_ri32(R::RAX, '0');
+        em.dec_r(R::R14);
+        em.mov_ptr_r8(R::R14, R::RAX);
+        em.label("__acd_senopad__");
+        em.lea_r_rbp32(R::RAX, -190);
+        em.label("__acd_secpy__");
+        em.movzx_r64_ptr8(R::RDX, R::R14);
+        em.mov_ptr_r8(R::R12, R::RDX); em.inc_r(R::R12); em.inc_r(R::R14);
+        em.cmp_rr(R::R14, R::RAX);
+        em.jl("__acd_secpy__");
+    }
     em.jmp("__acd_nl__");
 
     // ── Whole-valued float (after rounding) → append ".0" ─────────────────────────────────
@@ -5793,7 +6833,7 @@ static void emitSaveFileLinux(X64Emitter& em, int bufPtrSlot, int bufLenSlot) {
     em.pop_rbp(); em.ret();
 }
 
-static void emitInputIntLinux(X64Emitter& em) {
+static void emitInputIntLinux(X64Emitter& em, StringPool& sp) {
     // __ac_input_int__(): read integer from stdin via syscall, parse, return in RAX
     em.label("__ac_input_int__");
     em.push_rbp(); em.mov_rbp_rsp();
@@ -5830,6 +6870,22 @@ static void emitInputIntLinux(X64Emitter& em) {
         em.syscall();
         em.mov_rr(R::R13, R::RAX);     // rax has bytes read; save to r13
     }
+
+    // Zero bytes read == true stdin EOF (same reasoning/incident as __ac_input_str__'s own
+    // copy of this check, just above — a `to_int n = Term.ask ...` loop needs the exact same
+    // "stop instead of spinning forever" signal a plain string Term.ask now gets).
+    em.test_rr(R::R13, R::R13);
+    em.jne("__ac_input_int_have__");
+    {
+        std::string msg = "EOFError: EOF when reading a line\n";
+        int sid = sp.add(msg);
+        em.mov_ri64_str(R::RSI, sid);
+        em.mov_ri32(R::RDI, 2);
+        em.mov_ri32(R::RDX, (int32_t)msg.size());
+        em.call("__ac_sys_write__");
+        em.mov_ri32(R::RDI, 1); em.call("__ac_sys_exit__");
+    }
+    em.label("__ac_input_int_have__");
 
     // Parse integer from buffer [rbp-64]
     // Start with result = 0 in RAX
@@ -5943,7 +6999,7 @@ static void emitInputStrLinux(X64Emitter& em, StringPool& sp) {
         em.call_rip_rel("ReadFile");
         em.mov_r_rbp(R::RAX, -40);           // rax = bytes read (0 or 1)
         em.cmp_r_i32(R::RAX, 1);
-        em.jne("__ac_input_str_term__");
+        em.jne("__ac_input_str_short__");
     } else {
         em.mov_ri32(R::RDI, 0);
         em.mov_rr(R::RSI, R::R13);
@@ -5951,7 +7007,7 @@ static void emitInputStrLinux(X64Emitter& em, StringPool& sp) {
         em.mov_ri32(R::RAX, 0);
         em.syscall();
         em.cmp_r_i32(R::RAX, 1);
-        em.jne("__ac_input_str_term__");
+        em.jne("__ac_input_str_short__");
     }
 
     em.movzx_r64_ptr8(R::RCX, R::R13);
@@ -5963,11 +7019,44 @@ static void emitInputStrLinux(X64Emitter& em, StringPool& sp) {
     em.dec_r(R::R12);
     em.jmp("__ac_input_str_scan__");
 
+    // A read that returned anything other than exactly 1 byte: 0 means the OS has no more
+    // input at all (stdin EOF — pipe/redirect closed, Ctrl-D on a terminal). Without this
+    // check, EOF silently behaved exactly like hitting '\n' forever, so a REPL's own
+    // `WHILST running is 1 ... line = Term.ask ...` loop never saw any signal to stop and
+    // span forever re-reading "" — verified real incident: calculator.ac run with no stdin
+    // spun indefinitely, and because BNY's allocator (separately fixed to really grow
+    // instead of silently corrupting memory past a fixed 16MB region) now happily grows to
+    // satisfy every request, that infinite loop exhausted all system RAM instead of
+    // crashing quickly, triggering the OOM killer on unrelated processes. Matches the
+    // established cross-backend convention (see Rust's emitInput and this comment's sibling
+    // in ir_codegen.cpp): EOF is an error, exactly like PY's `input()` raising `EOFError` —
+    // but only when EOF arrives with ZERO bytes already read for the CURRENT line (R13 still
+    // == RBX, the start of this call's buffer); a final line with no trailing newline before
+    // EOF must still return that partial line normally, matching PY's `input()` (the NEXT
+    // call, with nothing left at all, is what actually raises).
+    em.label("__ac_input_str_short__");
+    em.test_rr(R::RAX, R::RAX);
+    em.jne("__ac_input_str_term__");        // nonzero (e.g. a signal-interrupted short read): treat as line end, as before
+    em.cmp_rr(R::R13, R::RBX);
+    em.jne("__ac_input_str_term__");        // partial line already read this call -> return it, no error
+    em.jmp("__ac_input_str_eoferr__");
+
     em.label("__ac_input_str_term__");
     em.mov_ri32(R::RAX, 0);
     em.mov_ptr_r8(R::R13, R::RAX);
     em.mov_rr(R::RAX, R::RBX);
     em.jmp("__ac_input_str_return__");
+
+    em.label("__ac_input_str_eoferr__");
+    {
+        std::string msg = "EOFError: EOF when reading a line\n";
+        int sid = sp.add(msg);
+        em.mov_ri64_str(R::RSI, sid);
+        em.mov_ri32(R::RDI, 2);
+        em.mov_ri32(R::RDX, (int32_t)msg.size());
+        em.call("__ac_sys_write__");       // write(2, msg)
+        em.mov_ri32(R::RDI, 1); em.call("__ac_sys_exit__"); // exit(1)
+    }
 
     em.label("__ac_input_str_fail__");
     em.mov_ri64_str(R::RAX, emptySid);
@@ -6670,6 +7759,24 @@ static std::string normalizeExtSym(const std::string& irName) {
         {"math.to_int", "ac_to_int"},  {"math.to_dec", "ac_to_dec"},
         {"math.gcd",    "ac_gcd"},    {"math.lcm",    "ac_lcm"},
         {"math.is_prime","ac_is_prime"},
+        // ── Symbolic calculus (string-expression args) + modular arithmetic ─────
+        // Exported by libacmath.so (confirmed via `nm -D`) but never added to this table —
+        // BNY's dynamic linker never had a reason to look for them, so every call hit a
+        // real runtime "undefined symbol" from ld.so (verified: calculus.ac/
+        // calculus_optimize.ac/calculus_physics.ac/modular_arithmetic.ac all crash this way
+        // on BNY while every other backend runs them fine, including BNY's own math.sin/
+        // math.sqrt/etc. right above — a pre-existing gap, not something this session's
+        // float-list/heap-allocator/Term.ask work touched).
+        {"math.integrate",  "ac_integrate"},
+        {"math.derivative", "ac_derivative"},
+        {"math.limit",      "ac_limit"},
+        {"math.minima",     "ac_minima"},
+        {"math.maxima",     "ac_maxima"},
+        {"math.modpow",     "ac_modpow"},
+        {"math.modinv",     "ac_modinv"},
+        {"math.modmul",     "ac_modmul"},
+        {"math.eval",       "ac_eval"},
+        {"math.eval_at",    "ac_eval_at"},
         // ── Constants ─────────────────────────────────────────────────────────
         {"math.pi",     "ac_math_pi_const"},
         {"math.e",      "ac_math_e_const"},
@@ -6754,6 +7861,12 @@ static std::string normalizeExtSym(const std::string& irName) {
         {"maudio.stop",              "ac_maudio_stop_all"},
         {"stringm.strip_clause",     "ac_stringm_strip_clause"},
         {"stringm.stripln",          "ac_stringm_stripln"},
+        // "length" is a pure alias for "len" (string-cheese.hpp aliases both names to the same
+        // ac_stringm_len export) — the generic fallback below derives "ac_stringm_length",
+        // which doesn't exist as a real symbol, causing a real undefined-symbol crash at load
+        // time (verified via string_cheese_checks.ac). "stringm.len" itself needs no entry
+        // here since the generic transform already produces the right name for it.
+        {"stringm.length",          "ac_stringm_len"},
     };
     auto it = tbl.find(irName);
     if (it != tbl.end()) return it->second;
@@ -6770,6 +7883,16 @@ static std::string normalizeExtSym(const std::string& irName) {
     // native-cpu's carried-over ptr_* functions are called BARE (ptr_new, not
     // ncpu.ptr_new) but the real .so symbol is still ac_ncpu_ptr_new — map it here,
     // same as the dotted case above just without a '.' to replace.
+    // "ptr_deref" is the one bare ptr_* name that is NOT a straight "ac_ncpu_" + name mapping:
+    // the real .so exports BOTH "ac_ncpu_ptr_deref" (returns the raw int64_t pointer value) and
+    // "ac_ncpu_ptr_deref_str" (returns the stored bytes as a char*) as separate symbols — BNY
+    // treats ptr_deref as a string-returning call everywhere else (returnsCString's own set,
+    // which calls __ac_strdup__ on the result), so it needs the "_str" variant specifically.
+    // Calling the plain "ac_ncpu_ptr_deref" and then strdup'ing its raw int64 return as if it
+    // were a valid C string pointer is exactly what crashed (verified real segfault on
+    // native_cpu_buffers.ac / native_cpu_deref.ac — confirmed via `nm -D libacncpu.so` showing
+    // both symbols really exist, this was a wrong-symbol bug, not a missing one).
+    if (irName == "ptr_deref") return "ac_ncpu_ptr_deref_str";
     if (isNativeCpuPtrSym(irName)) return "ac_ncpu_" + irName;
     return irName;
 }
@@ -7146,6 +8269,7 @@ class BinaryCompiler {
     std::map<std::string, std::set<std::string>> classStringFields_;
     std::map<std::string,std::set<std::string>> stringParamHints_;
     std::map<std::string,std::set<std::string>> floatParamHints_;   // fn → params passed a float
+    std::map<std::string,std::set<std::string>> floatArrayParamHints_;  // fn → params passed a float array
     bool                      bundleStatic_ = false; // --static-link: splice freestanding ilib .text
     std::string               runpath_;              // ilib dirs (also where freestanding objs live)
     bool                      usesArrays_ = false; // program allocates lists/arrays
@@ -7287,6 +8411,7 @@ class BinaryCompiler {
         // reserve the cursor slot and emit it (small, and string-ness is only known later).
         usesArrays_ = true;
         gvarSlots_["__heap_cursor"] = slot++;
+        gvarSlots_["__heap_limit"] = slot++;   // end address of the CURRENT mmap'd heap region
 
         // `atomic` vars: reserve one gvar slot for a real spinlock (xchg-based, no libc/syscall
         // needed — see X64Emitter::xchg_ptr_r) only if the program actually declares one.
@@ -7341,6 +8466,13 @@ class BinaryCompiler {
         if (usesTry_) {
             gvarSlots_["__try_stack_ptr"] = slot++;
             gvarSlots_["__try_depth"] = slot++;
+            // `report <var>` (parsed as CatchClause's exVar) binds the caught error's message —
+            // emitDivZeroTrap writes a message-string pointer here right before jmp_r'ing to the
+            // catch entry, and CATCH_BEGIN's codegen copies it into the named var there. Verified
+            // real bug: `report err` on BNY silently left `err` at its default 0, since nothing
+            // ever consulted CATCH_BEGIN's own exVar operand — every other backend binds this
+            // through its native exception value, BNY had no equivalent plumbing at all.
+            gvarSlots_["__exc_msg_ptr"] = slot++;
         }
 
         // `yield`/generators: single shared "currently active generator" slot — same design as
@@ -7686,6 +8818,152 @@ class BinaryCompiler {
             changed |= scanBlock(prog.globalInit, {});
             for (const auto& fn : prog.functions)
                 changed |= scanBlock(fn.instructions, floatParamHints_[fn.name]);
+        }
+    }
+
+    // Float-array-param inference — the analog of computeFloatParamHints for whole arrays. A
+    // param only ever INDEXED inside its own function (never appended to, never returned) has no
+    // local evidence of its own float-ness — the fact only exists at the CALL SITE, where the
+    // caller passes a var already known to be a float array (a literal with float elements, or
+    // one built via `.append(floatExpr)` earlier in the SAME caller). Without this, `v[j+1]`
+    // inside a callee like `sumit(v)` stays classified as a plain int array, so every element
+    // read reinterprets its raw IEEE-754 bits as an integer — verified real bug matching
+    // schrodinger_oscillator's `hpsi`/`energy` (both receive `psi`/`xs` purely by index, never
+    // append to them) and a minimal repro (fl5.ac: `sumit([1.5,2.5,3.0])` printed garbage bytes
+    // instead of 7.0).
+    void computeFloatArrayParamHints() {
+        using namespace AC_IR;
+        std::map<std::string,const IRFunction*> funcs;
+        for (const auto& fn : prog.functions) funcs[fn.name] = &fn;
+        auto refName = [&](const IRRef& r) -> std::string {
+            return (r.kind == IRRef::Kind::VAR && r.id >= 0) ? prog.symbols.getName(r.id) : "";
+        };
+        auto funcNameOf = [&](const IRRef& r) -> std::string {
+            if ((r.kind == IRRef::Kind::FUNCTION || r.kind == IRRef::Kind::VAR) && r.id >= 0)
+                return prog.symbols.getName(r.id);
+            return "";
+        };
+        auto literalHasFloatElem = [&](const std::string& s) -> bool {
+            size_t i = 0;
+            while (i < s.size()) {
+                size_t j = s.find(',', i);
+                std::string tok = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
+                size_t a = tok.find_first_not_of(" \t");
+                if (a != std::string::npos) {
+                    size_t b = tok.find_last_not_of(" \t");
+                    tok = tok.substr(a, b - a + 1);
+                    if (tok.find_first_of(".eE") != std::string::npos
+                            && tok.find_first_of("0123456789") != std::string::npos)
+                        return true;
+                }
+                if (j == std::string::npos) break;
+                i = j + 1;
+            }
+            return false;
+        };
+        // Which functions are known (so far, this fixpoint) to RETURN a float array — lets a
+        // caller's `hp = hpsi(psi, xs, h)` mark `hp` itself float-array too, so a LATER function
+        // receiving `hp` as a param (e.g. `energy`'s own `hp[j+1]`) gets the same param hint.
+        std::set<std::string> floatArrayReturnFuncs;
+        auto scanBlock = [&](const std::vector<IRInstruction>& code, std::set<std::string> farrs, const std::string& fnName) {
+            bool changed = false;
+            std::set<int> fatemps;
+            // A parallel SCALAR float tracker, duplicated from computeFloatParamHints — needed
+            // to tell whether a `.append(x)` argument is float when `x` is a plain variable
+            // (`xs.append(x)` where `x = -8.0 + i*h`), not just a literal float const.
+            std::set<std::string> fvars;
+            std::set<int> ftemps;
+            auto isFloat = [&](const IRRef& r) -> bool {
+                if (r.kind == IRRef::Kind::CONST) return r.value.type == IRType::FLOAT;
+                if (r.kind == IRRef::Kind::TEMP)  return ftemps.count(r.id) > 0;
+                if (r.kind == IRRef::Kind::VAR)   { std::string n = refName(r); return !n.empty() && fvars.count(n) > 0; }
+                return false;
+            };
+            auto markScalar = [&](const IRRef& r) {
+                if (r.kind == IRRef::Kind::TEMP) ftemps.insert(r.id);
+                else if (r.kind == IRRef::Kind::VAR) { std::string n = refName(r); if (!n.empty()) fvars.insert(n); }
+            };
+            auto isFloatArr = [&](const IRRef& r) -> bool {
+                if (r.kind == IRRef::Kind::TEMP) return fatemps.count(r.id) > 0;
+                if (r.kind == IRRef::Kind::VAR)  { std::string n = refName(r); return !n.empty() && farrs.count(n) > 0; }
+                return false;
+            };
+            auto mark = [&](const IRRef& r) {
+                if (r.kind == IRRef::Kind::TEMP) fatemps.insert(r.id);
+                else if (r.kind == IRRef::Kind::VAR) { std::string n = refName(r); if (!n.empty()) farrs.insert(n); }
+            };
+            for (const auto& ins : code) {
+                // scalar float propagation (same rules as computeFloatParamHints)
+                if ((ins.opcode == IROpcode::DIV || ins.opcode == IROpcode::FDIV) && ins.result.isValid())
+                    markScalar(ins.result);
+                if ((ins.opcode == IROpcode::ADD || ins.opcode == IROpcode::SUB
+                  || ins.opcode == IROpcode::MUL || ins.opcode == IROpcode::PMUL)
+                    && ins.result.isValid() && ins.typedOperands.size() >= 2
+                    && (isFloat(ins.typedOperands[0]) || isFloat(ins.typedOperands[1])))
+                    markScalar(ins.result);
+                if ((ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::CONST_DECL
+                  || ins.opcode == IROpcode::LOAD_CONST)) {
+                    bool hasResult = ins.result.isValid() && !ins.typedOperands.empty();
+                    IRRef val = hasResult ? ins.typedOperands[0]
+                              : (ins.typedOperands.size() >= 2 ? ins.typedOperands[1] : IRRef());
+                    if (isFloat(val)) markScalar(hasResult ? ins.result
+                              : (ins.typedOperands.size() >= 2 ? ins.typedOperands[0] : IRRef()));
+                }
+                // array rules
+                if (ins.opcode == IROpcode::ALLOC && ins.result.isValid()
+                        && ins.typedOperands.size() >= 2
+                        && ins.typedOperands[0].kind == IRRef::Kind::CONST
+                        && ins.typedOperands[0].value.type == IRType::STRING
+                        && std::get<std::string>(ins.typedOperands[0].value.data) == "list"
+                        && ins.typedOperands[1].kind == IRRef::Kind::CONST
+                        && ins.typedOperands[1].value.type == IRType::STRING
+                        && literalHasFloatElem(std::get<std::string>(ins.typedOperands[1].value.data)))
+                    mark(ins.result);
+                if ((ins.opcode == IROpcode::STORE_VAR || ins.opcode == IROpcode::LOAD_VAR)
+                        && ins.result.isValid() && !ins.typedOperands.empty()
+                        && isFloatArr(ins.typedOperands[0]))
+                    mark(ins.result);
+                if (ins.opcode == IROpcode::RETURN && !fnName.empty() && !ins.typedOperands.empty()
+                        && isFloatArr(ins.typedOperands[0]) && !floatArrayReturnFuncs.count(fnName)) {
+                    floatArrayReturnFuncs.insert(fnName);
+                    changed = true;
+                }
+                if ((ins.opcode == IROpcode::CALL || ins.opcode == IROpcode::LIB_CALL)
+                        && !ins.typedOperands.empty()) {
+                    std::string callee = funcNameOf(ins.typedOperands[0]);
+                    auto ap = callee.rfind(".append");
+                    if (ap != std::string::npos && ap == callee.size() - 7 && ap > 0
+                            && ins.typedOperands.size() >= 2 && isFloat(ins.typedOperands[1])) {
+                        // NOTE: only updates the LOCAL (per-call) `farrs`, so later instructions
+                        // in this same block see it — must NOT set the outer `changed` flag, since
+                        // `farrs` is a by-value copy that never persists across outer fixpoint
+                        // iterations (unlike floatArrayParamHints_/floatArrayReturnFuncs below).
+                        // Setting `changed` here made this fire identically every single pass
+                        // forever — verified real infinite loop on schrodinger_oscillator.ac
+                        // (1000+ iterations and still going before this fix).
+                        std::string recv = callee.substr(0, ap);
+                        if (!recv.empty()) farrs.insert(recv);
+                    }
+                    if (ins.result.isValid() && floatArrayReturnFuncs.count(callee))
+                        mark(ins.result);
+                    auto fit = funcs.find(callee);
+                    if (fit != funcs.end()) {
+                        const auto& params = fit->second->parameters;
+                        for (size_t i = 1; i < ins.typedOperands.size() && i <= params.size(); i++)
+                            if (isFloatArr(ins.typedOperands[i])
+                                && floatArrayParamHints_[callee].insert(params[i - 1]).second)
+                                changed = true;
+                    }
+                }
+            }
+            return changed;
+        };
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            changed |= scanBlock(prog.globalInit, {}, "");
+            for (const auto& fn : prog.functions)
+                changed |= scanBlock(fn.instructions, floatArrayParamHints_[fn.name], fn.name);
         }
     }
 
@@ -8046,6 +9324,7 @@ public:
         computePromotedGlobals();
         computeStringParamHints();
         computeFloatParamHints();
+        computeFloatArrayParamHints();
 
         // Windows OS primitives (write/exit) — unconditional, same as the print helpers just
         // below: cheap, and every one of those helpers now calls into these two by label.
@@ -8057,9 +9336,9 @@ public:
         emitPrintStrLinux(em);
         emitPrintCStrLinux(em);
         emitPrintDoubleLinux(em);
-        emitInputIntLinux(em);
+        emitInputIntLinux(em, sp);
         emitInputStrLinux(em, sp);
-        if (usesArrays_) { emitAllocLinux(em, gvarSlots_["__heap_cursor"]); emitAppendLinux(em); emitPrintArrLinux(em); }
+        if (usesArrays_) { emitAllocLinux(em, gvarSlots_["__heap_cursor"], gvarSlots_["__heap_limit"]); emitAppendLinux(em); emitPrintArrLinux(em); emitPrintArrFloatLinux(em); emitArrToStrLinux(em); emitArrToStrFloatLinux(em); }
         if (usesAtomic_) { emitAtomicLockLinux(em, gvarSlots_["__atomic_lock"]); emitAtomicUnlockLinux(em, gvarSlots_["__atomic_lock"]); }
         if (usesSave_) {
             emitSaveAppendCStrLinux(em, gvarSlots_["__save_buf_ptr"], gvarSlots_["__save_buf_len"]);
@@ -8097,6 +9376,7 @@ public:
         std::set<std::string> floatFuncs;
         std::set<std::string> stringFuncs;   // user fns returning strings (#6)
         std::set<std::string> arrayFuncs;    // user fns returning list blocks
+        std::set<std::string> floatArrayFuncs; // user fns returning a float-element list block
         std::set<std::string> strListFuncs;  // user fns returning lists of strings
 
         // Global names' kinds, from the global init, before any function is compiled.
@@ -8168,10 +9448,12 @@ public:
             fc.floatFuncs_ = &floatFuncs;
             fc.stringFuncs_ = &stringFuncs;
             fc.arrayFuncs_ = &arrayFuncs;
+            fc.floatArrayFuncs_ = &floatArrayFuncs;
             fc.strListFuncs_ = &strListFuncs;
             fc.globalKinds_ = &globalKinds;
             fc.forcedStringParams_ = stringParamHints_[fn.name];
             fc.forcedFloatParams_ = floatParamHints_[fn.name];
+            fc.forcedFloatArrayParams_ = floatArrayParamHints_[fn.name];
             fc.promotedGlobals_ = &promotedGlobals_;
             fc.gvarSlots_ = &gvarSlots_;
             fc.usesSave_ = usesSave_;
@@ -8194,6 +9476,7 @@ public:
             gc.floatFuncs_ = &floatFuncs;
             gc.stringFuncs_ = &stringFuncs;
             gc.arrayFuncs_ = &arrayFuncs;
+            gc.floatArrayFuncs_ = &floatArrayFuncs;
             gc.strListFuncs_ = &strListFuncs;
             gc.globalKinds_ = &globalKinds;
             gc.promotedGlobals_ = &promotedGlobals_;

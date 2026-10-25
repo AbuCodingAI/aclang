@@ -1818,6 +1818,25 @@ class IRGenerator {
                 for (auto& arg : expr.children) ops.push_back(lowerExprNode(*arg));
                 IRInstruction i(IROpcode::CALL, dst, ops);
                 emit(std::move(i));
+                // math.* calls are the one ilib family acCallReturnsFloat actually has a
+                // verdict for (float, or a specific named int-valued exception like
+                // math.to_int/math.gcd/math.modpow) — record it so a LATER plain reassignment
+                // of this result into a var (AssignStmt's own "automatic retype" check, just
+                // above in this file) can see the type actually changed and insert a real
+                // TYPE_CAST. Without this, `n = n/2; n = math.to_int(n)` left `n` permanently
+                // float-typed after the division (the retype check saw typeOfRef(math.to_int
+                // call result) as VOID — "backend-specific, unknown" — so no cast fired and no
+                // backend was told the var's type genuinely changed back to int); BNY's own
+                // backend-local float-classifier has no unmark operation at all, so a var once
+                // marked float that way stays float for the rest of the function — verified
+                // real infinite loop (collatz steps never terminate, comparing a float
+                // reinterpretation of an int against 1). Scoped to math.* specifically (not a
+                // blanket rule for every ilib call) since non-numeric return types (os.*
+                // returning a path string, etc.) have no such authority to consult safely.
+                {
+                    bool isMathCall = fname.rfind("math.", 0) == 0 || fname.rfind("math_", 0) == 0;
+                    if (isMathCall) setRefType(dst, acCallReturnsFloat(fname) ? IRType::FLOAT : IRType::INT);
+                }
                 return dst;
             }
             
@@ -2008,6 +2027,19 @@ class IRGenerator {
                 }
                 IRInstruction i(IROpcode::CALL, dst, ops);
                 emit(std::move(i));
+                // math.* is the one ilib family acCallReturnsFloat has a real verdict for —
+                // see the AssignStmt "automatic retype" comment (this file, `n.children[0]`
+                // path) for the full story: without this, a dotted call result's temp stayed
+                // VOID-typed, so reassigning it into a var already known to hold a DIFFERENT
+                // type (e.g. `n = n/2; n = math.to_int(n)`, n float from the division) never
+                // registered as a genuine retype and no TYPE_CAST got inserted. This is the
+                // ACTUAL node type a dotted call like "math.to_int(n)" lowers through
+                // (NodeType::MethodCall, not FunctionCall with a literal dotted name) —
+                // verified via instrumented build: neither of this file's two OTHER sibling
+                // fixes (lowerExprNode's plain FunctionCall case, AssignStmt's __funcall__
+                // branch) ever fired for math.to_int at all.
+                if (mname.rfind("math.", 0) == 0 || mname.rfind("math_", 0) == 0)
+                    setRefType(dst, acCallReturnsFloat(mname) ? IRType::FLOAT : IRType::INT);
                 return dst;
             }
 
@@ -3819,6 +3851,18 @@ class IRGenerator {
                         // no cast needed" apart from "reassignment of unknown-typed prior value,
                         // genuinely needs a TYPE_CAST" — see everAssignedVarIds_'s own comment.
                         everAssignedVarIds_.insert(dst.id);
+                        // math.* is the one ilib family with a real return-type verdict
+                        // (acCallReturnsFloat) — see lowerExprNode's FunctionCall case (the
+                        // sibling fix for this SAME gap when a call is a subexpression rather
+                        // than a direct "x = f(...)" assignment's whole RHS, which is what THIS
+                        // __funcall__ branch handles) for the full story: without it, `n = n/2;
+                        // n = math.to_int(n)` never signaled a genuine retype back to int, so
+                        // no backend was told `n`'s type changed — BNY's own float-classifier
+                        // has no unmark operation, so `n` stayed float-tagged forever, comparing
+                        // a float reinterpretation of an int against 1 and never terminating
+                        // (verified real infinite loop: math_number.ac's `collatz`).
+                        if (fc.value.rfind("math.", 0) == 0 || fc.value.rfind("math_", 0) == 0)
+                            setRefType(dst, acCallReturnsFloat(fc.value) ? IRType::FLOAT : IRType::INT);
                         if (widgetCtorNames().count(fc.value)) widgetCtorVars_.insert(n.value);
                         break;
                     }
@@ -5456,7 +5500,16 @@ class IRGenerator {
                 IRRef startL = mkLabel();
                 IRRef endL   = mkLabel();
                 std::string sfx = std::to_string(tc);
-                IRRef iterT  = mkTemp();
+                // `collRef` is already stable across iterations when it's a bare variable
+                // reference (`FOR x in v`) — skip the LOAD_VAR copy into a fresh temp and index
+                // `v` directly. This isn't just an optimization: a backend that tracks a side
+                // table of known-float-ELEMENT arrays BY NAME (ASM/BNY's `floatListVars_`, no
+                // static type system to carry the information any other way) can only recognize
+                // `v` itself, never an anonymous temp copy of it — `LOAD_INDEX itemT, {iterT,
+                // curV}` with `iterT` a copy made the array unrecognizable, so `FOR x in v`
+                // accumulated raw float bit patterns as integers (verified on ASM). A non-bare
+                // expression (`FOR x in f()`) still needs the temp, to avoid re-evaluating it.
+                IRRef iterT = (collRef.kind == IRRef::Kind::VAR) ? collRef : mkTemp();
                 IRRef lenT   = mkTemp();
                 IRRef curV   = mkVar("__foridx_" + sfx); // named loop cursor
                 IRRef itemT  = mkTemp();
@@ -5465,7 +5518,8 @@ class IRGenerator {
                 loopStart.push(contL);
                 loopEnd.push(endL);
 
-                emit(IRInstruction(IROpcode::LOAD_VAR, iterT, {collRef}));
+                if (collRef.kind != IRRef::Kind::VAR)
+                    emit(IRInstruction(IROpcode::LOAD_VAR, iterT, {collRef}));
                 emit(IRInstruction(IROpcode::LOAD_INDEX, lenT, {iterT, mkConst("__len__")}));
                 emit(IRInstruction(IROpcode::STORE_VAR, curV, {mkConstInt(0)}));
 

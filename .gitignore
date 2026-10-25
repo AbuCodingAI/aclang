@@ -74,3 +74,6 @@ context.md
 *.key
 id_rsa*
 credentials*.json
+
+# Local library rating notes (not for the repo)
+/library/LIBRARY_RATINGS.md

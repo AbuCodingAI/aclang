@@ -106,6 +106,20 @@ void stopWorker() {
     unlink(workerSocketPath().c_str());
 }
 
+// atexit() alone never fires when the host process dies by signal — SIGTERM (e.g. from
+// `timeout`, a shell's own Ctrl+C, or an orchestrator killing a long-running server), SIGINT,
+// or a crash all skip it entirely. Without this, jasql_cli.py outlives its parent as a real
+// orphan (verified: found two from hours-old test runs still running via `ps aux`, one of
+// them still holding a test harness's inherited stderr pipe open, hanging an unrelated `diff`
+// command that was waiting for EOF on it forever). Only async-signal-safe calls here (close/
+// kill/waitpid/unlink are all POSIX-listed safe); re-raise with the default disposition
+// afterward so the process's actual exit status/signal still reflects what killed it.
+void handleTermSignal(int sig) {
+    stopWorker();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 bool connectWorker(const std::string& path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return false;
@@ -125,13 +139,22 @@ bool ensureWorker() {
     pid_t pid = fork();
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); }
+        // stdin/stdout only used to be redirected — stderr stayed inherited from the parent,
+        // so the child kept holding that fd open (a real pipe, a test harness's capture, a
+        // terminal) even after the parent exited, which is exactly what let an orphaned worker
+        // hang readers waiting for EOF (see stopWorker's own comment above).
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
         execlp("python3", "python3", script.c_str(), "--serve", path.c_str(), (char*)nullptr);
         _exit(127); // python3 not found / exec failed
     }
     if (pid < 0) return false;
     g_workerPid = pid;
-    if (!g_atexitRegistered) { atexit(stopWorker); g_atexitRegistered = true; }
+    if (!g_atexitRegistered) {
+        atexit(stopWorker);
+        signal(SIGTERM, handleTermSignal);
+        signal(SIGINT, handleTermSignal);
+        g_atexitRegistered = true;
+    }
 
     for (int i = 0; i < 150; i++) { // ~3s worst case for the interpreter to start
         struct stat st{};

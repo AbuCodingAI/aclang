@@ -1,0 +1,45 @@
+AC->BNY
+
+/* Sum of squares via the complex-conjugate identity (a+bi)(a-bi) = a^2 + b^2.
+
+   Multiplying a complex number by its own conjugate out by hand:
+     (a+bi)(a-bi) = (a*a - b*(-b)) + (a*(-b) + b*a)i
+                  = (a^2 + b^2)    + 0i
+   The imaginary part always cancels — the cross terms a*(-b) and b*a are
+   opposites — so the product is a real number equal to a^2 + b^2. That means
+   a single complex multiplication gets you a sum of two squares without ever
+   squaring a and b on their own. Checked here two ways: once against a classic
+   3-4-5 Pythagorean triple (via math.sqrt), and once by setting b = 0 for every
+   term — which quietly reduces the identity to a^2 + 0 = a^2, so summing it
+   over i = 1..n reproduces the plain sum of squares 1..n. */
+
+use ilib math
+
+/* Real part of (a+bi)(a-bi) — expands to a^2 + b^2 */
+Make conj_square_real func(a, b)
+    c = a
+    d = 0 - b
+    return a @ c - b @ d
+
+/* Imaginary part of (a+bi)(a-bi) — always 0, since the cross terms cancel */
+Make conj_square_imag func(a, b)
+    c = a
+    d = 0 - b
+    return a @ d + b @ c
+
+<mainloop>
+    header.display $3-4-5 triple: 3^2 + 4^2 via (3+4i)(3-4i)$
+    Term.display conj_square_real(3, 4)
+    Term.display $Expected: 25$
+    Term.display conj_square_imag(3, 4)
+    Term.display $Expected: 0 (imaginary part cancels)$
+    Term.display math.sqrt(conj_square_real(3, 4))
+    Term.display $Expected: 5.0$
+
+    header.display $Sum of squares 1..10, each i^2 as (i+0i)(i-0i)$
+    total = 0
+    FOR i in sequence(1, 11)
+        total += conj_square_real(i, 0)
+    Term.display total
+    Term.display $Expected: 385$
+<mainloop>
