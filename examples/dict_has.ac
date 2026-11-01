@@ -1,0 +1,15 @@
+AC->PY
+
+/* dict has: membership testing for present and absent keys, including a key
+   that was absent, then became present after an insert. */
+
+<mainloop>
+    header.display $Dict membership (has)$
+    inventory = { apples: 5, pears: 3 }
+
+    Term.display inventory has $apples$
+    Term.display inventory has $bananas$
+
+    inventory[$bananas$] = 7
+    Term.display inventory has $bananas$
+<mainloop>

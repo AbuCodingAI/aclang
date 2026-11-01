@@ -1117,6 +1117,7 @@ private:
         };
         for (auto& ins : instrs) { add(ins.result); for (auto& op : ins.typedOperands) add(op); }
     }
+
     // Parameter names of whichever function is currently being compiled (empty for mainloop/
     // globalInit, which has none) — set once near the top of compileFn/compileGeneratorFn.
     std::set<std::string> currentParams_;
@@ -4255,6 +4256,19 @@ public:
                     if (key.size() >= 2 && key.front()=='$' && key.back()=='$') key = key.substr(1, key.size()-2);
                     auto keys = dictStrKeysFor(ins.typedOperands[0]);
                     if (keys.count(key)) mark(ins.result);
+                } else if (ins.opcode == OP::LOAD_INDEX && ins.result.isValid()
+                           && ins.typedOperands.size() >= 2 && isDictRef(ins.typedOperands[0])
+                           && dictAllStrRef(ins.typedOperands[0])) {
+                    // dict[dynamicKey] where EVERY value in the dict is a string (dictAllStrRef) —
+                    // unlike the static-$key$ case above, this needs no per-key lookup at all: any
+                    // read of an all-string dict is a string, however the key is computed. Verified
+                    // real bug this closes: examples/dict_lookup_table.ac's `return names[key]`
+                    // (key built at runtime via `$d$ + to_string(n)`) never hit this during the
+                    // PRESCAN (only compileInstr's own real-codegen copy of this check, line ~3941,
+                    // ever ran it) — so stringTempIds_ never saw the LOAD_INDEX result in time for
+                    // recordStringReturn's cross-function "does this function return a string"
+                    // analysis, and every CALLER printed the dict's string value as a raw pointer.
+                    mark(ins.result);
                 } else if (ins.opcode == OP::CALL && ins.result.isValid() && !ins.typedOperands.empty()) {
                     std::string callee = funcName(ins.typedOperands[0]);
                     if ((stringFuncs_ && stringFuncs_->count(callee)) || returnsCString(callee))
@@ -5368,35 +5382,134 @@ static void emitWidgetTrampolinesLinux(X64Emitter& em) {
     em.ret();
 }
 
-// __ac_dict_get__(rdi = block [n][k0][v0]…, rsi = key) -> rax = value; missing key → KeyError.
+// __ac_dict_hash__(rdi = key cstr ptr) -> rax = 64-bit FNV-1a hash (unmasked; every call site
+// applies & (cap-1) itself since cap varies per dict). Leaf routine — touches only
+// caller-saved scratch (rax/rcx/rdx/r8/rdi), so every call site below keeps its own state in
+// rbx/r12-r15 across a call to this with no save/restore needed.
+static void emitDictHashLinux(X64Emitter& em) {
+    em.label("__ac_dict_hash__");
+    em.mov_ri64(R::RAX, 0xcbf29ce484222325ULL);   // FNV-1a offset basis
+    em.mov_rr(R::RCX, R::RDI);
+    em.label("__ac_dh0_loop__");
+    em.movzx_r64_ptr8(R::RDX, R::RCX);
+    em.test_rr(R::RDX, R::RDX);
+    em.je("__ac_dh0_done__");
+    em.xor_rr(R::RAX, R::RDX);
+    em.mov_ri64(R::R8, 0x100000001b3ULL);          // FNV prime
+    em.imul_rr(R::RAX, R::R8);
+    em.inc_r(R::RCX);
+    em.jmp("__ac_dh0_loop__");
+    em.label("__ac_dh0_done__");
+    em.ret();
+}
+
+// __ac_dict_resize__(rdi = old block) -> rax = new block (capacity doubled, every entry
+// rehashed). Triggered from __ac_dict_set__ once occupancy would exceed 3/4 load factor.
+// No duplicate check needed while rehashing (every old key is already known-unique) and no
+// further resize can be needed mid-rehash (doubling always leaves room for however many
+// entries an under-3/4-loaded old table could have held). New slots start zeroed for free —
+// __ac_alloc__ only ever hands out fresh mmap'd/VirtualAlloc'd memory, never freed-and-reused,
+// so there is no need for an explicit zeroing pass here.
+static void emitDictResizeLinux(X64Emitter& em) {
+    em.label("__ac_dict_resize__");
+    em.push_rbp(); em.mov_rbp_rsp();
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
+
+    em.mov_rr(R::RAX, R::RDI); em.add_ri32(R::RAX, -8); em.mov_r_ptr(R::RAX, R::RAX); // old cap
+    em.mov_rr(R::RCX, R::RAX); em.add_rr(R::RCX, R::RCX);          // new cap = old cap * 2
+    em.mov_rr(R::R13, R::RCX);                                      // r13 = new cap
+
+    em.mov_rr(R::R12, R::RDI); em.add_ri32(R::R12, 8);               // r12 = cursor = old_block+8
+    em.mov_rr(R::RCX, R::RAX); em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::R15, R::RDI); em.add_ri32(R::R15, 8); em.add_rr(R::R15, R::RCX); // r15 = end ptr
+
+    // allocate new block: 16 (cap+count header) + 16*newcap bytes
+    em.mov_rr(R::RDI, R::R13); em.mov_ri32(R::RCX, 16); em.imul_rr(R::RDI, R::RCX);
+    em.add_ri32(R::RDI, 16);
+    em.call("__ac_alloc__");
+    em.mov_ptr_r(R::RAX, R::R13);                        // raw[0] = new cap
+    em.add_ri32(R::RAX, 8);
+    em.mov_ri32(R::RCX, 0); em.mov_ptr_r(R::RAX, R::RCX); // new_block[0] = count = 0
+    em.mov_rr(R::R14, R::RAX);                             // r14 = new block
+
+    // rehash: cursor r12 .. end r15, step 16 (old key at [cursor], old val at [cursor+8])
+    em.label("__ac_drh_loop__");
+    em.cmp_rr(R::R12, R::R15);
+    em.jge("__ac_drh_done__");
+    em.mov_r_ptr(R::RAX, R::R12);                           // old key
+    em.test_rr(R::RAX, R::RAX);
+    em.je("__ac_drh_next__");
+    em.mov_rr(R::RCX, R::R12); em.add_ri32(R::RCX, 8); em.mov_r_ptr(R::RBX, R::RCX); // old val
+    em.push_r(R::RAX);                                        // save old key across the call
+    em.mov_rr(R::RDI, R::RAX);
+    em.call("__ac_dict_hash__");
+    em.mov_rr(R::RCX, R::R13); em.dec_r(R::RCX);               // mask = newcap-1
+    em.and_rr(R::RAX, R::RCX);                                  // idx
+    em.pop_r(R::RDX);                                             // old key restored
+
+    em.label("__ac_drh_probe__");
+    em.mov_rr(R::R8, R::RAX); em.mov_ri32(R::R9, 16); em.imul_rr(R::R8, R::R9);
+    em.mov_rr(R::R10, R::R14); em.add_rr(R::R10, R::R8); em.add_ri32(R::R10, 8); // &new_slot.key
+    em.mov_r_ptr(R::R11, R::R10);
+    em.test_rr(R::R11, R::R11);
+    em.jne("__ac_drh_probenext__");
+    em.mov_ptr_r(R::R10, R::RDX);                                  // new_slot.key = old key
+    em.add_ri32(R::R10, 8); em.mov_ptr_r(R::R10, R::RBX);           // new_slot.val = old val
+    em.mov_r_ptr(R::RCX, R::R14); em.inc_r(R::RCX); em.mov_ptr_r(R::R14, R::RCX); // count++
+    em.jmp("__ac_drh_next__");
+    em.label("__ac_drh_probenext__");
+    em.inc_r(R::RAX); em.mov_rr(R::RCX, R::R13); em.dec_r(R::RCX); em.and_rr(R::RAX, R::RCX);
+    em.jmp("__ac_drh_probe__");
+
+    em.label("__ac_drh_next__");
+    em.add_ri32(R::R12, 16);
+    em.jmp("__ac_drh_loop__");
+    em.label("__ac_drh_done__");
+
+    em.mov_rr(R::RAX, R::R14);
+    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+}
+
+// __ac_dict_get__(rdi = block, rsi = key) -> rax = value; missing key → KeyError. Open-
+// addressing hash table: ptr[-8] = capacity (slot count, power of 2), ptr[0] = occupied
+// count, slots at ptr+8+16*i = [key (0 = empty), value]. O(1) average case, replacing the
+// previous design's O(n) linear scan comparing every key via __ac_streq__ — safe to switch
+// to since this backend has no dict-iteration construct at all, so there is no
+// insertion-order contract to preserve (verified: grepped every dict call site).
 static void emitDictLinux(X64Emitter& em, StringPool& sp) {
     em.label("__ac_dict_get__");
     em.push_rbp(); em.mov_rbp_rsp();
-    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13);
-    em.mov_rr(R::RBX, R::RDI);                  // block
-    em.mov_rr(R::R12, R::RSI);                  // key
-    em.mov_ri32(R::R13, 0);                     // i
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
+    em.mov_rr(R::R12, R::RDI);                  // r12 = block
+    em.mov_rr(R::R13, R::RSI);                  // r13 = key
+    em.mov_rr(R::RAX, R::R12); em.add_ri32(R::RAX, -8); em.mov_r_ptr(R::RAX, R::RAX); // cap
+    em.mov_rr(R::RBX, R::RAX); em.dec_r(R::RBX);  // rbx = mask
+    em.mov_rr(R::RDI, R::R13);
+    em.call("__ac_dict_hash__");
+    em.and_rr(R::RAX, R::RBX);
+    em.mov_rr(R::R15, R::RAX);                   // r15 = idx
+
     em.label("__ac_dg_loop__");
-    em.mov_r_ptr(R::RAX, R::RBX);               // n
-    em.cmp_rr(R::R13, R::RAX);
-    em.jge("__ac_dg_miss__");
-    em.mov_rr(R::RCX, R::R13);
-    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
-    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
-    em.mov_r_ptr(R::RDI, R::RDI);               // key_i
-    em.mov_rr(R::RSI, R::R12);
+    em.mov_rr(R::RCX, R::R15); em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::RDI, R::R12); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8); // &slot.key
+    em.mov_rr(R::R14, R::RDI);                    // r14 = &slot.key (survives the call below)
+    em.mov_r_ptr(R::RSI, R::RDI);                   // rsi = stored key (0 = empty)
+    em.test_rr(R::RSI, R::RSI);
+    em.je("__ac_dg_miss__");
+    em.mov_rr(R::RDI, R::RSI);
+    em.mov_rr(R::RSI, R::R13);
     em.call("__ac_streq__");
     em.test_rr(R::RAX, R::RAX);
-    em.je("__ac_dg_next__");
-    em.mov_rr(R::RCX, R::R13);                  // hit: value at block+16+16i
-    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
-    em.mov_rr(R::RAX, R::RBX); em.add_rr(R::RAX, R::RCX); em.add_ri32(R::RAX, 16);
-    em.mov_r_ptr(R::RAX, R::RAX);
-    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
-    em.pop_rbp(); em.ret();
-    em.label("__ac_dg_next__");
-    em.inc_r(R::R13);
+    em.jne("__ac_dg_found__");
+    em.inc_r(R::R15); em.and_rr(R::R15, R::RBX);
     em.jmp("__ac_dg_loop__");
+
+    em.label("__ac_dg_found__");
+    em.mov_rr(R::RAX, R::R14); em.add_ri32(R::RAX, 8); em.mov_r_ptr(R::RAX, R::RAX); // value
+    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_rbp(); em.ret();
+
     em.label("__ac_dg_miss__");
     {
         std::string msg = "Preposterous: KeyError: key not found\n";
@@ -5409,126 +5522,108 @@ static void emitDictLinux(X64Emitter& em, StringPool& sp) {
     }
 }
 
-// __ac_dict_has__(rdi = block [n][k0][v0]..., rsi = key) -> rax = 1 if the key is present, else 0.
-// The same scan as __ac_dict_get__, but a miss is an answer, not a KeyError.
+// __ac_dict_has__(rdi = block, rsi = key) -> rax = 1 if present, else 0. Same hash-table
+// probe as __ac_dict_get__, but a miss is an answer, not a KeyError.
 static void emitDictHasLinux(X64Emitter& em) {
     em.label("__ac_dict_has__");
     em.push_rbp(); em.mov_rbp_rsp();
-    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13);
-    em.mov_rr(R::RBX, R::RDI);                  // block
-    em.mov_rr(R::R12, R::RSI);                  // key
-    em.mov_ri32(R::R13, 0);                     // i
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R15);
+    em.mov_rr(R::R12, R::RDI);
+    em.mov_rr(R::R13, R::RSI);
+    em.mov_rr(R::RAX, R::R12); em.add_ri32(R::RAX, -8); em.mov_r_ptr(R::RAX, R::RAX);
+    em.mov_rr(R::RBX, R::RAX); em.dec_r(R::RBX);
+    em.mov_rr(R::RDI, R::R13);
+    em.call("__ac_dict_hash__");
+    em.and_rr(R::RAX, R::RBX);
+    em.mov_rr(R::R15, R::RAX);
+
     em.label("__ac_dh_loop__");
-    em.mov_r_ptr(R::RAX, R::RBX);               // n
-    em.cmp_rr(R::R13, R::RAX);
-    em.jge("__ac_dh_miss__");
-    em.mov_rr(R::RCX, R::R13);
-    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
-    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
-    em.mov_r_ptr(R::RDI, R::RDI);               // key_i
-    em.mov_rr(R::RSI, R::R12);
+    em.mov_rr(R::RCX, R::R15); em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::RDI, R::R12); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
+    em.mov_r_ptr(R::RSI, R::RDI);
+    em.test_rr(R::RSI, R::RSI);
+    em.je("__ac_dh_miss__");
+    em.mov_rr(R::RDI, R::RSI);
+    em.mov_rr(R::RSI, R::R13);
     em.call("__ac_streq__");
     em.test_rr(R::RAX, R::RAX);
     em.jne("__ac_dh_hit__");
-    em.inc_r(R::R13);
+    em.inc_r(R::R15); em.and_rr(R::R15, R::RBX);
     em.jmp("__ac_dh_loop__");
+
     em.label("__ac_dh_hit__");
     em.mov_ri32(R::RAX, 1);
-    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_r(R::R15); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
     em.label("__ac_dh_miss__");
     em.mov_ri32(R::RAX, 0);
-    em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_r(R::R15); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
 }
 
-// __ac_dict_set__(rdi = ptr, rsi = key, rdx = val) -> rax = ptr (same pointer whenever
-// capacity allows — O(1) amortized on top of the existing O(n) linear-scan-for-match; only
-// allocates+copies once every doubling interval, mirroring __ac_append__'s design against
-// the [cap][n][k0][v0]... layout ptr[-8]=cap seeded by the ALLOC "dict" site. Previously
-// this allocated a fresh (2n+3)-word block and copied every existing pair on EVERY insert
-// past the first match-scan — O(n^2) total memory traffic for an N-insert loop.
+// __ac_dict_set__(rdi = block, rsi = key, rdx = val) -> rax = block (may have moved if a
+// resize was triggered). Same open-addressing design as __ac_dict_get__. Probes from
+// hash(key)&mask; an empty slot means "insert here", after first checking the load factor
+// (resize via __ac_dict_resize__ if occupancy would exceed 3/4 of capacity) — same amortized
+// O(1) guarantee __ac_append__ gives arrays, just via rehashing instead of a flat copy.
 static void emitDictSetLinux(X64Emitter& em) {
     em.label("__ac_dict_set__");
     em.push_rbp(); em.mov_rbp_rsp();
-    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14);
-    em.mov_rr(R::RBX, R::RDI);                  // rbx = ptr
-    em.mov_rr(R::R12, R::RSI);                  // r12 = key
-    em.mov_rr(R::R13, R::RDX);                  // r13 = val
-    em.mov_ri32(R::R14, 0);                     // r14 = i (scan index)
+    em.push_r(R::RBX); em.push_r(R::R12); em.push_r(R::R13); em.push_r(R::R14); em.push_r(R::R15);
+    em.mov_rr(R::R12, R::RDI);                  // r12 = block
+    em.mov_rr(R::R13, R::RSI);                  // r13 = key
+    em.mov_rr(R::RBX, R::RDX);                  // rbx = val
+
+    em.label("__ac_ds_restart__");
+    em.mov_rr(R::RAX, R::R12); em.add_ri32(R::RAX, -8); em.mov_r_ptr(R::RAX, R::RAX); // cap
+    em.mov_rr(R::R14, R::RAX); em.dec_r(R::R14);   // r14 = mask
+    em.mov_rr(R::RDI, R::R13);
+    em.call("__ac_dict_hash__");
+    em.and_rr(R::RAX, R::R14);
+    em.mov_rr(R::R15, R::RAX);                   // r15 = idx
+
     em.label("__ac_ds_loop__");
-    em.mov_r_ptr(R::RAX, R::RBX);                // n
-    em.cmp_rr(R::R14, R::RAX);
-    em.jge("__ac_ds_grow__");                     // r14 == n → no match found, need to insert
-    em.mov_rr(R::RCX, R::R14);
-    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
-    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
-    em.mov_r_ptr(R::RDI, R::RDI);
-    em.mov_rr(R::RSI, R::R12);
+    em.mov_rr(R::RCX, R::R15); em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
+    em.mov_rr(R::RDI, R::R12); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8); // &slot.key
+    em.mov_r_ptr(R::RSI, R::RDI);
+    em.test_rr(R::RSI, R::RSI);
+    em.je("__ac_ds_empty__");
+    em.push_r(R::RDI);                             // save &slot.key across the call
+    em.mov_rr(R::RDI, R::RSI);
+    em.mov_rr(R::RSI, R::R13);
     em.call("__ac_streq__");
+    em.pop_r(R::RDI);
     em.test_rr(R::RAX, R::RAX);
-    em.je("__ac_ds_next__");
-    em.mov_rr(R::RCX, R::R14);                  // overwrite existing value
-    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
-    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 16);
-    em.mov_ptr_r(R::RDI, R::R13);
-    em.mov_rr(R::RAX, R::RBX);
-    em.jmp("__ac_ds_done__");
-    em.label("__ac_ds_next__");
-    em.inc_r(R::R14);
+    em.jne("__ac_ds_update__");
+    em.inc_r(R::R15); em.and_rr(R::R15, R::R14);
     em.jmp("__ac_ds_loop__");
 
-    em.label("__ac_ds_grow__");                  // r14 == n; decide fast (room) vs slow (full)
-    em.mov_rr(R::RCX, R::RBX); em.add_ri32(R::RCX, -8);
-    em.mov_r_ptr(R::RCX, R::RCX);                 // rcx = cap = ptr[-8]
-    em.cmp_rr(R::R14, R::RCX);
-    em.jl("__ac_ds_fast__");                       // n < cap → room already available
-
-    // ---- slow path: n == cap exactly (grow only ever triggers here, never n>cap) — r14
-    // doubles as oldcap for free, no separate read needed. Double capacity and copy. ----
-    em.mov_rr(R::RDI, R::R14); em.add_rr(R::RDI, R::RDI); em.inc_r(R::RDI);
-    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RDI, R::RDX);   // bytes = 16*(2*oldcap + 1)
-    em.call("__ac_alloc__");                                // rax = new raw block
-    em.mov_rr(R::RCX, R::R14); em.add_rr(R::RCX, R::RCX);    // rcx = newcap = 2*oldcap
-    em.mov_ptr_r(R::RAX, R::RCX);                             // new_raw[0] = newcap
-    em.add_ri32(R::RAX, 8);                                    // rax = new ptr
-    // copy old_ptr[0..2*oldcap] (word0=n plus 2*oldcap pair-words) -> new_ptr[same range];
-    // word0 gets overwritten with n+1 right after.
-    em.mov_ri32(R::RCX, 0);
-    em.label("__ac_ds_copy__");
-    em.mov_rr(R::RDX, R::R14); em.add_rr(R::RDX, R::RDX); em.inc_r(R::RDX); // bound = 2*oldcap+1
-    em.cmp_rr(R::RCX, R::RDX);
-    em.jge("__ac_ds_copied__");
-    em.mov_rr(R::RSI, R::RCX); em.mov_ri32(R::RDI, 8); em.imul_rr(R::RSI, R::RDI);
-    em.mov_rr(R::R8, R::RBX); em.add_rr(R::R8, R::RSI); em.mov_r_ptr(R::R9, R::R8);
-    em.mov_rr(R::R8, R::RAX); em.add_rr(R::R8, R::RSI); em.mov_ptr_r(R::R8, R::R9);
-    em.inc_r(R::RCX);
-    em.jmp("__ac_ds_copy__");
-    em.label("__ac_ds_copied__");
-    em.mov_rr(R::RCX, R::R14); em.inc_r(R::RCX);
-    em.mov_ptr_r(R::RAX, R::RCX);                    // new_ptr[0] = n+1 (= oldcap+1)
-    em.mov_rr(R::RCX, R::R14);
-    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
-    em.mov_rr(R::RDI, R::RAX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
-    em.mov_ptr_r(R::RDI, R::R12);                    // new key slot
+    em.label("__ac_ds_update__");
     em.add_ri32(R::RDI, 8);
-    em.mov_ptr_r(R::RDI, R::R13);                     // new value slot
+    em.mov_ptr_r(R::RDI, R::RBX);
+    em.mov_rr(R::RAX, R::R12);
     em.jmp("__ac_ds_done__");
 
-    // ---- fast path: n < cap — write in place, O(1), zero allocation/copy ----
-    em.label("__ac_ds_fast__");
-    em.mov_rr(R::RCX, R::R14);
-    em.mov_ri32(R::RDX, 16); em.imul_rr(R::RCX, R::RDX);
-    em.mov_rr(R::RDI, R::RBX); em.add_rr(R::RDI, R::RCX); em.add_ri32(R::RDI, 8);
-    em.mov_ptr_r(R::RDI, R::R12);                    // key slot at ptr + 8 + 16n
-    em.add_ri32(R::RDI, 8);
-    em.mov_ptr_r(R::RDI, R::R13);                     // value slot
-    em.mov_rr(R::RCX, R::R14); em.inc_r(R::RCX);
-    em.mov_ptr_r(R::RBX, R::RCX);                       // ptr[0] = n+1
-    em.mov_rr(R::RAX, R::RBX);                           // return same ptr — nothing moved
+    em.label("__ac_ds_empty__");                   // rdi = &slot.key (an empty slot)
+    em.mov_rr(R::RAX, R::R12); em.mov_r_ptr(R::RAX, R::RAX); em.inc_r(R::RAX); em.shl_r_i8(R::RAX, 2); // 4*(count+1)
+    em.mov_rr(R::RCX, R::R12); em.add_ri32(R::RCX, -8); em.mov_r_ptr(R::RCX, R::RCX);
+    em.mov_ri32(R::R8, 3); em.imul_rr(R::RCX, R::R8);  // 3*cap
+    em.cmp_rr(R::RAX, R::RCX);
+    em.jle("__ac_ds_doinsert__");
+    em.mov_rr(R::RDI, R::R12);
+    em.call("__ac_dict_resize__");
+    em.mov_rr(R::R12, R::RAX);
+    em.jmp("__ac_ds_restart__");
+
+    em.label("__ac_ds_doinsert__");                // rdi still = &slot.key (untouched above)
+    em.mov_ptr_r(R::RDI, R::R13);                     // slot.key = key
+    em.mov_rr(R::RAX, R::RDI); em.add_ri32(R::RAX, 8);
+    em.mov_ptr_r(R::RAX, R::RBX);                       // slot.val = val
+    em.mov_r_ptr(R::RCX, R::R12); em.inc_r(R::RCX); em.mov_ptr_r(R::R12, R::RCX); // count++
+    em.mov_rr(R::RAX, R::R12);
 
     em.label("__ac_ds_done__");
-    em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
+    em.pop_r(R::R15); em.pop_r(R::R14); em.pop_r(R::R13); em.pop_r(R::R12); em.pop_r(R::RBX);
     em.pop_rbp(); em.ret();
 }
 
@@ -9361,7 +9456,7 @@ public:
         emitWildcardLinux(em);   // always: ~110 bytes; backs `subject % pattern`
         emitItoaLinux(em);
         emitWidgetTrampolinesLinux(em);
-        if (usesDict_) { emitDictLinux(em, sp); emitDictSetLinux(em); emitDictHasLinux(em); }
+        if (usesDict_) { emitDictHashLinux(em); emitDictResizeLinux(em); emitDictLinux(em, sp); emitDictSetLinux(em); emitDictHasLinux(em); }
         if (usesAtoi_) emitAtoiLinux(em);
         if (usesRand_) emitRandLinux(em);
 

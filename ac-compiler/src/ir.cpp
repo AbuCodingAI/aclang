@@ -6266,6 +6266,48 @@ public:
         }
     }
 
+    // A function PARAMETER that receives a dict-typed argument at a call site is itself a dict
+    // inside that function's body — isDictContainer only ever learns a name is a dict from a
+    // direct `x = {...}` assignment or a dict-returning function's result (both populate
+    // dictVarNames_ during the real gen() pass, too late for a parameter: by the time a
+    // parameter's own uses are lowered, nothing has ever told isDictContainer about it at all).
+    // Verified real bug this closes: examples/dict_function_param.ac — `Make add_item
+    // func(cart, name, price) ... cart[name] = price` lowered `name`'s index with the array's
+    // -1 adjustment (wrong for a dict) because `cart` was never recognized as a dict parameter;
+    // PY's generated code computed `name - 1` on a STRING and raised a TypeError, BNY's raw
+    // linear/hash lookup used the wrong slot and raised a false KeyError. Single forward pass
+    // (same shape as collectDictReturnFunctions, run right after it so it also sees
+    // dictReturnFuncs_) — depth-1 argument forwarding only, matching that function's own scope;
+    // a dict forwarded through two or more levels of call indirection isn't picked up here.
+    void collectDictParams(const ASTNode& ast) {
+        std::map<std::string, std::vector<std::string>> paramsOf;
+        for (auto& top : ast.children) {
+            if (top && top->type == NodeType::FuncDef) paramsOf[top->value] = top->attrs;
+        }
+        std::function<void(const ASTNode&, const std::string&, std::set<std::string>&)> walk;
+        walk = [&](const ASTNode& node, const std::string& fn, std::set<std::string>& dictLocals) {
+            if (node.type == NodeType::AssignStmt && !node.attrs.empty() && node.attrs[0].rfind("__dict__", 0) == 0)
+                dictLocals.insert(node.value);
+            if (node.type == NodeType::FunctionCall) {
+                auto pit = paramsOf.find(node.value);
+                if (pit != paramsOf.end()) {
+                    auto args = mergeBracketAttrs(node.attrs);
+                    for (size_t ai = 0; ai < args.size() && ai < pit->second.size(); ai++) {
+                        const std::string& a = args[ai];
+                        bool isDictArg = dictLocals.count(a) > 0 || dictReturnFuncs_.count(a) > 0;
+                        if (isDictArg) dictVarNames_.insert(pit->first + "::" + pit->second[ai]);
+                    }
+                }
+            }
+            for (auto& c : node.children) if (c) walk(*c, fn, dictLocals);
+        };
+        for (auto& top : ast.children) {
+            if (!top) continue;
+            std::set<std::string> locals;
+            walk(*top, top->type == NodeType::FuncDef ? top->value : std::string(), locals);
+        }
+    }
+
     IRProgram generate(const ASTNode& ast, const std::string& backend) {
         prog         = IRProgram();
         prog.backend = backend;
@@ -6286,6 +6328,7 @@ public:
         collectGeneratorFunctions(ast);
         dictReturnFuncs_.clear(); dictVarNames_.clear();
         collectDictReturnFunctions(ast);
+        collectDictParams(ast);
         collectGlobalStringConsts(ast);
         collectGeneratorHandleVars(ast);
         scalarizableTupleVars_.clear();

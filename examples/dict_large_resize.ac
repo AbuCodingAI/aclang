@@ -1,0 +1,25 @@
+AC->PY
+
+/* dict growth: inserts enough keys to force several internal capacity grows
+   (BNY's dict starts at 8 slots), then verifies every value survived. */
+
+<mainloop>
+    header.display $Dict growth across many inserts$
+    d = { seed: 0 }
+    i = 0
+    WHILST i < 200
+        key = $n$ + to_string(i)
+        d[key] = i
+        i = i + 1
+
+    checksum = 0
+    j = 0
+    WHILST j < 200
+        key = $n$ + to_string(j)
+        checksum = checksum + d[key]
+        j = j + 1
+
+    Term.display checksum
+    Term.display d[$n0$]
+    Term.display d[$n199$]
+<mainloop>

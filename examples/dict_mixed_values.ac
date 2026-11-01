@@ -1,0 +1,23 @@
+AC->PY
+
+/* dict with heterogeneous value types: string-valued and number-valued slots
+   living side by side in the same dict literal. */
+
+<mainloop>
+    header.display $Dict with mixed value types$
+    car = {
+        make: $Toyota$
+        model: $Corolla$
+        year: 2021
+        price: 19999
+    }
+    Term.display car[$make$]
+    Term.display car[$model$]
+    Term.display car[$year$]
+    Term.display car[$price$]
+
+    car[$model$] = $Camry$
+    car[$price$] = 24999
+    Term.display car[$model$]
+    Term.display car[$price$]
+<mainloop>

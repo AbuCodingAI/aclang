@@ -1,0 +1,22 @@
+AC->PY
+
+/* dict passed into a function: reading a caller's dict inside a callee, and
+   confirming a mutation made inside the callee is visible back in the caller
+   (dicts, like arrays, are passed by reference). */
+
+Make total_price func(cart)
+    return cart[$apples$] + cart[$bread$]
+
+Make add_item func(cart, name, price)
+    cart[name] = price
+    return cart
+
+<mainloop>
+    header.display $Dict passed to/from functions$
+    cart = { apples: 3, bread: 2 }
+    Term.display total_price(cart)
+
+    cart = add_item(cart, $milk$, 4)
+    Term.display cart[$milk$]
+    Term.display total_price(cart)
+<mainloop>

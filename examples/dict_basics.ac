@@ -1,0 +1,19 @@
+AC->PY
+
+/* dict basics: literal creation, reading existing keys, reading a key that was
+   overwritten after creation. */
+
+<mainloop>
+    header.display $Dict basics$
+    person = {
+        name: $Ada$
+        age: 37
+        city: $London$
+    }
+    Term.display person[$name$]
+    Term.display person[$age$]
+    Term.display person[$city$]
+
+    person[$age$] = 38
+    Term.display person[$age$]
+<mainloop>

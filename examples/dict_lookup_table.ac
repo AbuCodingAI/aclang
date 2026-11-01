@@ -1,0 +1,25 @@
+AC->PY
+
+/* dict as a static lookup table: map a small fixed set of keys to names, then
+   look every one of them up in a loop instead of one at a time. */
+
+Make day_name func(n)
+    names = {
+        d1: $Monday$
+        d2: $Tuesday$
+        d3: $Wednesday$
+        d4: $Thursday$
+        d5: $Friday$
+        d6: $Saturday$
+        d7: $Sunday$
+    }
+    key = $d$ + to_string(n)
+    return names[key]
+
+<mainloop>
+    header.display $Dict as a lookup table$
+    i = 1
+    WHILST i #> 7
+        Term.display day_name(i)
+        i = i + 1
+<mainloop>

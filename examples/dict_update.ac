@@ -1,0 +1,20 @@
+AC->PY
+
+/* dict update: inserting a brand new key vs overwriting an existing one, and
+   confirming a repeated overwrite doesn't grow the entry count. */
+
+<mainloop>
+    header.display $Dict update vs insert$
+    scores = { alice: 10 }
+
+    scores[$alice$] = 20
+    Term.display scores[$alice$]
+
+    scores[$bob$] = 5
+    Term.display scores[$bob$]
+
+    scores[$alice$] = 30
+    scores[$alice$] = 40
+    Term.display scores[$alice$]
+    Term.display scores[$bob$]
+<mainloop>

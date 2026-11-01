@@ -592,10 +592,15 @@ public:
                 case '~': tokens.emplace_back(TokenType::TILDE, "~", line, sc); break;
                 case '%': tokens.emplace_back(TokenType::PERCENT, "%", line, sc); break;  // wildcard (was silently dropped)
                 case '<':
-                    tokens.emplace_back(TokenType::LT, "<", line, sc);
+                    // <= is a C/Python-muscle-memory alias for #> (≤, "not greater than") —
+                    // same token type as #>, so the parser/IR see it identically.
+                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::HASH_GT, "<=", line, sc); }
+                    else tokens.emplace_back(TokenType::LT, "<", line, sc);
                     break;
                 case '>':
-                    tokens.emplace_back(TokenType::GT, ">", line, sc);
+                    // >= is the same alias for #< (≥, "not less than").
+                    if (pos < src.size() && src[pos] == '=') { pos++; col++; tokens.emplace_back(TokenType::HASH_LT, ">=", line, sc); }
+                    else tokens.emplace_back(TokenType::GT, ">", line, sc);
                     break;
                 case '[': tokens.emplace_back(TokenType::LBRACKET,  "[",  line, sc); break;
                 case ']': tokens.emplace_back(TokenType::RBRACKET,  "]",  line, sc); break;

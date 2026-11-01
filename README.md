@@ -258,8 +258,8 @@ way, and a whole `/` result is still usable anywhere an integer is (indexing, `/
 | `#=` | Not equal (`!=`) |
 | `<` | Less than |
 | `>` | Greater than |
-| `#>` | Not greater (≤) |
-| `#<` | Not less (≥) |
+| `#>` / `<=` | Not greater (≤) |
+| `#<` / `>=` | Not less (≥) |
 
 ### Logical
 
@@ -295,7 +295,7 @@ Term.display 5 ptm 3       /* 40 */
 1. Unary `-`, `#`
 2. `*`, `/`, `//`, `///`, `@`
 3. `+`, `-`, `xsub`
-4. `is`, `#=`, `<`, `>`, `#>`, `#<`, `overlap`
+4. `is`, `#=`, `<`, `>`, `#>`/`<=`, `#<`/`>=`, `overlap`
 5. `&`, `and`
 6. `\|`, `#\|`
 7. `or`

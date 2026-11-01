@@ -1,0 +1,28 @@
+AC->PY
+
+/* defensive dict usage: checking `has` before indexing to avoid a KeyError on
+   a missing product, with two independent dicts alive at the same time. */
+
+<mainloop>
+    header.display $Safe lookups with has + two dicts at once$
+    prices = { bread: 3, milk: 4, eggs: 5 }
+    stock  = { bread: 10, milk: 0 }
+
+    names = { n1: $bread$, n2: $milk$, n3: $eggs$, n4: $cheese$ }
+    i = 1
+    WHILST i #> 4
+        key = $n$ + to_string(i)
+        name = names[key]
+        IF prices has name
+            Term.display name + $ costs $ + to_string(prices[name])
+        OTHER
+            Term.display name + $ is not in the price list$
+        i = i + 1
+
+    IF stock has $bread$
+        Term.display $bread in stock: $ + to_string(stock[$bread$])
+    IF stock has $eggs$
+        Term.display $eggs in stock: $ + to_string(stock[$eggs$])
+    OTHER
+        Term.display $no stock entry for eggs$
+<mainloop>

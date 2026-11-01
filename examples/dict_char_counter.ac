@@ -1,0 +1,23 @@
+AC->PY
+
+/* classic dict use case: counting how many times each character appears in a
+   string, using `has` to tell a first sighting from a repeat. */
+
+<mainloop>
+    header.display $Character frequency counter$
+    text = $mississippi$
+    counts = { seed: 0 }
+    i = 1
+    WHILST i #> length(text)
+        ch = text[i]
+        IF counts has ch
+            counts[ch] = counts[ch] + 1
+        OTHER
+            counts[ch] = 1
+        i = i + 1
+
+    Term.display counts[$m$]
+    Term.display counts[$i$]
+    Term.display counts[$s$]
+    Term.display counts[$p$]
+<mainloop>

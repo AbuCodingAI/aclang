@@ -21709,7 +21709,17 @@ static std::set<std::string> detectListParams(const AC_IR::IRFunction& fn,
 // Cross-function list-parameter fixpoint: a parameter passed into a callee's list parameter is itself
 // a list (`energy(psi, xs, h)` forwards `xs` to `hpsi`, which indexes it). detectListParams only sees
 // each body alone, so without this the forwarding function declared `xs` as a scalar.
-static std::map<std::string, std::set<std::string>> g_crossListParams;
+// thread_local: `--all` compiles every backend on its own std::thread (main.cpp's compileOne
+// pool), each calling computeCrossListParams() on its own IRProgram — a plain `static` here
+// let every thread clear/mutate the SAME map concurrently with no synchronization at all.
+// Verified real crash: `./ac file.ac --all --no-run` aborted with "malloc(): unaligned tcache
+// chunk" / "double free detected in tcache 2" (exit 134), reproducing on every run; the same
+// file compiled individually per backend (`--target PY`, `JS`, `C`, ...) never crashed once,
+// isolating it to concurrent std::map corruption on this global. The data is pure per-compile
+// scratch state anyway (computeCrossListParams clears it at its own start every call, so
+// nothing is meant to persist across calls or backends) — thread_local gives each thread its
+// own independent instance with zero other changes needed.
+static thread_local std::map<std::string, std::set<std::string>> g_crossListParams;
 static std::set<std::string> listParamsFor(const AC_IR::IRFunction& fn, const AC_IR::SymbolTable& symbols) {
     std::set<std::string> s = detectListParams(fn, symbols);
     auto it = g_crossListParams.find(fn.name);
