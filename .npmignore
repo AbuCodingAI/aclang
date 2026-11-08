@@ -1,0 +1,86 @@
+# Mirrors .gitignore exactly, so the npm package ships the same files as the GitHub repo.
+# Keep these two files in sync — if .gitignore's allow-list changes, update this one too.
+# (npm ignores .gitignore entirely once a .npmignore exists, and the package.json "files"
+# field — which used to drive this and had drifted out of sync with .gitignore — was removed.)
+
+# AC repository layout — everything at the top level is ignored unless allow-listed here.
+# The repo ships: compiler source + includes + prebuilt binaries, examples/, library/,
+# README, LICENSE, install.sh, plus the npm package.json/bin/ wrapper (ac --version prints
+# just "AC 1" — the npm semver only ever appears in package.json itself, for publishing).
+# Anything else (IDE, LSP, website, scratch, benchmarks, session notes) lives outside the repo.
+/*
+!/.gitignore
+!/.npmignore
+!/README.md
+!/LICENSE
+!/install.sh
+!/package.json
+!/bin/
+!/scripts/
+!/ac-compiler/
+!/examples/
+!/library/
+
+# ── ac-compiler/: source + includes + prebuilt binaries only ──────────────────────────────
+/ac-compiler/*
+!/ac-compiler/Makefile
+!/ac-compiler/src/
+!/ac-compiler/include/
+!/ac-compiler/wasm/
+!/ac-compiler/ac
+!/ac-compiler/ac.exe
+!/ac-compiler/ac.arm
+
+# wasm/ is source for the embedded blobs (wasm_blobs.hpp); its npm deps are not
+/ac-compiler/wasm/node_modules/
+
+# relics/: the old per-backend codegen files (codegen_py.cpp, codegen_c.cpp, etc.) from
+# before everything merged into ir_codegen.cpp. Kept on disk as a local reference, never
+# tracked — already covered by the /ac-compiler/* deny above, named here so it doesn't
+# get mistaken for untracked clutter and cleaned up by accident.
+/ac-compiler/relics/
+
+# ── Build / run byproducts, anywhere in the tree ──────────────────────────────────────────
+*.o
+*.d
+*.obj
+*.core
+core
+core.*
+*.log
+*.tmp
+*.swp
+*~
+*.backup
+*.pyc
+__pycache__/
+.pytest_cache/
+node_modules/
+
+# AC compiler caches and intermediates (generated next to whatever file was compiled)
+**/ac-cache/
+*.acc
+*.lir
+*.irc
+*.datac
+*.acb
+
+# Editor / assistant state
+.kiro/
+.vscode/
+.idea/
+.windsurf/
+.claude/
+.aider*
+context.md
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+credentials*.json
+
+# Local library rating notes (not for the repo)
+/library/LIBRARY_RATINGS.md

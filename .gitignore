@@ -5,11 +5,13 @@
 # Anything else (IDE, LSP, website, scratch, benchmarks, session notes) lives outside the repo.
 /*
 !/.gitignore
+!/.npmignore
 !/README.md
 !/LICENSE
 !/install.sh
 !/package.json
 !/bin/
+!/scripts/
 !/ac-compiler/
 !/examples/
 !/library/

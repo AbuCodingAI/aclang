@@ -6,7 +6,9 @@
     "ac": "bin/ac"
   },
   "scripts": {
-    "test": "echo \"see install.sh / ac-compiler/Makefile for build+test\" && exit 0"
+    "test": "echo \"see install.sh / ac-compiler/Makefile for build+test\" && exit 0",
+    "prepack": "scripts/npm-symlinks.sh materialize",
+    "postpack": "scripts/npm-symlinks.sh restore"
   },
   "keywords": [
     "compiler",
@@ -31,15 +33,6 @@
   "engines": {
     "node": ">=14.0.0"
   },
-  "files": [
-    "bin/",
-    "ac-compiler/ac",
-    "ac-compiler/ac.exe",
-    "ac-compiler/ac.arm",
-    "library/",
-    "README.md",
-    "LICENSE"
-  ],
   "publishConfig": {
     "access": "public"
   }
