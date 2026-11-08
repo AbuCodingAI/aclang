@@ -1075,6 +1075,16 @@ public:
     // typed backends must declare them as arrays, not integers.
     std::set<std::string> listParams_;
     virtual void setListParams(const std::set<std::string>& s) { listParams_ = s; }
+    // Params that receive a DICT argument at some call site (no in-body signal distinguishes a
+    // dict parameter from a list one — both are just LOAD_INDEX/STORE_INDEX on the name — so
+    // this is purely cross-function evidence, mirroring listParams_'s own detection but seeded
+    // from ALLOC "dict" sightings instead of indexing usage; see computeDictParams).
+    std::set<std::string> dictParams_;
+    virtual void setDictParams(const std::set<std::string>& s) { dictParams_ = s; }
+    // Subset of dictParams_ whose values are non-numeric (string-valued dict arriving only via
+    // a parameter, never a local literal, in this function) — see g_crossDictStrVal.
+    std::set<std::string> dictStrValParams_;
+    virtual void setDictStrValParams(const std::set<std::string>& s) { dictStrValParams_ = s; }
     // List params the body REBINDS (`psi = []`): PY rebinds only the local name, so these stay by value.
     std::set<std::string> reboundParams_;
     virtual void setReboundParams(const std::set<std::string>& s) { reboundParams_ = s; }
@@ -1342,6 +1352,16 @@ public:
     bool baseReturnIsList_ = false;
     bool baseReturnIsString_ = false;
     virtual void setReturnIsString(bool v) { baseReturnIsString_ = v; } // #6: fn returns a string
+    // A function whose `return` traces to a dict-typed PARAMETER (see dictParams_/
+    // computeDictParams) — unlike list/float/string, there's no existing per-function flag for
+    // this at all before this fix, so a function returning its own dict parameter defaulted to
+    // whatever the int/list/string/void inference above guessed (verified real bug: examples/
+    // dict_function_param.ac's `add_item` — see this base class's own setReturnIsList comment
+    // for the parallel list case this mirrors).
+    bool baseReturnIsDict_ = false;
+    bool baseReturnIsDictStrVal_ = false;
+    virtual void setReturnIsDict(bool v) { baseReturnIsDict_ = v; }
+    virtual void setReturnIsDictStrVal(bool v) { baseReturnIsDictStrVal_ = v; }
     virtual void setListReturnFuncs(const std::set<std::string>&) {}
     // Which of THOSE list-returning functions specifically return a STRING list, not an int
     // one — see crossFnStringListVars_/stringListReturnFuncs_'s own comment in the driver.
@@ -4528,35 +4548,55 @@ private:
             emitRaw(out, "    ac_save_append(b);");
             emitRaw(out, "}");
         }
-        // Dict runtime: string-keyed assoc (linear scan — fine for AC-scale dicts)
+        // Dict runtime: open-addressing hash table (FNV-1a + linear probing, resize-and-rehash
+        // at 3/4 load factor) — was a linear strcmp scan per get/set/has (fine at AC-example
+        // scale, O(n) for real use); `n`/`cap` now count SLOTS (cap always a power of 2), not
+        // a dense prefix, so a NULL key marks an empty slot. Mirrors exp_bny.cpp's BNY dict.
         emitRaw(out, "typedef struct { ac_int n, cap; const char** ks; ac_int* vs; } ac_dict;");
+        emitRaw(out, "static unsigned long long ac_dict_hash(const char* k) {");
+        emitRaw(out, "    unsigned long long h = 0xcbf29ce484222325ULL;");
+        emitRaw(out, "    while (*k) { h ^= (unsigned char)(*k++); h *= 0x100000001b3ULL; }");
+        emitRaw(out, "    return h;");
+        emitRaw(out, "}");
         emitRaw(out, "static ac_dict* ac_dict_new(void) {");
         emitRaw(out, "    ac_dict* d = (ac_dict*)malloc(sizeof(ac_dict));");
         emitRaw(out, "    d->n = 0;");
         emitRaw(out, "    d->cap = 8;");
-        emitRaw(out, "    d->ks = (const char**)malloc(8 * sizeof(char*));");
+        emitRaw(out, "    d->ks = (const char**)calloc(8, sizeof(char*));");
         emitRaw(out, "    d->vs = (ac_int*)malloc(8 * sizeof(ac_int));");
         emitRaw(out, "    return d;");
         emitRaw(out, "}");
-        emitRaw(out, "static void ac_dict_set(ac_dict* d, const char* k, ac_int v) {");
-        emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
-        emitRaw(out, "        if (!strcmp(d->ks[i], k)) { d->vs[i] = v; return; }");
-        emitRaw(out, "    if (d->n == d->cap) {");
-        emitRaw(out, "        d->cap *= 2;");
-        emitRaw(out, "        d->ks = (const char**)realloc(d->ks, d->cap * sizeof(char*));");
-        emitRaw(out, "        d->vs = (ac_int*)realloc(d->vs, d->cap * sizeof(ac_int));");
+        emitRaw(out, "static void ac_dict_resize(ac_dict* d) {");
+        emitRaw(out, "    ac_int oldCap = d->cap; const char** oldKs = d->ks; ac_int* oldVs = d->vs;");
+        emitRaw(out, "    d->cap = oldCap * 2;");
+        emitRaw(out, "    d->ks = (const char**)calloc((size_t)d->cap, sizeof(char*));");
+        emitRaw(out, "    d->vs = (ac_int*)malloc((size_t)d->cap * sizeof(ac_int));");
+        emitRaw(out, "    for (ac_int i = 0; i < oldCap; i++) {");
+        emitRaw(out, "        if (!oldKs[i]) continue;");
+        emitRaw(out, "        ac_int j = (ac_int)(ac_dict_hash(oldKs[i]) & (unsigned long long)(d->cap - 1));");
+        emitRaw(out, "        while (d->ks[j]) j = (j + 1) % d->cap;");
+        emitRaw(out, "        d->ks[j] = oldKs[i]; d->vs[j] = oldVs[i];");
         emitRaw(out, "    }");
-        emitRaw(out, "    d->ks[d->n] = k;");
-        emitRaw(out, "    d->vs[d->n] = v;");
-        emitRaw(out, "    d->n++;");
+        emitRaw(out, "    free(oldKs); free(oldVs);");
+        emitRaw(out, "}");
+        emitRaw(out, "static void ac_dict_set(ac_dict* d, const char* k, ac_int v) {");
+        emitRaw(out, "    if (4 * (d->n + 1) > 3 * d->cap) ac_dict_resize(d);");
+        emitRaw(out, "    ac_int i = (ac_int)(ac_dict_hash(k) & (unsigned long long)(d->cap - 1));");
+        emitRaw(out, "    while (d->ks[i]) {");
+        emitRaw(out, "        if (!strcmp(d->ks[i], k)) { d->vs[i] = v; return; }");
+        emitRaw(out, "        i = (i + 1) % d->cap;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    d->ks[i] = k; d->vs[i] = v; d->n++;");
         emitRaw(out, "}");
         emitRaw(out, "static int ac_dict_has(const ac_dict* d, const char* k) {");
-        emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
+        emitRaw(out, "    ac_int i = (ac_int)(ac_dict_hash(k) & (unsigned long long)(d->cap - 1));");
+        emitRaw(out, "    for (ac_int seen = 0; d->ks[i] && seen < d->cap; seen++, i = (i + 1) % d->cap)");
         emitRaw(out, "        if (!strcmp(d->ks[i], k)) return 1;");
         emitRaw(out, "    return 0;");
         emitRaw(out, "}");
         emitRaw(out, "static ac_int ac_dict_get(const ac_dict* d, const char* k) {");
-        emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
+        emitRaw(out, "    ac_int i = (ac_int)(ac_dict_hash(k) & (unsigned long long)(d->cap - 1));");
+        emitRaw(out, "    for (ac_int seen = 0; d->ks[i] && seen < d->cap; seen++, i = (i + 1) % d->cap)");
         emitRaw(out, "        if (!strcmp(d->ks[i], k)) return d->vs[i];");
         emitRaw(out, "    fprintf(stderr, \"Preposterous: KeyError: %s\\n\", k);");
         emitRaw(out, "    exit(1);");
@@ -4569,29 +4609,41 @@ private:
         emitRaw(out, "    ac_sdict* d = (ac_sdict*)malloc(sizeof(ac_sdict));");
         emitRaw(out, "    d->n = 0;");
         emitRaw(out, "    d->cap = 8;");
-        emitRaw(out, "    d->ks = (const char**)malloc(8 * sizeof(char*));");
+        emitRaw(out, "    d->ks = (const char**)calloc(8, sizeof(char*));");
         emitRaw(out, "    d->vs = (const char**)malloc(8 * sizeof(char*));");
         emitRaw(out, "    return d;");
         emitRaw(out, "}");
-        emitRaw(out, "static void ac_sdict_set(ac_sdict* d, const char* k, const char* v) {");
-        emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
-        emitRaw(out, "        if (!strcmp(d->ks[i], k)) { d->vs[i] = v; return; }");
-        emitRaw(out, "    if (d->n == d->cap) {");
-        emitRaw(out, "        d->cap *= 2;");
-        emitRaw(out, "        d->ks = (const char**)realloc(d->ks, d->cap * sizeof(char*));");
-        emitRaw(out, "        d->vs = (const char**)realloc(d->vs, d->cap * sizeof(char*));");
+        emitRaw(out, "static void ac_sdict_resize(ac_sdict* d) {");
+        emitRaw(out, "    ac_int oldCap = d->cap; const char** oldKs = d->ks; const char** oldVs = d->vs;");
+        emitRaw(out, "    d->cap = oldCap * 2;");
+        emitRaw(out, "    d->ks = (const char**)calloc((size_t)d->cap, sizeof(char*));");
+        emitRaw(out, "    d->vs = (const char**)malloc((size_t)d->cap * sizeof(char*));");
+        emitRaw(out, "    for (ac_int i = 0; i < oldCap; i++) {");
+        emitRaw(out, "        if (!oldKs[i]) continue;");
+        emitRaw(out, "        ac_int j = (ac_int)(ac_dict_hash(oldKs[i]) & (unsigned long long)(d->cap - 1));");
+        emitRaw(out, "        while (d->ks[j]) j = (j + 1) % d->cap;");
+        emitRaw(out, "        d->ks[j] = oldKs[i]; d->vs[j] = oldVs[i];");
         emitRaw(out, "    }");
-        emitRaw(out, "    d->ks[d->n] = k;");
-        emitRaw(out, "    d->vs[d->n] = v;");
-        emitRaw(out, "    d->n++;");
+        emitRaw(out, "    free(oldKs); free(oldVs);");
+        emitRaw(out, "}");
+        emitRaw(out, "static void ac_sdict_set(ac_sdict* d, const char* k, const char* v) {");
+        emitRaw(out, "    if (4 * (d->n + 1) > 3 * d->cap) ac_sdict_resize(d);");
+        emitRaw(out, "    ac_int i = (ac_int)(ac_dict_hash(k) & (unsigned long long)(d->cap - 1));");
+        emitRaw(out, "    while (d->ks[i]) {");
+        emitRaw(out, "        if (!strcmp(d->ks[i], k)) { d->vs[i] = v; return; }");
+        emitRaw(out, "        i = (i + 1) % d->cap;");
+        emitRaw(out, "    }");
+        emitRaw(out, "    d->ks[i] = k; d->vs[i] = v; d->n++;");
         emitRaw(out, "}");
         emitRaw(out, "static int ac_sdict_has(const ac_sdict* d, const char* k) {");
-        emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
+        emitRaw(out, "    ac_int i = (ac_int)(ac_dict_hash(k) & (unsigned long long)(d->cap - 1));");
+        emitRaw(out, "    for (ac_int seen = 0; d->ks[i] && seen < d->cap; seen++, i = (i + 1) % d->cap)");
         emitRaw(out, "        if (!strcmp(d->ks[i], k)) return 1;");
         emitRaw(out, "    return 0;");
         emitRaw(out, "}");
         emitRaw(out, "static const char* ac_sdict_get(const ac_sdict* d, const char* k) {");
-        emitRaw(out, "    for (ac_int i = 0; i < d->n; i++)");
+        emitRaw(out, "    ac_int i = (ac_int)(ac_dict_hash(k) & (unsigned long long)(d->cap - 1));");
+        emitRaw(out, "    for (ac_int seen = 0; d->ks[i] && seen < d->cap; seen++, i = (i + 1) % d->cap)");
         emitRaw(out, "        if (!strcmp(d->ks[i], k)) return d->vs[i];");
         emitRaw(out, "    fprintf(stderr, \"Preposterous: KeyError: %s\\n\", k);");
         emitRaw(out, "    exit(1);");
@@ -5986,6 +6038,12 @@ private:
                 auto cit = cpt.find(idx);
                 if (cit != cpt.end()) {
                     tparams += cit->second + " " + pname;   // bundle/tuple-instance param — real struct type, by value
+                } else if (dictParams_.count(pname)) {
+                    // A dict arriving only via a parameter (never a local literal in THIS
+                    // function) has no in-body signal distinguishing it from a list — see
+                    // dictParams_/computeDictParams. ac_sdict/ac_dict mirrors the same
+                    // string-vs-int split a local dict literal gets (see decl()'s own check).
+                    tparams += (dictStrValParams_.count(pname) ? "ac_sdict* " : "ac_dict* ") + pname;
                 } else if (isStringVar(pname)) {
                     tparams += "const char* " + pname;   // #6: inferred string param (char-iterable)
                 } else if (listParams_.count(pname)) {
@@ -6018,7 +6076,8 @@ private:
         auto cf = classReturnFuncs_.find(name);
         std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
                          : boxedRetFuncs_.count(name) ? "AcDynVal "
-                         : retKind == 4 ? "void " : retKind == 5 ? "ac_str* " : retKind == 6 ? "double* " : retKind == 2 ? "ac_int* " : retKind == 3 ? "ac_str " : retKind == 1 ? "double " : "ac_int ";
+                         : retKind == 4 ? "void " : retKind == 7 ? "ac_dict* " : retKind == 8 ? "ac_sdict* "
+                         : retKind == 5 ? "ac_str* " : retKind == 6 ? "double* " : retKind == 2 ? "ac_int* " : retKind == 3 ? "ac_str " : retKind == 1 ? "double " : "ac_int ";
         emit(out, 0, ret + cEscape(name) + "(" + typedParamListC(params, name) + ");");
     }
     // Per-param (name, C type) breakdown — same type inference as typedParamListC, just not
@@ -6130,12 +6189,23 @@ private:
         }
         if (tparams.empty()) tparams = "void";
         declareParams(cParams, declared);
+        // Seed dictVars_/dictStrVals_ with this function's own dict-typed PARAMETERS (see
+        // dictParams_/computeDictParams) — without this, the body's LOAD_INDEX/STORE_INDEX
+        // dict-dispatch (which only ever checks dictVars_) never recognized a dict that arrived
+        // via a parameter, only one created by a local `x = {...}` literal (verified real bug:
+        // examples/dict_function_param.ac — `cart[name] = price` inside a function receiving
+        // `cart` as a parameter compiled as plain array indexing).
+        for (const auto& p : dictParams_) {
+            dictVars_.insert(p);
+            if (dictStrValParams_.count(p)) dictStrVals_.insert(p);
+        }
         // #retvoid: a genuinely void function (e.g. a `configure event-listener` key-callback
         // body, or `init` — see emitConstructCall, which already discards init's return value
         // regardless of type) defaulted to `ac_int` — harmless for `init` (call site never
         // used it) but a real bug for event callbacks: `_ac_bind` takes `ac_evfn` = `void
         // (*)(void)`, and `ac_int (*)(void)` is an incompatible pointer type.
         std::string retT = returnIsVoid_ ? "void"
+            : baseReturnIsDict_ ? (baseReturnIsDictStrVal_ ? "ac_sdict*" : "ac_dict*")
             : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "ac_str*"
                               : floatListReturnFuncs_.count(name) ? "double*" : "ac_int*")
             : baseReturnIsString_ ? "ac_str" : returnIsFloat_ ? "double" : "ac_int";
@@ -6149,6 +6219,7 @@ private:
         curFuncReturnsDyn_ = classOwner.empty() && boxedRetFuncs_.count(name) > 0;
         if (curFuncReturnsDyn_) retT = "AcDynVal";   // returns a var whose type cycles (see detectBoxedVars)
         returnIsFloat_ = false; returnIsList_ = false; baseReturnIsString_ = false; returnIsVoid_ = false;
+        baseReturnIsDict_ = false; baseReturnIsDictStrVal_ = false;
         emit(out, indent, retT + " " + cName + "(" + tparams + ") {");
         indent++;
         // Hoist cross-block locals to the top (fixes #41). C has no `auto`, so concrete types only.
@@ -6490,6 +6561,7 @@ protected:
     bool curFuncReturnIsList_ = false;
     bool curFuncReturnIsString_ = false;   // persists through the body so emitReturn "" → std::string(), not 0
     bool curFuncReturnIsFloat_ = false;
+    bool curFuncReturnIsDict_ = false;   // same snapshot need — see the three siblings' comment
     // Same "persists through the body" need as the three above — the #retvoid fix in
     // emitReturn checked the raw `returnIsVoid_` directly, but that gets reset to false
     // immediately after the function prologue below (before the body's own trailing
@@ -6617,6 +6689,7 @@ protected:
         emitRaw(out, "#include <string>");
         emitRaw(out, "#include <vector>");
         emitRaw(out, "#include <map>");
+        emitRaw(out, "#include <unordered_map>");   // AC dict literals: real O(1) hash map, not the ordered tree
         emitRaw(out, "#include <functional>");
         emitRaw(out, "#include <cstdio>");
         emitRaw(out, "#include <cstdlib>");
@@ -7456,7 +7529,7 @@ protected:
             // constructed value of the right type, not the bare `return 0;` fallback below —
             // verified real error: "could not convert '0' from 'int' to 'Point'".
             if (!curFuncReturnClass_.empty()) { emit(out, indent, "return " + curFuncReturnClass_ + "();"); return; }
-            const char* z = curFuncReturnIsList_   ? "return {};"
+            const char* z = (curFuncReturnIsList_ || curFuncReturnIsDict_) ? "return {};"
                           : curFuncReturnIsString_ ? "return std::string();"
                           : curFuncReturnIsFloat_  ? "return 0.0;"
                           :                          "return 0;";
@@ -7696,7 +7769,7 @@ protected:
             bool numeric = dictValsAllNumeric(content);
             if (!numeric) dictStrVals_.insert(var);
             std::string vt = numeric ? "long long" : "std::string";
-            std::string d = "std::map<std::string," + vt + "> " + var + " = {";
+            std::string d = "std::unordered_map<std::string," + vt + "> " + var + " = {";
             bool first = true;
             for (auto& [k, v] : parseDictPairs(content)) {
                 if (!first) d += ", ";
@@ -7714,7 +7787,7 @@ protected:
                 bool strVal = dictStrVals_.count(elems[0]) > 0;
                 if (strVal) listOfDictStrVals_.insert(var);
                 std::string vt = strVal ? "std::string" : "long long";
-                emit(out, indent, "std::vector<std::map<std::string," + vt + ">> " + var + " = {" + content + "};");
+                emit(out, indent, "std::vector<std::unordered_map<std::string," + vt + ">> " + var + " = {" + content + "};");
                 declared.insert(var);
                 return;
             }
@@ -7760,7 +7833,7 @@ protected:
             dictVars_.insert(result);
             if (strVal) dictStrVals_.insert(result);
             std::string vt = strVal ? "std::string" : "long long";
-            emit(out, indent, "std::map<std::string," + vt + "> " + result + " = " + arr + "[" + idx + "];");
+            emit(out, indent, "std::unordered_map<std::string," + vt + "> " + result + " = " + arr + "[" + idx + "];");
             declared.insert(result);
             return;
         }
@@ -7862,6 +7935,15 @@ protected:
                 // never catches (see its own comment).
                 if (cit != cpt.end()) {
                     tparams += cit->second + " " + pname;   // bundle/tuple-instance param — real struct/class type, by value
+                } else if (dictParams_.count(pname)) {
+                    // A dict arriving only via a parameter (never a local literal in THIS
+                    // function) — see dictParams_/computeDictParams. By reference, same as a
+                    // list parameter just below (AC dicts are shared references, see decl()).
+                    tparams += (dictStrValParams_.count(pname)
+                                  ? "std::unordered_map<std::string,std::string>& "
+                                  : "std::unordered_map<std::string,long long>& ") + pname;
+                    dictVars_.insert(pname);
+                    if (dictStrValParams_.count(pname)) dictStrVals_.insert(pname);
                 } else if (isStringVar(pname) || stringParams_.count(pname)) {
                     tparams += "std::string " + pname;   // #6: inferred string param (iterable as chars)
                 } else if (listParams_.count(pname)) {
@@ -7896,6 +7978,8 @@ protected:
         std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
                         : boxedRetFuncs_.count(name) ? "AcDynVal "
                         : retKind == 4 ? "void "
+                        : retKind == 7 ? "std::unordered_map<std::string,long long> "
+                        : retKind == 8 ? "std::unordered_map<std::string,std::string> "
                         : retKind == 5 ? "std::vector<std::string> "
                         : retKind == 6 ? "std::vector<double> "
                         : retKind == 2 ? "std::vector<long long> "
@@ -8034,9 +8118,16 @@ protected:
             }
         }
         declareParams(cppParams, declared);
+        // Seed dictVars_/dictStrVals_ with this function's own dict-typed PARAMETERS, same fix
+        // as CStrategy's emitFunctionBegin — see its own comment for the verified bug.
+        for (const auto& p : dictParams_) {
+            dictVars_.insert(p);
+            if (dictStrValParams_.count(p)) dictStrVals_.insert(p);
+        }
         curFuncReturnIsList_ = returnIsList_;
         curFuncReturnIsString_ = baseReturnIsString_;
         curFuncReturnIsFloat_ = returnIsFloat_;
+        curFuncReturnIsDict_ = baseReturnIsDict_;
         // #retvoid: CppStrategy never consulted returnIsVoid_ at all — a genuinely void
         // function (e.g. a `configure event-listener` key-callback body) always got the
         // `long long` default, an immediate prototype/definition mismatch once
@@ -8047,6 +8138,8 @@ protected:
         curFuncReturnIsVoid_ = isVoidFn;
         std::string retType = (!classOwner.empty() && name == "init") ? ""
             : isVoidFn ? "void "
+            : baseReturnIsDict_ ? (baseReturnIsDictStrVal_ ? "std::unordered_map<std::string,std::string> "
+                                                            : "std::unordered_map<std::string,long long> ")
             : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "std::vector<std::string> "
                               : floatListReturnFuncs_.count(name) ? "std::vector<double> " : "std::vector<long long> ")
             : baseReturnIsString_ ? "std::string "
@@ -8063,6 +8156,7 @@ protected:
         curFuncReturnsDyn_ = classOwner.empty() && boxedRetFuncs_.count(name) > 0;
         if (curFuncReturnsDyn_) retType = "AcDynVal ";   // returns a var whose type cycles (see detectBoxedVars)
         returnIsFloat_ = false; returnIsList_ = false; baseReturnIsString_ = false; returnIsVoid_ = false;
+        baseReturnIsDict_ = false; baseReturnIsDictStrVal_ = false;
         emit(out, indent, retType + cppName + "(" + tparams + ") {");
         indent++;
         // Hoist cross-block locals to the top so a later use in a sibling/outer block resolves (#41).
@@ -8111,6 +8205,7 @@ protected:
             curFuncReturnIsString_ = false;
             curFuncReturnIsFloat_ = false;
             curFuncReturnIsVoid_ = false;
+            curFuncReturnIsDict_ = false;
             return;
         }
         indent--;
@@ -8121,6 +8216,7 @@ protected:
         curFuncReturnIsString_ = false;
         curFuncReturnIsFloat_ = false;
         curFuncReturnIsVoid_ = false;
+        curFuncReturnIsDict_ = false;
     }
     void emitIndirectCall(std::ostringstream &out, int &indent,
                           const std::string &res, const std::string &func,
@@ -8319,6 +8415,8 @@ public:
         auto cf = classReturnFuncs_.find(name);
         std::string ret = cf != classReturnFuncs_.end() ? cf->second + " "
                         : retKind == 4 ? "void "
+                        : retKind == 7 ? "std::unordered_map<std::string,long long> "
+                        : retKind == 8 ? "std::unordered_map<std::string,std::string> "
                         : retKind == 5 ? "std::vector<std::string> "
                         : retKind == 6 ? "std::vector<double> "
                         : retKind == 2 ? "std::vector<long long> "
@@ -10993,6 +11091,12 @@ class JavaStrategy : public BackendStrategy
                     ptype = cit->second;
                     classInstanceVars_.insert(pname);
                     classInstanceVarNames_[pname] = cit->second;
+                } else if (dictParams_.count(pname)) {
+                    // A dict arriving only via a parameter (never a local literal in THIS
+                    // function) — see dictParams_/computeDictParams.
+                    ptype = dictStrValParams_.count(pname) ? "java.util.Map<String,String>" : "java.util.Map<String,Long>";
+                    dictVars_.insert(pname);
+                    if (dictStrValParams_.count(pname)) dictStrVals_.insert(pname);
                 } else if (isStringVar(pname)) {
                     ptype = "String";    // #6: inferred string param
                 } else if (listParams_.count(pname)) {
@@ -11068,7 +11172,8 @@ class JavaStrategy : public BackendStrategy
         }
         stringParams_.clear();
         funcTypedParams_.clear();
-        std::string retT = returnIsList_ ? (stringListReturnFuncs_.count(name) ? "java.util.ArrayList<String>"
+        std::string retT = baseReturnIsDict_ ? (baseReturnIsDictStrVal_ ? "java.util.Map<String,String>" : "java.util.Map<String,Long>")
+                         : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "java.util.ArrayList<String>"
                               : floatListReturnFuncs_.count(name) ? "java.util.ArrayList<Double>" : "java.util.ArrayList<Long>")
                          : baseReturnIsString_ ? "String"
                          : returnIsFloat_ ? "double"
@@ -12698,11 +12803,14 @@ class RustStrategy : public BackendStrategy
             // abu_speaks_ac's `apply_line`, "expected f64, found i64").
             bool needsFloatify = !needsStringify && curFuncReturnIsFloat_
                 && !floatVars.count(val) && !looksFloat(val);
-            // A list parameter is a `&mut Vec` in this function (see the parameter emitter), so
-            // returning it hands back a copy: the caller owns a fresh Vec, as before.
+            // A list (or dict) parameter is a `&mut Vec`/`&mut HashMap` in this function (see
+            // the parameter emitter), so returning it hands back a copy: the caller owns a
+            // fresh Vec/HashMap, as before. A REBOUND dict param is already owned (by-value,
+            // not &mut — see emitFunctionBegin's dictParams_ branch), so it needs no clone.
+            bool needsDictClone = dictParams_.count(val) > 0 && !reboundParams_.count(val);
             std::string v = needsStringify ? "(" + val + ").to_string()"
                 : needsFloatify ? "(" + val + ") as f64"
-                : (listParams_.count(val) ? val + ".clone()" : val);
+                : (listParams_.count(val) || needsDictClone) ? val + ".clone()" : val;
             emit(out, indent, "return " + v + ";");
             lastWasReturn = true;
         }
@@ -13225,6 +13333,17 @@ class RustStrategy : public BackendStrategy
                     tparams += "mut " + pname + ": " + cit->second;
                     classInstanceVars_.insert(pname);
                     classInstanceVarNames_[pname] = cit->second;
+                } else if (dictParams_.count(pname)) {
+                    // A dict arriving only via a parameter (never a local literal in THIS
+                    // function) — see dictParams_/computeDictParams. Same by-&mut-ref vs
+                    // rebound-by-value split as the list case just below.
+                    std::string vt = dictStrValParams_.count(pname) ? "String" : "i64";
+                    dictVars_.insert(pname);
+                    if (dictStrValParams_.count(pname)) dictStrVals_.insert(pname);
+                    if (reboundParams_.count(pname))
+                        tparams += "mut " + pname + ": std::collections::HashMap<String," + vt + ">";
+                    else
+                        tparams += pname + ": &mut std::collections::HashMap<String," + vt + ">";
                 } else if (isStringVar(pname) || stringParams_.count(pname)) {
                     stringVars_.insert(pname);
                     tparams += pname + ": &str";   // #6: read-only string param (literals pass free)
@@ -13322,6 +13441,8 @@ class RustStrategy : public BackendStrategy
         curFuncIsConstructor_ = isNew;
         curFuncReturnIsVoid_ = returnIsVoid_ && !isNew;
         std::string retT = curFuncReturnIsVoid_ ? ""
+            : baseReturnIsDict_ ? (baseReturnIsDictStrVal_ ? "-> std::collections::HashMap<String,String> "
+                                                            : "-> std::collections::HashMap<String,i64> ")
             : returnIsList_ ? (stringListReturnFuncs_.count(name) ? "-> Vec<String> "
                               : floatListReturnFuncs_.count(name) ? "-> Vec<f64> " : "-> Vec<i64> ")
             : baseReturnIsString_ ? "-> String " : returnIsFloat_ ? "-> f64 " : "-> i64 ";
@@ -15522,6 +15643,13 @@ private:
                     tparams += pname + " *" + cit->second;
                     classInstanceVars_.insert(pname);
                     classInstanceVarNames_[pname] = cit->second;
+                } else if (dictParams_.count(pname)) {
+                    // A dict arriving only via a parameter (never a local literal in THIS
+                    // function) — see dictParams_/computeDictParams. No by-ref ceremony needed:
+                    // a Go map value IS already a reference to the underlying hash table.
+                    tparams += pname + " map[string]" + std::string(dictStrValParams_.count(pname) ? "string" : "int64");
+                    dictVars_.insert(pname);
+                    if (dictStrValParams_.count(pname)) dictStrVals_.insert(pname);
                 } else if (isStringVar(pname)) {
                     tparams += pname + " string";    // #6: inferred string param
                 } else if (listParams_.count(pname)) {
@@ -15583,6 +15711,7 @@ private:
         // `return <value>` either — it always returns `self` via its own dedicated line below.
         curFuncReturnIsVoid_ = returnIsVoid_ && !isNew;
         std::string retT = curFuncReturnIsVoid_ ? ""
+                         : baseReturnIsDict_ ? "map[string]" + std::string(baseReturnIsDictStrVal_ ? "string" : "int64")
                          : returnIsList_ ? (floatListReturnFuncs_.count(name) ? "[]float64" : "[]int64")
                          : baseReturnIsString_ ? "string"
                          : returnIsFloat_ ? "float64" : "int64";
@@ -15597,10 +15726,13 @@ private:
             if (classRetIt != classReturnFuncs_.end()) { curFuncReturnClass_ = classRetIt->second; retT = "*" + classRetIt->second; }
         }
         curFuncRetString_ = baseReturnIsString_;
+        curFuncReturnIsDict_ = baseReturnIsDict_;
+        curFuncReturnIsDictStrVal_ = baseReturnIsDictStrVal_;
         curFuncReturnsDyn_ = !isNew && classOwner.empty() && boxedRetFuncs_.count(name) > 0;
         if (curFuncReturnsDyn_) retT = "AcDynVal";   // returns a var whose type cycles (see detectBoxedVars)
         baseReturnIsString_ = false;
         returnIsList_ = false; returnIsFloat_ = false; returnIsVoid_ = false;
+        baseReturnIsDict_ = false; baseReturnIsDictStrVal_ = false;
         if (isNew) {
             emit(out, indent, "func New" + classOwner + "(" + tparams + ") *" + classOwner + " {");
             // Unlike Rust, `self` isn't a reserved word in Go — a real local named `self` is
@@ -15635,6 +15767,8 @@ private:
         funcTypedParams_.clear();
     }
     bool curFuncReturnIsList_ = false;
+    bool curFuncReturnIsDict_ = false;
+    bool curFuncReturnIsDictStrVal_ = false;
     bool curFuncIsConstructor_ = false;
     bool curFuncReturnIsVoid_ = false;
     bool curFuncIsGenerator_ = false;
@@ -15667,10 +15801,11 @@ private:
                             // typecheck even though unreachable after a real `return p`.
                             : !curFuncReturnClass_.empty() ? "return nil"
                             : curFuncReturnsDyn_     ? "return AcDynVal{}"
-                            : curFuncReturnIsList_   ? "return nil"
+                            : (curFuncReturnIsList_ || curFuncReturnIsDict_) ? "return nil"
                             : curFuncRetString_      ? "return \"\"" : "return 0");
         curFuncReturnsDyn_ = false;
         curFuncReturnIsList_ = false; curFuncRetString_ = false;
+        curFuncReturnIsDict_ = false; curFuncReturnIsDictStrVal_ = false;
         curFuncIsConstructor_ = false; curFuncReturnIsVoid_ = false; curFuncReturnClass_ = "";
         indent--;
         emit(out, indent, "}");
@@ -16687,6 +16822,8 @@ class VStrategy : public BackendStrategy
     bool returnIsFloat_ = false;
     bool curFuncReturnIsFloat_ = false;
     bool curFuncReturnIsString_ = false;
+    bool curFuncReturnIsDict_ = false;
+    bool curFuncReturnIsDictStrVal_ = false;
     std::set<std::string> userFloatFuncs_;
     std::set<std::string> floatParams_;
     void setFloatParams(const std::set<std::string>& s) override { floatParams_ = s; }
@@ -17459,11 +17596,16 @@ class VStrategy : public BackendStrategy
             if (i > 0) tparams += ", ";
             bool isStr  = isStringVar(paramNames[i]);
             bool isList = !isStr && listParams_.count(paramNames[i]) > 0;
+            // A dict arriving only via a parameter (never a local literal in THIS function) —
+            // see dictParams_/computeDictParams. Same `mut`-by-reference convention as a list
+            // param just below (V maps work the same way: `mut` passes by reference).
+            bool isDict = !isStr && !isList && dictParams_.count(paramNames[i]) > 0;
+            if (isDict) { dictVars_.insert(paramNames[i]); if (dictStrValParams_.count(paramNames[i])) dictStrVals_.insert(paramNames[i]); }
             // Same gap/fix as RustStrategy/JavaStrategy's floatParams_ (see their comments) — a
             // param the function's OWN body treats as float (`x / 2.0`) always defaulted to
             // `i64` here regardless (verified: examples/newton_sqrt.ac's `nsqrt(2.0)` —
             // "cannot use `float literal` as `i64` in argument 1").
-            bool isFloat = !isStr && !isList && floatParams_.count(paramNames[i]) > 0;
+            bool isFloat = !isStr && !isList && !isDict && floatParams_.count(paramNames[i]) > 0;
             // classParamTypes_ (see its own comment): a param proven to receive a bundle/tuple
             // instance argument needs the real struct type, not `i64` — same bug as C's
             // `ac_int p`, fixed identically. classInstanceVars_/classInstanceVarNames_ get
@@ -17472,6 +17614,11 @@ class VStrategy : public BackendStrategy
             auto cit = cpt ? cpt->find((int)i) : std::map<int,std::string>::const_iterator();
             if (cpt && cit != cpt->end()) {
                 tparams += paramNames[i] + "_p " + cit->second;
+            } else if (isDict && !isGenerator_ && !reboundParams_.count(paramNames[i])) {
+                tparams += "mut " + paramNames[i] + " map[string]" + std::string(dictStrValParams_.count(paramNames[i]) ? "string" : "i64");
+            } else if (isDict) {
+                // Generator wrapper or rebound: forwarded by value, same shape as the list cases below.
+                tparams += paramNames[i] + "_p map[string]" + std::string(dictStrValParams_.count(paramNames[i]) ? "string" : "i64");
             } else if (isList && !isGenerator_ && !reboundParams_.count(paramNames[i])) {
                 // A `mut` array param is passed by reference (see the call site): the body
                 // works on the parameter itself, with no `_p` copy, so writes reach the caller.
@@ -17547,6 +17694,7 @@ class VStrategy : public BackendStrategy
         // constructor as void (its own dedicated `ClassName` return line below always applies).
         curFuncReturnIsVoid_ = returnIsVoid_ && !isNew;
         std::string vret = curFuncReturnIsVoid_ ? ""
+                         : baseReturnIsDict_ ? "map[string]" + std::string(baseReturnIsDictStrVal_ ? "string" : "i64")
                          : baseReturnIsString_ ? "string"
                          : baseReturnIsList_ ? (floatListReturnFuncs_.count(name) ? "[]f64" : "[]i64")
                          : returnIsFloat_ ? "f64" : "i64";
@@ -17573,7 +17721,10 @@ class VStrategy : public BackendStrategy
         curFuncReturnIsString_ = baseReturnIsString_;
         baseReturnIsString_ = false;
         curFuncReturnIsFloat_ = returnIsFloat_;
+        curFuncReturnIsDict_ = baseReturnIsDict_;
+        curFuncReturnIsDictStrVal_ = baseReturnIsDictStrVal_;
         baseReturnIsList_ = false;
+        baseReturnIsDict_ = false; baseReturnIsDictStrVal_ = false;
         returnIsFloat_ = false; returnIsVoid_ = false;
         if (isNew) {
             // Free function, not a method — `new_ClassName(args) ClassName { mut self := ... }`.
@@ -17595,9 +17746,10 @@ class VStrategy : public BackendStrategy
             const std::string& p = paramNames[pi];
             bool isStr  = isStringVar(p);
             bool isList = !isStr && listParams_.count(p) > 0;
-            bool isFloat = !isStr && !isList && floatParams_.count(p) > 0;
-            if (isList && !isGenerator_ && !reboundParams_.count(p)) { declared.insert(p); /* aliased by the `mut` param itself */ }
-            else emit(out, indent, "mut " + p + " := " + p + "_p" + (isList ? ".clone()" : ""));
+            bool isDict = !isStr && !isList && dictParams_.count(p) > 0;
+            bool isFloat = !isStr && !isList && !isDict && floatParams_.count(p) > 0;
+            if ((isList || isDict) && !isGenerator_ && !reboundParams_.count(p)) { declared.insert(p); /* aliased by the `mut` param itself */ }
+            else emit(out, indent, "mut " + p + " := " + p + "_p" + ((isList || isDict) ? ".clone()" : ""));
             if (isStr) stringVars_.insert(vName(p));   // keep string-ness for body codegen
             if (isFloat) floatVars.insert(p);          // keep float-ness for body codegen
             // classParamTypes_: pre-seed classInstanceVars_/classInstanceVarNames_ under the
@@ -17657,8 +17809,10 @@ class VStrategy : public BackendStrategy
                              // "still has to typecheck even though unreachable after a real
                              // `return p`" reasoning as every sibling backend's matching fix.
                              : !curFuncReturnClass_.empty() ? "return " + curFuncReturnClass_ + "{}"
+                             : curFuncReturnIsDict_ ? "return map[string]" + std::string(curFuncReturnIsDictStrVal_ ? "string" : "i64") + "{}"
                              : curFuncReturnIsFloat_ ? "return f64(0)" : "return i64(0)");
         curFuncReturnIsFloat_ = false; curFuncIsConstructor_ = false; curFuncReturnIsVoid_ = false;
+        curFuncReturnIsDict_ = false; curFuncReturnIsDictStrVal_ = false;
         curFuncReturnClass_ = "";
         lastWasReturn = false;
         indent--;
@@ -18831,61 +18985,171 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    pop rbx");
         emitRaw(out, "    ret");
         emitRaw(out, "");
-        // Dict runtime: string-keyed assoc, O(n) linear scan (real hashing is a bigger,
-        // separate follow-up — not attempted here), but capacity now grows dynamically
-        // instead of the old fixed 64-pair cap (which had NO overflow check at all — a 65th
-        // insert was an unguarded buffer overflow, a correctness bug, not just a perf one).
-        // Layout: [cap(8)][n(8)][k0(8)][v0(8)]...  — a hidden capacity word at ptr[-8], one
-        // slot before the n word every other dict-reading path already knows about (get only
-        // ever reads ptr[0]=n and ptr[8+16i]/ptr[16+16i] for keys/values, unaware ptr-8
-        // exists) — mirrors exp_bny.cpp's BNY dict fix. Values are raw 8-byte payloads (an
-        // int64 OR a string-pool pointer) — mirrors CStrategy's ac_dict too.
+        // Dict runtime: open-addressing hash table (FNV-1a + linear probing, resize-and-rehash
+        // at 3/4 load factor) — was an O(n) strcmp-per-slot linear scan (ported verbatim from
+        // CStrategy's old design, same fix now applied there too; see exp_bny.cpp's BNY dict
+        // for the from-scratch version of this same design in raw machine code).
+        // Layout: [cap(8)][n(8)][slot0_key(8)][slot0_val(8)]...  — cap is a SLOT COUNT (always
+        // a power of 2, doubled on resize), n is occupied slots, a NULL key marks an empty
+        // slot. Hidden cap word at ptr[-8], same as before.
         definedFuncs_.insert("_ac_dict_new");
         definedFuncs_.insert("_ac_dict_get");
         definedFuncs_.insert("_ac_dict_has");
         definedFuncs_.insert("_ac_dict_set");
-        calledFuncs_.insert("malloc"); calledFuncs_.insert("strcmp");
+        definedFuncs_.insert("_ac_dict_hash");
+        definedFuncs_.insert("_ac_dict_resize");
+        calledFuncs_.insert("malloc"); calledFuncs_.insert("strcmp"); calledFuncs_.insert("free");
         calledFuncs_.insert("printf"); calledFuncs_.insert("exit");
-        emitRaw(out, "_ac_dict_new:");                 // -> rax = ptr, seed cap = 8 pairs
-        emitRaw(out, "    mov rdi, " + std::to_string(16 * (8 + 1)));
+        emitRaw(out, "_ac_dict_hash:");                // rdi = key ptr -> rax = FNV-1a hash
+        emitRaw(out, "    mov rax, 0xcbf29ce484222325");
+        emitRaw(out, "    mov r9, 0x100000001b3");
+        emitRaw(out, ".ac_dhash_loop:");
+        emitRaw(out, "    movzx ecx, byte [rdi]");
+        emitRaw(out, "    test cl, cl");
+        emitRaw(out, "    jz .ac_dhash_done");
+        emitRaw(out, "    xor rax, rcx");
+        emitRaw(out, "    imul rax, r9");
+        emitRaw(out, "    inc rdi");
+        emitRaw(out, "    jmp .ac_dhash_loop");
+        emitRaw(out, ".ac_dhash_done:");
+        emitRaw(out, "    ret");
+        emitRaw(out, "");
+        emitRaw(out, "_ac_dict_new:");                 // -> rax = ptr, seed cap = 8 slots
+        emitRaw(out, "    mov rdi, " + std::to_string(16 * (8 + 1)));  // cap word + n word + 8 pairs
         emitRaw(out, "    call malloc");
         emitRaw(out, "    mov qword [rax], 8");        // raw[0] = cap
         emitRaw(out, "    add rax, 8");                 // rax = ptr (skip cap word)
         emitRaw(out, "    mov qword [rax], 0");         // ptr[0] = n = 0
+        emitRaw(out, "    mov rdi, rax");
+        emitRaw(out, "    add rdi, 8");                  // first key slot
+        emitRaw(out, "    mov rcx, 8");
+        emitRaw(out, "    xor rsi, rsi");
+        emitRaw(out, ".ac_dnew_zero:");                  // zero all 8 key/val slots (NULL = empty)
+        emitRaw(out, "    mov [rdi], rsi");
+        emitRaw(out, "    mov [rdi+8], rsi");
+        emitRaw(out, "    add rdi, 16");
+        emitRaw(out, "    dec rcx");
+        emitRaw(out, "    jnz .ac_dnew_zero");
+        emitRaw(out, "    ret");
+        emitRaw(out, "");
+        emitRaw(out, "_ac_dict_resize:");                // rdi = old ptr -> rax = new ptr
+        emitRaw(out, "    push rbx");
+        emitRaw(out, "    push r12");
+        emitRaw(out, "    push r13");
+        emitRaw(out, "    push r14");
+        emitRaw(out, "    push r15");
+        emitRaw(out, "    mov r12, rdi");                 // r12 = old ptr
+        emitRaw(out, "    mov r13, [r12-8]");             // r13 = oldCap
+        emitRaw(out, "    mov r14, r13");
+        emitRaw(out, "    add r14, r14");                  // r14 = newCap = 2*oldCap
+        emitRaw(out, "    mov rdi, r14");
+        emitRaw(out, "    imul rdi, rdi, 16");
+        emitRaw(out, "    add rdi, 16");                    // bytes = 16*newCap + cap word + n word
+        emitRaw(out, "    call malloc");
+        emitRaw(out, "    mov qword [rax], r14");          // new_raw[0] = newCap
+        emitRaw(out, "    add rax, 8");                     // rax = new ptr
+        emitRaw(out, "    mov r15, rax");                    // r15 = new ptr
+        emitRaw(out, "    mov rdi, r15");
+        emitRaw(out, "    xor rsi, rsi");
+        emitRaw(out, "    mov rcx, r14");
+        emitRaw(out, ".ac_drz_zero:");                       // zero new_ptr[0..newCap) pairs (NULL keys)
+        emitRaw(out, "    mov [rdi], rsi");
+        emitRaw(out, "    mov [rdi+8], rsi");
+        emitRaw(out, "    add rdi, 16");
+        emitRaw(out, "    dec rcx");
+        emitRaw(out, "    jnz .ac_drz_zero");
+        emitRaw(out, "    dec r14");                          // r14 now repurposed: mask = newCap-1
+        emitRaw(out, "    xor rbx, rbx");                     // rbx = i over OLD slots
+        emitRaw(out, ".ac_drz_loop:");
+        emitRaw(out, "    cmp rbx, r13");
+        emitRaw(out, "    jge .ac_drz_done");
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    lea rdx, [r12+8+rcx]");
+        emitRaw(out, "    mov rax, [rdx]");
+        emitRaw(out, "    test rax, rax");
+        emitRaw(out, "    jz .ac_drz_next");                  // empty old slot, skip
+        emitRaw(out, "    mov rdi, rax");
+        emitRaw(out, "    call _ac_dict_hash");               // rax = hash; r12,r13,r14,r15,rbx preserved
+        emitRaw(out, "    and rax, r14");                      // j = hash & mask
+        emitRaw(out, ".ac_drz_probe:");
+        emitRaw(out, "    mov rcx, rax");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    lea r8, [r15+8+rcx]");
+        emitRaw(out, "    cmp qword [r8], 0");
+        emitRaw(out, "    je .ac_drz_place");
+        emitRaw(out, "    inc rax");
+        emitRaw(out, "    and rax, r14");
+        emitRaw(out, "    jmp .ac_drz_probe");
+        emitRaw(out, ".ac_drz_place:");
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    lea rdx, [r12+8+rcx]");
+        emitRaw(out, "    mov r9, [rdx]");
+        emitRaw(out, "    mov [r8], r9");
+        emitRaw(out, "    mov r9, [rdx+8]");
+        emitRaw(out, "    mov [r8+8], r9");
+        emitRaw(out, ".ac_drz_next:");
+        emitRaw(out, "    inc rbx");
+        emitRaw(out, "    jmp .ac_drz_loop");
+        emitRaw(out, ".ac_drz_done:");
+        emitRaw(out, "    mov rax, [r12]");                    // oldN
+        emitRaw(out, "    mov [r15], rax");                     // new_ptr[0] = n (unchanged by rehash)
+        emitRaw(out, "    mov rdi, r12");
+        emitRaw(out, "    sub rdi, 8");
+        emitRaw(out, "    call free");
+        emitRaw(out, "    mov rax, r15");
+        emitRaw(out, "    pop r15");
+        emitRaw(out, "    pop r14");
+        emitRaw(out, "    pop r13");
+        emitRaw(out, "    pop r12");
+        emitRaw(out, "    pop rbx");
         emitRaw(out, "    ret");
         emitRaw(out, "");
         emitRaw(out, "_ac_dict_has:");                 // rdi=ptr, rsi=key -> rax = 1 if present, else 0
         emitRaw(out, "    push rbx");
         emitRaw(out, "    push r12");
         emitRaw(out, "    push r13");
-        emitRaw(out, "    mov r12, rdi");
-        emitRaw(out, "    mov r13, rsi");
-        emitRaw(out, "    xor rbx, rbx");
+        emitRaw(out, "    push r14");
+        emitRaw(out, "    push r15");
+        emitRaw(out, "    mov r12, rdi");                // ptr
+        emitRaw(out, "    mov r13, rsi");                // key
+        emitRaw(out, "    mov rdi, rsi");
+        emitRaw(out, "    call _ac_dict_hash");
+        emitRaw(out, "    mov r14, [r12-8]");             // cap
+        emitRaw(out, "    mov rcx, r14");
+        emitRaw(out, "    dec rcx");
+        emitRaw(out, "    and rax, rcx");
+        emitRaw(out, "    mov rbx, rax");                  // probe idx
+        emitRaw(out, "    xor r15, r15");                   // seen count
         emitRaw(out, ".ac_dh_loop:");
-        emitRaw(out, "    mov rax, [r12]");
-        emitRaw(out, "    cmp rbx, rax");
+        emitRaw(out, "    cmp r15, r14");
         emitRaw(out, "    jge .ac_dh_miss");
-        emitRaw(out, "    lea rcx, [r12+8]");
-        emitRaw(out, "    mov rax, rbx");
-        emitRaw(out, "    imul rax, rax, 16");
-        emitRaw(out, "    add rcx, rax");
-        emitRaw(out, "    mov rdi, [rcx]");
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    lea rdx, [r12+8+rcx]");
+        emitRaw(out, "    mov rax, [rdx]");
+        emitRaw(out, "    test rax, rax");
+        emitRaw(out, "    jz .ac_dh_miss");
+        emitRaw(out, "    mov rdi, rax");
         emitRaw(out, "    mov rsi, r13");
-        emitRaw(out, "    push rcx");
         emitRaw(out, "    call strcmp");
-        emitRaw(out, "    pop rcx");
         emitRaw(out, "    test eax, eax");
         emitRaw(out, "    jz .ac_dh_hit");
         emitRaw(out, "    inc rbx");
+        emitRaw(out, "    mov rcx, r14");
+        emitRaw(out, "    dec rcx");
+        emitRaw(out, "    and rbx, rcx");
+        emitRaw(out, "    inc r15");
         emitRaw(out, "    jmp .ac_dh_loop");
         emitRaw(out, ".ac_dh_hit:");
         emitRaw(out, "    mov eax, 1");
-        emitRaw(out, "    pop r13");
-        emitRaw(out, "    pop r12");
-        emitRaw(out, "    pop rbx");
-        emitRaw(out, "    ret");
+        emitRaw(out, "    jmp .ac_dh_ret");
         emitRaw(out, ".ac_dh_miss:");
         emitRaw(out, "    xor eax, eax");
+        emitRaw(out, ".ac_dh_ret:");
+        emitRaw(out, "    pop r15");
+        emitRaw(out, "    pop r14");
         emitRaw(out, "    pop r13");
         emitRaw(out, "    pop r12");
         emitRaw(out, "    pop rbx");
@@ -18895,31 +19159,48 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    push rbx");
         emitRaw(out, "    push r12");
         emitRaw(out, "    push r13");
+        emitRaw(out, "    push r14");
+        emitRaw(out, "    push r15");
         emitRaw(out, "    mov r12, rdi");
         emitRaw(out, "    mov r13, rsi");
-        emitRaw(out, "    xor rbx, rbx");
+        emitRaw(out, "    mov rdi, rsi");
+        emitRaw(out, "    call _ac_dict_hash");
+        emitRaw(out, "    mov r14, [r12-8]");
+        emitRaw(out, "    mov rcx, r14");
+        emitRaw(out, "    dec rcx");
+        emitRaw(out, "    and rax, rcx");
+        emitRaw(out, "    mov rbx, rax");
+        emitRaw(out, "    xor r15, r15");
         emitRaw(out, ".ac_dg_loop:");
-        emitRaw(out, "    mov rax, [r12]");
-        emitRaw(out, "    cmp rbx, rax");
+        emitRaw(out, "    cmp r15, r14");
         emitRaw(out, "    jge .ac_dg_miss");
-        emitRaw(out, "    lea rcx, [r12+8]");
-        emitRaw(out, "    mov rax, rbx");
-        emitRaw(out, "    imul rax, rax, 16");
-        emitRaw(out, "    add rcx, rax");
-        emitRaw(out, "    mov rdi, [rcx]");
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    lea rdx, [r12+8+rcx]");
+        emitRaw(out, "    mov rax, [rdx]");
+        emitRaw(out, "    test rax, rax");
+        emitRaw(out, "    jz .ac_dg_miss");
+        emitRaw(out, "    mov rdi, rax");
         emitRaw(out, "    mov rsi, r13");
-        emitRaw(out, "    push rcx");
         emitRaw(out, "    call strcmp");
-        emitRaw(out, "    pop rcx");
         emitRaw(out, "    test eax, eax");
         emitRaw(out, "    jnz .ac_dg_next");
-        emitRaw(out, "    mov rax, [rcx+8]");
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    lea rdx, [r12+8+rcx]");
+        emitRaw(out, "    mov rax, [rdx+8]");
+        emitRaw(out, "    pop r15");
+        emitRaw(out, "    pop r14");
         emitRaw(out, "    pop r13");
         emitRaw(out, "    pop r12");
         emitRaw(out, "    pop rbx");
         emitRaw(out, "    ret");
         emitRaw(out, ".ac_dg_next:");
         emitRaw(out, "    inc rbx");
+        emitRaw(out, "    mov rcx, r14");
+        emitRaw(out, "    dec rcx");
+        emitRaw(out, "    and rbx, rcx");
+        emitRaw(out, "    inc r15");
         emitRaw(out, "    jmp .ac_dg_loop");
         emitRaw(out, ".ac_dg_miss:");
         // dprintf(2, ...): the KeyError message belongs on stderr (PY's traceback), not stdout.
@@ -18937,91 +19218,58 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    push r12");
         emitRaw(out, "    push r13");
         emitRaw(out, "    push r14");
+        emitRaw(out, "    push r15");
         emitRaw(out, "    mov r12, rdi");               // r12 = ptr
         emitRaw(out, "    mov r13, rsi");               // r13 = key
         emitRaw(out, "    mov r14, rdx");               // r14 = val
-        emitRaw(out, "    xor rbx, rbx");               // rbx = i (scan index)
-        emitRaw(out, ".ac_ds_loop:");
         emitRaw(out, "    mov rax, [r12]");              // n
-        emitRaw(out, "    cmp rbx, rax");
-        emitRaw(out, "    jge .ac_ds_grow");             // rbx == n -> no match, need insert
-        emitRaw(out, "    lea rcx, [r12+8]");
-        emitRaw(out, "    mov rax, rbx");
-        emitRaw(out, "    imul rax, rax, 16");
-        emitRaw(out, "    add rcx, rax");
-        emitRaw(out, "    mov rdi, [rcx]");
+        emitRaw(out, "    inc rax");
+        emitRaw(out, "    imul rax, rax, 4");
+        emitRaw(out, "    mov rcx, [r12-8]");             // cap
+        emitRaw(out, "    imul rcx, rcx, 3");
+        emitRaw(out, "    cmp rax, rcx");
+        emitRaw(out, "    jle .ac_ds_hash");               // 4*(n+1) <= 3*cap -> room, skip resize
+        emitRaw(out, "    mov rdi, r12");
+        emitRaw(out, "    call _ac_dict_resize");          // rax = new ptr (old block freed inside)
+        emitRaw(out, "    mov r12, rax");
+        emitRaw(out, ".ac_ds_hash:");
+        emitRaw(out, "    mov rdi, r13");
+        emitRaw(out, "    call _ac_dict_hash");
+        emitRaw(out, "    mov r15, [r12-8]");              // cap
+        emitRaw(out, "    mov rcx, r15");
+        emitRaw(out, "    dec rcx");
+        emitRaw(out, "    and rax, rcx");
+        emitRaw(out, "    mov rbx, rax");                   // probe idx
+        emitRaw(out, ".ac_ds_loop:");
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    imul rcx, rcx, 16");
+        emitRaw(out, "    lea rdx, [r12+8+rcx]");
+        emitRaw(out, "    mov rax, [rdx]");
+        emitRaw(out, "    test rax, rax");
+        emitRaw(out, "    jz .ac_ds_empty");
+        emitRaw(out, "    mov rdi, rax");
         emitRaw(out, "    mov rsi, r13");
-        emitRaw(out, "    push rcx");
+        emitRaw(out, "    push rdx");                        // slot addr clobbered by call, save it
         emitRaw(out, "    call strcmp");
-        emitRaw(out, "    pop rcx");
+        emitRaw(out, "    pop rdx");
         emitRaw(out, "    test eax, eax");
-        emitRaw(out, "    jnz .ac_ds_next");
-        emitRaw(out, "    mov qword [rcx+8], r14");
+        emitRaw(out, "    jz .ac_ds_update");
+        emitRaw(out, "    inc rbx");
+        emitRaw(out, "    mov rcx, r15");
+        emitRaw(out, "    dec rcx");
+        emitRaw(out, "    and rbx, rcx");
+        emitRaw(out, "    jmp .ac_ds_loop");
+        emitRaw(out, ".ac_ds_update:");
+        emitRaw(out, "    mov [rdx+8], r14");
         emitRaw(out, "    mov rax, r12");
         emitRaw(out, "    jmp .ac_ds_done");
-        emitRaw(out, ".ac_ds_next:");
-        emitRaw(out, "    inc rbx");
-        emitRaw(out, "    jmp .ac_ds_loop");
-        emitRaw(out, "");
-        emitRaw(out, ".ac_ds_grow:");                    // rbx == n; fast (room) vs slow (full)?
-        emitRaw(out, "    mov rax, [r12-8]");             // rax = cap
-        emitRaw(out, "    cmp rbx, rax");
-        emitRaw(out, "    jl .ac_ds_fast");                // n < cap -> room already available
-        // ---- slow path: rbx == n == cap exactly (grow only ever triggers here, never
-        // n>cap) — rbx doubles as oldcap for free, no separate read needed. ----
-        emitRaw(out, "    mov rdi, rbx");
-        emitRaw(out, "    add rdi, rdi");
-        emitRaw(out, "    inc rdi");
-        emitRaw(out, "    imul rdi, rdi, 16");             // bytes = 16*(2*oldcap + 1)
-        emitRaw(out, "    call malloc");                    // rax = new raw block
-        emitRaw(out, "    mov rcx, rbx");
-        emitRaw(out, "    add rcx, rcx");                    // rcx = newcap = 2*oldcap
-        emitRaw(out, "    mov qword [rax], rcx");            // new_raw[0] = newcap
-        emitRaw(out, "    add rax, 8");                       // rax = new ptr
-        // copy old_ptr[0..2*oldcap] (word0=n plus 2*oldcap pair-words); word0 overwritten after
-        emitRaw(out, "    xor rcx, rcx");
-        emitRaw(out, ".ac_ds_copy:");
-        emitRaw(out, "    mov rdx, rbx");
-        emitRaw(out, "    add rdx, rdx");
-        emitRaw(out, "    inc rdx");                           // bound = 2*oldcap+1
-        emitRaw(out, "    cmp rcx, rdx");
-        emitRaw(out, "    jge .ac_ds_copied");
-        emitRaw(out, "    mov rsi, rcx");
-        emitRaw(out, "    imul rsi, rsi, 8");
-        emitRaw(out, "    mov r8, r12");
-        emitRaw(out, "    add r8, rsi");
-        emitRaw(out, "    mov r9, [r8]");
-        emitRaw(out, "    mov r8, rax");
-        emitRaw(out, "    add r8, rsi");
-        emitRaw(out, "    mov [r8], r9");
-        emitRaw(out, "    inc rcx");
-        emitRaw(out, "    jmp .ac_ds_copy");
-        emitRaw(out, ".ac_ds_copied:");
-        emitRaw(out, "    mov rcx, rbx");
-        emitRaw(out, "    inc rcx");
-        emitRaw(out, "    mov [rax], rcx");                    // new_ptr[0] = n+1
-        emitRaw(out, "    mov rcx, rbx");
-        emitRaw(out, "    imul rcx, rcx, 16");
-        emitRaw(out, "    mov rdi, rax");
-        emitRaw(out, "    add rdi, rcx");
-        emitRaw(out, "    add rdi, 8");
-        emitRaw(out, "    mov [rdi], r13");                     // new key
-        emitRaw(out, "    mov qword [rdi+8], r14");              // new val
-        emitRaw(out, "    jmp .ac_ds_done");
-        emitRaw(out, "");
-        emitRaw(out, ".ac_ds_fast:");                            // n < cap — write in place, O(1)
-        emitRaw(out, "    mov rcx, rbx");
-        emitRaw(out, "    imul rcx, rcx, 16");
-        emitRaw(out, "    mov rdi, r12");
-        emitRaw(out, "    add rdi, rcx");
-        emitRaw(out, "    add rdi, 8");
-        emitRaw(out, "    mov [rdi], r13");                       // key slot
-        emitRaw(out, "    mov qword [rdi+8], r14");                // value slot
-        emitRaw(out, "    mov rcx, rbx");
-        emitRaw(out, "    inc rcx");
-        emitRaw(out, "    mov [r12], rcx");                         // ptr[0] = n+1
-        emitRaw(out, "    mov rax, r12");                            // return same ptr
+        emitRaw(out, ".ac_ds_empty:");
+        emitRaw(out, "    mov [rdx], r13");
+        emitRaw(out, "    mov [rdx+8], r14");
+        emitRaw(out, "    inc qword [r12]");                  // n++
+        emitRaw(out, "    mov rax, r12");
         emitRaw(out, ".ac_ds_done:");
+        emitRaw(out, "    pop r15");
         emitRaw(out, "    pop r14");
         emitRaw(out, "    pop r13");
         emitRaw(out, "    pop r12");
@@ -20856,6 +21104,15 @@ class AsmStrategy : public BackendStrategy
             if (cpt) { auto ci = cpt->find(ai); if (ci != cpt->end()) instanceClass_[pname] = ci->second; }
             out << "    mov [" << slotAddr(pname) << "], " << argRegs[ai++] << "\n";
         }
+        // A dict arriving only via a parameter (never a local literal in THIS function) — see
+        // dictParams_/computeDictParams. Unlike the 7 shared-driver backends, no signature
+        // change is needed (see setClassParamTypes' own comment just above this class) — this
+        // is a pure dictVars_/dictAllStr_ pre-seed so LOAD_INDEX/STORE_INDEX on the parameter
+        // dispatch to _ac_dict_get/_ac_dict_set instead of raw array pointer arithmetic.
+        for (const auto& p : dictParams_) {
+            dictVars_.insert(p);
+            if (dictStrValParams_.count(p)) dictAllStr_.insert(p);
+        }
         // Authoritative per-function, not just per-class: methods of DIFFERENT classes are
         // emitted sequentially and each needs `self.field` inside its OWN body resolved against
         // ITS class, not whatever emitClassBegin last set. Plain functions clear it (empty
@@ -21785,6 +22042,101 @@ static void computeCrossListParams(const AC_IR::IRProgram& ir) {
     }
 }
 
+// Dict parameters: unlike a list, there's no in-body signal that distinguishes a dict
+// parameter from a list one (both are just LOAD_INDEX/STORE_INDEX on the name) — the ONLY
+// evidence is the CALLER's side: an argument that is itself a known dict var (either a direct
+// `x = {...}` literal, or itself a dict parameter forwarded along). Mirrors
+// computeCrossListParams' shape exactly, just seeded from ALLOC "dict" instead of indexing
+// usage, and ALSO scanning the top-level/mainloop body (ir.globalInit/mainSection — never a
+// "function", so invisible to computeCrossListParams' ir.functions-only loop, but very much a
+// real caller: `cart = {...}; total_price(cart)` at mainloop scope is exactly the shape that
+// exposed this bug, examples/dict_function_param.ac).
+// thread_local for the same reason as g_crossListParams (see its own comment) — `--all`
+// compiles every backend on its own thread.
+static thread_local std::map<std::string, std::set<std::string>> g_crossDictParams;
+// Subset of g_crossDictParams (plus any local dict var) whose VALUES are non-numeric — typed
+// backends need this to pick the string-valued container type (C: ac_sdict vs ac_dict) for a
+// dict that only ever arrives as a parameter, never a local literal, in a given function.
+static thread_local std::map<std::string, std::set<std::string>> g_crossDictStrVal;
+static std::set<std::string> detectLocalDictVars(const std::vector<AC_IR::IRInstruction>& instrs,
+                                                  const AC_IR::SymbolTable& symbols,
+                                                  std::set<std::string>* strValOut = nullptr) {
+    using namespace AC_IR;
+    std::set<std::string> out;
+    for (const auto& ins : instrs) {
+        if (ins.opcode == IROpcode::ALLOC && ins.result.kind == IRRef::Kind::VAR && ins.result.id >= 0
+            && !ins.typedOperands.empty() && ins.typedOperands[0].kind == IRRef::Kind::CONST
+            && ins.typedOperands[0].value.type == IRType::STRING
+            && std::get<std::string>(ins.typedOperands[0].value.data) == "dict") {
+            std::string vn = const_cast<SymbolTable&>(symbols).getName(ins.result.id);
+            out.insert(vn);
+            if (strValOut && ins.typedOperands.size() >= 2 && ins.typedOperands[1].kind == IRRef::Kind::CONST
+                && ins.typedOperands[1].value.type == IRType::STRING
+                && !dictValsAllNumeric(std::get<std::string>(ins.typedOperands[1].value.data)))
+                strValOut->insert(vn);
+        }
+    }
+    return out;
+}
+static void computeDictParams(const AC_IR::IRProgram& ir) {
+    using namespace AC_IR;
+    g_crossDictParams.clear();
+    g_crossDictStrVal.clear();
+    std::map<std::string, const IRFunction*> byName;
+    for (const auto& f : ir.functions) byName[f.name] = &f;
+    auto nameOf = [&](const IRRef& r) -> std::string {
+        if ((r.kind == IRRef::Kind::VAR || r.kind == IRRef::Kind::FUNCTION) && r.id >= 0)
+            return const_cast<SymbolTable&>(ir.symbols).getName(r.id);
+        if (r.kind == IRRef::Kind::CONST && r.value.type == IRType::STRING)
+            return std::get<std::string>(r.value.data);
+        return "";
+    };
+    std::map<std::string, std::set<std::string>> localDictVars, localStrDictVars;
+    for (const auto& f : ir.functions)
+        localDictVars[f.name] = detectLocalDictVars(f.instructions, ir.symbols, &localStrDictVars[f.name]);
+    {
+        std::set<std::string> topStr;
+        auto topVars = detectLocalDictVars(ir.globalInit, ir.symbols, &topStr);
+        auto mainVars = detectLocalDictVars(ir.mainSection, ir.symbols, &topStr);
+        topVars.insert(mainVars.begin(), mainVars.end());
+        localDictVars[""] = std::move(topVars);
+        localStrDictVars[""] = std::move(topStr);
+    }
+    std::vector<std::pair<std::string, const std::vector<AC_IR::IRInstruction>*>> callerBodies;
+    for (const auto& f : ir.functions) callerBodies.push_back({f.name, &f.instructions});
+    callerBodies.push_back({"", &ir.globalInit});
+    callerBodies.push_back({"", &ir.mainSection});
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < 50) {
+        changed = false;
+        for (const auto& [callerName, instrsPtr] : callerBodies) {
+            const auto& localKnown = localDictVars[callerName];
+            const auto& localStr = localStrDictVars[callerName];
+            for (const auto& ins : *instrsPtr) {
+                if (ins.opcode != IROpcode::CALL && ins.opcode != IROpcode::LIB_CALL) continue;
+                if (ins.typedOperands.empty()) continue;
+                auto cit = byName.find(nameOf(ins.typedOperands[0]));
+                if (cit == byName.end()) continue;
+                const IRFunction* callee = cit->second;
+                for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
+                    size_t pidx = ai - 1;
+                    if (pidx >= callee->parameters.size()) break;
+                    const IRRef& arg = ins.typedOperands[ai];
+                    if (arg.kind != IRRef::Kind::VAR) continue;
+                    std::string an = nameOf(arg);
+                    bool argIsDict = localKnown.count(an) > 0 || g_crossDictParams[callerName].count(an) > 0;
+                    if (!argIsDict) continue;
+                    const std::string& pname = callee->parameters[pidx];
+                    if (g_crossDictParams[callee->name].insert(pname).second) changed = true;
+                    bool argIsStr = localStr.count(an) > 0 || g_crossDictStrVal[callerName].count(an) > 0;
+                    if (argIsStr && g_crossDictStrVal[callee->name].insert(pname).second) changed = true;
+                }
+            }
+        }
+    }
+}
+
 static bool isSyntheticVar(const std::string& n) {
     // "aac_" catches the SAME `_ac_`-prefixed names after V's formatRef/vName rewrite (a
     // leading `_` becomes `a` — V rejects underscore-led identifiers outright). This free-var
@@ -21844,6 +22196,7 @@ class UnifiedIRCodeGen
     // `p.field` formats as a real struct access instead of a flattened `p_field` name).
     std::map<std::string, std::map<int, std::string>> classParamTypes_;
     std::set<std::string> protoFloatFuncs_, protoListFuncs_, protoStringFuncs_; // fwd-decl return types
+    std::set<std::string> protoDictFuncs_, protoDictStrFuncs_; // fwd-decl return types: dict / string-valued dict
     std::map<std::string, ForeignFuncDef> foreignDefs_;   // funcs whose body IS a foreign definition (C/C++)
     std::set<std::string> boxedRetFuncsDrv_;   // user fns returning a boxed (tagged) value — see setBoxedRetFuncs
     // Whole-program string-var sets, one per function — see the fixpoint that fills this in at
@@ -23015,11 +23368,12 @@ class UnifiedIRCodeGen
             std::map<std::string, std::vector<bool>> listArgs;
             for (const auto& fn : ir.functions) {
                 auto lp = listParamsFor(fn, ir.symbols);
+                const auto& dp = g_crossDictParams[fn.name];   // dict params need &mut/by-ref too
                 auto sit = crossFnStringVars_.find(fn.name);
                 auto rb = reboundParamsOf(fn, ir.symbols);
                 std::vector<bool> flags;
                 for (const auto& p : fn.parameters)
-                    flags.push_back(lp.count(p) > 0 && !rb.count(p) && !(sit != crossFnStringVars_.end() && sit->second.count(p)));
+                    flags.push_back((lp.count(p) > 0 || dp.count(p) > 0) && !rb.count(p) && !(sit != crossFnStringVars_.end() && sit->second.count(p)));
                 listArgs[fn.name] = std::move(flags);
             }
             strategy->setUserFuncListArgs(listArgs);
@@ -23027,10 +23381,16 @@ class UnifiedIRCodeGen
         // A parameter with string evidence is a string even when it is also indexed: `s[i]` on a
         // string is a one-char read (detectListParams counts every indexed param as a list).
         // detectStringVars never marks an array name, so this cannot hide a real list.
+        // Dict precedence: a dict param (see computeDictParams/g_crossDictParams) is never ALSO
+        // counted as a plain list — its own setDictParams call just below is what backends must
+        // check first when choosing a container type for it.
         std::set<std::string> fnListParams = listParamsFor(func, ir.symbols);
         if (auto fsv = crossFnStringVars_.find(func.name); fsv != crossFnStringVars_.end())
             for (const auto& sv : fsv->second) fnListParams.erase(sv);
+        for (const auto& dn : g_crossDictParams[func.name]) fnListParams.erase(dn);
         strategy->setListParams(fnListParams);
+        strategy->setDictParams(g_crossDictParams[func.name]);
+        strategy->setDictStrValParams(g_crossDictStrVal[func.name]);
         strategy->setReboundParams(reboundParamsOf(func, ir.symbols));
 
         std::set<std::string> fnStringParams = detectStringParams(func, ir.symbols);
@@ -23076,7 +23436,7 @@ class UnifiedIRCodeGen
         std::set<std::string> fnFloatVars = detectFloatVars(func.instructions, ir.symbols, protoFloatFuncs_,
                                                               floatParamSeed);
         {
-            bool retFloat = false, retList = false, retString = false;
+            bool retFloat = false, retList = false, retString = false, retDict = false, retDictStrVal = false;
             // A generator's `return`s are always bare (value production goes through
             // `yield`, not `return <value>`), but calling it always produces a genuine
             // generator/channel object — never treat it as a void-returning function here
@@ -23128,7 +23488,10 @@ class UnifiedIRCodeGen
                     if (isVarLike(op) && fnStringVars.count(refName(op))) retString = true; // #6
                     if (isVarLike(op)) {
                         std::string rname = refName(op);
-                        if (fnListParams.count(rname)) retList = true; // returning a list param
+                        if (g_crossDictParams[func.name].count(rname)) {
+                            retDict = true;   // returning a dict param (see dictParams_'s comment)
+                            if (g_crossDictStrVal[func.name].count(rname)) retDictStrVal = true;
+                        } else if (fnListParams.count(rname)) retList = true; // returning a list param
                         for (const auto& ai : func.instructions) {
                             if (!isVarLike(ai.result) || refName(ai.result) != rname) continue;
                             // returning a computed STRING temp/var (e.g. `return $hi $ + name`) → string fn (#6)
@@ -23147,6 +23510,8 @@ class UnifiedIRCodeGen
             if (retFloat) strategy->setReturnIsFloat(true);
             if (retList)  strategy->setReturnIsList(true);
             if (retString) strategy->setReturnIsString(true);
+            if (retDict) strategy->setReturnIsDict(true);
+            if (retDictStrVal) strategy->setReturnIsDictStrVal(true);
             if (!hasValueReturn) strategy->setReturnIsVoid(true);
         }
 
@@ -24058,6 +24423,7 @@ public:
             std::set<std::string> floatFuncs = {"ml.take", "ml_take", "aczip.get_ratio", "aczip_get_ratio"};
             std::set<std::string> listFuncs;
             std::set<std::string> stringFuncs;
+            std::set<std::string> dictFuncs, dictStrFuncs;
             std::map<std::string, std::set<int>> userFloatParamIdx;
             std::map<std::string, const AC_IR::IRFunction*> fnByName;
             for (const auto& fn : ir.functions) fnByName[fn.name] = &fn;
@@ -24097,7 +24463,8 @@ public:
             while (fpChanged && fpGuard++ < 50) {
             fpChanged = false;
             size_t crossFPBefore = 0; for (auto& kv : crossFnFloatParams_) crossFPBefore += kv.second.size();
-            size_t fpBefore = floatFuncs.size() + listFuncs.size() + stringFuncs.size() + crossFPBefore;
+            size_t fpBefore = floatFuncs.size() + listFuncs.size() + stringFuncs.size() + crossFPBefore
+                             + dictFuncs.size() + dictStrFuncs.size();
             std::map<std::string, std::set<std::string>> extraFloatParams;
             for (const auto& fn : ir.functions) {
                 // Same exemption as voidUserFuncs_ just above: a generator's `return` (if it has
@@ -24190,7 +24557,13 @@ public:
                             std::string rname = gRefName(rv);
                             if (fnFloatVars().count(rname)) floatFuncs.insert(fn.name);   // #floatret
                             if (fnStringVars().count(rname)) stringFuncs.insert(fn.name);  // #6: returns a string var
-                            if (listParamsFor(fn, ir.symbols).count(rname))
+                            // Dict precedence over list: a dict param (g_crossDictParams, see
+                            // computeDictParams) returned bare is a dict, not a plain list, even
+                            // though listParamsFor's own indexing-based heuristic also flags it.
+                            if (g_crossDictParams[fn.name].count(rname)) {
+                                dictFuncs.insert(fn.name);
+                                if (g_crossDictStrVal[fn.name].count(rname)) dictStrFuncs.insert(fn.name);
+                            } else if (listParamsFor(fn, ir.symbols).count(rname))
                                 listFuncs.insert(fn.name);   // returns a list param
                             for (const auto& ai : fn.instructions) {
                                 bool aiVarLike = ai.result.kind == IRRef::Kind::VAR || ai.result.kind == IRRef::Kind::TEMP;
@@ -24212,7 +24585,8 @@ public:
             for (auto& kv : extraFloatParams)
                 crossFnFloatParams_[kv.first].insert(kv.second.begin(), kv.second.end());
             size_t crossFPAfter = 0; for (auto& kv : crossFnFloatParams_) crossFPAfter += kv.second.size();
-            size_t fpAfter = floatFuncs.size() + listFuncs.size() + stringFuncs.size() + crossFPAfter;
+            size_t fpAfter = floatFuncs.size() + listFuncs.size() + stringFuncs.size() + crossFPAfter
+                            + dictFuncs.size() + dictStrFuncs.size();
             if (fpAfter != fpBefore) fpChanged = true;
             }  // while (fpChanged)
             if (!userFloatParamIdx.empty()) strategy->setUserFloatParams(userFloatParamIdx);
@@ -24222,6 +24596,8 @@ public:
             protoFloatFuncs_ = floatFuncs;
             protoListFuncs_  = listFuncs;
             protoStringFuncs_ = stringFuncs;
+            protoDictFuncs_ = dictFuncs;
+            protoDictStrFuncs_ = dictStrFuncs;
             for (const auto& [fname, fd] : foreignDefs_) {   // return type comes from the foreign C signature
                 if (fd.retKind == 1) protoFloatFuncs_.insert(fname);
                 else if (fd.retKind == 3) protoStringFuncs_.insert(fname);
@@ -24916,11 +25292,15 @@ public:
                 // per-function param hints for correct prototype types
                 std::set<std::string> protoListParams = listParamsFor(func, ir.symbols);
         // Same string-over-list precedence as the definition's setup (see fnListParams there), so
-        // the forward declaration and the definition agree on every parameter's type.
+        // the forward declaration and the definition agree on every parameter's type. Dict
+        // params get the same precedence/exclusion (see fnListParams' own comment).
         if (auto psv = crossFnStringVars_.find(func.name); psv != crossFnStringVars_.end())
             for (const auto& sv : psv->second) protoListParams.erase(sv);
+        for (const auto& dn : g_crossDictParams[func.name]) protoListParams.erase(dn);
                 std::set<std::string> protoStringParams = detectStringParams(func, ir.symbols);
                 strategy->setListParams(protoListParams);
+                strategy->setDictParams(g_crossDictParams[func.name]);
+                strategy->setDictStrValParams(g_crossDictStrVal[func.name]);
                 strategy->setReboundParams(reboundParamsOf(func, ir.symbols));
                 strategy->setStringParams(protoStringParams);
                 // #protostrvars: `isStringVar` (consulted by CStrategy's typedParamListC and
@@ -24985,6 +25365,7 @@ public:
                 int retKind = 0;
                 if (stringListReturnFuncs_.count(func.name)) retKind = 5;
                 else if (floatListReturnFuncs_.count(func.name)) retKind = 6;
+                else if (protoDictFuncs_.count(func.name)) retKind = protoDictStrFuncs_.count(func.name) ? 8 : 7;
                 else if (protoListFuncs_.count(func.name))  retKind = 2;
                 else if (protoFloatFuncs_.count(func.name)) retKind = 1;
                 else if (protoStringFuncs_.count(func.name)) retKind = 3;
@@ -25014,6 +25395,8 @@ public:
         // set got the WRONG by-ref/by-value decision (verified: schrodinger_oscillator's
         // `evolve(psi_even, xs, ...)` at mainloop scope — `xs` needed `&mut` and didn't get it).
         strategy->setListParams({});
+        strategy->setDictParams({});
+        strategy->setDictStrValParams({});
         strategy->setReboundParams({});
         // #6: the mainloop (globalInit) needs its own string inference — it's not a function, so
         // genFunction's setStringVars never ran for it. Without this, mainloop string vars are
@@ -25151,6 +25534,7 @@ std::string generateFromIR(const IRProgram &ir, const std::string &stem,
                            const std::string &outputBase)
 {
     computeCrossListParams(ir);
+    computeDictParams(ir);
     UnifiedIRCodeGen gen(ir, stem, outputBase);
     return gen.generate();
 }

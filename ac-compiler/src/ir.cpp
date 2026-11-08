@@ -501,6 +501,58 @@ class IRGenerator {
     bool isDictContainer(const std::string& name) const {
         return dictVarNames_.count(currentFunc_ + "::" + name) > 0 || dictVarNames_.count("::" + name) > 0;
     }
+    // Dict vars whose every literal value is a `$..$` string — a LOAD_INDEX on one of these is
+    // ALWAYS a string read, even with a dynamically-computed key (see collectAllStringDictVars).
+    std::set<std::string> dictAllStrVarNames_;
+    bool isAllStringDict(const std::string& name) const {
+        return dictAllStrVarNames_.count(currentFunc_ + "::" + name) > 0 || dictAllStrVarNames_.count("::" + name) > 0;
+    }
+    // Same comma/colon split as resolveDictValues, just to check value shape instead of resolving.
+    static bool dictContentAllStr(const std::string& content) {
+        auto splitAt = [](const std::string& t, char ch) {
+            bool inSpan = false;
+            for (size_t i = 0; i < t.size(); i++) {
+                if (t[i] == '$') inSpan = !inSpan;
+                else if (!inSpan && t[i] == ch) return i;
+            }
+            return std::string::npos;
+        };
+        std::string rest = content;
+        bool sawAny = false;
+        while (!rest.empty()) {
+            auto comma = splitAt(rest, ',');
+            std::string pair = comma == std::string::npos ? rest : rest.substr(0, comma);
+            rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
+            auto colon = splitAt(pair, ':');
+            if (colon == std::string::npos) continue;
+            std::string v = pair.substr(colon + 1);
+            size_t a = v.find_first_not_of(" \n\t"), b = v.find_last_not_of(" \n\t");
+            v = a == std::string::npos ? "" : v.substr(a, b - a + 1);
+            if (v.size() < 2 || v.front() != '$' || v.back() != '$') return false;
+            sawAny = true;
+        }
+        return sawAny;
+    }
+    // Mirrors collectDictReturnFunctions' shape: a direct `x = {k: $v$, ...}` literal whose
+    // every value is a string marks `x` (fn-qualified) in dictAllStrVarNames_ — fixes a real
+    // bug where a helper function's `return dict[dynamicKey]` (key built at runtime, e.g.
+    // `$d$ + to_string(n)`) was never recognized as string-returning by its CALLERS, since the
+    // existing #6 string-return fixpoint only trusted a LOAD_INDEX's resultType, which was never
+    // set for a dict read at all (verified: examples/dict_lookup_table.ac printed raw pointers).
+    void collectAllStringDictVars(const ASTNode& ast) {
+        std::function<void(const ASTNode&, const std::string&)> walk;
+        walk = [&](const ASTNode& node, const std::string& fn) {
+            if (node.type == NodeType::AssignStmt && !node.attrs.empty() && node.attrs[0].rfind("__dict__", 0) == 0) {
+                std::string content = node.attrs[0].substr(8);
+                if (dictContentAllStr(content)) dictAllStrVarNames_.insert(fn + "::" + node.value);
+            }
+            for (auto& c : node.children) if (c) walk(*c, fn);
+        };
+        for (auto& top : ast.children) {
+            if (!top) continue;
+            walk(*top, top->type == NodeType::FuncDef ? top->value : std::string());
+        }
+    }
 
     static std::string sanitizeForVarName(const std::string& s) {
         std::string r = s;
@@ -1864,6 +1916,7 @@ class IRGenerator {
                     IRRef idx = dictContainer ? rawIdx : adjustIndex(rawIdx);
                     IRRef dst = mkTemp();
                     IRInstruction i(IROpcode::LOAD_INDEX, dst, {arr, idx});
+                    if (dictContainer && isAllStringDict(expr.children[0]->value)) i.resultType = IRType::STRING;
                     emit(std::move(i));
                     return dst;
                 }
@@ -5826,9 +5879,11 @@ class IRGenerator {
                 // load: tmp = arr[idx]  (AC 1-based → 0-based)
                 IRRef arr = mkVar(n.value);
                 IRRef rawIdx = lowerExpr(n.attrs[0]);
-                IRRef idx = isDictContainer(n.value) ? rawIdx : adjustIndex(rawIdx);
+                bool dictContainer = isDictContainer(n.value);
+                IRRef idx = dictContainer ? rawIdx : adjustIndex(rawIdx);
                 IRRef dst = mkTemp();
                 IRInstruction i(IROpcode::LOAD_INDEX, dst, {arr, idx});
+                if (dictContainer && isAllStringDict(n.value)) i.resultType = IRType::STRING;
                 emit(std::move(i));
             }
             break;
@@ -6254,7 +6309,13 @@ public:
                 dictLocals.insert(node.value);
             if (node.type == NodeType::ReturnStmt && !fn.empty() && !node.children.empty() && node.children[0]) {
                 const ASTNode& r = *node.children[0];
-                if (r.type == NodeType::DictLiteral || (r.type == NodeType::Identifier && dictLocals.count(r.value)))
+                // dictVarNames_.count(fn+"::"+r.value): catches `return cart` where cart is a
+                // dict PARAMETER, not a local literal — only populated after collectDictParams
+                // has run, which is why generate() calls this function a second time right
+                // after it (see that call site's own comment).
+                if (r.type == NodeType::DictLiteral
+                    || (r.type == NodeType::Identifier
+                        && (dictLocals.count(r.value) || dictVarNames_.count(fn + "::" + r.value))))
                     dictReturnFuncs_.insert(fn);
             }
             for (auto& c : node.children) if (c) walk(*c, fn, dictLocals);
@@ -6326,9 +6387,14 @@ public:
         generatorFuncNames_.clear();
         generatorHandleVars_.clear();
         collectGeneratorFunctions(ast);
-        dictReturnFuncs_.clear(); dictVarNames_.clear();
+        dictReturnFuncs_.clear(); dictVarNames_.clear(); dictAllStrVarNames_.clear();
         collectDictReturnFunctions(ast);
         collectDictParams(ast);
+        // Re-run now that dictVarNames_ also knows about dict PARAMETERS (not just local
+        // literals) — catches `return cart` where cart only ever arrives as a parameter (see
+        // collectDictReturnFunctions' own comment on this exact check).
+        collectDictReturnFunctions(ast);
+        collectAllStringDictVars(ast);
         collectGlobalStringConsts(ast);
         collectGeneratorHandleVars(ast);
         scalarizableTupleVars_.clear();
