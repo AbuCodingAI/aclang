@@ -32,8 +32,16 @@ inline time_t fileModTime(const std::string& path) {
 inline bool fileNewerThan(const std::string& a, const std::string& b) {
     struct stat sa, sb;
     if (stat(a.c_str(), &sa) != 0 || stat(b.c_str(), &sb) != 0) return false;
+#if defined(_WIN32) || defined(__MINGW32__)
+    // mingw-w64's `struct stat` has no st_mtim (nanosecond) field, only the plain st_mtime
+    // time_t — whole-second comparison only on this platform (verified real build break: the
+    // Windows cross-compile (`make windows`) failed outright with "'struct stat' has no
+    // member named 'st_mtim'").
+    return sa.st_mtime > sb.st_mtime;
+#else
     if (sa.st_mtim.tv_sec != sb.st_mtim.tv_sec) return sa.st_mtim.tv_sec > sb.st_mtim.tv_sec;
     return sa.st_mtim.tv_nsec > sb.st_mtim.tv_nsec;
+#endif
 }
 
 // FNV-1a 64-bit digest: a cache key is only reused for exactly the same text.

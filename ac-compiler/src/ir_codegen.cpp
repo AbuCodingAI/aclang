@@ -18985,6 +18985,66 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    pop rbx");
         emitRaw(out, "    ret");
         emitRaw(out, "");
+        // ac_ipow/ac_rand/ac_choice: emitted unconditionally, same "just always emit" choice as
+        // ac_iota just above — these three were never emitted AT ALL on ASM (every OTHER backend
+        // defines a real native version; see e.g. CStrategy's own `ac_ipow`/`ac_rand`/`ac_choice`).
+        // Verified real bug: any `^` with a non-constant exponent, or `random.number`/
+        // `random.choice`, failed to even LINK ("undefined reference to `ac_ipow'"/`ac_rand'") —
+        // examples/power.ac and any random.* use. Mirrors exp_bny.cpp's own native
+        // implementations (ac_ipow/__ac_rand__) ported from hand-emitted X64Emitter calls to
+        // literal NASM text; ac_choice is new here (BNY never factored it out as its own
+        // routine — C's own ac_choice, `xs[ac_rand(ac_arr_len(xs))]`, is the model instead).
+        definedFuncs_.insert("ac_ipow");
+        definedFuncs_.insert("ac_rand");
+        definedFuncs_.insert("ac_choice");
+        emitRaw(out, "ac_ipow:");                      // rdi=base, rsi=exp -> rax=base^exp (exp<=0 -> 1)
+        emitRaw(out, "    mov rax, 1");
+        emitRaw(out, ".ac_ipow_loop:");
+        emitRaw(out, "    cmp rsi, 0");
+        emitRaw(out, "    jle .ac_ipow_done");
+        emitRaw(out, "    imul rax, rdi");
+        emitRaw(out, "    dec rsi");
+        emitRaw(out, "    jmp .ac_ipow_loop");
+        emitRaw(out, ".ac_ipow_done:");
+        emitRaw(out, "    ret");
+        emitRaw(out, "");
+        emitRaw(out, "ac_rand:");                      // rdi=n -> rax = pseudo-random in [0,n)
+        emitRaw(out, "    push rbx");
+        emitRaw(out, "    mov rbx, rdi");
+        emitRaw(out, "    rdtsc");                       // edx:eax = cycle counter
+        emitRaw(out, "    shl rdx, 32");
+        emitRaw(out, "    or rax, rdx");                 // rax = 64-bit seed
+        emitRaw(out, "    mov rcx, rax");                // xorshift64
+        emitRaw(out, "    shl rcx, 13");
+        emitRaw(out, "    xor rax, rcx");
+        emitRaw(out, "    mov rcx, rax");
+        emitRaw(out, "    shr rcx, 7");
+        emitRaw(out, "    xor rax, rcx");
+        emitRaw(out, "    mov rcx, rax");
+        emitRaw(out, "    shl rcx, 17");
+        emitRaw(out, "    xor rax, rcx");
+        emitRaw(out, "    cmp rbx, 0");
+        emitRaw(out, "    jle .ac_rand_zero");
+        emitRaw(out, "    mov rcx, rbx");
+        emitRaw(out, "    xor rdx, rdx");
+        emitRaw(out, "    div rcx");                     // unsigned: rdx = rax % rcx
+        emitRaw(out, "    mov rax, rdx");
+        emitRaw(out, "    jmp .ac_rand_done");
+        emitRaw(out, ".ac_rand_zero:");
+        emitRaw(out, "    xor rax, rax");
+        emitRaw(out, ".ac_rand_done:");
+        emitRaw(out, "    pop rbx");
+        emitRaw(out, "    ret");
+        emitRaw(out, "");
+        emitRaw(out, "ac_choice:");                     // rdi = array block ([len][e0][e1]...]) -> rax = random element
+        emitRaw(out, "    push rbx");
+        emitRaw(out, "    mov rbx, rdi");
+        emitRaw(out, "    mov rdi, [rbx]");              // len
+        emitRaw(out, "    call ac_rand");
+        emitRaw(out, "    mov rax, [rbx + 8 + rax*8]");
+        emitRaw(out, "    pop rbx");
+        emitRaw(out, "    ret");
+        emitRaw(out, "");
         // Dict runtime: open-addressing hash table (FNV-1a + linear probing, resize-and-rehash
         // at 3/4 load factor) — was an O(n) strcmp-per-slot linear scan (ported verbatim from
         // CStrategy's old design, same fix now applied there too; see exp_bny.cpp's BNY dict
