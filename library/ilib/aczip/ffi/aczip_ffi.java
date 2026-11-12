@@ -44,6 +44,8 @@ final class AcAczip {
     private static final MethodHandle _compress   = _mh("ac_zip_compress_to_file",     FunctionDescriptor.of(L8, P, I, P));
     private static final MethodHandle _decompress = _mh("ac_zip_decompress_from_file", FunctionDescriptor.of(I, P, P));
     private static final MethodHandle _ratio      = _mh("ac_get_compression_ratio",    FunctionDescriptor.of(D, L8, L8));
+    private static final MethodHandle _iso        = _mh("ac_zip_iso",                  FunctionDescriptor.of(I, P, P, P));
+    private static final MethodHandle _package    = _mh("ac_zip_package",              FunctionDescriptor.of(I, P, P));
 
     private static final Arena _arena = Arena.ofAuto();
     private static MemorySegment _cs(String s) { return _arena.allocateFrom(s); }
@@ -60,6 +62,14 @@ final class AcAczip {
         try { return (double)_ratio.invoke(original, compressed); }
         catch (Throwable t) { throw new RuntimeException(t); }
     }
+    static long iso(String srcdir, String outIso, String label) {
+        try { return (long)(int)_iso.invoke(_cs(srcdir), _cs(outIso), _cs(label)); }
+        catch (Throwable t) { throw new RuntimeException(t); }
+    }
+    static long pack(String srcdir, String outPath) {
+        try { return (long)(int)_package.invoke(_cs(srcdir), _cs(outPath)); }
+        catch (Throwable t) { throw new RuntimeException(t); }
+    }
 }
 
 // Namespace class — AC-generated Java uses aczip.compress(...), aczip.decompress(...)
@@ -67,4 +77,6 @@ class aczip {
     public static long compress(String path, long parallel, String outputPath) { return AcAczip.compress(path, parallel, outputPath); }
     public static long decompress(String archivePath, String outputPath)       { return AcAczip.decompress(archivePath, outputPath); }
     public static double get_ratio(long original, long compressed)             { return AcAczip.get_ratio(original, compressed); }
+    public static long iso(String srcdir, String outIso, String label)         { return AcAczip.iso(srcdir, outIso, label); }
+    public static long pack(String srcdir, String outPath)                     { return AcAczip.pack(srcdir, outPath); }
 }

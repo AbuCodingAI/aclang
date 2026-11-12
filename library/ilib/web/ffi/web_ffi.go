@@ -12,21 +12,21 @@ import (
 
 var web = struct {
 	open      func(string)
-	fileOpen  func(string)
+	file_open func(string)
 	popen     func(string)
 	ropen     func(string)
 	browser   func()
 	pdf       func(string) bool
 	text      func(string) bool
 	inspect   func(string) bool
-	acPage    func()
-	pageGet   func(string) string
+	ac_page   func()
+	page_get  func(string) string
 	help      func()
 }{
 	open: func(link string) {
 		openURL("https://" + link)
 	},
-	fileOpen: func(file string) {
+	file_open: func(file string) {
 		openURL("file://" + file)
 	},
 	popen: func(rawLink string) {
@@ -40,7 +40,7 @@ var web = struct {
 	},
 	pdf: func(pdf string) bool {
 		if strings.HasSuffix(pdf, ".pdf") {
-			web.fileOpen(pdf)
+			openURL("file://" + pdf)
 			return true
 		}
 		return false
@@ -49,7 +49,7 @@ var web = struct {
 		validExts := []string{".txt", ".md", ".bashrc", ".zshrc"}
 		for _, ext := range validExts {
 			if strings.HasSuffix(text, ext) {
-				web.fileOpen(text)
+				openURL("file://" + text)
 				return true
 			}
 		}
@@ -59,16 +59,16 @@ var web = struct {
 		validExts := []string{".py", ".java", ".js", ".c", ".cpp", ".v", ".ac", ".s", ".go", ".rs", ".sh", ".html", ".sql"}
 		for _, ext := range validExts {
 			if strings.HasSuffix(program, ext) {
-				web.fileOpen(program)
+				openURL("file://" + program)
 				return true
 			}
 		}
 		return false
 	},
-	acPage: func() {
+	ac_page: func() {
 		openURL("https://aclang.vercel.app")
 	},
-	pageGet: func(url string) string {
+	page_get: func(url string) string {
 		// HTTP(S) GET returning the body as a string (net/http, stdlib). Adds https:// if
 		// no scheme; "" on error.
 		full := url

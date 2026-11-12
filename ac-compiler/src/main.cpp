@@ -1691,6 +1691,20 @@ int main(int argc, char* argv[]) {
                     }
                     std::vector<std::string> vArgs = {"v", "-enable-globals"};
                     if (optLevel >= 4) vArgs.push_back("-prod");
+                    // `net.http` (the web ilib's page_get) pulls in V's OpenSSL/GC C bindings,
+                    // which V's default TCC backend chokes on — "section type conflict:
+                    // .note.GNU-stack 01 <> 07" from tcc's bundled libgc.a, a genuine TCC/V
+                    // toolchain incompatibility, not an AC codegen bug (verified: identical V
+                    // source compiles clean under -cc gcc). gcc is slower to invoke but every
+                    // dev machine already has it (needed for C/CPP targets anyway).
+                    {
+                        std::ifstream vsrc(outFile, std::ios::binary);
+                        std::string vtext((std::istreambuf_iterator<char>(vsrc)), std::istreambuf_iterator<char>());
+                        if (vtext.find("net.http") != std::string::npos) {
+                            vArgs.push_back("-cc");
+                            vArgs.push_back("gcc");
+                        }
+                    }
                     vArgs.push_back("run");
                     vArgs.push_back(runFile);
                     timedRunArgv(vArgs);

@@ -16,6 +16,8 @@ extern "C" {
     fn ac_zip_compress_to_file(path: *const c_char, parallel: c_int, output_path: *const c_char) -> c_longlong;
     fn ac_zip_decompress_from_file(archive_path: *const c_char, output_path: *const c_char) -> c_int;
     fn ac_get_compression_ratio(original: usize, compressed: usize) -> f64;
+    fn ac_zip_iso(srcdir: *const c_char, out_iso: *const c_char, label: *const c_char) -> c_int;
+    fn ac_zip_package(srcdir: *const c_char, out_path: *const c_char) -> c_int;
 }
 
 fn _cs(s: &str) -> CString { CString::new(s).unwrap_or_default() }
@@ -32,6 +34,14 @@ impl AcZip {
     }
     pub fn get_ratio(&self, original: i64, compressed: i64) -> f64 {
         unsafe { ac_get_compression_ratio(original as usize, compressed as usize) }
+    }
+    pub fn iso(&self, srcdir: &str, out_iso: &str, label: &str) -> i64 {
+        let s = _cs(srcdir); let o = _cs(out_iso); let l = _cs(label);
+        unsafe { ac_zip_iso(s.as_ptr(), o.as_ptr(), l.as_ptr()) as i64 }
+    }
+    pub fn pack(&self, srcdir: &str, out_path: &str) -> i64 {
+        let s = _cs(srcdir); let o = _cs(out_path);
+        unsafe { ac_zip_package(s.as_ptr(), o.as_ptr()) as i64 }
     }
 }
 

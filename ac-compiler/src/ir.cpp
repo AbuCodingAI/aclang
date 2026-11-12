@@ -1781,6 +1781,43 @@ class IRGenerator {
                         IRInstruction i(IROpcode::NOT, dst, {operand});
                         emit(std::move(i));
                         return dst;
+                    } else if (expr.value == "TO_STRING" && typeOfRef(operand) == IRType::BOOL) {
+                        // to_string(boolExpr) must stringify as PY's str(bool) does
+                        // ("True"/"False"), not the generic numeric-to-string path (which would
+                        // print "1"/"0" — verified real bug: html_page.ac's
+                        // `to_string(regex.match(...))`/`to_string(sure_result)`). Reuses the
+                        // exact synthetic-VAR + if/else shape TernaryExpr's own lowering
+                        // established above (see its own comment for why a VAR, not a plain
+                        // TEMP, is needed for block-scoped backends' hoisting) — no
+                        // backend-specific codegen needed anywhere.
+                        thread_local int boolStrC = 0;
+                        std::string rn = "ac_boolstr_" + std::to_string(boolStrC++);
+                        IRRef resV = mkVar(rn);
+                        setRefType(resV, IRType::STRING);
+                        emit(IRInstruction(IROpcode::STORE_VAR, resV, {mkConst("$$")}));
+                        // `operand` is ALREADY known bool-typed (that's this branch's own
+                        // guard) — use it directly as the condition. Unlike TernaryExpr's own
+                        // NEQ-wrap (needed there since its condition can be any general
+                        // expression), wrapping a genuine native bool in `!= 0` is a hard type
+                        // error on backends that track real bool types (verified: Rust,
+                        // "expected bool, found integer" on `(result != 0) as i64`).
+                        IRRef condT = operand;
+                        if (prog.useHighLevelIR) {
+                            { IRInstruction ib(IROpcode::IF_BEGIN); ib.typedOperands = {condT}; emit(std::move(ib)); }
+                            emit(IRInstruction(IROpcode::STORE_VAR, resV, {mkConst("$True$")}));
+                            emit(IRInstruction(IROpcode::IF_ELSE));
+                            emit(IRInstruction(IROpcode::STORE_VAR, resV, {mkConst("$False$")}));
+                            emit(IRInstruction(IROpcode::IF_END));
+                        } else {
+                            IRRef elseL = mkLabel(), endL = mkLabel();
+                            emitJF(condT, elseL);
+                            emit(IRInstruction(IROpcode::STORE_VAR, resV, {mkConst("$True$")}));
+                            emitJump(endL);
+                            emitLabel(elseL);
+                            emit(IRInstruction(IROpcode::STORE_VAR, resV, {mkConst("$False$")}));
+                            emitLabel(endL);
+                        }
+                        return resV;
                     } else if (expr.value == "TO_STRING" || expr.value == "TO_INT" ||
                                expr.value == "TO_DEC" || expr.value == "TO_BOOL" ||
                                expr.value == "TO_SHORT" || expr.value == "TO_MINI" ||
@@ -1869,7 +1906,21 @@ class IRGenerator {
                 std::vector<IRRef> ops = {mkVar(fname)};
                 for (auto& arg : expr.children) ops.push_back(lowerExprNode(*arg));
                 IRInstruction i(IROpcode::CALL, dst, ops);
+                // Known bool-returning ilib calls (acCallReturnsBool, type.hpp) must have
+                // resultType set BEFORE emit() — the shared PRINT dispatch's boolTempIds_ set
+                // (ir_codegen.cpp's genInstr) is populated by inspecting i.resultType at
+                // emission time, not via a later setRefType side-channel (unlike the math.*
+                // float-tracking below, which only needs to update the var-type map for a
+                // LATER reassignment check). This is what lets C/CPP's emitPrintBool actually
+                // fire, matching the True/False text BNY/Java/Rust/Go/V already print for the
+                // same calls (regex.match, os.exists, stringm.startswith, etc).
+                bool dstIsBool = acCallReturnsBool(fname);
+                if (dstIsBool) i.resultType = IRType::BOOL;
                 emit(std::move(i));
+                // Also register in tempTypes_ (see the sibling MethodCall case's matching
+                // comment) so a later plain reassignment of this result into a var sees it as
+                // bool-typed too, not just the immediate temp right after the call.
+                if (dstIsBool) setRefType(dst, IRType::BOOL);
                 // math.* calls are the one ilib family acCallReturnsFloat actually has a
                 // verdict for (float, or a specific named int-valued exception like
                 // math.to_int/math.gcd/math.modpow) — record it so a LATER plain reassignment
@@ -1948,7 +1999,12 @@ class IRGenerator {
                     IRRef arg = expr.children.empty() ? mkConst("$Confirm?$") : lowerExprNode(*expr.children[0]);
                     IRInstruction i(IROpcode::LIB_CALL, dst, {});
                     i.typedOperands = {mkVar("sure"), arg};
+                    // `sure` (a confirm dialog) returns a real bool in PY, matching
+                    // os.exists/regex.match etc — same True/False-vs-0/1 treatment (see
+                    // acCallReturnsBool's sibling uses in this file).
+                    i.resultType = IRType::BOOL;
                     emit(std::move(i));
+                    setRefType(dst, IRType::BOOL);
                     return dst;
                 }
                 // GL object method calls used as expressions: receiver.METHOD(args) → gl:obj.METHOD
@@ -2079,7 +2135,22 @@ class IRGenerator {
                         ops.push_back(lowerExprNode(*arg));
                 }
                 IRInstruction i(IROpcode::CALL, dst, ops);
+                // Known bool-returning ilib calls (acCallReturnsBool, type.hpp) — set
+                // resultType BEFORE emit() so the shared PRINT dispatch's boolTempIds_ set
+                // (ir_codegen.cpp's genInstr) sees it at emission time. This is the ACTUAL
+                // node type dotted calls like "regex.match(...)" lower through (see this
+                // case's own comment above about math.to_int for the same discovery) — the
+                // sibling check in lowerExprNode's plain FunctionCall case never fires for
+                // these names at all.
+                bool dstIsBool = acCallReturnsBool(mname);
+                if (dstIsBool) i.resultType = IRType::BOOL;
                 emit(std::move(i));
+                // Also register in tempTypes_ (typeOfRef/setRefType's own map, separate from
+                // i.resultType) — this is what a LATER plain reassignment of this result into a
+                // var (AssignStmt's generic `t = typeOfRef(src)` path) actually consults, so
+                // `safe = web.pdf(...); Term.display safe` sees `safe` as bool-typed too (not
+                // just the immediate temp print right after the call).
+                if (dstIsBool) setRefType(dst, IRType::BOOL);
                 // math.* is the one ilib family acCallReturnsFloat has a real verdict for —
                 // see the AssignStmt "automatic retype" comment (this file, `n.children[0]`
                 // path) for the full story: without this, a dotted call result's temp stayed

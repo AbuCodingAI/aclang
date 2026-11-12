@@ -20,6 +20,12 @@ struct _AcZipNS {
     double get_ratio(size_t original, size_t compressed) const {
         return ac_get_compression_ratio(original, compressed);
     }
+    int iso(const std::string& srcdir, const std::string& out_iso, const std::string& label) const {
+        return ac_zip_iso(srcdir.c_str(), out_iso.c_str(), label.c_str());
+    }
+    int pack(const std::string& srcdir, const std::string& out_path) const {
+        return ac_zip_package(srcdir.c_str(), out_path.c_str());
+    }
 };
 static _AcZipNS aczip;
 #endif

@@ -23,32 +23,32 @@ impl WebLib {
         Self::open_url("https://www.google.com");
     }
 
-    pub fn pdf(&self, pdf: &str) -> i64 {
+    pub fn pdf(&self, pdf: &str) -> bool {
         if pdf.ends_with(".pdf") {
             self.file_open(pdf);
-            1
+            true
         } else {
-            0
+            false
         }
     }
 
-    pub fn text(&self, text: &str) -> i64 {
+    pub fn text(&self, text: &str) -> bool {
         let valid_exts = [".txt", ".md", ".bashrc", ".zshrc"];
         if valid_exts.iter().any(|ext| text.ends_with(ext)) {
             self.file_open(text);
-            1
+            true
         } else {
-            0
+            false
         }
     }
 
-    pub fn inspect(&self, program: &str) -> i64 {
+    pub fn inspect(&self, program: &str) -> bool {
         let valid_exts = [".py", ".java", ".js", ".c", ".cpp", ".v", ".ac", ".s", ".go", ".rs", ".sh", ".html", ".sql"];
         if valid_exts.iter().any(|ext| program.ends_with(ext)) {
             self.file_open(program);
-            1
+            true
         } else {
-            0
+            false
         }
     }
 

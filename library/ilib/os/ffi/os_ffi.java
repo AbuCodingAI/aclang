@@ -212,9 +212,9 @@ class OSLib {
      * @param path Path to check
      * @return 1 if exists, 0 otherwise
      */
-    public static int osExists(String path) {
-        if (path == null || path.isEmpty()) return 0;
-        return Files.exists(Paths.get(path)) ? 1 : 0;
+    public static boolean osExists(String path) {
+        if (path == null || path.isEmpty()) return false;
+        return Files.exists(Paths.get(path));
     }
 
     /**
@@ -320,7 +320,7 @@ class os {
     public static int    rmfile(String path)               { return OSLib.osRmfile(path); }
     public static int    mkdir(String path)                { return OSLib.osMkdir(path); }
     public static int    rmdir(String path)                { return OSLib.osRmdir(path); }
-    public static int    exists(String path)                { return OSLib.osExists(path); }
+    public static boolean exists(String path)                { return OSLib.osExists(path); }
     public static String cwd()                              { return OSLib.osGetwd(); }
     public static String env(String key)                    { return OSLib.osEnv(key); }
     public static int    write_to(String path, String c)    { return OSLib.osWriteTo(path, c); }

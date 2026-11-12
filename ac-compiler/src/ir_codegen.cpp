@@ -4388,11 +4388,17 @@ private:
             emitRaw(out, "#include <setjmp.h>");
             emitRaw(out, "static jmp_buf _ac_try_stack[32];");
             emitRaw(out, "static int _ac_try_depth = 0;");
+            // `report err` (emitCatchBegin) reads this back — PY's own wording ("division by
+            // zero", matching str(ZeroDivisionError())), not the "Preposterous: ..." banner
+            // (that's the separate UNCAUGHT-error message, below) — verified real bug:
+            // examples/try_report.ac's `report err` printed "0" (emitCatchBegin never bound
+            // exVar to anything but a literal 0 at all before this).
+            emitRaw(out, "static const char* _ac_exc_msg = \"\";");
         }
         if (hasIdivOp_) {
             emitRaw(out, "static ac_int ac_idiv(ac_int a, ac_int b) {");
             emitRaw(out, "    if (!b) {");
-            emitRaw(out, "        if (_ac_try_depth > 0) longjmp(_ac_try_stack[_ac_try_depth - 1], 1);");
+            emitRaw(out, "        if (_ac_try_depth > 0) { _ac_exc_msg = \"division by zero\"; longjmp(_ac_try_stack[_ac_try_depth - 1], 1); }");
             emitRaw(out, "        fprintf(stderr, \"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\");");
             emitRaw(out, "        exit(1);");
             emitRaw(out, "    }");
@@ -4435,6 +4441,18 @@ private:
         emitRaw(out, "static const char* ac_to_str(ac_int n) {");
         emitRaw(out, "    char* r = (char*)malloc(24);");
         emitRaw(out, "    snprintf(r, 24, \"%lld\", (long long)n);");
+        emitRaw(out, "    return r;");
+        emitRaw(out, "}");
+        // s[i] on a string -> 1-char string (AC semantics). Heap, not a stack buffer: the
+        // result is a real ac_str that can outlive the current statement — stored into a
+        // dict key, a list, returned, etc. (verified real bug: examples/dict_char_counter.ac
+        // — `ch = text[i]` into a per-iteration `char t[2]` STACK buffer, then `counts[ch] =
+        // 1`/`counts has ch` stored/read that pointer; the next loop iteration's OWN `char
+        // t[2]` reused the same stack slot and silently changed every previously-stored key's
+        // bytes out from under it — "KeyError: m" even though 'm' genuinely was inserted).
+        emitRaw(out, "static const char* ac_char_at(const char* s, ac_int i) {");
+        emitRaw(out, "    char* r = (char*)malloc(2);");
+        emitRaw(out, "    r[0] = s[i]; r[1] = 0;");
         emitRaw(out, "    return r;");
         emitRaw(out, "}");
         // to_string(someArray): Python-style "[1, 2, 3]" — `to_string` on a plain scalar
@@ -4911,7 +4929,7 @@ private:
         // ZeroDivisionError). Only emit the longjmp check when hasTryOp_ declared the stack
         // (see its own gating comment) — with no `try` anywhere, there's nothing to jump to.
         if (hasTryOp_)
-            emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { if (_ac_try_depth > 0) longjmp(_ac_try_stack[_ac_try_depth - 1], 1); fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
+            emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { if (_ac_try_depth > 0) { _ac_exc_msg = \"division by zero\"; longjmp(_ac_try_stack[_ac_try_depth - 1], 1); } fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
         else
             emit(out, indent, "if ((double)(" + rhs + ") == 0.0) { fputs(\"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\\n\", stderr); exit(1); }");
         std::string expr = "(double)(" + lhs + ") / (double)(" + rhs + ")";
@@ -5655,7 +5673,9 @@ private:
         emit(out, indent, "} else {");
         indent++;
         emit(out, indent, "_ac_try_depth--;");
-        emit(out, indent, "long long " + exVar + " = 0; (void)" + exVar + ";");
+        // See _ac_exc_msg's own comment (emitHeader) — PY's exact wording, for `report err`.
+        strVars.insert(exVar); declared.insert(exVar);
+        emit(out, indent, "ac_str " + exVar + " = _ac_exc_msg; (void)" + exVar + ";");
     }
     void emitAfterBegin(std::ostringstream &out, int &indent) override
     {
@@ -5742,9 +5762,12 @@ private:
             return;
         }
         if (isStringVar(collection)) {
-            // AC iterates a string as 1-char strings; C: walk chars, make a 2-byte buffer.
+            // AC iterates a string as 1-char strings. ac_char_at heap-allocates each one (see
+            // its own comment) — a per-iteration stack buffer here would have the same
+            // stale-pointer risk as emitLoadIndex's matching fix if the loop body ever stores
+            // iterVar somewhere that outlives the iteration (a dict key, a list, etc).
             emit(out, indent, "for (size_t _fi = 0, _fn = strlen(" + collection + "); _fi < _fn; _fi++) {");
-            emit(out, indent + 1, "char " + iterVar + "[2] = { " + collection + "[_fi], 0 };");
+            emit(out, indent + 1, "ac_str " + iterVar + " = ac_char_at(" + collection + ", _fi);");
             strVars.insert(iterVar);
             declared.insert(iterVar); forVarStack_.push_back(iterVar);
             indent++;
@@ -5913,9 +5936,10 @@ private:
             return;
         }
         if (isStringVar(arr) || strVars.count(arr)) {
-            // s[i] on a string → 1-char string (AC semantics). Stack 2-byte buffer.
+            // s[i] on a string → 1-char string (AC semantics). ac_char_at heap-allocates —
+            // see its own comment for the real bug a stack buffer caused here.
             strVars.insert(result); declared.insert(result);
-            emit(out, indent, "char " + result + "[2] = { " + arr + "[" + idx + "], 0 };");
+            emit(out, indent, "ac_str " + result + " = ac_char_at(" + arr + ", " + idx + ");");
             return;
         }
         if (stringListVars_.count(arr)) {
@@ -5940,9 +5964,20 @@ private:
                         const std::string &val) override
     {
         if (dictVars_.count(arr)) {
-            if (dictStrVals_.count(arr))
-                emit(out, indent, "ac_sdict_set(" + arr + ", " + idx + ", " + val + ");");
-            else
+            if (dictStrVals_.count(arr)) {
+                // A string-valued dict (homogenized from a mixed int/string literal, or
+                // created all-string) needs its VALUE stringified first — ac_sdict_set takes
+                // `const char* v`; passing a raw int/float literal straight through is an
+                // int/double-to-pointer conversion (verified real bug: examples/dict_basics.ac's
+                // `person[$age$] = 38` — "passing argument 3 of 'ac_sdict_set' makes pointer
+                // from integer without a cast", and would have corrupted memory at runtime if
+                // gcc hadn't caught it at compile time).
+                bool valIsStr = looksString(val) || strVars.count(val) || isStringVar(val);
+                std::string sval = valIsStr ? val
+                                  : floatVars.count(val) ? "ac_hard_to_str((double)(" + val + "))"
+                                  : "ac_to_str(" + val + ")";
+                emit(out, indent, "ac_sdict_set(" + arr + ", " + idx + ", " + sval + ");");
+            } else
                 emit(out, indent, "ac_dict_set(" + arr + ", " + idx + ", " + val + ");");
             return;
         }
@@ -6429,6 +6464,14 @@ private:
                             : srcIsStringLiteral ? src
                             : smartPrint_ ? "ac_smart_to_str((double)(" + src + "))"
                             : hardPrint_  ? "ac_hard_to_str((double)(" + src + "))"
+                            // `src` is a plain float (not from `/` or `///`, which set
+                            // smartPrint_/hardPrint_ above) — e.g. an ilib call result like
+                            // aczip.get_ratio. ac_to_str takes ac_int, so the implicit
+                            // double->ac_int argument conversion silently truncated it
+                            // (verified real bug: aczip_demo.ac's `to_string(ratio)` printed
+                            // "81" instead of "81.5"). Matches PY's own fallback here
+                            // (plain str() on a float), which never drops the fraction either.
+                            : floatVars.count(src) ? "ac_hard_to_str((double)(" + src + "))"
                             : "ac_to_str(" + src + ")";
             emit(out, indent, (isNew ? "ac_str " : "") + var + " = " + rhs + ";");
             if (isNew) strVars.insert(var);
@@ -7478,7 +7521,15 @@ protected:
                 emit(out, indent, "std::vector<double> " + res + " = " + call + ";");
             } else
                 emit(out, indent, "std::vector<long long> " + res + " = " + call + ";");
-        } else if (isUserFloatReturningFunc(func) && declared.insert(res).second) {
+        } else if ((isUserFloatReturningFunc(func) || acCallReturnsFloat(func)) && declared.insert(res).second) {
+            // acCallReturnsFloat (type.hpp) covers ilib float-returning calls (math.sqrt,
+            // aczip.get_ratio, ml.take, ...) — missing here meant `auto t = math.sqrt(x)`
+            // deduced a genuine `double` correctly (the call signature really does return one)
+            // but `res` was never tracked in floatVars, so a DIRECT print of that temp
+            // (`Term.display math.sqrt(...)`, no intermediate named var) fell through
+            // emitPrint's isFloatVal(val) check to plain `std::cout <<`, which drops the
+            // trailing ".0" on a whole-valued double (verified: examples/
+            // sum_of_squares_conjugate.ac printed "5" instead of "5.0" for math.sqrt(25)).
             floatVars.insert(res);
             emit(out, indent, "double " + res + " = " + call + ";");
         } else {
@@ -7865,6 +7916,18 @@ protected:
                                        + std::string(pf->second == 1 ? "float" : pf->second == 3 ? "string"
                                                      : pf->second == 2 ? "list" : "nothing") + ")");
             sval = "(long long)(intptr_t)" + val;
+        }
+        // A string-valued dict (homogenized from a mixed int/string literal, or created
+        // all-string) needs its VALUE stringified first — the map's value type is
+        // std::string, so assigning a raw int/float straight through either fails to
+        // compile or (for a small int) silently picks std::string::operator=(char) instead
+        // (verified real bug: examples/dict_basics.ac's `person[$age$] = 38` printed "&" —
+        // char 38 — instead of "38"). Same fix as CStrategy's own emitStoreIndex.
+        else if (dictVars_.count(arr) && dictStrVals_.count(arr)) {
+            bool valIsStr = looksString(val) || stringVars_.count(val) || isStringVar(val);
+            sval = valIsStr ? val
+                 : floatVars.count(val) ? ("ac_hard_str((double)(" + val + "))")
+                 : ("ac_cat(" + val + ")");
         }
         emit(out, indent, arr + "[" + idx + "] = " + sval + ";");
     }
@@ -10356,6 +10419,12 @@ class JavaStrategy : public BackendStrategy
             // "incompatible types: boolean cannot be converted to long").
             "stringm.ischar",
             "stringm.startswith", "stringm.endswith", "stringm.isws", "stringm.scan",   // boolean in the Java binding
+            // os.exists and web.pdf/text/inspect were wrapped to int/long in their Java
+            // dispatcher classes (os_ffi.java/web_ffi.java) even though the underlying
+            // OSLib/WebLib methods are real booleans — the ONLY backend of 8 with this gap
+            // (BNY/Rust/Go/V/C/CPP all already treat these as bool). Fixed the Java wrappers
+            // to return boolean directly so this declaration matches reality.
+            "os.exists", "web.pdf", "web.text", "web.inspect",
         };
         // native-cpu's carried-over pointer functions are called BARE (ptr_new, not
         // ncpu.ptr_new) — but Java has no free functions, so an unqualified call can't
@@ -10591,7 +10660,14 @@ class JavaStrategy : public BackendStrategy
                      const std::string &res, const std::string &val) override
     {
         emit(out, indent, "System.out.println(" + val + ");");
-        if (!res.empty()) emit(out, indent, decl(res, "0"));
+        // `sure` (confirm dialog) returns a real bool in PY — declare it a genuine Java
+        // `boolean`, not a plain `long`/`int` "0" literal (same class of gap as glBoolFuncs'
+        // own call results — see boolVars' comment).
+        if (!res.empty()) {
+            boolVars.insert(res);
+            if (declared.insert(res).second) emit(out, indent, "boolean " + res + " = false;");
+            else emit(out, indent, res + " = false;");
+        }
     }
     void emitHalt(std::ostringstream &out, int &indent) override
     {
@@ -10661,6 +10737,19 @@ class JavaStrategy : public BackendStrategy
         indent++;
         // Bind exVar as a plain String so Term.display works
         emit(out, indent, "String " + exVar + " = _ac_exc.getMessage();");
+    }
+    // `//` (floor/int div) fell through to the base default (plain `a / b`), relying entirely
+    // on Java's OWN native ArithmeticException to make it catchable at all — it is, but its
+    // message is Java's own wording ("/ by zero"), not PY's ("division by zero"), which
+    // `report err` then surfaces verbatim (verified real bug: examples/try_report.ac printed
+    // "/ by zero" instead of "division by zero"). Explicit check + AC's own wording matches
+    // every other backend's `report err` text exactly; an UNCAUGHT one still throws, so the
+    // JVM's own default uncaught-exception trace takes over same as any other exception.
+    void emitIntDiv(std::ostringstream &out, int &indent, const std::string &res,
+                    const std::string &lhs, const std::string &rhs) override
+    {
+        emit(out, indent, "if ((" + rhs + ") == 0) throw new ArithmeticException(\"division by zero\");");
+        emitBinaryOp(out, indent, res, lhs, rhs, "/");
     }
     void emitAfterBegin(std::ostringstream &out, int &indent) override
     {
@@ -10982,7 +11071,18 @@ class JavaStrategy : public BackendStrategy
                         const std::string &val) override
     {
         if (dictVars_.count(arr)) {
-            emit(out, indent, arr + ".put(" + idx + ", " + (dictStrVals_.count(arr) ? val : "(long)(" + val + ")") + ");");
+            // A string-valued dict needs its VALUE stringified first — `.put` is typed
+            // `(String, String)`; passing a raw int/long literal straight through is a hard
+            // "incompatible types: long cannot be converted to String" compile error
+            // (verified: examples/dict_basics.ac's `person[$age$] = 38`).
+            std::string sval = val;
+            if (dictStrVals_.count(arr)) {
+                bool valIsStr = looksString(val) || isStringVar(val);
+                sval = valIsStr ? val : "String.valueOf(" + val + ")";
+            } else {
+                sval = "(long)(" + val + ")";
+            }
+            emit(out, indent, arr + ".put(" + idx + ", " + sval + ");");
             return;
         }
         auto fv = funcValueIds_.find(val);   // a user function stored as a value: keep its integer id
@@ -11354,6 +11454,16 @@ class JavaStrategy : public BackendStrategy
             emit(out, indent, "synchronized (_ac_atomic_lock) {");
             emit(out, indent + 1, var + " = " + rhs + ";");
             emit(out, indent, "}");
+        } else if (t == IRType::BOOL) {
+            // `to_bool flag = 1` — the shared PRINT dispatch (ir_codegen.cpp) sees this var's
+            // tracked IRType as BOOL and always calls emitPrintBool (a ternary needing a REAL
+            // boolean condition); falling through to the generic `long` branch below declared
+            // a plain long, "incompatible types: long cannot be converted to boolean" the
+            // moment it was printed (verified: examples/keyword_catalog_core.ac's `to_bool
+            // flag = 1; Term.display flag`).
+            boolVars.insert(var);
+            std::string rhs = srcIsStr ? "Boolean.parseBoolean(" + src + ")" : "(" + src + ") != 0";
+            emit(out, indent, (isNew ? "boolean " : "") + var + " = " + rhs + ";");
         } else {
             std::string rhs = srcIsStr ? "Long.parseLong(" + src + ")" : "(long)(" + src + ")";
             emit(out, indent, (isNew ? "long " : "") + var + " = " + rhs + ";");
@@ -12090,6 +12200,18 @@ class RustStrategy : public BackendStrategy
     void emitMod(std::ostringstream &out, int &indent,
                  const std::string &res, const std::string &lhs, const std::string &rhs) override
     { emit(out, indent, decl(res, "(((" + lhs + " as i64) % (" + rhs + " as i64)) + (" + rhs + " as i64)) % (" + rhs + " as i64)")); }
+    // `//` fell through to the base default (plain `a / b`), relying entirely on Rust's OWN
+    // native divide-by-zero panic to make it catchable at all — catch_unwind DOES catch it
+    // (verified), but the payload is Rust's own wording ("attempt to divide by zero"), not
+    // PY's ("division by zero"), which `report err` then surfaces verbatim (verified real
+    // bug: examples/try_report.ac). An explicit panic!() with AC's own wording matches PY
+    // exactly and is still a normal, catch_unwind-catchable panic.
+    void emitIntDiv(std::ostringstream &out, int &indent, const std::string &res,
+                    const std::string &lhs, const std::string &rhs) override
+    {
+        emit(out, indent, "if (" + rhs + ") == 0 { panic!(\"division by zero\"); }");
+        emit(out, indent, decl(res, "(" + lhs + ") / (" + rhs + ")"));
+    }
     // `_ac_lg` (the RAII MutexGuard) stays alive for the whole span between these two —
     // opening/closing one shared `{ }` block, exactly like the old single-statement
     // version did, just spanning everything ir.cpp now brackets instead of one store.
@@ -12730,6 +12852,11 @@ class RustStrategy : public BackendStrategy
             // machine-audio ilib (machine-audio_ffi.rs) — same class of gap (verified:
             // audio_test.ac's `maudio.tts_ok()`, "expected i64, found bool").
             "maudio.tts_ok", "maudio_tts_ok", "ac_maudio_tts_ok",
+            // web ilib (web_ffi.rs) — fixed to genuinely return bool (was i64), same class
+            // of gap as the others above.
+            "web.pdf", "web_pdf", "ac_web_pdf",
+            "web.text", "web_text", "ac_web_text",
+            "web.inspect", "web_inspect", "ac_web_inspect",
         };
         if (res.empty()) {
             emit(out, indent, call + ";");
@@ -12852,7 +12979,15 @@ class RustStrategy : public BackendStrategy
     {
         lastWasReturn = false;
         emit(out, indent, "println!(\"{}\", " + val + ");");
-        if (!res.empty()) emit(out, indent, decl(res, "0"));
+        // `sure` (confirm dialog) returns a real bool in PY (`= False`) — declare it as a
+        // genuine Rust `bool`, not a plain `i64` literal, and track it in rustBoolVars_ so
+        // a LATER use of this var as a condition (e.g. `to_string(result)`'s own bool-aware
+        // lowering, ir.cpp) doesn't hit "expected bool, found integer".
+        if (!res.empty()) {
+            rustBoolVars_.insert(res);
+            if (declared.insert(res).second) emit(out, indent, "let mut " + res + ": bool = false;");
+            else emit(out, indent, res + " = false;");
+        }
     }
     void emitHalt(std::ostringstream &out, int &indent) override
     {
@@ -12944,7 +13079,7 @@ class RustStrategy : public BackendStrategy
             // original live (#6/#22 loop-sandbox on Rust).
             emit(out, indent, "let mut " + pfx + v + " = " + v
                               + ((isStringVar(v) || listVars.count(v) || stringListVars_.count(v) || listParams_.count(v) || listGlobals_.count(v)
-                                  || classInstanceVars_.count(v)) ? ".clone();" : ";"));
+                                  || classInstanceVars_.count(v) || dictVars_.count(v)) ? ".clone();" : ";"));
     }
     void emitScopeExit(std::ostringstream &out, int &indent,
                        const std::vector<std::string> &vars, int depth) override
@@ -13188,7 +13323,18 @@ class RustStrategy : public BackendStrategy
                         const std::string &val) override
     {
         if (dictVars_.count(arr)) {
-            emit(out, indent, arr + ".insert((" + idx + ").to_string(), " + val + ");");
+            // A string-valued dict needs its VALUE stringified first — the map's value type
+            // is String; passing a raw int straight through is "expected String, found
+            // integer" (verified: examples/dict_basics.ac's `person[$age$] = 38`).
+            std::string sval = val;
+            if (dictStrVals_.count(arr)) {
+                // A raw string LITERAL (`"Camry"`) is `&str`, not the `String` the map's value
+                // type needs — `.to_string()` is required either way, just like the numeric
+                // case, UNLESS `val` is already an owned String var.
+                bool valIsOwnedStringVar = (isStringVar(val) || stringVars_.count(val)) && !looksString(val);
+                sval = valIsOwnedStringVar ? val : "(" + val + ").to_string()";
+            }
+            emit(out, indent, arr + ".insert((" + idx + ").to_string(), " + sval + ");");
             return;
         }
         auto fv = funcValueIds_.find(val);   // a user function stored as a value: keep its integer id
@@ -13692,6 +13838,15 @@ class RustStrategy : public BackendStrategy
             std::string rhs = srcIsStr ? (src + ".parse::<i64>().unwrap_or(0)") : (src + " as i64");
             if (isNew) emit(out, indent, "let mut " + var + ": i64;");
             emit(out, indent, "{ let _ac_lg = _ac_atomic_lock().lock().unwrap(); " + var + " = " + rhs + "; }");
+        } else if (t == IRType::BOOL) {
+            // `to_bool flag = 1` — the shared PRINT dispatch (ir_codegen.cpp) sees this var's
+            // tracked IRType as BOOL and always calls emitPrintBool (needs a real `bool`);
+            // falling through to the generic `i64` branch below declared a plain i64,
+            // "expected bool, found i64" the moment it was printed (verified: examples/
+            // keyword_catalog_core.ac's `to_bool flag = 1; Term.display flag`).
+            rustBoolVars_.insert(var);
+            std::string rhs = srcIsStr ? ("!(" + src + ").is_empty() && (" + src + ") != \"0\"") : ("(" + src + ") != 0");
+            emit(out, indent, (isNew ? "let mut " + var + ": bool = " : var + " = ") + rhs + ";");
         } else {
             std::string rhs = srcIsStr ? (src + ".parse::<i64>().unwrap_or(0)") : (src + " as i64");
             emit(out, indent, (isNew ? "let mut " + var + ": i64 = " : var + " = ") + rhs + ";");
@@ -14672,6 +14827,18 @@ private:
     void emitMod(std::ostringstream &out, int &indent,
                  const std::string &res, const std::string &lhs, const std::string &rhs) override
     { declared.insert(res); emit(out, indent, res + " := ((int64(" + lhs + ") % int64(" + rhs + ")) + int64(" + rhs + ")) % int64(" + rhs + ")"); }
+    // `//` fell through to the base default (plain `a / b`), relying entirely on Go's OWN
+    // native panic to make it catchable at all — it is (recover()+fmt.Sprint in emitTryBegin),
+    // but the message is Go's own wording ("runtime error: integer divide by zero"), not PY's
+    // ("division by zero"), which `report err` then surfaces verbatim (verified real bug:
+    // examples/try_report.ac). Explicit check + AC's own wording matches PY exactly.
+    void emitIntDiv(std::ostringstream &out, int &indent, const std::string &res,
+                    const std::string &lhs, const std::string &rhs) override
+    {
+        emit(out, indent, "if (" + rhs + ") == 0 { panic(\"division by zero\") }");
+        declared.insert(res);
+        emit(out, indent, res + " := " + lhs + " / " + rhs);
+    }
     void emitLockBegin(std::ostringstream &out, int &indent) override {
         emit(out, indent, "_acAtomicLock.Lock()");
     }
@@ -15135,6 +15302,11 @@ private:
             "regex.match", "regex_match", "ac_regex_match",
             "regex.test", "regex_test", "ac_regex_test",
             "maudio.tts_ok", "maudio_tts_ok", "ac_maudio_tts_ok",
+            // web ilib (web_ffi.go) already declares these `bool` natively — just missing
+            // from this set (same class of gap as the others above).
+            "web.pdf", "web_pdf", "ac_web_pdf",
+            "web.text", "web_text", "ac_web_text",
+            "web.inspect", "web_inspect", "ac_web_inspect",
         };
         if (res.empty()) {
             emit(out, indent, call);
@@ -15203,7 +15375,13 @@ private:
                      const std::string &res, const std::string &val) override
     {
         emit(out, indent, "fmt.Println(" + val + ")");
-        if (!res.empty()) emit(out, indent, decl(res, "0"));
+        // `sure` (confirm dialog) returns a real bool in PY — declare a genuine Go `bool`,
+        // not a plain "0" int literal (same class of gap as goBoolFuncs' own call results).
+        if (!res.empty()) {
+            boolVars.insert(res);
+            if (declared.insert(res).second) emit(out, indent, "var " + res + " bool = false");
+            else emit(out, indent, res + " = false");
+        }
     }
     void emitHalt(std::ostringstream &out, int &indent) override
     {
@@ -15530,6 +15708,16 @@ private:
                         const std::string &arr, const std::string &idx,
                         const std::string &val) override
     {
+        // A string-valued dict (map[string]string) needs its VALUE stringified first —
+        // passing a raw int literal straight through is "cannot use 38 (untyped int
+        // constant) as string value in assignment" (verified: examples/dict_basics.ac's
+        // `person[$age$] = 38`).
+        if (dictVars_.count(arr) && dictStrVals_.count(arr)) {
+            bool valIsStr = looksString(val) || isStringVar(val) || stringVars.count(val);
+            std::string sval = valIsStr ? val : "_ac_fmt(" + val + ")";
+            emit(out, indent, arr + "[" + idx + "] = " + sval);
+            return;
+        }
         auto fv = funcValueIds_.find(val);   // a user function stored as a value: keep its integer id
         emit(out, indent, arr + "[" + idx + "] = " + (fv != funcValueIds_.end() ? std::to_string(fv->second) : val));
     }
@@ -15929,8 +16117,14 @@ private:
             else emit(out, indent, var + " = " + rhs);
         }
         else if (t == IRType::BOOL) {
-            std::string rhs = "func() int64 { if " + intSrc + " != 0 { return 1 }; return 0 }()";
-            if (declared.insert(var).second) emit(out, indent, "var " + var + " int64 = " + rhs);
+            // The shared PRINT dispatch (ir_codegen.cpp) sees this var's tracked IRType as
+            // BOOL and always calls emitPrintBool (needs a real `bool`); declaring a plain
+            // int64 here was "non-boolean condition in if statement" the moment it was
+            // printed (verified: examples/keyword_catalog_core.ac's `to_bool flag = 1;
+            // Term.display flag`).
+            boolVars.insert(var);
+            std::string rhs = intSrc + " != 0";
+            if (declared.insert(var).second) emit(out, indent, "var " + var + " bool = " + rhs);
             else emit(out, indent, var + " = " + rhs);
         }
         else if (irIntWidth(t)) {
@@ -16221,12 +16415,21 @@ class VStrategy : public BackendStrategy
             emitRaw(out, "fn C.longjmp(voidptr, int)");
             emitRaw(out, "__global ( ac_try_stack [32]C.jmp_buf )");
             emitRaw(out, "__global ( ac_try_depth = 0 )");
+            // `report err` (emitCatchBegin) reads this back — PY's own wording, matching
+            // CStrategy's identical `_ac_exc_msg` fix (see its comment) — emitCatchBegin
+            // previously just bound the caught var to a literal '' (verified real bug:
+            // examples/try_report.ac's `report err` printed nothing at all instead of
+            // "division by zero").
+            emitRaw(out, "__global ( ac_exc_msg = '' )");
         }
         if (hasIdivOp_) {
             // `//` truncating integer division
             emitRaw(out, "fn ac_idiv(a i64, b i64) i64 {");
             emitRaw(out, "    if b == 0 {");
-            emitRaw(out, "        if ac_try_depth > 0 { C.longjmp(&ac_try_stack[ac_try_depth-1], 1) }");
+            emitRaw(out, "        if ac_try_depth > 0 {");
+            emitRaw(out, "            ac_exc_msg = 'division by zero'");
+            emitRaw(out, "            C.longjmp(&ac_try_stack[ac_try_depth-1], 1)");
+            emitRaw(out, "        }");
             emitRaw(out, "        eprintln('Preposterous: 3rd grade mathematics violated (ZeroDivisionError)')");
             emitRaw(out, "        exit(1)");
             emitRaw(out, "    }");
@@ -16645,7 +16848,7 @@ class VStrategy : public BackendStrategy
         if (declared.insert(vn).second) {
             if (isFloat) { floatVars.insert(vn); emit(out, indent, "mut " + vn + " := f64(" + val + ")"); }
             else if (t == IRType::STRING) { stringVars_.insert(vn); emit(out, indent, "mut " + vn + " := " + val); }
-            else if (t == IRType::BOOL)   emit(out, indent, "mut " + vn + " := bool(" + val + ")");
+            else if (t == IRType::BOOL)   { vBoolVars_.insert(vn); emit(out, indent, "mut " + vn + " := bool(" + val + ")"); }
             else if (looksString(val))    emit(out, indent, "mut " + vn + " := "      + val);
             else if (dictVars_.count(val)) {
                 dictVars_.insert(vn);
@@ -16901,6 +17104,30 @@ class VStrategy : public BackendStrategy
             emitCall(out, indent, res, func == "math.mod" ? "math.mod_int" : "math_mod_int", args);
             return;
         }
+        // `math.mod_int` can also be called DIRECTLY (not just reached via the `math.mod`
+        // dispatch above) — its real signature takes i64 args, so a caller-side arg that's
+        // float-typed (e.g. a param the callee body ALSO assigns a float value somewhere else
+        // — V has no true per-point redeclaration) needs an explicit `i64(...)` cast (verified:
+        // examples/math_number.ac calls `math.mod_int(n, 2)` directly with `n` inferred f64 —
+        // "cannot use f64 as i64"). Same fix as Java's/Rust's/Go's own emitCall.
+        if ((func == "math.mod_int" || func == "math_mod_int") && !args.empty()) {
+            std::vector<std::string> margs; { std::string cur; int depth = 0;
+                for (char c : args) { if (c=='('||c=='[') depth++; else if (c==')'||c==']') depth--;
+                    if (c==',' && depth==0) { margs.push_back(cur); cur.clear(); } else cur += c; }
+                if (!cur.empty()) margs.push_back(cur); }
+            std::string castArgs;
+            for (size_t k = 0; k < margs.size(); k++) {
+                if (k) castArgs += ", ";
+                castArgs += "i64(" + margs[k] + ")";
+            }
+            // math.mod_int returns a plain int — emit the same generic call-expression shape
+            // the fallback at the bottom of this function would, but DON'T recurse through
+            // emitCall with the same func name (the cast args would re-match this exact
+            // branch forever, an infinite compiler recursion, not a codegen bug).
+            std::string call = func + "(" + castArgs + ")";
+            emit(out, indent, res.empty() ? call : decl(res, call));
+            return;
+        }
         // Widget ctor (`root = Screen(...)`, `tb = textbox(root, c, f, lazy)`) — V's own
         // `:=` type inference means no explicit type annotation is needed here (unlike Go),
         // so this only needs to: (1) lowercase "Screen" specifically (the ONLY capitalized
@@ -17055,6 +17282,11 @@ class VStrategy : public BackendStrategy
             "regex.match", "regex_match", "ac_regex_match",
             "regex.test", "regex_test", "ac_regex_test",
             "maudio.tts_ok", "maudio_tts_ok", "ac_maudio_tts_ok",
+            // web ilib (web_ffi.v) already declares these `bool` natively — just missing
+            // from this set (same class of gap as the others above).
+            "web.pdf", "web_pdf", "ac_web_pdf",
+            "web.text", "web_text", "ac_web_text",
+            "web.inspect", "web_inspect", "ac_web_inspect",
         };
         if (!res.empty() && vBoolFuncs.count(func)) {
             vBoolVars_.insert(res);
@@ -17107,7 +17339,13 @@ class VStrategy : public BackendStrategy
     {
         lastWasReturn = false;
         emit(out, indent, "println(" + val + ")");
-        if (!res.empty()) emit(out, indent, decl(res, "0"));
+        // `sure` (confirm dialog) returns a real bool in PY — declare a genuine V `bool`,
+        // not a plain "0" int literal (same class of gap as vBoolFuncs' own call results).
+        if (!res.empty()) {
+            vBoolVars_.insert(res);
+            if (declared.insert(res).second) emit(out, indent, "mut " + res + " := false");
+            else emit(out, indent, res + " = false");
+        }
     }
     void emitHalt(std::ostringstream &out, int &indent) override
     {
@@ -17178,7 +17416,9 @@ class VStrategy : public BackendStrategy
         emit(out, indent, "} else {");
         indent++;
         emit(out, indent, "ac_try_depth--");
-        emit(out, indent, "mut " + ev + " := '' ; _ = " + ev);
+        // See ac_exc_msg's own comment (emitHeader) — PY's exact wording, for `report err`.
+        stringVars_.insert(ev); declared.insert(ev);
+        emit(out, indent, "mut " + ev + " := ac_exc_msg");
     }
     void emitAfterBegin(std::ostringstream &out, int &indent) override
     {
@@ -17220,7 +17460,13 @@ class VStrategy : public BackendStrategy
         // append-mutated inside the loop, and cloning it here is safe.
         std::string pfx = "acs" + std::to_string(depth) + "_";  // V: no leading underscore
         for (const auto &v : vars) {
-            std::string rhs = listVars_.count(v) ? (v + ".clone()") : v;
+            // dictVars_ needs the same .clone() as listVars_ just above, for the same V
+            // copy-semantics rule (verified real bug: "cannot copy map: call `move` or `clone`
+            // method" saving a dict var across a loop scope, e.g. examples/dict_char_counter.ac
+            // with a WHILST loop body — the shared free-var/hoist machinery treats a dict var
+            // exactly like a list one here, so the same "not append-mutated inside the loop,
+            // cloning here is safe" reasoning in this function's own comment applies).
+            std::string rhs = (listVars_.count(v) || dictVars_.count(v)) ? (v + ".clone()") : v;
             bool isNew = declared.insert(pfx + v).second;
             emit(out, indent, (isNew ? "mut " : "") + pfx + v + (isNew ? " := " : " = ") + rhs);
         }
@@ -17230,7 +17476,7 @@ class VStrategy : public BackendStrategy
     {
         std::string pfx = "acs" + std::to_string(depth) + "_";
         for (const auto &v : vars) {
-            std::string rhs = listVars_.count(v) ? (pfx + v + ".clone()") : (pfx + v);
+            std::string rhs = (listVars_.count(v) || dictVars_.count(v)) ? (pfx + v + ".clone()") : (pfx + v);
             emit(out, indent, v + " = " + rhs);
         }
     }
@@ -17476,6 +17722,15 @@ class VStrategy : public BackendStrategy
                         const std::string &arr, const std::string &idx,
                         const std::string &val) override
     {
+        // A string-valued dict (map[string]string) needs its VALUE stringified first —
+        // assigning a raw int literal is "expected `string`, not `int literal`" (verified:
+        // examples/dict_basics.ac's `person[$age$] = 38`).
+        if (dictVars_.count(arr) && dictStrVals_.count(arr)) {
+            bool valIsStr = looksString(val) || isStringVar(val) || stringVars_.count(val);
+            std::string sval = valIsStr ? val : "(" + val + ").str()";
+            emit(out, indent, arr + "[" + idx + "] = " + sval);
+            return;
+        }
         auto fv = funcValueIds_.find(val);   // a user function stored as a value: keep its integer id
         emit(out, indent, arr + "[" + idx + "] = " + (fv != funcValueIds_.end() ? "i64(" + std::to_string(fv->second) + ")" : val));
     }
@@ -17907,7 +18162,18 @@ class VStrategy : public BackendStrategy
         else if (t == IRType::STRING) expr = smartPrint_ ? "ac_smart_double(f64(" + src + "))"
                                              : hardPrint_ ? "ac_fmtg(f64(" + src + "))"
                                              : src + ".str()";
-        else if (t == IRType::BOOL)   expr = "if " + src + " != 0 { i64(1) } else { i64(0) }";
+        else if (t == IRType::BOOL) {
+            // The shared PRINT dispatch (ir_codegen.cpp) sees this var's tracked IRType as
+            // BOOL and always calls emitPrintBool (needs a real V `bool`); the generic
+            // i64(1)/i64(0) ternary below left `var` plain i64-typed, "non-bool type `i64`
+            // used as if condition" the moment it was printed (verified: examples/
+            // keyword_catalog_core.ac's `to_bool flag = 1; Term.display flag`).
+            vBoolVars_.insert(var);
+            std::string bexpr = "(" + src + ") != 0";
+            if (declared.count(var)) emit(out, indent, var + " = " + bexpr);
+            else { declared.insert(var); emit(out, indent, "mut " + var + " := " + bexpr); }
+            return;
+        }
         else if (t == IRType::ATOMIC) {
             expr = srcIsStr ? (src + ".i64()") : ("i64(" + src + ")");
             if (!declared.count(var)) { declared.insert(var); emit(out, indent, "mut " + var + " := i64(0)"); }
@@ -18478,6 +18744,7 @@ class AsmStrategy : public BackendStrategy
         int g = divGuardIdx_++;
         out << "    test rbx, rbx\n    jnz .divok" << g << "\n";
         out << "    mov rax, [rel _ac_try_depth]\n    test rax, rax\n    jz .divfatal" << g << "\n";
+        out << "    lea rcx, [rel _msg_divzero_short]\n    mov [rel _ac_exc_msg], rcx\n";
         out << "    dec rax\n    imul rax, rax, 200\n";
         out << "    lea rdi, [rel _ac_try_stack]\n    add rdi, rax\n    mov esi, 1\n    call longjmp\n";
         calledFuncs_.insert("longjmp");
@@ -18778,6 +19045,7 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "    _fmt_fbare db \"%.16g\", 0");     // float -> string (to_string), no trailing newline
         emitRaw(out, "    _fmt_dotcheck db \".eEnN\", 0");  // strpbrk charset: is a %g result already float-shaped?
         emitRaw(out, "    _msg_divzero db \"Preposterous: 3rd grade mathematics violated (ZeroDivisionError)\", 10, 0");
+        emitRaw(out, "    _msg_divzero_short db \"division by zero\", 0");  // _ac_exc_msg's text — see its own comment
         if (needsSave_) emitRaw(out, "    _fmt_wmode db \"w\", 0");
         emitRaw(out, "");
         // Real try/catch via setjmp/longjmp (mirrors CStrategy's proven `_ac_try_stack`/
@@ -18794,6 +19062,11 @@ class AsmStrategy : public BackendStrategy
         emitRaw(out, "section .bss");
         emitRaw(out, "    _ac_try_stack resb 6400");   // 32 slots * 200 bytes/jmp_buf (glibc x86-64)
         emitRaw(out, "    _ac_try_depth resq 1");
+        // `report err` (emitCatchBegin) reads this back — PY's own wording ("division by
+        // zero"), not `_msg_divzero`'s "Preposterous: ..." banner (that one's only for the
+        // UNCAUGHT/.divfatal path) — see CStrategy's identical `_ac_exc_msg` fix for the full
+        // rationale (verified real bug: examples/try_report.ac's `report err` printed "0").
+        emitRaw(out, "    _ac_exc_msg resq 1");
         emitRaw(out, "");
         // `yield`/generators: single shared "currently active generator" slot — same design as
         // every other backend's fiber/thread implementation (see e.g. CStrategy's ac_gen_cur):
@@ -20877,12 +21150,12 @@ class AsmStrategy : public BackendStrategy
         out << "    jmp .after" << idx << "\n";
         out << ".catch" << idx << ":\n";
         out << "    mov rax, [rel _ac_try_depth]\n    dec rax\n    mov [rel _ac_try_depth], rax\n";
-        // Mirrors C's `long long exVar = 0;` — the exception var's stack slot
-        // must be zero-initialized, else it holds whatever garbage was left
-        // on the stack from before the try (matches C, no real message
-        // propagation across the setjmp/longjmp model on either backend).
-        if (!exVar.empty())
-            out << "    mov qword [" << slotAddr(exVar) << "], 0\n";
+        // See _ac_exc_msg's own comment (emitHeader) — PY's exact wording, for `report err`.
+        if (!exVar.empty()) {
+            strVars_.insert(exVar);
+            out << "    mov rax, [rel _ac_exc_msg]\n";
+            out << "    mov qword [" << slotAddr(exVar) << "], rax\n";
+        }
     }
     void emitAfterBegin(std::ostringstream &out, int & /*indent*/) override
     {
@@ -21626,6 +21899,19 @@ static std::set<std::string> detectStringVars(const std::vector<AC_IR::IRInstruc
                         if (iv.size() && str.count(iv))   add(coll);
                         if (coll.size() && str.count(coll)) add(iv);
                     }
+                    break;
+                case IROpcode::LOAD_INDEX:
+                    // Indexing a known STRING var/const (text[i]) yields a 1-char string — same
+                    // reasoning as FOR_BEGIN's string-iteration rule just above. `known()` only
+                    // ever true here for a genuine string container (dicts/lists are tracked in
+                    // separate sets, never added to `str`), so this can't misfire on dict/list
+                    // indexing. Only the CONSTANT-index case was ever visible before (the
+                    // constant folder resolves `text[1]` before this fixpoint even runs) — a
+                    // dynamic index (`ch = text[i]`, i non-constant) was invisible here entirely
+                    // (verified real bug: examples/dict_char_counter.ac's `ch = text[i]` defaulted
+                    // to ac_int, a hard C compile error passing it anywhere a string is expected).
+                    if (ins.result.isValid() && !ins.typedOperands.empty() && known(ins.typedOperands[0]))
+                        add(nm2(ins.result));
                     break;
                 case IROpcode::INPUT: // Term.ask always reads and returns text — unconditional,
                     // no `known(...)` gate needed (unlike STORE_VAR/CALL above, which only add
@@ -23945,6 +24231,21 @@ public:
                         varName = ref(ins.result);
                     if (!varName.empty() && !isSyntheticVar(varName))
                         loopMutatedVars.insert(varName);
+                    // `d[k] = v` / `arr[i] = v` (STORE_INDEX) is ALSO an accumulator write to the
+                    // container — it has no STORE_VAR and no VAR `.result` of its own (the write
+                    // goes straight into the container + index + value operands), so it was
+                    // totally invisible to both checks just above. Same "worse than the compile
+                    // error it replaced" risk as the `.append()` case just below, but for ANY
+                    // in-loop dict/array element write rather than just append (verified real
+                    // bug: examples/dict_char_counter.ac's `counts[ch] = ...` inside a WHILST —
+                    // Rust panicked "no entry found for key" after the loop clobbered every
+                    // insert back to the pre-loop snapshot; V hard-errored needing `.clone()` to
+                    // even compile, which would have hit the exact same clobber once it did).
+                    if (ins.opcode == IROpcode::STORE_INDEX && !ins.typedOperands.empty()) {
+                        std::string recv = ref(ins.typedOperands[0]);
+                        if (!recv.empty() && !isSyntheticVar(recv))
+                            loopMutatedVars.insert(recv);
+                    }
                     // `arr.append(x)` inside a loop is ALSO an accumulator write to `arr` — but on
                     // backends whose append is a pure in-place mutation (V's `arr << x`, no
                     // reassignment) it never surfaces as a STORE_VAR/result-VAR at all, so this scan
@@ -24352,7 +24653,19 @@ public:
         // passes that var as an argument are almost always in different functions), then one
         // pass over every CALL/LIB_CALL's arguments against it.
         {
-            std::map<std::string, std::string> varClassGlobal;
+            // Keyed by the var's actual symbol ID, not its bare name string — two UNRELATED
+            // variables that happen to share a name (e.g. a user's `c = Critter()` at mainloop
+            // level and an entirely different local `c` inside a compiler-synthesized helper
+            // like ac_evp_digit) get distinct IDs from SymbolTable::intern, but getName(id)
+            // collapses them to the same string. Matching by name treated the UNRELATED `c` as
+            // a Critter-typed parameter too (verified real bug: examples/
+            // keyword_catalog_core.ac's `strcmp(c, "0")`-style comparison inside ac_evp_digit
+            // broke on C/CPP/Java/RS/GO/V — "incompatible type ... expected Critter but
+            // argument is of type ac_str"). ID-based matching still finds the legitimate
+            // cross-function case (constructing a bundle in one function and passing that SAME
+            // variable, same ID, as an argument to another) — only the false-positive same-NAME
+            // collision is removed.
+            std::map<int, std::string> varClassGlobal;
             auto scanConstructs = [&](const std::vector<IRInstruction>& instrs) {
                 for (const auto& ins : instrs) {
                     if (ins.opcode != IROpcode::CALL || ins.result.kind != IRRef::Kind::VAR
@@ -24361,9 +24674,9 @@ public:
                             || ins.typedOperands[0].id < 0) continue;
                     std::string callee = ir.symbols.getName(ins.typedOperands[0].id);
                     if (classNames_.count(callee))
-                        varClassGlobal[ir.symbols.getName(ins.result.id)] = callee;
+                        varClassGlobal[ins.result.id] = callee;
                     else if (classFuncs_.count(callee))
-                        varClassGlobal[ir.symbols.getName(ins.result.id)] = classFuncs_[callee];
+                        varClassGlobal[ins.result.id] = classFuncs_[callee];
                 }
             };
             for (const auto& fn : ir.functions) scanConstructs(fn.instructions);
@@ -24381,7 +24694,7 @@ public:
                     for (size_t ai = 1; ai < ins.typedOperands.size(); ai++) {
                         const IRRef& arg = ins.typedOperands[ai];
                         if (arg.kind != IRRef::Kind::VAR) continue;
-                        auto vc = varClassGlobal.find(ir.symbols.getName(arg.id));
+                        auto vc = varClassGlobal.find(arg.id);
                         if (vc != varClassGlobal.end())
                             classParamTypes_[calleeName][(int)(ai - 1)] = vc->second;
                     }

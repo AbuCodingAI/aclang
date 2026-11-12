@@ -35,6 +35,26 @@ inline bool acCallReturnsFloat(const std::string& irName) {
     return intValued.find(irName) == intValued.end();
 }
 
+// ── Assumed result type of a built-in / ilib AC call: boolean ──────────────────────
+// Mirrors acCallReturnsFloat's role but for the ilib calls whose Python implementation
+// returns a real bool (so PY prints "True"/"False"). BNY/Java/Rust/Go/V each already
+// special-case this exact set (isBoolReturningIlibCall / glBoolFuncs / goBoolFuncs /
+// vBoolFuncs) so their printed output matches PY; C/CPP never got the equivalent
+// treatment, so this is the single authority the IR lowering (ir.cpp) consults to mark
+// such a call's result IRType::BOOL, letting the shared PRINT dispatch in ir_codegen.cpp
+// route it through emitPrintBool instead of printing it as a plain 0/1 integer.
+inline bool acCallReturnsBool(const std::string& irName) {
+    static const std::set<std::string> boolValued = {
+        "os.exists", "os_exists",
+        "regex.match", "regex.test", "regex_match", "regex_test",
+        "maudio.tts_ok", "maudio.stt_ok", "maudio_tts_ok", "maudio_stt_ok",
+        "stringm.ischar", "stringm.startswith", "stringm.endswith", "stringm.isws", "stringm.scan",
+        "stringm_ischar", "stringm_startswith", "stringm_endswith", "stringm_isws", "stringm_scan",
+        "web.pdf", "web.text", "web.inspect", "web_pdf", "web_text", "web_inspect",
+    };
+    return boolValued.find(irName) != boolValued.end();
+}
+
 // ─────────────────────────────────────────────────────────────
 // Core AC type system (semantic level)
 // ─────────────────────────────────────────────────────────────

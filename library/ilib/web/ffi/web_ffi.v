@@ -3,6 +3,12 @@ import net.http
 
 pub struct Web {}
 
+// web namespace const — AC-generated V uses web.pdf(...), web.page_get(...), etc. (same
+// pattern as os_ffi.v's `const os = AcOsNS{}` / regex_ffi.v's `const regex = AcRegexNS{}`)
+// — missing entirely before (verified: "undefined ident: `web`" on every program using
+// `use ilib web`).
+const web = Web{}
+
 pub fn (w Web) open(link string) {
     open_url('https://${link}')
 }

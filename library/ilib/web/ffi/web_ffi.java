@@ -129,9 +129,9 @@ class web {
     public static void popen(String rawLink) { WebLib.popen(rawLink); }
     public static void ropen(String identifier) { WebLib.ropen(identifier); }
     public static void browser() { WebLib.browser(); }
-    public static long pdf(String pdf) { return WebLib.pdf(pdf) ? 1L : 0L; }
-    public static long text(String text) { return WebLib.text(text) ? 1L : 0L; }
-    public static long inspect(String program) { return WebLib.inspect(program) ? 1L : 0L; }
+    public static boolean pdf(String pdf) { return WebLib.pdf(pdf); }
+    public static boolean text(String text) { return WebLib.text(text); }
+    public static boolean inspect(String program) { return WebLib.inspect(program); }
     public static void ac_page() { WebLib.acPage(); }
     public static String page_get(String url) { return WebLib.pageGet(url); }
     public static String help() {
